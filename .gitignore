@@ -1,0 +1,29 @@
+# ---- Flutter / Dart (mobile/) ----
+mobile/.dart_tool/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
+mobile/.packages
+mobile/build/
+mobile/.pub-cache/
+mobile/.pub/
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/android/**/gradle-wrapper.jar
+mobile/ios/Pods/
+mobile/ios/.symlinks/
+mobile/ios/Flutter/Flutter.framework
+mobile/*.iml
+
+# ---- Node / Vite (dashboard/) ----
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.env
+dashboard/.env.local
+dashboard/.env.*.local
+dashboard/*.log
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+.DS_Store
+*.swp

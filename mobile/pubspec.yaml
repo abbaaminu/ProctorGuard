@@ -1,0 +1,46 @@
+name: exam_proctor
+description: Cross-platform AI exam proctoring app (Flutter + Supabase + ML Kit)
+publish_to: "none"
+version: 0.1.0
+
+environment:
+  sdk: ^3.12.0
+  flutter: ">=3.44.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State management
+  flutter_riverpod: ^2.6.1
+
+  # Backend
+  supabase_flutter: ^2.5.6
+
+  # Desktop Window & Fullscreen Control
+  window_manager: ^0.5.2
+
+  # Camera / on-device AI
+  camera: ^0.12.1
+  google_mlkit_face_detection: ^0.15.1
+
+  # Permissions & lifecycle
+  permission_handler: ^11.3.1
+
+  # Browser-level exam guards (tab switch / blur / HTML5 fullscreen) — the web
+  # implementation of `lib/core/services/web_guards_web.dart` talks to the DOM
+  # through `package:web` + `dart:js_interop`, which also keeps a Wasm build
+  # possible (unlike the deprecated `dart:html`).
+  web: ^1.1.1
+
+  # Utils
+  equatable: ^2.0.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  http: ^1.0.0
+
+flutter:
+  uses-material-design: true

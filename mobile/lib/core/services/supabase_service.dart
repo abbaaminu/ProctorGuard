@@ -1,0 +1,464 @@
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart'
+    show debugPrint, kIsWeb, visibleForTesting;
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+/// Contract for the evidence uploader that the proctoring notifier depends on.
+///
+/// Declared here (rather than passing the singleton around) so the notifier
+/// can be unit-tested with a fake and stays free of Supabase wiring.
+typedef SnapshotUploader = Future<String?> Function({
+  required String submissionId,
+  required String actionType,
+  required Uint8List bytes,
+});
+
+/// Supabase connection settings, resolved from compile-time `--dart-define`
+/// values — the only configuration mechanism that also works on Flutter Web,
+/// where there is no `.env` file to read at runtime.
+class SupabaseConfig {
+  const SupabaseConfig({required this.url, required this.publishableKey});
+
+  final String url;
+  final String publishableKey;
+
+  /// Reads `--dart-define=SUPABASE_URL` and
+  /// `--dart-define=SUPABASE_PUBLISHABLE_KEY`, falling back to the legacy
+  /// `SUPABASE_ANON_KEY` name, and returns null when the build wasn't
+  /// configured.
+  ///
+  /// Returning null instead of forwarding empty strings matters:
+  /// `Supabase.initialize` asserts on a missing key, and an assertion failure
+  /// before `runApp` is precisely the blank-page startup failure this guards
+  /// against.
+  static SupabaseConfig? fromEnvironment() => fromValues(
+        url: const String.fromEnvironment('SUPABASE_URL'),
+        publishableKey: const String.fromEnvironment('SUPABASE_PUBLISHABLE_KEY'),
+        anonKey: const String.fromEnvironment('SUPABASE_ANON_KEY'),
+      );
+
+  /// Same fallback order as [fromEnvironment] with the values injected, so the
+  /// precedence is testable — compile-time defines cannot be faked at runtime.
+  static SupabaseConfig? fromValues({
+    required String url,
+    required String publishableKey,
+    required String anonKey,
+  }) =>
+      resolve(
+        url: url,
+        publishableKey:
+            publishableKey.trim().isEmpty ? anonKey : publishableKey,
+      );
+
+  /// Validation rules, kept separate from [fromEnvironment] so they can be
+  /// unit-tested without compile-time defines.
+  static SupabaseConfig? resolve({
+    required String url,
+    required String publishableKey,
+  }) {
+    final cleanUrl = url.trim().replaceAll(RegExp(r'/+$'), '');
+    final cleanKey = publishableKey.trim();
+
+    if (!_isUsable(cleanUrl) || !_isUsable(cleanKey)) return null;
+    if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+      return null;
+    }
+    return SupabaseConfig(url: cleanUrl, publishableKey: cleanKey);
+  }
+
+  /// Rejects empty values and the placeholders copied out of docs/examples, so
+  /// a half-filled command fails loudly at boot instead of pointing silently at
+  /// `https://your-project.supabase.co`.
+  static bool _isUsable(String value) {
+    if (value.isEmpty) return false;
+    final lower = value.toLowerCase();
+    const placeholders = [
+      'your-project',
+      'your-anon-key',
+      'your-publishable-key',
+      'your_url',
+      'your_key',
+      'replace-me',
+      'changeme',
+    ];
+    for (final placeholder in placeholders) {
+      if (lower.contains(placeholder)) return false;
+    }
+    return true;
+  }
+
+  /// Key the SDK persists the session under, matching supabase_flutter's own
+  /// default (`sb-<project-ref>-auth-token`) so existing sessions keep working.
+  String get sessionKey {
+    final host = Uri.tryParse(url)?.host ?? '';
+    return 'sb-${host.split('.').first}-auth-token';
+  }
+
+  /// Unknown leftovers for the startup screen: never log the key itself.
+  @override
+  String toString() => 'SupabaseConfig($url, key: ${publishableKey.length} chars)';
+}
+
+/// How far initialisation got, so the UI can explain itself instead of showing
+/// a blank screen.
+enum SupabaseInitStatus { ready, notConfigured, failed }
+
+/// Outcome of an auth call, so UI code never has to catch platform, storage or
+/// network exceptions itself.
+class AuthOutcome {
+  const AuthOutcome.success()
+      : ok = true,
+        message = null;
+  const AuthOutcome.failure(this.message) : ok = false;
+
+  final bool ok;
+  final String? message;
+}
+
+/// Thin wrapper around the Supabase client so the rest of the app never
+/// imports `supabase_flutter` directly (keeps the data layer swappable and
+/// testable).
+///
+/// Web notes: [init] resolves `--dart-define` values and never throws, because a
+/// startup exception in a browser is a blank page; the SDK touches
+/// `window.localStorage` while initialising and browsers can refuse that
+/// (private mode, partitioned storage, sandboxed iframes), so the storage is
+/// probed first and persistence is turned off deliberately when it is missing.
+/// Auth callbacks arrive in the URL; PKCE plus `detectSessionInUri` exchange
+/// them for a session and the SDK then clears the parameters.
+class SupabaseService {
+  SupabaseService._();
+  static final SupabaseService instance = SupabaseService._();
+
+  /// Public bucket holding violation snapshots (see schema.sql §6).
+  static const String snapshotBucket = 'proctor-snapshots';
+
+  SupabaseClient? _client;
+  SupabaseInitStatus _status = SupabaseInitStatus.notConfigured;
+  String? _initError;
+  bool _canPersistSession = true;
+  StreamSubscription<AuthState>? _authSubscription;
+  final StreamController<AuthState> _authStates =
+      StreamController<AuthState>.broadcast();
+
+  /// Whether [init] produced a usable client.
+  bool get isReady => _client != null;
+
+  SupabaseInitStatus get status => _status;
+
+  /// Readable reason when [status] isn't [SupabaseInitStatus.ready].
+  String? get initError => _initError;
+
+  /// False when the runtime refused local storage: sessions are in-memory only,
+  /// so a browser refresh signs the user out (everything else still works).
+  bool get sessionPersistenceAvailable => _canPersistSession;
+
+  /// The client, or null when the app booted without a backend. Startup paths
+  /// must use this — the former `late final client` threw
+  /// `LateInitializationError` whenever configuration was missing.
+  SupabaseClient? get clientOrNull => _client;
+
+  /// The client, for code that genuinely cannot work without one.
+  SupabaseClient get client {
+    final client = _client;
+    if (client == null) {
+      throw StateError(
+        'Supabase client unavailable ($_status): ${_initError ?? 'not configured'}',
+      );
+    }
+    return client;
+  }
+
+  User? get currentUser => _client?.auth.currentUser;
+  String? get currentUserId => _client?.auth.currentUser?.id;
+  Session? get currentSession => _client?.auth.currentSession;
+  bool get isSignedIn => currentUser != null;
+
+  /// Auth events; stream errors are logged rather than forwarded.
+  Stream<AuthState> get authStateChanges => _authStates.stream;
+
+  /// Signed-in status, re-emitted on every auth event — including the session
+  /// the SDK restores from storage after a browser refresh. Typed `bool` so
+  /// widgets do not need to import `supabase_flutter`.
+  Stream<bool> get signedInChanges async* {
+    yield isSignedIn;
+    await for (final _ in _authStates.stream) {
+      yield isSignedIn;
+    }
+  }
+
+  /// Redirect target for web/OAuth flows: the origin the app is served from.
+  /// Register it under Authentication → URL Configuration → Redirect URLs.
+  String? get authRedirectUrl => kIsWeb ? Uri.base.origin : null;
+
+  /// Initialises the client. **Never throws**: failures surface through
+  /// [status] and [initError] so `main()` keeps booting and the UI can explain
+  /// them.
+  Future<SupabaseInitStatus> init({SupabaseConfig? config}) async {
+    final settings = config ?? SupabaseConfig.fromEnvironment();
+    if (settings == null) {
+      _status = SupabaseInitStatus.notConfigured;
+      _initError = 'No SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY in this build '
+          '(or they are still the documentation placeholders).';
+      debugPrint('SupabaseService: $_initError');
+      return _status;
+    }
+
+    _canPersistSession = await _probeSessionStorage(settings);
+
+    try {
+      final app = await Supabase.initialize(
+        url: settings.url,
+        publishableKey: settings.publishableKey,
+        authOptions: FlutterAuthClientOptions(
+          // PKCE keeps tokens out of the URL fragment while still handling the
+          // `?code=...` / `#access_token=...` callbacks a provider sends back.
+          authFlowType: AuthFlowType.pkce,
+          detectSessionInUri: true,
+          persistSession: _canPersistSession,
+          // With storage blocked the default stores throw, so keep the PKCE
+          // verifier in memory for this tab.
+          pkceAsyncStorage: _canPersistSession ? null : _MemoryAsyncStorage(),
+        ),
+        realtimeClientOptions: const RealtimeClientOptions(eventsPerSecond: 10),
+      );
+
+      _client = app.client;
+      _status = SupabaseInitStatus.ready;
+      _initError = null;
+      _listenToAuthState();
+      debugPrint('SupabaseService: ready at ${settings.url} '
+          '(session persistence: $_canPersistSession)');
+    } catch (error, stackTrace) {
+      _client = null;
+      _status = SupabaseInitStatus.failed;
+      _initError = error.toString();
+      debugPrint('SupabaseService: initialisation failed: $error\n$stackTrace');
+    }
+    return _status;
+  }
+
+  /// Reads through the same storage the SDK uses during initialisation, so a
+  /// browser that refuses it is detected *before* it can abort startup.
+  static Future<bool> _probeSessionStorage(SupabaseConfig settings) async {
+    if (!kIsWeb) return true; // mobile/desktop storage is reliable
+
+    try {
+      final storage = SharedPreferencesLocalStorage(
+        persistSessionKey: settings.sessionKey,
+      );
+      await storage.initialize();
+      await storage.hasAccessToken(); // blocked storage throws right here
+      return true;
+    } catch (error) {
+      debugPrint('SupabaseService: browser storage unavailable ($error) — '
+          'continuing without session persistence.');
+      return false;
+    }
+  }
+
+  /// Signs in with email/password. Every failure mode (wrong password,
+  /// unconfirmed email, offline, blocked storage) comes back as an
+  /// [AuthOutcome] instead of an exception at the call site.
+  Future<AuthOutcome> signInWithPassword({
+    required String email,
+    required String password,
+  }) =>
+      _guardAuth('sign-in', () async {
+        final auth = _client?.auth;
+        if (auth == null) return _notConfigured;
+        await auth.signInWithPassword(email: email.trim(), password: password);
+        return const AuthOutcome.success();
+      });
+
+  /// Emails a magic link / OTP that returns to [redirectTo] (defaults to the
+  /// web origin — see [authRedirectUrl]).
+  Future<AuthOutcome> sendMagicLink({
+    required String email,
+    String? redirectTo,
+  }) =>
+      _guardAuth('magic link', () async {
+        final auth = _client?.auth;
+        if (auth == null) return _notConfigured;
+        await auth.signInWithOtp(
+          email: email.trim(),
+          emailRedirectTo: redirectTo ?? authRedirectUrl,
+        );
+        return const AuthOutcome.success();
+      });
+
+  /// Re-validates the persisted session (browser refresh, stale token) without
+  /// throwing: a failed refresh just means "not signed in any more".
+  Future<AuthOutcome> refreshSession() =>
+      _guardAuth('session refresh', () async {
+        final auth = _client?.auth;
+        if (auth == null) return _notConfigured;
+        final response = await auth.refreshSession();
+        return response.session == null
+            ? const AuthOutcome.failure('Session expired — please sign in again.')
+            : const AuthOutcome.success();
+      });
+
+  Future<AuthOutcome> signOut() =>
+      _guardAuth('sign-out', () async {
+        final auth = _client?.auth;
+        if (auth == null) return _notConfigured;
+        await auth.signOut();
+        return const AuthOutcome.success();
+      });
+
+  static const AuthOutcome _notConfigured =
+      AuthOutcome.failure('Backend not configured — see the setup screen.');
+
+  /// Single safety net for auth calls: platform, channel and storage failures
+  /// become [AuthOutcome.failure] instead of crashing the UI — which is what
+  /// used to happen on web when storage was restricted.
+  Future<AuthOutcome> _guardAuth(
+    String what,
+    Future<AuthOutcome> Function() action,
+  ) async {
+    try {
+      return await action();
+    } on AuthException catch (error) {
+      return AuthOutcome.failure(error.message); // expected, user-actionable
+    } catch (error, stackTrace) {
+      debugPrint('SupabaseService: $what failed: $error\n$stackTrace');
+      return AuthOutcome.failure(
+        '$what failed. Check your connection and try again.',
+      );
+    }
+  }
+
+  void _listenToAuthState() {
+    final auth = _client?.auth;
+    if (auth == null) return;
+
+    _authSubscription?.cancel();
+    _authSubscription = listenToAuthState(
+      auth.onAuthStateChange,
+      onState: (state) {
+        debugPrint('SupabaseService: auth event ${state.event.name}');
+        if (!_authStates.isClosed) _authStates.add(state);
+      },
+      onError: (error) =>
+          debugPrint('SupabaseService: auth stream error: $error'),
+    );
+  }
+
+  /// Wires an auth-state stream defensively: errors go to [onError] and the
+  /// subscription keeps listening (`cancelOnError: false`), so a failed token
+  /// refresh after a long offline period cannot surface as an unhandled stream
+  /// error — a genuine web crash source. Extracted so the contract is testable
+  /// without a live client.
+  @visibleForTesting
+  static StreamSubscription<AuthState> listenToAuthState(
+    Stream<AuthState> stream, {
+    required void Function(AuthState state) onState,
+    required void Function(Object error) onError,
+  }) =>
+      stream.listen(
+        onState,
+        onError: (Object error, StackTrace _) => onError(error),
+        cancelOnError: false,
+      );
+
+  /// Points the singleton at a client built over a fake HTTP transport so tests
+  /// can assert the exact PostgREST/Storage payloads. Production code must never
+  /// call this.
+  @visibleForTesting
+  void debugSetClient(SupabaseClient? client) {
+    _client = client;
+    _status = client == null
+        ? SupabaseInitStatus.notConfigured
+        : SupabaseInitStatus.ready;
+  }
+
+  /// Releases the auth listener; the singleton normally lives for the whole run,
+  /// tests call this to avoid leaking subscriptions.
+  Future<void> dispose() async {
+    await _authSubscription?.cancel();
+    _authSubscription = null;
+    if (!_authStates.isClosed) await _authStates.close();
+  }
+
+  /// Path convention the Storage policies (and the supervisor console) rely on:
+  /// `<submission_id>/<action_type>_<epoch-ms>.jpg`.
+  ///
+  /// Epoch-ms keeps the name unique per violation (the notifier already
+  /// debounces to one log every ~2s) without pulling in a uuid package, and the
+  /// first folder is the exact segment `proctor-snapshots` upload policies match
+  /// against `exam_submissions.id`.
+  static String snapshotPath({
+    required String submissionId,
+    required String actionType,
+    DateTime? at,
+  }) =>
+      '$submissionId/${actionType}_${(at ?? DateTime.now()).millisecondsSinceEpoch}.jpg';
+
+  /// Uploads violation evidence as `<submissionId>/<actionType>_<epochMs>.jpg`
+  /// and returns the public URL to store on the `proctoring_logs` row.
+  ///
+  /// The path layout is what the Storage policies key off: the first folder must
+  /// be the submission id, and the policy only allows it while that submission
+  /// is the caller's own and still `ongoing`.
+  ///
+  /// Returns `null` — never throws — when the upload cannot happen (offline,
+  /// policy rejection, quota): a missing picture must not stop the violation from
+  /// being logged or the 3-strike escalation from running.
+  Future<String?> uploadViolationSnapshot({
+    required String submissionId,
+    required String actionType,
+    required Uint8List bytes,
+    String contentType = 'image/jpeg',
+  }) async {
+    if (bytes.isEmpty) return null;
+
+    final client = _client;
+    if (client == null) return null; // unconfigured build: nothing to upload to
+
+    // Single source of truth for the path convention (see [snapshotPath]).
+    final path = snapshotPath(
+      submissionId: submissionId,
+      actionType: actionType,
+    );
+
+    try {
+      final storage = client.storage.from(snapshotBucket);
+      await storage.uploadBinary(
+        path,
+        bytes,
+        fileOptions: FileOptions(
+          contentType: contentType,
+          cacheControl: '3600', // evidence never changes; let the CDN hold it
+        ),
+      );
+      return storage.getPublicUrl(path);
+    } catch (error) {
+      debugPrint('Snapshot upload failed for $path: $error');
+      return null;
+    }
+  }
+}
+
+/// In-memory [GotrueAsyncStorage] for the PKCE code verifier, used only when the
+/// runtime refuses local storage: keeps the redirect exchange working for this
+/// tab instead of throwing.
+class _MemoryAsyncStorage implements GotrueAsyncStorage {
+  final Map<String, String> _values = <String, String>{};
+
+  @override
+  Future<String?> getItem({required String key}) async => _values[key];
+
+  @override
+  Future<void> setItem({required String key, required String value}) async {
+    _values[key] = value;
+  }
+
+  @override
+  Future<void> removeItem({required String key}) async {
+    _values.remove(key);
+  }
+}
+
