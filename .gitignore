@@ -21,6 +21,11 @@ dashboard/.env
 dashboard/.env.local
 dashboard/.env.*.local
 dashboard/*.log
+# `tsc -b` bookkeeping: machine-specific, regenerated on every build.
+dashboard/*.tsbuildinfo
+
+# ---- Kotlin/Gradle build state (mobile/android/) ----
+mobile/android/.kotlin/
 
 # ---- Editor / OS ----
 .vscode/

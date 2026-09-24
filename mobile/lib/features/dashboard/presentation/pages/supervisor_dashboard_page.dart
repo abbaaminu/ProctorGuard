@@ -5,7 +5,9 @@ import '../../../../core/services/supabase_service.dart';
 
 /// Streams `proctoring_logs` and `exam_submissions` for a given exam via
 /// Supabase Realtime, so supervisors see violations and status changes as
-/// they happen — no polling.
+/// they happen — no polling. RLS is what scopes the rows: a supervisor may read
+/// every attempt and every log (see `users_select_own_or_supervisor` and
+/// friends in `supabase/schema.sql`), a student only their own.
 final examSubmissionsStreamProvider =
     StreamProvider.family<List<Map<String, dynamic>>, String>((ref, examId) {
   return SupabaseService.instance.client
@@ -15,36 +17,99 @@ final examSubmissionsStreamProvider =
       .order('started_at');
 });
 
+/// `id -> display name` for every account the caller may read, so the monitor
+/// shows "Aisha Bello" instead of a raw uuid.
+final accountNamesProvider = StreamProvider<Map<String, String>>((ref) {
+  return SupabaseService.instance.client.from('users').stream(
+        primaryKey: ['id'],
+      ).map((rows) => {
+            for (final row in rows)
+              row['id'] as String: _displayName(row),
+          });
+});
+
+/// Live violation feed for **one** exam.
+///
+/// `proctoring_logs` carries no `exam_id` (it hangs off `submission_id`), so
+/// this streams the bounded log feed and filters it against this exam's
+/// submission ids — the previous version ignored `examId` altogether, which
+/// meant the "live feed" for exam A also listed incidents from exam B.
+///
+/// The subscription does not restart when the roster changes: the filter is
+/// applied on the stream, so a new submission is picked up without dropping
+/// buffered rows. For very large exams, put the join in a Postgres view and
+/// stream that instead.
 final liveViolationFeedProvider =
     StreamProvider.family<List<Map<String, dynamic>>, String>((ref, examId) {
-  // proctoring_logs doesn't carry exam_id directly (normalized via
-  // submission_id), so the dashboard filters client-side against the
-  // submission IDs it already holds for this exam. For high-volume exams,
-  // replace with a Postgres view joining logs -> submissions -> exam_id
-  // and stream that view instead.
+  final submissionIds = ref.watch(examSubmissionsStreamProvider(examId)).maybeWhen(
+        data: (rows) => rows.map((row) => row['id'] as String).toSet(),
+        orElse: () => const <String>{},
+      );
+
   return SupabaseService.instance.client
       .from('proctoring_logs')
       .stream(primaryKey: ['id'])
       .order('timestamp', ascending: false)
-      .limit(200);
+      .limit(200)
+      .map((rows) => rows
+          .where((row) => submissionIds.contains(row['submission_id']))
+          .toList());
 });
+
+/// `users.name`, falling back to the address (never an empty tile).
+String _displayName(Map<String, dynamic> row) {
+  final name = (row['name'] as String? ?? '').trim();
+  if (name.isNotEmpty) return name;
+  final email = (row['email'] as String? ?? '').trim();
+  return email.isEmpty ? 'Unknown account' : email;
+}
+
+/// `proctoring_logs.timestamp` → `HH:mm:ss`, or the raw value when it is not a
+/// parseable timestamp (the feed must never crash on an unexpected shape).
+String _clock(String? iso) {
+  final parsed = iso == null ? null : DateTime.tryParse(iso)?.toLocal();
+  if (parsed == null) return iso ?? '';
+  String two(int value) => value.toString().padLeft(2, '0');
+  return '${two(parsed.hour)}:${two(parsed.minute)}:${two(parsed.second)}';
+}
 
 class SupervisorDashboardPage extends ConsumerWidget {
   final String examId;
   final String examTitle;
   const SupervisorDashboardPage({super.key, required this.examId, required this.examTitle});
 
-  Color _statusColor(String status) => switch (status) {
-        'ongoing' => Colors.blue,
-        'submitted' => Colors.green,
-        'disqualified' => Colors.red,
-        _ => Colors.grey,
-      };
+  /// Human wording for `proctoring_logs.action_type`, kept identical to the
+  /// dashboard's incident labels so both consoles read the same.
+  static const Map<String, String> actionLabels = {
+    'looking_away': 'Looking away',
+    'multiple_faces': 'Multiple faces',
+    'no_face': 'No face',
+    'app_minimized': 'Left the exam app',
+    'audio_noise': 'Background noise',
+  };
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final submissions = ref.watch(examSubmissionsStreamProvider(examId));
-    final allLogs = ref.watch(liveViolationFeedProvider(examId));
+    final violations = ref.watch(liveViolationFeedProvider(examId));
+    final names = ref.watch(accountNamesProvider);
+
+    final roster = submissions.valueOrNull ?? const <Map<String, dynamic>>[];
+    final nameById = names.valueOrNull ?? const <String, String>{};
+
+    // submission id -> student name: a log row only knows its submission.
+    final studentBySubmission = <String, String>{
+      for (final row in roster)
+        row['id'] as String: nameById[row['student_id'] as String] ??
+            'Student ${_shortId(row['student_id'])}',
+    };
+
+    // Flags are counted from the feed that is already scoped to this exam.
+    final flagsBySubmission = <String, int>{};
+    for (final log in violations.valueOrNull ?? const <Map<String, dynamic>>[]) {
+      final id = log['submission_id'] as String;
+      flagsBySubmission[id] = (flagsBySubmission[id] ?? 0) + 1;
+    }
 
     return Scaffold(
       appBar: AppBar(title: Text('Live Monitor — $examTitle')),
@@ -53,46 +118,69 @@ class SupervisorDashboardPage extends ConsumerWidget {
           // ---- Student status grid --------------------------------------
           Expanded(
             flex: 3,
-            child: submissions.when(
-              loading: () => const Center(child: CircularProgressIndicator()),
-              error: (e, _) => Center(child: Text('Error: $e')),
-              data: (rows) {
-                final submissionIds = rows.map((r) => r['id'] as String).toSet();
-                return ListView.builder(
-                  itemCount: rows.length,
-                  itemBuilder: (context, i) {
-                    final s = rows[i];
-                    return Card(
-                      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                      child: ListTile(
-                        leading: CircleAvatar(
-                          backgroundColor: _statusColor(s['status'] as String),
-                          child: Text(
-                            (s['status'] as String).substring(0, 1).toUpperCase(),
-                            style: const TextStyle(color: Colors.white),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _RosterSummary(roster: roster),
+                Expanded(
+                  child: submissions.when(
+                    loading: () =>
+                        const Center(child: CircularProgressIndicator()),
+                    error: (error, _) => _FeedError(
+                      message: 'Could not load the roster.',
+                      detail: '$error',
+                    ),
+                    data: (rows) => rows.isEmpty
+                        ? const _FeedEmpty(
+                            message: 'No student has started this exam yet.',
+                          )
+                        : ListView.builder(
+                            itemCount: rows.length,
+                            itemBuilder: (context, i) {
+                              final row = rows[i];
+                              final status = row['status'] as String;
+                              final score = row['score'];
+                              final flags = flagsBySubmission[row['id']] ?? 0;
+
+                              return Card(
+                                margin: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 6,
+                                ),
+                                child: ListTile(
+                                  leading: CircleAvatar(
+                                    backgroundColor: _statusColor(status),
+                                    child: Text(
+                                      status.substring(0, 1).toUpperCase(),
+                                      style:
+                                          const TextStyle(color: Colors.white),
+                                    ),
+                                  ),
+                                  title: Text(
+                                    nameById[row['student_id'] as String] ??
+                                        'Student ${_shortId(row['student_id'])}',
+                                  ),
+                                  subtitle: Text(
+                                    'Status: $status'
+                                    '${score != null ? '  •  Score: $score' : ''}',
+                                  ),
+                                  trailing: Text(
+                                    '$flags flags',
+                                    style: TextStyle(
+                                      color: flags > 0
+                                          ? Colors.orange
+                                          : Theme.of(context)
+                                              .colorScheme
+                                              .onSurfaceVariant,
+                                    ),
+                                  ),
+                                ),
+                              );
+                            },
                           ),
-                        ),
-                        title: Text('Student: ${s['student_id']}'),
-                        subtitle: Text(
-                          'Status: ${s['status']}'
-                          '${s['score'] != null ? ' • Score: ${s['score']}' : ''}',
-                        ),
-                        trailing: allLogs.when(
-                          data: (logs) {
-                            final count = logs
-                                .where((l) => submissionIds.contains(l['submission_id']))
-                                .where((l) => l['submission_id'] == s['id'])
-                                .length;
-                            return Text('$count flags');
-                          },
-                          loading: () => const SizedBox.shrink(),
-                          error: (_, _) => const SizedBox.shrink(),
-                        ),
-                      ),
-                    );
-                  },
-                );
-              },
+                  ),
+                ),
+              ],
             ),
           ),
           const VerticalDivider(width: 1),
@@ -108,27 +196,141 @@ class SupervisorDashboardPage extends ConsumerWidget {
                       style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                 ),
                 Expanded(
-                  child: allLogs.when(
-                    loading: () => const Center(child: CircularProgressIndicator()),
-                    error: (e, _) => Center(child: Text('Error: $e')),
-                    data: (logs) => ListView.builder(
-                      itemCount: logs.length,
-                      itemBuilder: (context, i) {
-                        final log = logs[i];
-                        return ListTile(
-                          dense: true,
-                          leading: const Icon(Icons.flag, color: Colors.orange, size: 18),
-                          title: Text(log['action_type'] as String),
-                          subtitle: Text(log['timestamp'] as String),
-                        );
-                      },
+                  child: violations.when(
+                    loading: () =>
+                        const Center(child: CircularProgressIndicator()),
+                    error: (error, _) => _FeedError(
+                      message: 'Could not load violations.',
+                      detail: '$error',
                     ),
+                    data: (logs) => logs.isEmpty
+                        ? const _FeedEmpty(
+                            message: 'No violations recorded for this exam.',
+                          )
+                        : ListView.builder(
+                            itemCount: logs.length,
+                            itemBuilder: (context, i) {
+                              final log = logs[i];
+                              final type =
+                                  log['action_type'] as String? ?? 'unknown';
+
+                              return ListTile(
+                                dense: true,
+                                leading: const Icon(Icons.flag,
+                                    color: Colors.orange, size: 18),
+                                title: Text(actionLabels[type] ?? type),
+                                subtitle: Text(
+                                  '${studentBySubmission[log['submission_id']] ?? 'Unknown student'}'
+                                  '  •  ${_clock(log['timestamp'] as String?)}',
+                                ),
+                              );
+                            },
+                          ),
                   ),
                 ),
               ],
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// One-line roll-up above the student list.
+class _RosterSummary extends StatelessWidget {
+  const _RosterSummary({required this.roster});
+
+  final List<Map<String, dynamic>> roster;
+
+  @override
+  Widget build(BuildContext context) {
+    final total = roster.length;
+    final ongoing = roster.where((row) => row['status'] == 'ongoing').length;
+    final submitted =
+        roster.where((row) => row['status'] == 'submitted').length;
+    final disqualified =
+        roster.where((row) => row['status'] == 'disqualified').length;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      child: Text(
+        '$total attempt(s)  •  $ongoing in progress  •  $submitted submitted  •  '
+        '$disqualified disqualified',
+        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+      ),
+    );
+  }
+}
+
+/// First eight characters of a uuid, for the fallback student label.
+String _shortId(Object? value) {
+  final text = value is String ? value : '';
+  return text.length <= 8 ? text : text.substring(0, 8);
+}
+
+/// Avatar colour per submission status.
+Color _statusColor(String status) => switch (status) {
+      'ongoing' => Colors.blue,
+      'submitted' => Colors.green,
+      'disqualified' => Colors.red,
+      _ => Colors.grey,
+    };
+
+/// Centred placeholder for an empty pane.
+class _FeedEmpty extends StatelessWidget {
+  const _FeedEmpty({required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) => Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            message,
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+          ),
+        ),
+      );
+}
+
+/// Centred failure state for a pane that could not load (offline, RLS, …) —
+/// deliberately not a silent empty list, which is indistinguishable from
+/// "no incidents were recorded".
+class _FeedError extends StatelessWidget {
+  const _FeedError({required this.message, required this.detail});
+
+  final String message;
+  final String detail;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.cloud_off_outlined, color: theme.colorScheme.error),
+            const SizedBox(height: 8),
+            Text(message, textAlign: TextAlign.center),
+            const SizedBox(height: 4),
+            Text(
+              detail,
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+          ],
+        ),
       ),
     );
   }

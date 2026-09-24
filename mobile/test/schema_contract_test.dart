@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:exam_proctor/core/services/supabase_service.dart';
+import 'package:exam_proctor/features/exam/data/repositories/exam_repository_impl.dart';
+import 'package:exam_proctor/features/exam/domain/entities/submission.dart';
 import 'package:exam_proctor/features/proctoring/data/repositories/proctoring_repository_impl.dart';
 import 'package:exam_proctor/features/proctoring/domain/entities/violation.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -111,6 +113,79 @@ void main() {
           'audio_noise',
         ],
       );
+    });
+  });
+
+  group('submit_exam RPC payload', () {
+    test('submitExam asks the server to grade and close the attempt',
+        () async {
+      transport.responseBody =
+          '[{"result_status":"submitted","final_score":4}]';
+      final repo = ExamRepositoryImpl(client);
+
+      await repo.submitExam('sub-1');
+
+      final request = transport.requests.single;
+      expect(request.method, 'POST');
+      expect(request.url.path, '/rest/v1/rpc/submit_exam');
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      expect(body.keys.toSet(), <String>{'p_submission_id'});
+      expect(body['p_submission_id'], 'sub-1');
+    });
+
+    test('markDisqualified flags the close so the server never grades',
+        () async {
+      transport.responseBody =
+          '[{"result_status":"disqualified","final_score":null}]';
+      final repo = ExamRepositoryImpl(client);
+
+      await repo.markDisqualified('sub-1');
+
+      expect(transport.requests.single.url.path, '/rest/v1/rpc/submit_exam');
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      expect(body.keys.toSet(), <String>{'p_submission_id', 'p_disqualified'});
+      expect(body['p_disqualified'], isTrue);
+    });
+
+    test('closing an attempt never PATCHes exam_submissions directly',
+        () async {
+      // schema.sql §4 has no student UPDATE policy on the table, so a direct
+      // write would be rejected by RLS — submit_exam is the only writer.
+      transport.responseBody =
+          '[{"result_status":"submitted","final_score":0}]';
+      final repo = ExamRepositoryImpl(client);
+
+      await repo.submitExam('sub-1');
+
+      expect(
+        transport.requests.where((request) => request.method == 'PATCH'),
+        isEmpty,
+      );
+    });
+  });
+
+  group('attempt clock', () {
+    test('Submission parses started_at so the countdown can be anchored', () {
+      final submission = Submission.fromMap(<String, dynamic>{
+        'id': 'sub-1',
+        'student_id': 'student-1',
+        'exam_id': 'exam-1',
+        'answers': <String, dynamic>{},
+        'status': 'ongoing',
+        'score': null,
+        'started_at': '2026-01-01T09:00:00+00:00',
+      });
+
+      expect(submission.startedAt?.toUtc(), DateTime.utc(2026, 1, 1, 9));
+      expect(submission.status, SubmissionStatus.ongoing);
+    });
+
+    test('an unusable started_at is null rather than an exception', () {
+      for (final value in <Object?>[null, 42, 'not-a-date']) {
+        expect(Submission.parseTimestamp(value), isNull);
+      }
     });
   });
 

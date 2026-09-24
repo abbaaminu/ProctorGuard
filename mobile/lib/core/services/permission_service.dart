@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart' show debugPrint, kIsWeb;
 import 'package:flutter/services.dart' show MissingPluginException;
 import 'package:permission_handler/permission_handler.dart';
@@ -128,6 +130,17 @@ class PermissionService {
     return missing;
   }
 
+  /// Upper bound on a *status* query.
+  ///
+  /// A plugin that never answers must not be able to block the exam bootstrap —
+  /// the exam screen has no back button, so a silent plugin would strand the
+  /// student on a spinner. A timed-out query is reported as "not granted", which
+  /// the UI can explain and offer a retry for.
+  ///
+  /// Permission *requests* are deliberately not time-boxed: the OS dialog
+  /// legitimately stays on screen until the student answers it.
+  static const Duration statusTimeout = Duration(seconds: 2);
+
   /// Status query with the same "never throw" guarantee as [_request] —
   /// `isGranted` has no web implementation for the mobile-only permissions
   /// either, so a query can fail exactly like a request.
@@ -135,7 +148,13 @@ class PermissionService {
     if (!isSupported(permission)) return false;
 
     try {
-      return await _platform(permission).isGranted;
+      return await _platform(permission).isGranted.timeout(statusTimeout);
+    } on TimeoutException {
+      debugPrint(
+        'PermissionService: ${permission.name} status did not answer within '
+        '$statusTimeout',
+      );
+      return false;
     } catch (error) {
       debugPrint('PermissionService: ${permission.name} status failed: $error');
       return false;

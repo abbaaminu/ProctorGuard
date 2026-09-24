@@ -19,12 +19,31 @@ function emptyQuestion(): DraftQuestion {
   return { question_text: "", options: ["", "", "", ""], correct_option: 0, points: 1 };
 }
 
-function CreateExamModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+/**
+ * Create *or* edit an exam.
+ *
+ * Edit mode only touches the metadata (title + duration). Question rows are
+ * referenced by id inside `exam_submissions.answers` (the grading RPC joins on
+ * them), so replacing the set would orphan every answer already recorded and
+ * break the audit trail — question authoring therefore stays on the create path.
+ */
+function ExamFormModal({
+  exam,
+  onClose,
+  onSaved,
+}: {
+  exam?: ExamRow;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
   const { profile } = useAuth();
-  const [title, setTitle] = useState("");
-  const [duration, setDuration] = useState(30);
+  const [title, setTitle] = useState(exam?.title ?? "");
+  const [duration, setDuration] = useState(exam?.duration_minutes ?? 30);
   const [questions, setQuestions] = useState<DraftQuestion[]>([emptyQuestion()]);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const isEdit = exam !== undefined;
 
   function updateQuestion(i: number, patch: Partial<DraftQuestion>) {
     setQuestions((qs) => qs.map((q, idx) => (idx === i ? { ...q, ...patch } : q)));
@@ -39,31 +58,67 @@ function CreateExamModal({ onClose, onCreated }: { onClose: () => void; onCreate
   }
 
   async function handleSave() {
-    if (!profile) return;
-    setSaving(true);
-    try {
-      const { data: exam, error: examError } = await supabase
-        .from("exams")
-        .insert({ title, duration_minutes: duration, created_by: profile.id, is_published: false })
-        .select()
-        .single();
-      if (examError || !exam) throw examError;
+    if (saving) return;
 
-      const rows = questions
-        .filter((q) => q.question_text.trim())
-        .map((q) => ({
-          exam_id: exam.id,
-          question_text: q.question_text,
-          options: q.options,
-          correct_option: q.correct_option,
-          points: q.points,
-        }));
-      if (rows.length > 0) {
-        const { error: qError } = await supabase.from("questions").insert(rows);
-        if (qError) throw qError;
+    if (!profile) {
+      setError("Your profile is still loading — try again in a moment.");
+      return;
+    }
+    if (!title.trim()) {
+      setError("Give the exam a title.");
+      return;
+    }
+    if (!Number.isFinite(duration) || duration <= 0) {
+      setError("The duration must be at least one minute.");
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+
+    try {
+      if (exam) {
+        const { error: updateError } = await supabase
+          .from("exams")
+          .update({ title: title.trim(), duration_minutes: duration })
+          .eq("id", exam.id);
+        if (updateError) throw updateError;
+      } else {
+        const { data: created, error: examError } = await supabase
+          .from("exams")
+          .insert({
+            title: title.trim(),
+            duration_minutes: duration,
+            created_by: profile.id,
+            is_published: false,
+          })
+          .select()
+          .single();
+        if (examError || !created) {
+          throw examError ?? new Error("The exam was not created.");
+        }
+
+        const rows = questions
+          .filter((q) => q.question_text.trim())
+          .map((q) => ({
+            exam_id: created.id,
+            question_text: q.question_text.trim(),
+            options: q.options,
+            correct_option: q.correct_option,
+            points: q.points,
+          }));
+        if (rows.length > 0) {
+          const { error: qError } = await supabase.from("questions").insert(rows);
+          if (qError) throw qError;
+        }
       }
-      onCreated();
+
+      onSaved();
       onClose();
+    } catch (err) {
+      // This used to be unhandled: the promise rejected with nothing on screen,
+      // so a refused insert looked like the Save button doing nothing.
+      setError(err instanceof Error ? err.message : "Could not save the exam.");
     } finally {
       setSaving(false);
     }
@@ -73,13 +128,21 @@ function CreateExamModal({ onClose, onCreated }: { onClose: () => void; onCreate
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
       <div className="flex max-h-[85vh] w-full max-w-2xl flex-col rounded-lg border border-border bg-surface-raised">
         <div className="flex items-center justify-between border-b border-border px-5 py-3">
-          <h2 className="text-sm font-semibold text-slate-100">Create exam</h2>
+          <h2 className="text-sm font-semibold text-slate-100">
+            {isEdit ? "Edit exam details" : "Create exam"}
+          </h2>
           <button onClick={onClose} className="text-slate-500 hover:text-slate-300">
             <X size={18} />
           </button>
         </div>
 
         <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4">
+          {error && (
+            <div className="rounded-md border border-alert/30 bg-alert/10 px-3 py-2 text-sm text-alert">
+              {error}
+            </div>
+          )}
+
           <div className="grid grid-cols-3 gap-3">
             <div className="col-span-2">
               <label className="mb-1 block text-xs font-medium text-slate-400">Exam title</label>
@@ -102,6 +165,13 @@ function CreateExamModal({ onClose, onCreated }: { onClose: () => void; onCreate
             </div>
           </div>
 
+          {isEdit ? (
+            <p className="text-xs leading-relaxed text-slate-500">
+              Question editing is not available for an exam that already exists:
+              recorded answers reference these rows by id, so replacing them would
+              break every submission audit. Create a new exam to change the bank.
+            </p>
+          ) : (
           <div>
             <div className="mb-2 flex items-center justify-between">
               <span className="text-xs font-medium text-slate-400">Questions</span>
@@ -161,12 +231,13 @@ function CreateExamModal({ onClose, onCreated }: { onClose: () => void; onCreate
               ))}
             </div>
           </div>
+          )}
         </div>
 
         <div className="flex justify-end gap-2 border-t border-border px-5 py-3">
           <Button variant="outline" onClick={onClose}>Cancel</Button>
           <Button onClick={handleSave} disabled={saving || !title.trim()}>
-            {saving ? "Saving…" : "Save exam"}
+            {saving ? "Saving…" : isEdit ? "Save changes" : "Save exam"}
           </Button>
         </div>
       </div>
@@ -176,32 +247,74 @@ function CreateExamModal({ onClose, onCreated }: { onClose: () => void; onCreate
 
 export function ExamManager() {
   const [exams, setExams] = useState<(ExamRow & { question_count: number })[]>([]);
-  const [modalOpen, setModalOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [editing, setEditing] = useState<ExamRow | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   async function loadExams() {
     setLoading(true);
-    const { data: examRows } = await supabase.from("exams").select("*").order("created_at", { ascending: false });
-    const { data: questionRows } = await supabase.from("questions").select("exam_id");
+
+    const [examsRes, questionsRes] = await Promise.all([
+      supabase.from("exams").select("*").order("created_at", { ascending: false }),
+      supabase.from("questions").select("exam_id"),
+    ]);
+
+    const failure = examsRes.error ?? questionsRes.error;
+    if (failure) {
+      setError(failure.message);
+      setLoading(false);
+      return;
+    }
+
     const counts: Record<string, number> = {};
-    (questionRows ?? []).forEach((q) => {
+    (questionsRes.data ?? []).forEach((q) => {
       counts[q.exam_id] = (counts[q.exam_id] ?? 0) + 1;
     });
-    setExams((examRows ?? []).map((e) => ({ ...e, question_count: counts[e.id] ?? 0 })));
+
+    setError(null);
+    setExams(
+      ((examsRes.data as ExamRow[]) ?? []).map((e) => ({
+        ...e,
+        question_count: counts[e.id] ?? 0,
+      }))
+    );
     setLoading(false);
   }
 
   useEffect(() => { loadExams(); }, []);
 
   async function togglePublish(exam: ExamRow) {
-    await supabase.from("exams").update({ is_published: !exam.is_published }).eq("id", exam.id);
-    loadExams();
+    setError(null);
+    const { error: updateError } = await supabase
+      .from("exams")
+      .update({ is_published: !exam.is_published })
+      .eq("id", exam.id);
+
+    if (updateError) {
+      // A refused write used to be silent: the badge simply did not change.
+      setError(`Could not update "${exam.title}": ${updateError.message}`);
+      return;
+    }
+    await loadExams();
   }
 
-  async function deleteExam(examId: string) {
-    if (!confirm("Delete this exam and all its questions?")) return;
-    await supabase.from("exams").delete().eq("id", examId);
-    loadExams();
+  async function deleteExam(exam: ExamRow) {
+    if (
+      !confirm(
+        `Delete "${exam.title}" and all of its questions? Any recorded attempts and their proctoring evidence go with it.`
+      )
+    ) {
+      return;
+    }
+
+    setError(null);
+    const { error: deleteError } = await supabase.from("exams").delete().eq("id", exam.id);
+    if (deleteError) {
+      setError(`Could not delete "${exam.title}": ${deleteError.message}`);
+      return;
+    }
+    await loadExams();
   }
 
   return (
@@ -211,8 +324,14 @@ export function ExamManager() {
           <h1 className="text-lg font-semibold text-slate-100">Exams</h1>
           <p className="text-sm text-slate-500">Create and manage exams and question banks</p>
         </div>
-        <Button onClick={() => setModalOpen(true)}><Plus size={15} /> Create exam</Button>
+        <Button onClick={() => setCreateOpen(true)}><Plus size={15} /> Create exam</Button>
       </div>
+
+      {error && (
+        <div className="mb-4 rounded-md border border-alert/30 bg-alert/10 px-3 py-2 text-sm text-alert">
+          {error}
+        </div>
+      )}
 
       <Card>
         <table className="w-full text-sm">
@@ -249,8 +368,15 @@ export function ExamManager() {
                     <Link to={`/exams/${exam.id}/monitor`}>
                       <Button variant="ghost" size="icon" title="Live monitor"><Monitor size={15} /></Button>
                     </Link>
-                    <Button variant="ghost" size="icon" title="Edit"><Pencil size={15} /></Button>
-                    <Button variant="ghost" size="icon" title="Delete" onClick={() => deleteExam(exam.id)}>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title="Edit exam details"
+                      onClick={() => setEditing(exam)}
+                    >
+                      <Pencil size={15} />
+                    </Button>
+                    <Button variant="ghost" size="icon" title="Delete" onClick={() => deleteExam(exam)}>
                       <Trash2 size={15} className="text-alert" />
                     </Button>
                   </div>
@@ -261,7 +387,16 @@ export function ExamManager() {
         </table>
       </Card>
 
-      {modalOpen && <CreateExamModal onClose={() => setModalOpen(false)} onCreated={loadExams} />}
+      {createOpen && (
+        <ExamFormModal onClose={() => setCreateOpen(false)} onSaved={loadExams} />
+      )}
+      {editing && (
+        <ExamFormModal
+          exam={editing}
+          onClose={() => setEditing(null)}
+          onSaved={loadExams}
+        />
+      )}
     </div>
   );
 }

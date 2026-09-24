@@ -66,6 +66,19 @@ class KioskService {
   static const String channelName = 'lock_task_channel';
   static const MethodChannel _channel = MethodChannel(channelName);
 
+  /// Upper bound on a *command* round-trip (`startLock` / `stopLock`).
+  ///
+  /// A platform channel that never answers — no handler registered, a wedged
+  /// activity, a suspended engine — would otherwise block the exam bootstrap
+  /// forever and leave the student on a loading spinner with no way out (the
+  /// exam chrome has no back button). Timing out degrades to "not pinned",
+  /// which the exam chrome already reports.
+  static const Duration commandTimeout = Duration(seconds: 2);
+
+  /// Upper bound on a lock-task *state query*. A timeout is reported as
+  /// "unknown" — never as an escape — so a slow device cannot burn a strike.
+  static const Duration stateQueryTimeout = Duration(seconds: 1);
+
   /// How often the platform is asked whether lock task is still active. One
   /// method call per interval is negligible next to the camera pipeline.
   final Duration escapePollInterval;
@@ -84,8 +97,12 @@ class KioskService {
   Stream<KioskExitReason> get escapes => _exits.stream;
 
   Future<void> _checkStillPinned() async {
-    final active = await isLockTaskActive();
+    final active = await _isLockTaskActiveOrNull();
     if (_disposed || _stopping) return;
+
+    // The platform did not answer in time: inconclusive, not "the student
+    // escaped". The next tick asks again.
+    if (active == null) return;
 
     if (active) {
       _pinningConfirmed = true;
@@ -123,7 +140,9 @@ class KioskService {
     _stopPolling();
 
     try {
-      final reply = await _channel.invokeMapMethod<String, dynamic>('startLock');
+      final reply = await _channel
+          .invokeMapMethod<String, dynamic>('startLock')
+          .timeout(commandTimeout);
       if (reply == null || reply.isEmpty) return KioskResult.unsupported;
       final result = KioskResult(
         granted: reply['granted'] == true,
@@ -137,6 +156,14 @@ class KioskService {
         _poll = Timer.periodic(escapePollInterval, (_) => _checkStillPinned());
       }
       return result;
+    } on TimeoutException {
+      // See [commandTimeout]: the session continues unpinned rather than
+      // hanging on a bridge that is not answering.
+      return KioskResult(
+        granted: false,
+        message: 'The kiosk bridge did not answer within '
+            '${commandTimeout.inSeconds}s.',
+      );
     } on MissingPluginException {
       return KioskResult.unsupported;
     } on PlatformException catch (error) {
@@ -150,22 +177,38 @@ class KioskService {
     _stopping = true;
     _stopPolling();
     try {
-      await _channel.invokeMethod<void>('stopLock');
+      await _channel.invokeMethod<void>('stopLock').timeout(commandTimeout);
     } on MissingPluginException {
       // Not Android: nothing was ever pinned.
+    } on TimeoutException {
+      // The bridge stopped answering, and the activity is going away with the
+      // exam page anyway: there is nothing left to wait for.
     } on PlatformException {
       // Already unpinned, or the activity is gone: nothing to restore.
     }
   }
 
   /// True while the platform reports lock task mode as active.
-  Future<bool> isLockTaskActive() async {
+  ///
+  /// Time-boxed ([stateQueryTimeout]); a bridge that does not answer is
+  /// reported as `false`. Use [_isLockTaskActiveOrNull] where "unknown" and
+  /// "not pinned" must be told apart.
+  Future<bool> isLockTaskActive() async =>
+      (await _isLockTaskActiveOrNull()) ?? false;
+
+  /// The same query, with `null` meaning "the platform did not answer".
+  Future<bool?> _isLockTaskActiveOrNull() async {
     try {
-      return await _channel.invokeMethod<bool>('isLockTaskActive') ?? false;
+      return await _channel
+              .invokeMethod<bool>('isLockTaskActive')
+              .timeout(stateQueryTimeout) ??
+          false;
+    } on TimeoutException {
+      return null;
     } on MissingPluginException {
-      return false;
+      return null;
     } on PlatformException {
-      return false;
+      return null;
     }
   }
 

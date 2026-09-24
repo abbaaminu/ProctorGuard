@@ -67,21 +67,25 @@ class ExamRepositoryImpl implements ExamRepository {
 
   @override
   Future<void> submitExam(String submissionId) async {
-    await _client
-        .from('exam_submissions')
-        .update({'status': 'submitted', 'submitted_at': DateTime.now().toIso8601String()})
-        .eq('id', submissionId)
-        .eq('status', 'ongoing'); // no-op if already disqualified
+    // Server-side grading: `submit_exam` computes `score` from the stored
+    // answers (sum of `questions.points` for correct ones) and flips the status
+    // in one transaction. It is the *only* way to close an attempt now that
+    // there is no student UPDATE policy on exam_submissions — a patched client
+    // cannot write its own score. Idempotent, so a retry is safe.
+    await _client.rpc('submit_exam', params: {
+      'p_submission_id': submissionId,
+    });
   }
 
   @override
   Future<void> markDisqualified(String submissionId) async {
-    // Normally a side effect of register_violation(); exposed here for
-    // client-side redundancy (e.g. offline queue flush after reconnect).
-    await _client
-        .from('exam_submissions')
-        .update({'status': 'disqualified', 'submitted_at': DateTime.now().toIso8601String()})
-        .eq('id', submissionId)
-        .eq('status', 'ongoing');
+    // Normally a side effect of register_violation(); kept as the client-side
+    // redundancy path (offline queue flush after reconnect, or a strike whose
+    // log row never reached the server). `p_disqualified` never grades, and the
+    // RPC is idempotent for an attempt that is already closed.
+    await _client.rpc('submit_exam', params: {
+      'p_submission_id': submissionId,
+      'p_disqualified': true,
+    });
   }
 }

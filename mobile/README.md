@@ -7,11 +7,13 @@ lib/
                             # detection engine, lifecycle observer, kiosk bridge,
                             # browser guards (tab switch/blur/fullscreen)
   features/
-    auth/                   # email/password sign-in form (Supabase Auth)
-    exam/                   # domain entities, repo, exam-taking UI
+    auth/                   # sign-in form, `users.role` profile lookup,
+                            # post-login RoleGate router
+    exam/                   # domain entities, repo, student portal,
+                            # exam-taking UI
     proctoring/             # violation domain model, repo, Riverpod
                             # escalation notifier, full-screen overlay
-    dashboard/              # supervisor real-time monitoring page
+    dashboard/              # supervisor exam picker + live monitoring page
 supabase/schema.sql         # tables, RLS policies, RPCs
 android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLock
 ```
@@ -19,9 +21,10 @@ android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLoc
 ## Wiring order (what to do first)
 1. Run `../supabase/schema.sql` in the Supabase SQL editor (or via CLI
    migrations) — shared with the `../dashboard` app in this monorepo. It
-   creates all 5 tables, RLS policies, the `questions_public` safe view,
-   and two RPCs: `register_violation` (server-enforced 3-strike rule) and
-   `merge_submission_answer` (race-safe autosave).
+   creates all 5 tables, the RLS policies, the `questions_public` safe view and
+   three RPCs: `register_violation` (server-enforced 3-strike rule),
+   `submit_exam` (server-side grading + close) and `merge_submission_answer`
+   (race-safe autosave).
 2. `flutter pub get`, then run with:
    ```
    flutter run --dart-define=SUPABASE_URL=... --dart-define=SUPABASE_PUBLISHABLE_KEY=...
@@ -40,9 +43,11 @@ android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLoc
    mode (`.\run_app.ps1 -Mock`, or `--dart-define=MOCK_CAMERA=true`) or with a
    webcam and no face signals; the audio hook (`reportAudioLevel`) and the
    browser guards below are platform-independent and work either way.
-4. Wire your router (`go_router` is *not* a dependency yet) using the page
-   constructors already built: `ExamTakingPage(examId, submissionId)`,
-   `SupervisorDashboardPage(examId, examTitle)`.
+4. Routing is wired: `RoleGate` reads `users.role` after sign-in and sends
+   students to `StudentExamPortalPage` (published exams → `ExamTakingPage`) and
+   supervisors to `SupervisorExamPickerPage` → `SupervisorDashboardPage`. Drop in
+   `go_router` (`go_router` is *not* a dependency yet) when deep links matter —
+   every page takes plain constructor args.
 5. Nothing else to download — ML Kit bundles its face model inside the app, so
    no `assets/models/face_landmarker.task` file is needed any more.
 6. `flutter test` runs the unit/widget tests in `test/` (head-pose geometry,
@@ -102,6 +107,12 @@ the supervisor console already renders).
   can never delay the 3-strike escalation.
 - `register_violation(p_submission_id, p_action_type, p_snapshot_url)` now
   carries the URL; the third argument is optional so older clients keep working.
+- `register_violation` is `SECURITY DEFINER` (a student may neither insert into
+  `proctoring_logs` nor update `exam_submissions`), so it re-checks that the
+  caller owns the submission before writing anything. Without that guard any
+  signed-in account could disqualify a classmate by calling the RPC with their
+  submission id. A violation that arrives *after* the attempt closed is reported
+  rather than logged, so late frames cannot pad the evidence.
 - The bucket, its size/mime limits and its policies live in
   `../supabase/schema.sql` §6: an authenticated student may only upload into
   their **own, still-ongoing** submission folder (mirroring the append-only
@@ -204,7 +215,7 @@ has one, and that needs device-owner status), which is why escape detection poll
 ## Sign-in (email + password)
 
 `LoginPage` (`lib/features/auth/presentation/pages/login_page.dart`) is what
-`_RoleGate` renders whenever there is no session — the `"Login page goes here"`
+`RoleGate` renders whenever there is no session — the `"Login page goes here"`
 placeholder is gone. It:
 
 - validates both fields before touching the network (whitespace counts as
@@ -227,9 +238,89 @@ placeholder is gone. It:
 tests drive success, rejection, a hung request and the unconfigured path with no
 backend at all (`mobile/test/login_page_test.dart`).
 
-Role routing after sign-in is still a placeholder: `_RoleGate` rebuilds on
-`SupabaseService.signedInChanges`, so a successful sign-in swaps this page out,
-but the student/supervisor split (reading `users.role`) is the next step.
+Role routing after sign-in is covered in "Role routing (post-login)" below.
+
+## Role routing (post-login)
+
+`RoleGate` (`lib/features/auth/presentation/widgets/role_gate.dart`) is the whole
+router today. Once `SupabaseService.signedInChanges` reports a session it:
+
+1. takes the auth user id and reads **`public.users`** for it
+   (`ProfileRepositoryImpl` → `select().eq('id', userId).maybeSingle()`, allowed by
+   the "Authenticated users can read profiles" policy);
+2. shows "Loading your profile…" with a spinner while that read is in flight;
+3. routes on the role:
+   * `student` → `StudentExamPortalPage`
+   * `supervisor` → `SupervisorExamPickerPage`
+
+A failed lookup (offline, no row, unrecognised role) renders a retryable error
+with a **Sign out** escape hatch instead of guessing a role — an unknown
+`users.role` throws in `UserRole.fromDb` rather than defaulting to `student`.
+`profileRepositoryProvider` is bound in `main()` next to the exam/proctoring
+repositories, and `userProfileProvider` is keyed by the auth user id, so signing
+in as a different account resolves a different profile.
+
+### Student Exam Portal
+
+`StudentExamPortalPage` lists every published exam (CS101 and MAT201 in
+`seed.sql`) through `PublishedExamList`, and on tap:
+
+* calls `startOrResumeSubmission(examId)` — the schema's
+  `unique(student_id, exam_id)` means a second tap resumes rather than duplicates;
+* an `ongoing` attempt pushes `ExamTakingPage(examId, submissionId, durationMinutes,
+  startedAt)`: the session screen with the camera (or the `MOCK_CAMERA` feed),
+  question navigation, the countdown, the 3-strike overlay, Android kiosk pinning
+  and the browser guards;
+* an attempt that is already `submitted` **or `disqualified`** is reported in a
+  SnackBar and *not* reopened — exactly what Aisha hits on CS101 in the seed data,
+  where the server disqualified her after three strikes;
+* a failed start shows "Could not start …" instead of a silent no-op.
+
+### The exam session screen
+
+`ExamTakingPage` owns one attempt end to end, and every way it can fail ends
+somewhere the student can leave from — the chrome deliberately has no back button
+mid-exam, so a silent failure would strand them:
+
+| Situation | What the student sees |
+| --- | --- |
+| Camera/mic permission refused (Android/iOS) | "This exam needs camera and microphone access…" + **Try again** / **Leave** |
+| No camera, or the camera refuses to start | the same blocking screen with the plugin's error code |
+| Question feed unreachable | "Could not load the questions for this exam." + **Try again** / **Leave** |
+| Exam has no questions yet | "No questions yet" + **Leave** (the attempt stays `ongoing`, so it can be resumed after a supervisor adds them) |
+| Clock ran out | auto-submit; if the server cannot be reached, a "Time is up" screen with **Send again** / **Leave** |
+
+Details worth knowing:
+
+* **`exams.duration_minutes` is enforced.** The countdown is anchored on
+  `exam_submissions.started_at` (not on "now"), so a resumed attempt keeps its
+  remaining time and one that is already past its deadline is submitted on the
+  first tick. The chip in the app bar turns amber under 5 minutes and red under 1.
+* **Answers are painted locally and saved through `merge_submission_answer`.** A
+  failed autosave says so and *stays on the question* instead of advancing past
+  the only chance to save that answer — grading reads the server copy.
+* **Submitting goes through `submit_exam`** (see `../supabase/schema.sql`): the
+  server grades and closes the attempt, and `score` is never written by the
+  client. There is no student `UPDATE` policy on `exam_submissions` at all.
+* **Retry re-runs only the failed stage** — the permissions, camera, kiosk pin or
+  question feed that already succeeded is not reopened.
+* **The kiosk bridge and permission status queries are time-boxed**
+  (`KioskService.commandTimeout`, `PermissionService.statusTimeout`). A platform
+  channel that never answers used to leave the bootstrap waiting forever, i.e. the
+  spinner above; now the session degrades to "not pinned" / "not granted" and the
+  screen explains itself. A lock-task *state* query that times out is treated as
+  "unknown" rather than as an escape, so a slow device cannot burn a strike.
+* **Startup permission prompts do not block the first frame.** `main()` fires the
+  permission pass without awaiting it (an OS dialog can stay open indefinitely,
+  and blocking `runApp` on it is the blank-page startup failure the boot order
+  exists to avoid); the exam screen re-checks the critical statuses before opening
+  the camera.
+
+`mobile/test/role_routing_test.dart` covers the portal path with injected
+repositories: role parsing, both routes, the loading state, the retry after a
+failure, the disqualified guard, and the exam/submission ids handed to the session
+screen. `mobile/test/exam_taking_page_test.dart` covers the blocking state and its
+retry/leave actions.
 
 ## Web authentication (and startup safety)
 
@@ -268,7 +359,7 @@ What `SupabaseService` guarantees on web:
   `signedInChanges` (`bool`, so widgets need no `supabase_flutter` import) are
   backed by a listener that routes errors to `debugPrint` with
   `cancelOnError: false`, so a failed token refresh can never become an
-  unhandled stream error. `_RoleGate` rebuilds from `signedInChanges`, which is
+  unhandled stream error. `RoleGate` rebuilds from `signedInChanges`, which is
   how a restored session reaches the UI after a refresh.
 * **Redirect flows.** The client uses PKCE with `detectSessionInUri: true`, so
   the `?code=…` (or `#access_token=…`) that Supabase appends on the way back is
@@ -322,12 +413,14 @@ own unpin is not an escape" and "a single inactive blip is tolerated" rules);
   patching the client can't spoof past it — the client's `warningCount`
   is reconciled against the RPC's authoritative return value every time.
 - **Grading never touches the device.** `questions.correct_option` is
-  excluded from the `questions_public` view the exam-taking page reads
-  from; RLS also blocks students from selecting the raw `questions` table
-  directly.
-- **Append-only violation log.** `proctoring_logs` has insert + select
-  policies but no update/delete policy, so RLS makes tampering with
-  history impossible from the client.
+  excluded from the `questions_public` view the exam-taking page reads (a
+  definer view filtered to published exams), and there is **no** student SELECT
+  policy on the raw `questions` table at all — so the answer key cannot reach a
+  student device. `submit_exam` grades from the stored answers on the server.
+- **Append-only violation log.** `proctoring_logs` has no insert, update or
+  delete policy: `register_violation` is the only writer, and it re-checks that
+  the caller owns the submission, so RLS makes tampering with evidence
+  impossible from a client.
 - **`app_minimized` detection accepts false positives.** `AppLifecycleState
   .inactive` fires for notification-shade pulls, incoming calls, *and*
   (on many Android builds) the screenshot flash — that's intentional

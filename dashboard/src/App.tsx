@@ -8,18 +8,16 @@ import { LiveMonitor } from "@/pages/LiveMonitor";
 import { SubmissionAudit } from "@/pages/SubmissionAudit";
 
 function RequireSupervisor({ children }: { children: React.ReactNode }) {
-  const { loading, profile, error } = useAuth();
+  const { loading, profile } = useAuth();
 
   if (loading) {
     return <div className="flex min-h-screen items-center justify-center bg-surface text-sm text-slate-500">Loading…</div>;
   }
   if (!profile) {
+    // Signed out, or signed in without a supervisor profile — `useAuth` puts the
+    // reason (a failed profile read, a student account) in its `error`, which
+    // LoginPage renders above the form. The console itself stays unreachable.
     return <LoginPage />;
-  }
-  if (error) {
-    // Authenticated but role check failed elsewhere — defensive fallback,
-    // primary messaging happens on the login screen itself.
-    return <Navigate to="/" replace />;
   }
   return <>{children}</>;
 }

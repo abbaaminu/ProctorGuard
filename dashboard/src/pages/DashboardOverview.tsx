@@ -6,6 +6,7 @@ import {
 } from "recharts";
 import { supabase } from "@/lib/supabase";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import type { ExamRow, SubmissionRow, ProctoringLogRow } from "@/types/database";
 
 function MetricCard({
@@ -43,8 +44,14 @@ export function DashboardOverview() {
   const [submissions, setSubmissions] = useState<SubmissionRow[]>([]);
   const [logs, setLogs] = useState<ProctoringLogRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError(null);
+
     (async () => {
       const [examsRes, subsRes, logsRes] = await Promise.all([
         supabase.from("exams").select("*"),
@@ -54,18 +61,41 @@ export function DashboardOverview() {
           .select("*")
           .gte("timestamp", new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()),
       ]);
+      if (!active) return;
+
+      // A failed read used to be indistinguishable from an empty backend (the
+      // cards simply showed zeros), so it is surfaced with a Retry instead.
+      const failure = examsRes.error ?? subsRes.error ?? logsRes.error;
+      if (failure) {
+        setError(failure.message);
+        setLoading(false);
+        return;
+      }
+
       setExams((examsRes.data as ExamRow[]) ?? []);
       setSubmissions((subsRes.data as SubmissionRow[]) ?? []);
       setLogs((logsRes.data as ProctoringLogRow[]) ?? []);
       setLoading(false);
     })();
-  }, []);
 
-  const activeLiveExams = exams.filter((e) => e.is_published).length;
+    return () => {
+      active = false;
+    };
+  }, [reloadKey]);
+
+  // "Live now" is a real signal: an exam a candidate is sitting *right now*.
+  // It used to count published exams, which says nothing about live activity.
+  const liveExamCount = new Set(
+    submissions.filter((s) => s.status === "ongoing").map((s) => s.exam_id)
+  ).size;
+  const publishedExamCount = exams.filter((e) => e.is_published).length;
   const activeCandidates = submissions.filter((s) => s.status === "ongoing").length;
   const incidentsToday = logs.length;
-  const dqRate = submissions.length
-    ? Math.round((submissions.filter((s) => s.status === "disqualified").length / submissions.length) * 100)
+  const closedAttempts = submissions.filter((s) => s.status !== "ongoing").length;
+  const dqRate = closedAttempts
+    ? Math.round(
+        (submissions.filter((s) => s.status === "disqualified").length / closedAttempts) * 100
+      )
     : 0;
 
   const incidentBreakdown = useMemo(() => {
@@ -98,14 +128,32 @@ export function DashboardOverview() {
     return <div className="p-6 text-sm text-slate-500">Loading dashboard…</div>;
   }
 
+  if (error) {
+    return (
+      <div className="p-6">
+        <h1 className="mb-1 text-lg font-semibold text-slate-100">Dashboard</h1>
+        <Card className="mt-4">
+          <CardContent className="flex flex-col items-start gap-3 p-4">
+            <p className="text-sm text-alert">Could not load the dashboard: {error}</p>
+            <Button variant="outline" size="sm" onClick={() => setReloadKey((k) => k + 1)}>
+              Try again
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div className="p-6">
       <h1 className="mb-1 text-lg font-semibold text-slate-100">Dashboard</h1>
-      <p className="mb-6 text-sm text-slate-500">Exam activity across your organization</p>
+      <p className="mb-6 text-sm text-slate-500">
+        Exam activity across your organization — {publishedExamCount} published of {exams.length} exam(s)
+      </p>
 
       <div className="grid grid-cols-4 gap-4">
-        <MetricCard label="Active live exams" value={String(activeLiveExams)} icon={Activity} />
-        <MetricCard label="Active candidates" value={String(activeCandidates)} icon={Users} />
+        <MetricCard label="Live exams now" value={String(liveExamCount)} icon={Activity} />
+        <MetricCard label="Candidates in progress" value={String(activeCandidates)} icon={Users} />
         <MetricCard label="Incidents (24h)" value={String(incidentsToday)} icon={AlertTriangle} />
         <MetricCard label="Disqualification rate" value={`${dqRate}%`} icon={Ban} tone="alert" />
       </div>

@@ -72,11 +72,15 @@ class WebExamGuard {
   /// Stops listening, leaves fullscreen and releases the DOM listeners: a
   /// finished exam must neither trap the student in fullscreen nor keep counting
   /// strikes. Safe to call twice.
+  ///
+  /// The subscription cancellation is fire-and-forget — the guard ignores every
+  /// later event anyway (`_startedAt == null`) — so a stalled platform stream
+  /// cannot hold up the caller (bootstrap, retry or dispose).
   Future<void> stop() async {
     if (_stopped) return;
     _stopped = true;
     _startedAt = null;
-    await _subscription?.cancel();
+    unawaited(_subscription?.cancel());
     _subscription = null;
     await guards.exitFullscreen();
     guards.dispose();

@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
-import { AlertOctagon, Ban, Clock, Image as ImageIcon, X } from "lucide-react";
+import { Link, useParams } from "react-router-dom";
+import { AlertOctagon, Ban, Clock, FileText, Image as ImageIcon, X } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { useExamSubmissions } from "@/hooks/useExamSubmissions";
 import { useLiveIncidentFeed } from "@/hooks/useLiveIncidentFeed";
+import { useAccountNames } from "@/hooks/useAccountNames";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge, statusTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn, formatTime, shortId, timeElapsed } from "@/lib/utils";
-import type { ExamRow } from "@/types/database";
+import type { ExamRow, SubmissionRow } from "@/types/database";
 
 const INCIDENT_LABELS: Record<string, string> = {
   looking_away: "Looking away",
@@ -36,14 +37,24 @@ export function LiveMonitor() {
   const [exam, setExam] = useState<ExamRow | null>(null);
   const [snapshot, setSnapshot] = useState<string | null>(null);
   const [flash, setFlash] = useState(false);
+  /** Action-level failure: a disqualify that the server refused, say. */
+  const [actionError, setActionError] = useState<string | null>(null);
 
-  const { submissions, disqualify } = useExamSubmissions(examId!);
+  const { submissions, error: rosterError, disqualify } = useExamSubmissions(examId ?? "");
   const submissionIds = useMemo(() => submissions.map((s) => s.id), [submissions]);
   const logs = useLiveIncidentFeed(submissionIds.length ? submissionIds : null);
+  // `id -> name` so the roster and the feed read like a class list instead of a
+  // wall of uuids (RLS lets a supervisor read every profile row).
+  const names = useAccountNames();
 
   useEffect(() => {
     if (!examId) return;
-    supabase.from("exams").select("*").eq("id", examId).single().then(({ data }) => setExam(data));
+    supabase
+      .from("exams")
+      .select("*")
+      .eq("id", examId)
+      .single()
+      .then(({ data }) => setExam(data));
   }, [examId]);
 
   // Visual ping when a new violation lands — flash the feed header briefly
@@ -62,6 +73,39 @@ export function LiveMonitor() {
     logs.forEach((l) => { counts[l.submission_id] = (counts[l.submission_id] ?? 0) + 1; });
     return counts;
   }, [logs]);
+
+  const labelFor = (studentId: string) => names[studentId] ?? `Student ${shortId(studentId)}`;
+
+  /** submission id -> student id, for the feed rows (a log only knows its submission). */
+  const studentBySubmission = useMemo(
+    () => Object.fromEntries(submissions.map((s) => [s.id, s.student_id])),
+    [submissions]
+  );
+
+  const feedLabel = (submissionId: string) => {
+    const studentId = studentBySubmission[submissionId];
+    return studentId ? labelFor(studentId) : shortId(submissionId);
+  };
+
+  /**
+   * Closing an attempt is irreversible (the server never reopens one), so it
+   * takes an explicit confirmation — and a refused write is reported instead of
+   * leaving the supervisor wondering why nothing happened.
+   */
+  async function handleDisqualify(submission: SubmissionRow) {
+    const label = labelFor(submission.student_id);
+    if (!confirm(`Disqualify ${label}? The attempt is closed immediately and cannot be reopened.`)) {
+      return;
+    }
+
+    setActionError(null);
+    const ok = await disqualify(submission.id);
+    if (!ok) {
+      setActionError(
+        `Could not disqualify ${label}. The attempt is unchanged — check that you are a supervisor for this exam.`
+      );
+    }
+  }
 
   return (
     <div className="flex h-screen flex-col">
@@ -84,37 +128,63 @@ export function LiveMonitor() {
           <p className="mb-3 text-xs font-medium uppercase tracking-wide text-slate-500">
             Candidates ({submissions.length})
           </p>
-          <div className="grid grid-cols-3 gap-3">
-            {submissions.map((s) => (
-              <Card key={s.id} className={cn(s.status === "disqualified" && "border-alert/40")}>
-                <CardContent className="p-3.5">
-                  <div className="mb-2 flex items-center justify-between">
-                    <span className="font-mono text-xs text-slate-400">{shortId(s.student_id)}</span>
-                    <Badge tone={statusTone(s.status)}>{s.status}</Badge>
-                  </div>
-                  <div className="flex items-center justify-between text-xs text-slate-500">
-                    <span>{s.status === "ongoing" ? timeElapsed(s.started_at) : "—"}</span>
-                    <span>{s.score != null ? `${s.score} pts` : "Unscored"}</span>
-                  </div>
-                  {(incidentCountBySubmission[s.id] ?? 0) > 0 && (
-                    <div className="mt-2 flex items-center gap-1 text-xs text-warn">
-                      <AlertOctagon size={12} /> {incidentCountBySubmission[s.id]} flag(s)
+
+          {rosterError && (
+            <div className="mb-3 rounded-md border border-alert/30 bg-alert/10 px-3 py-2 text-sm text-alert">
+              Could not load the roster: {rosterError}
+            </div>
+          )}
+          {actionError && (
+            <div className="mb-3 rounded-md border border-alert/30 bg-alert/10 px-3 py-2 text-sm text-alert">
+              {actionError}
+            </div>
+          )}
+
+          {submissions.length === 0 && !rosterError ? (
+            <p className="text-sm text-slate-500">No student has started this exam yet.</p>
+          ) : (
+            <div className="grid grid-cols-3 gap-3">
+              {submissions.map((s) => (
+                <Card key={s.id} className={cn(s.status === "disqualified" && "border-alert/40")}>
+                  <CardContent className="p-3.5">
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <span className="truncate text-sm font-medium text-slate-200">
+                        {labelFor(s.student_id)}
+                      </span>
+                      <Badge tone={statusTone(s.status)}>{s.status}</Badge>
                     </div>
-                  )}
-                  {s.status === "ongoing" && (
-                    <Button
-                      variant="destructive"
-                      size="sm"
-                      className="mt-3 w-full"
-                      onClick={() => disqualify(s.id)}
-                    >
-                      <Ban size={13} /> Disqualify
-                    </Button>
-                  )}
-                </CardContent>
-              </Card>
-            ))}
-          </div>
+                    <div className="flex items-center justify-between text-xs text-slate-500">
+                      <span>{s.status === "ongoing" ? timeElapsed(s.started_at) : "—"}</span>
+                      <span>{s.score != null ? `${s.score} pts` : "Unscored"}</span>
+                    </div>
+                    {(incidentCountBySubmission[s.id] ?? 0) > 0 && (
+                      <div className="mt-2 flex items-center gap-1 text-xs text-warn">
+                        <AlertOctagon size={12} /> {incidentCountBySubmission[s.id]} flag(s)
+                      </div>
+                    )}
+                    <div className="mt-3 flex items-center gap-2">
+                      <Link
+                        to={`/submissions/${s.id}`}
+                        className="inline-flex items-center gap-1 text-xs text-accent hover:underline"
+                      >
+                        <FileText size={12} /> Audit
+                      </Link>
+                      {s.status === "ongoing" && (
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          className="ml-auto"
+                          onClick={() => handleDisqualify(s)}
+                        >
+                          <Ban size={13} /> Disqualify
+                        </Button>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Right: realtime incident feed */}
@@ -145,8 +215,15 @@ export function LiveMonitor() {
                     </span>
                     <span className="font-mono text-[11px] text-slate-500">{formatTime(log.timestamp)}</span>
                   </div>
-                  <p className="mt-0.5 font-mono text-[11px] text-slate-500">
-                    {shortId(log.submission_id)}
+                  <p className="mt-0.5 text-[11px] text-slate-500">
+                    {feedLabel(log.submission_id)}
+                    {" · "}
+                    <Link
+                      to={`/submissions/${log.submission_id}`}
+                      className="text-accent hover:underline"
+                    >
+                      audit
+                    </Link>
                   </p>
                   {log.snapshot_url && (
                     <button

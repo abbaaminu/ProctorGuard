@@ -2,19 +2,34 @@ import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import type { SubmissionRow } from "@/types/database";
 
+/**
+ * One exam's roster, live.
+ *
+ * Errors used to be swallowed (`const { data } = await ...`), which made a
+ * failed read indistinguishable from an exam nobody has started — so the load
+ * error is now returned and the monitor renders it.
+ */
 export function useExamSubmissions(examId: string) {
   const [submissions, setSubmissions] = useState<SubmissionRow[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (!examId) return;
     let active = true;
 
     (async () => {
-      const { data } = await supabase
+      const { data, error: loadError } = await supabase
         .from("exam_submissions")
         .select("*")
         .eq("exam_id", examId)
         .order("started_at");
-      if (active && data) setSubmissions(data as SubmissionRow[]);
+      if (!active) return;
+      if (loadError) {
+        setError(loadError.message);
+        return;
+      }
+      setError(null);
+      setSubmissions((data as SubmissionRow[]) ?? []);
     })();
 
     const channel = supabase
@@ -45,12 +60,28 @@ export function useExamSubmissions(examId: string) {
     };
   }, [examId]);
 
-  async function disqualify(submissionId: string) {
-    await supabase
+  /**
+   * Supervisor intervention: close an ongoing attempt as disqualified.
+   *
+   * Returns false instead of throwing so the caller can say *why* nothing
+   * happened — the update is rejected by RLS for an exam the caller does not
+   * own, and that failure used to be invisible (the row simply kept its old
+   * status). `status = 'ongoing'` keeps a double click from re-stamping an
+   * attempt that was already closed.
+   */
+  async function disqualify(submissionId: string): Promise<boolean> {
+    const { error: updateError } = await supabase
       .from("exam_submissions")
       .update({ status: "disqualified", submitted_at: new Date().toISOString() })
-      .eq("id", submissionId);
+      .eq("id", submissionId)
+      .eq("status", "ongoing");
+    if (updateError) {
+      console.error("Could not disqualify submission", submissionId, updateError);
+      return false;
+    }
+    return true;
   }
 
-  return { submissions, disqualify };
+  return { submissions, error, disqualify };
 }
+

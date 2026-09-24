@@ -281,7 +281,11 @@ final proctoringProvider = StateNotifierProvider.autoDispose
     // with a fake uploader.
     uploadSnapshot: SupabaseService.instance.uploadViolationSnapshot,
   );
-  ref.onDispose(notifier.dispose);
+  // No `ref.onDispose(notifier.dispose)` here on purpose: Riverpod's
+  // StateNotifierProvider already disposes the notifier it created
+  // (StateNotifierProviderElement.runOnDispose), so registering it a second
+  // time made every exam exit log "Tried to use ProctoringNotifier after
+  // dispose was called" and skip the real teardown.
   return notifier;
 });
 

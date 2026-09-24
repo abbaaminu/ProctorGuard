@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { CheckCircle2, XCircle, AlertOctagon } from "lucide-react";
 import { supabase } from "@/lib/supabase";
+import { useAccountNames } from "@/hooks/useAccountNames";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge, statusTone } from "@/components/ui/badge";
 import { formatTime } from "@/lib/utils";
@@ -21,6 +22,8 @@ export function SubmissionAudit() {
   const [logs, setLogs] = useState<ProctoringLogRow[]>([]);
   const [questions, setQuestions] = useState<QuestionRow[]>([]);
   const [loading, setLoading] = useState(true);
+  // Names come from `public.users` (RLS: a supervisor may read every profile).
+  const names = useAccountNames();
 
   useEffect(() => {
     if (!submissionId) {
@@ -50,6 +53,9 @@ export function SubmissionAudit() {
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold text-slate-100">Submission audit</h1>
+          <p className="text-xs text-slate-400">
+            {names[submission.student_id] ?? "Unknown student"}
+          </p>
           <p className="font-mono text-xs text-slate-500">{submission.id}</p>
         </div>
         <div className="flex items-center gap-3">

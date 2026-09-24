@@ -1,10 +1,14 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'core/services/permission_service.dart';
 import 'core/services/supabase_service.dart';
 import 'core/widgets/setup_required_page.dart';
-import 'features/auth/presentation/pages/login_page.dart';
+import 'features/auth/data/repositories/profile_repository_impl.dart';
+import 'features/auth/presentation/providers/profile_provider.dart';
+import 'features/auth/presentation/widgets/role_gate.dart';
 import 'features/exam/data/repositories/exam_repository_impl.dart';
 import 'features/proctoring/data/repositories/proctoring_repository_impl.dart';
 import 'features/proctoring/presentation/providers/proctoring_provider.dart';
@@ -21,13 +25,14 @@ Future<void> main() async {
 
   // Request camera/mic/overlay up front so the permission prompts don't
   // interrupt the flow right as an exam is starting. The service already skips
-  // permissions a platform lacks (the Android-only overlay permission on web);
-  // this guard is belt-and-braces.
-  try {
-    await PermissionService().requestAll();
-  } catch (error) {
-    debugPrint('Startup permission pass failed, continuing without it: $error');
-  }
+  // permissions a platform lacks (the Android-only overlay permission on web).
+  //
+  // Deliberately NOT awaited: an OS permission dialog stays on screen until the
+  // student answers it, and blocking the first frame on that is exactly the
+  // blank-page startup failure this boot order exists to avoid. `ExamTakingPage`
+  // re-checks the critical statuses before opening the camera anyway, so an
+  // unproctored session can never start silently.
+  unawaited(requestStartupPermissions());
 
   final client = SupabaseService.instance.clientOrNull;
 
@@ -40,12 +45,27 @@ Future<void> main() async {
         if (client != null)
           examRepositoryProvider.overrideWithValue(ExamRepositoryImpl(client)),
         if (client != null)
+          profileRepositoryProvider
+              .overrideWithValue(ProfileRepositoryImpl(client)),
+        if (client != null)
           proctoringRepositoryProvider
               .overrideWithValue(ProctoringRepositoryImpl(client)),
       ],
       child: ExamProctorApp(supabaseStatus: supabaseStatus),
     ),
   );
+}
+
+/// Fire-and-forget startup permission pass (see [main]).
+///
+/// Every failure is logged rather than thrown: this runs outside any caller's
+/// await, so a thrown error would only surface as an unhandled async error.
+Future<void> requestStartupPermissions() async {
+  try {
+    await PermissionService().requestAll();
+  } catch (error) {
+    debugPrint('Startup permission pass failed, continuing without it: $error');
+  }
 }
 
 class ExamProctorApp extends StatelessWidget {
@@ -63,11 +83,12 @@ class ExamProctorApp extends StatelessWidget {
       title: 'Exam Proctor',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
-      // Replace with go_router config wiring: /login, /exams, /exam/:id,
-      // /dashboard/:examId — omitted here for brevity, each page above
-      // takes plain constructor args so any router works.
+      // `RoleGate` is the whole router today: signed out -> login, then
+      // `users.role` picks the student portal or the supervisor console. Swap in
+      // go_router config (/login, /exams, /exam/:id, /dashboard/:examId) when
+      // deep links matter — every page takes plain constructor args.
       home: supabaseStatus == SupabaseInitStatus.ready
-          ? const _RoleGate()
+          ? const RoleGate()
           : SetupRequiredPage(
               status: supabaseStatus,
               detail: service.initError,
@@ -77,29 +98,5 @@ class ExamProctorApp extends StatelessWidget {
   }
 }
 
-/// Reads `users.role` for the authenticated user and routes to the
-/// student exam list or the supervisor dashboard picker accordingly.
-class _RoleGate extends StatelessWidget {
-  const _RoleGate();
 
-  @override
-  Widget build(BuildContext context) {
-    // Rebuilds on every auth event, so the session the SDK restores from
-    // storage after a browser refresh lands here too.
-    return StreamBuilder<bool>(
-      stream: SupabaseService.instance.signedInChanges,
-      builder: (context, snapshot) {
-        final user = SupabaseService.instance.currentUser;
-        if (user == null) {
-          return const LoginPage();
-        }
-        // return const ExamListPage(); // student
-        // or SupervisorExamPickerPage(); // supervisor, based on users.role
-        return const Scaffold(
-          body: Center(child: Text('Role-based home goes here')),
-        );
-      },
-    );
-  }
-}
 

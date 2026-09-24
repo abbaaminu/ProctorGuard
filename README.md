@@ -26,6 +26,42 @@ proctor/
 Both apps read/write the same tables, so a submission a student makes in
 `mobile` shows up live in `dashboard`'s monitor view via Supabase Realtime.
 
+## Production checklist
+
+`supabase/schema.sql` is idempotent — re-run it whenever it changes. Beyond that:
+
+- [ ] **Turn off public sign-ups** (Supabase → Authentication → Sign In /
+      Providers). The schema lets a self-provisioned account create *only* a
+      `student` profile row and makes `users.role` immutable for non-supervisors,
+      so it cannot self-promote — but an open sign-up form still lets strangers
+      into the exam portal. Create students/supervisors yourself (or invite them);
+      supervisor rows must be inserted by an admin, since RLS rejects
+      `role='supervisor'` from a client.
+- [ ] **Client keys only.** Dashboard: `VITE_SUPABASE_URL` +
+      `VITE_SUPABASE_ANON_KEY`. Mobile: `SUPABASE_URL` +
+      `SUPABASE_PUBLISHABLE_KEY` (via `mobile/run_app.ps1` / `build_apk.ps1`).
+      Never a `service_role` / `sb_secret_` key — it bypasses every policy.
+- [ ] **Decide the `proctor-snapshots` bucket's visibility.** It ships *public* so
+      the console can render evidence with a plain `<img>` (the object paths are
+      unguessable submission UUIDs). If violation stills are sensitive, flip the
+      bucket to private and sign URLs server-side in the console.
+- [ ] **Keep the free-tier project awake.** `.github/workflows/keep_alive.yml`
+      pings the REST API twice a week; set the `SUPABASE_URL` and `SUPABASE_KEY`
+      repository secrets, or delete the workflow if you are on a paid plan.
+- [ ] **Verify both builds.** `cd mobile && flutter analyze && flutter test`, then
+      `cd dashboard && npm run build`.
+
+## Verifying a change
+
+```
+cd mobile   && flutter analyze && flutter test     # 87 tests, no device needed
+cd dashboard && npm run build                      # tsc -b && vite build
+```
+
+The Flutter suite pins the client↔database contract (`mobile/test/schema_contract_test.dart`:
+RPC names, argument names and the `action_type` values), so a schema change that
+breaks the app fails there rather than at runtime.
+
 ## Pushing to GitHub
 From this folder:
 ```bash

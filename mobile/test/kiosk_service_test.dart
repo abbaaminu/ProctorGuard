@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:exam_proctor/core/services/kiosk_service.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -143,6 +145,27 @@ void main() {
 
       expect(calls.last.method, 'stopLock');
       expect(escapes, isEmpty);
+    });
+
+    test('a bridge that never answers cannot hang the exam bootstrap',
+        () async {
+      // A wedged platform (or an engine that never replies) used to leave
+      // `await startLock()` pending forever — i.e. the exam screen stuck on its
+      // loading spinner. It now times out and the session runs unpinned.
+      messenger.setMockMethodCallHandler(
+        channel,
+        (call) => Completer<Object?>().future, // accepted, never answered
+      );
+      final kiosk = KioskService();
+      addTearDown(kiosk.dispose);
+
+      final result = await kiosk.startLock();
+
+      expect(result.granted, isFalse);
+      expect(result.message, contains('did not answer'));
+
+      // The unpin path has to survive the same silence.
+      await kiosk.stopLock();
     });
   });
 
