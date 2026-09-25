@@ -66,6 +66,22 @@ class ExamRepositoryImpl implements ExamRepository {
   }
 
   @override
+  Future<void> saveTextAnswer({
+    required String submissionId,
+    required String questionId,
+    required String answer,
+  }) async {
+    // Same merge semantics for free text: the server stores it as a JSON string
+    // under the question id and `submit_exam` compares it case-insensitively
+    // after trimming, so "  http " scores for "HTTP".
+    await _client.rpc('merge_submission_text_answer', params: {
+      'p_submission_id': submissionId,
+      'p_question_id': questionId,
+      'p_answer': answer,
+    });
+  }
+
+  @override
   Future<void> submitExam(String submissionId) async {
     // Server-side grading: `submit_exam` computes `score` from the stored
     // answers (sum of `questions.points` for correct ones) and flips the status

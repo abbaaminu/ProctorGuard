@@ -153,14 +153,14 @@ on conflict (id) do nothing;
 -- ---------------------------------------------------------------------
 -- 3. QUESTIONS  (public.questions) - 5 per exam, 10 points each paper.
 --
--- `options` is jsonb and `correct_option` is the 0-BASED index of the right
--- answer inside that array (both clients render `options` as tap targets).
---
--- NOTE ON SHORT-ANSWER ITEMS: this table has no free-text answer column, so
--- short-answer prompts are seeded as choice-based rows whose options are the
--- candidate written answers, with `correct_option` pointing at the accepted
--- wording. Add an `answer_text` column plus a grading RPC if typed answers
--- are ever needed.
+-- Two shapes are seeded so both code paths are exercised end to end:
+--   * 'multiple_choice'   - `options` is a jsonb array and `correct_option` is
+--                           the 0-BASED index of the right answer inside it
+--                           (both clients render `options` as tap targets).
+--   * 'fill_in_the_blank' - `options` is empty and `correct_text_answer` holds
+--                           the accepted wording; grading trims and ignores
+--                           case, so "  http " scores for "HTTP" (CS101 Q4,
+--                           inserted separately below).
 -- ---------------------------------------------------------------------
 insert into public.questions (id, exam_id, question_text, options, correct_option, points) values
 
@@ -176,10 +176,6 @@ insert into public.questions (id, exam_id, question_text, options, correct_optio
   ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
    'Which of the following is NOT a primitive type in Java?',
    '["int","boolean","String","char"]'::jsonb, 2, 1),
-
-  ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb4', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
-   'Short answer: What does the acronym HTTP stand for?',
-   '["HyperText Transfer Protocol","High Throughput Transfer Process","Hyperlink Text Transmission Protocol","Host Transfer Text Protocol"]'::jsonb, 0, 2),
 
   ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb5', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
    'In SQL, which clause filters rows before they are grouped by GROUP BY?',
@@ -205,6 +201,17 @@ insert into public.questions (id, exam_id, question_text, options, correct_optio
   ('cccccccc-cccc-4ccc-8ccc-ccccccccccc5', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2',
    'The derivative of ln(x) with respect to x is:',
    '["1 / x","x","e^x","ln(x) / x"]'::jsonb, 0, 1)
+on conflict (id) do nothing;
+
+-- CS101 Q4 is a real fill-in-the-blank item: no options, one accepted wording
+-- (graded case-insensitively after trimming by submit_exam). It is inserted
+-- separately so the block above stays a pure 'multiple_choice' insert.
+insert into public.questions
+  (id, exam_id, question_text, question_type, options, correct_option, correct_text_answer, points)
+values
+  ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb4', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
+   'What does the acronym HTTP stand for?',
+   'fill_in_the_blank', '[]'::jsonb, null, 'HyperText Transfer Protocol', 2)
 on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------

@@ -16,6 +16,16 @@ abstract class ExamRepository {
     required int selectedOption,
   });
 
+  /// Saves a free-text answer (fill-in-the-blank) through
+  /// `merge_submission_text_answer`. The value is stored as a JSON string under
+  /// the question id and graded case-insensitively after trimming by
+  /// `submit_exam`.
+  Future<void> saveTextAnswer({
+    required String submissionId,
+    required String questionId,
+    required String answer,
+  });
+
   Future<void> submitExam(String submissionId);
 
   /// Used by the escalation logic in section 3 — auto-submits with

@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:exam_proctor/core/services/supabase_service.dart';
 import 'package:exam_proctor/features/exam/data/repositories/exam_repository_impl.dart';
+import 'package:exam_proctor/features/exam/domain/entities/question.dart';
 import 'package:exam_proctor/features/exam/domain/entities/submission.dart';
 import 'package:exam_proctor/features/proctoring/data/repositories/proctoring_repository_impl.dart';
 import 'package:exam_proctor/features/proctoring/domain/entities/violation.dart';
@@ -248,6 +249,87 @@ void main() {
         ),
         'sub-9/looking_away_1700000000000.jpg',
       );
+    });
+  });
+
+  group('merge_submission_text_answer RPC payload', () {
+    test('saveTextAnswer uses the documented argument names', () async {
+      transport.responseBody = 'null';
+      final repo = ExamRepositoryImpl(client);
+
+      await repo.saveTextAnswer(
+        submissionId: 'sub-1',
+        questionId: 'q-1',
+        answer: '  HyperText Transfer Protocol ',
+      );
+
+      final request = transport.requests.single;
+      expect(request.method, 'POST');
+      expect(request.url.path, '/rest/v1/rpc/merge_submission_text_answer');
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      expect(body.keys.toSet(), <String>{
+        'p_submission_id',
+        'p_question_id',
+        'p_answer',
+      });
+      expect(body['p_submission_id'], 'sub-1');
+      expect(body['p_question_id'], 'q-1');
+      // Sent verbatim: submit_exam() trims and lowercases both sides when it
+      // grades, so the student's spacing and casing survive as evidence.
+      expect(body['p_answer'], '  HyperText Transfer Protocol ');
+    });
+  });
+
+  group('question shapes', () {
+    test('QuestionType round-trips the values the check constraint allows', () {
+      expect(
+        QuestionType.values.map((type) => type.dbValue).toList(),
+        <String>['multiple_choice', 'fill_in_the_blank'],
+      );
+      expect(
+        QuestionType.fromDb('fill_in_the_blank'),
+        QuestionType.fillInTheBlank,
+      );
+      expect(
+        QuestionType.fromDb('multiple_choice'),
+        QuestionType.multipleChoice,
+      );
+    });
+
+    test('an unknown or missing type falls back instead of throwing', () {
+      // A row must not be able to take the whole exam screen down through the
+      // question feed.
+      expect(QuestionType.fromDb('essay'), QuestionType.multipleChoice);
+      expect(QuestionType.fromDb(null), QuestionType.multipleChoice);
+    });
+
+    test('Question.fromMap reads a fill-in-the-blank row from the safe view',
+        () {
+      final question = Question.fromMap(<String, dynamic>{
+        'id': 'q-1',
+        'exam_id': 'exam-1',
+        'question_text': 'What does the acronym HTTP stand for?',
+        'question_type': 'fill_in_the_blank',
+        'options': <String>[],
+        'points': 2,
+      });
+
+      expect(question.questionType, QuestionType.fillInTheBlank);
+      expect(question.isFillInTheBlank, isTrue);
+      expect(question.options, isEmpty);
+    });
+
+    test('a row without question_type (pre-types database) still parses', () {
+      final question = Question.fromMap(<String, dynamic>{
+        'id': 'q-2',
+        'exam_id': 'exam-1',
+        'question_text': 'Which structure is FIFO?',
+      });
+
+      expect(question.questionType, QuestionType.multipleChoice);
+      expect(question.isFillInTheBlank, isFalse);
+      expect(question.options, isEmpty);
     });
   });
 }

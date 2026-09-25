@@ -9,11 +9,17 @@
 --     (users_insert_self_student) and a trigger blocks later role rewrites.
 --   * Students never see answer keys: there is no student SELECT policy on
 --     `questions`; they read the definer view `questions_public` (published
---     exams only, no correct_option) while supervisors read the raw table.
+--     exams only, neither `correct_option` nor `correct_text_answer`) while
+--     supervisors read the raw table.
+--   * Two question shapes share `questions`: `question_type = 'multiple_choice'`
+--     (options + index) and `'fill_in_the_blank'` (`correct_text_answer`, graded
+--     case-insensitively after trimming). Answers are merged by
+--     `merge_submission_answer` (choice) or `merge_submission_text_answer`
+--     (text).
 --   * Students cannot grade or close themselves with a direct UPDATE — the
---     RPCs `submit_exam` (grading) and `register_violation` (3-strike rule) are
---     the only writers of status/score/submitted_at, and both re-check that the
---     caller owns the submission.
+--     RPCs `submit_exam` (grading, both shapes) and `register_violation`
+--     (3-strike rule) are the only writers of status/score/submitted_at, and
+--     both re-check that the caller owns the submission.
 --   * Evidence is append-only for clients: `proctoring_logs` has no INSERT
 --     policy, so register_violation() is the single write path.
 -- =====================================================================
@@ -155,14 +161,57 @@ create policy "exams_delete_owner"
 -- 3. QUESTIONS
 -- ---------------------------------------------------------------------
 create table if not exists public.questions (
-  id              uuid primary key default uuid_generate_v4(),
-  exam_id         uuid not null references public.exams(id) on delete cascade,
-  question_text   text not null,
-  options         jsonb not null,          -- e.g. ["A","B","C","D"]
-  correct_option  int not null,
-  points          numeric not null default 1,
-  created_at      timestamptz not null default now()
+  id                  uuid primary key default uuid_generate_v4(),
+  exam_id             uuid not null references public.exams(id) on delete cascade,
+  question_text       text not null,
+  -- Two question shapes share this table:
+  --   'multiple_choice'   -> `options` are the tap targets, `correct_option` the index
+  --   'fill_in_the_blank' -> `options` is empty, `correct_text_answer` is graded
+  --                          case-insensitively after trimming
+  question_type       text not null default 'multiple_choice'
+                        check (question_type in ('multiple_choice', 'fill_in_the_blank')),
+  options             jsonb not null default '[]'::jsonb,
+  correct_option      int,
+  correct_text_answer text,
+  points              numeric not null default 1,
+  created_at          timestamptz not null default now(),
+  -- Exactly one answer key, matching the question's type. Without this a row
+  -- could carry both (graded twice by submit_exam) or neither (ungradeable).
+  constraint questions_answer_key_shape check (
+    (question_type = 'multiple_choice' and correct_option is not null)
+    or
+    (question_type = 'fill_in_the_blank'
+      and coalesce(btrim(correct_text_answer), '') <> '')
+  )
 );
+
+-- Migration for databases created before question types existed (`create table
+-- if not exists` above is a no-op there). Every statement is idempotent.
+alter table public.questions add column if not exists question_type text not null default 'multiple_choice';
+alter table public.questions add column if not exists correct_text_answer text;
+alter table public.questions alter column options set default '[]'::jsonb;
+-- A fill-in-the-blank row has no option index, so this column cannot stay NOT NULL.
+alter table public.questions alter column correct_option drop not null;
+
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'questions_question_type_check') then
+    alter table public.questions
+      add constraint questions_question_type_check
+      check (question_type in ('multiple_choice', 'fill_in_the_blank'));
+  end if;
+
+  if not exists (select 1 from pg_constraint where conname = 'questions_answer_key_shape') then
+    alter table public.questions
+      add constraint questions_answer_key_shape
+      check (
+        (question_type = 'multiple_choice' and correct_option is not null)
+        or
+        (question_type = 'fill_in_the_blank'
+          and coalesce(btrim(correct_text_answer), '') <> '')
+      );
+  end if;
+end $$;
 
 alter table public.questions enable row level security;
 
@@ -214,17 +263,31 @@ create policy "questions_delete_owner"
     exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
   );
 
--- Student-safe view: strips correct_option so students never receive answer
--- keys, and returns published exams only.
+-- Student-safe view: strips both answer keys (`correct_option` and
+-- `correct_text_answer`) so students never receive them, and returns published
+-- exams only.
 --
 -- `security_invoker` is turned OFF on purpose. With invoker semantics the view
 -- runs under the caller's own policies, which would require exactly the student
--- SELECT policy on `questions` that leaks `correct_option`. As a definer view
+-- SELECT policy on `questions` that leaks the answer keys. As a definer view
 -- owned by owner of the schema it reads the base table directly (RLS is not
 -- applied to a table's owner) and exposes one fixed column set, filtered to
--- published exams. Re-runnable: the view keeps its grants.
-create or replace view public.questions_public as
-  select q.id, q.exam_id, q.question_text, q.options, q.points, q.created_at
+-- published exams.
+--
+-- DROP + CREATE rather than `create or replace`: Postgres refuses to reorder or
+-- re-type the columns of an existing view, and `question_type` has to sit with
+-- the rest of the question shape. The view has no dependants, and the grant is
+-- re-applied below.
+drop view if exists public.questions_public;
+
+create view public.questions_public as
+  select q.id,
+         q.exam_id,
+         q.question_text,
+         q.question_type,
+         q.options,
+         q.points,
+         q.created_at
   from public.questions q
   join public.exams e on e.id = q.exam_id
   where e.is_published = true;
@@ -232,7 +295,7 @@ create or replace view public.questions_public as
 alter view public.questions_public set (security_invoker = false);
 
 comment on view public.questions_public is
-  'Student-facing question feed: published exams only, never correct_option.';
+  'Student-facing question feed: published exams only, neither answer key.';
 
 grant select on public.questions_public to authenticated;
 
@@ -587,12 +650,31 @@ begin
     return;
   end if;
 
+  -- Grading is a sum of `questions.points` over the questions the student got
+  -- right, and it has to cover both question shapes:
+  --   * multiple choice: the stored jsonb number equals `correct_option`
+  --   * fill in the blank: the stored jsonb string matches `correct_text_answer`
+  --     case-insensitively after trimming, so "  http " counts for "HTTP"
+  -- An unanswered question stores nothing, so `->>` is NULL and the comparison
+  -- is NULL (never true) - it simply does not score.
   select coalesce(sum(q.points), 0)
     into v_score
   from public.questions q
   join public.exam_submissions s on s.id = p_submission_id
   where q.exam_id = v_exam
-    and s.answers -> q.id::text = to_jsonb(q.correct_option);
+    and (
+      (
+        q.question_type = 'multiple_choice'
+        and s.answers -> q.id::text = to_jsonb(q.correct_option)
+      )
+      or
+      (
+        q.question_type = 'fill_in_the_blank'
+        and coalesce(btrim(q.correct_text_answer), '') <> ''
+        and lower(btrim(s.answers ->> q.id::text)) =
+            lower(btrim(q.correct_text_answer))
+      )
+    );
 
   update public.exam_submissions
   set status = 'submitted', submitted_at = now(), score = v_score
@@ -604,3 +686,39 @@ $$;
 
 comment on function public.submit_exam(uuid, boolean) is
   'Closes (and grades, unless disqualified) a student''s own attempt; idempotent.';
+
+-- ---------------------------------------------------------------------
+-- Race-safe free-text answer merge (RPC)
+-- ---------------------------------------------------------------------
+-- The fill-in-the-blank twin of merge_submission_answer(): it stores a JSON
+-- *string* under the question id instead of an option index, with the same
+-- ownership + `ongoing` guard. Used by the Flutter exam screen, and the only
+-- way a text answer reaches the row (students have no UPDATE policy on
+-- exam_submissions).
+--
+-- The value is capped at 2000 characters: a patched client must not be able to
+-- park an unbounded blob in the answers jsonb of a row a supervisor will later
+-- read.
+create or replace function public.merge_submission_text_answer(
+  p_submission_id uuid,
+  p_question_id   uuid,
+  p_answer        text
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.exam_submissions
+  set answers = jsonb_set(
+        coalesce(answers, '{}'::jsonb),
+        array[p_question_id::text],
+        to_jsonb(left(coalesce(p_answer, ''), 2000)),
+        true
+      )
+  where id = p_submission_id
+    and student_id = auth.uid()
+    and status = 'ongoing';
+end;
+$$;

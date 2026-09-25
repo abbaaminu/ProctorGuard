@@ -22,9 +22,10 @@ android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLoc
 1. Run `../supabase/schema.sql` in the Supabase SQL editor (or via CLI
    migrations) — shared with the `../dashboard` app in this monorepo. It
    creates all 5 tables, the RLS policies, the `questions_public` safe view and
-   three RPCs: `register_violation` (server-enforced 3-strike rule),
-   `submit_exam` (server-side grading + close) and `merge_submission_answer`
-   (race-safe autosave).
+   four RPCs: `register_violation` (server-enforced 3-strike rule),
+   `submit_exam` (server-side grading + close), `merge_submission_answer`
+   (race-safe autosave for choices) and `merge_submission_text_answer` (the same
+   for typed answers).
 2. `flutter pub get`, then run with:
    ```
    flutter run --dart-define=SUPABASE_URL=... --dart-define=SUPABASE_PUBLISHABLE_KEY=...
@@ -134,6 +135,12 @@ forced exit) against your Supabase project, so emulators, desktop targets and CI
 runners can exercise the overlay, the log rows and the supervisor's live feed
 without a physical camera. Simulated violations carry no snapshot (there is
 nothing to capture). Tune the cadence with the service's `mockInterval`.
+
+A dart-define is a compile-time constant and cannot be faked at runtime, so
+`ExamTakingPage` also takes `mockCamera` (null = follow the flag). That is what
+`mobile/test/exam_taking_page_test.dart` uses to exercise the question half of
+the screen — numbering, option taps, the fill-in-the-blank field and the submit
+flush — without a camera.
 
 > Web is a buildable target too (`flutter run -d chrome`), which is why
 > `PermissionService` skips Android-only permissions such as
@@ -292,16 +299,40 @@ mid-exam, so a silent failure would strand them:
 
 Details worth knowing:
 
+* **Every question is numbered explicitly** — "Question 3 of 5" in the app bar
+  (both shapes), and the app bar also shows how many answers the *server* has
+  stored ("3 of 5 answered").
+* **Two question shapes.** `multiple_choice` renders tap targets and saves the
+  option index through `merge_submission_answer`; `fill_in_the_blank` renders a
+  text field and saves through `merge_submission_text_answer`, graded
+  server-side case-insensitively after trimming (so `"  http "` scores for
+  `"HTTP"`). A typed answer is written by "Save & next", the keyboard's done
+  action, or the submit flush below — the field shows "Answer saved" once the
+  server has it.
 * **`exams.duration_minutes` is enforced.** The countdown is anchored on
   `exam_submissions.started_at` (not on "now"), so a resumed attempt keeps its
   remaining time and one that is already past its deadline is submitted on the
   first tick. The chip in the app bar turns amber under 5 minutes and red under 1.
-* **Answers are painted locally and saved through `merge_submission_answer`.** A
-  failed autosave says so and *stays on the question* instead of advancing past
-  the only chance to save that answer — grading reads the server copy.
+* **The camera session includes the microphone.** `CameraController` is created
+  with `enableAudio: true`, so the attempt holds the microphone (RECORD_AUDIO on
+  Android, the browser's mic grant on web) alongside the video stream. A denied
+  microphone blocks the session exactly like a denied camera, and **Open
+  settings** appears when the OS will not prompt again.
+* **Web: access is requested *before* the camera is enumerated.** `camera_web`
+  drops every device whose `deviceId` is empty, which is exactly what a browser
+  reports *before* the camera grant — so `availableCameras()` legitimately
+  returns an empty list on a page that has never been granted access, and a
+  session used to conclude "no camera" and show the crossed-out placeholder.
+  `WebCameraPermission` now runs one `getUserMedia` probe (releasing the probe
+  tracks immediately) and the enumeration is retried, so the browser's own
+  prompt appears instead.
+* **Answers are painted locally and saved through the RPCs.** A failed autosave
+  says so and *stays on the question* instead of advancing past the only chance to
+  save that answer — grading reads the server copy.
 * **Submitting goes through `submit_exam`** (see `../supabase/schema.sql`): the
-  server grades and closes the attempt, and `score` is never written by the
-  client. There is no student `UPDATE` policy on `exam_submissions` at all.
+  server grades both shapes and closes the attempt, and `score` is never written
+  by the client. There is no student `UPDATE` policy on `exam_submissions` at
+  all. Submitting flushes an unsaved fill-in-the-blank answer first.
 * **Retry re-runs only the failed stage** — the permissions, camera, kiosk pin or
   question feed that already succeeded is not reopened.
 * **The kiosk bridge and permission status queries are time-boxed**
@@ -412,11 +443,12 @@ own unpin is not an escape" and "a single inactive blip is tolerated" rules);
   the `register_violation` Postgres function, not just in Dart. A student
   patching the client can't spoof past it — the client's `warningCount`
   is reconciled against the RPC's authoritative return value every time.
-- **Grading never touches the device.** `questions.correct_option` is
-  excluded from the `questions_public` view the exam-taking page reads (a
-  definer view filtered to published exams), and there is **no** student SELECT
-  policy on the raw `questions` table at all — so the answer key cannot reach a
-  student device. `submit_exam` grades from the stored answers on the server.
+- **Grading never touches the device.** Neither answer key
+  (`questions.correct_option`, `questions.correct_text_answer`) is exposed by the
+  `questions_public` view the exam-taking page reads (a definer view filtered to
+  published exams), and there is **no** student SELECT policy on the raw
+  `questions` table at all — so the answers cannot reach a student device.
+  `submit_exam` grades both shapes from the stored answers on the server.
 - **Append-only violation log.** `proctoring_logs` has no insert, update or
   delete policy: `register_violation` is the only writer, and it re-checks that
   the caller owns the submission, so RLS makes tampering with evidence

@@ -161,6 +161,13 @@ class _StubExamRepository implements ExamRepository {
   }) async {}
 
   @override
+  Future<void> saveTextAnswer({
+    required String submissionId,
+    required String questionId,
+    required String answer,
+  }) async {}
+
+  @override
   Future<void> submitExam(String submissionId) async {}
 
   @override

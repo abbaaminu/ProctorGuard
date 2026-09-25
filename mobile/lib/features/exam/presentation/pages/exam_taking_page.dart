@@ -10,6 +10,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/services/kiosk_service.dart';
 import '../../../../core/services/mediapipe_proctoring_service.dart';
 import '../../../../core/services/permission_service.dart';
+import '../../../../core/services/web_camera_permission.dart';
 import '../../../../core/services/web_exam_guard.dart';
 import '../../../../core/services/web_guards.dart';
 import '../../../proctoring/presentation/providers/proctoring_provider.dart';
@@ -36,6 +37,13 @@ class ExamTakingPage extends ConsumerStatefulWidget {
   /// DOM) does not exist.
   final WebGuards? webGuards;
 
+  /// Overrides `--dart-define=MOCK_CAMERA=true` for this session.
+  ///
+  /// The dart-define is a compile-time constant, so this is what lets a widget
+  /// test — or a desktop/CI demo — exercise the *question* half of the screen
+  /// without a camera. `null` falls back to the compile-time flag.
+  final bool? mockCamera;
+
   const ExamTakingPage({
     super.key,
     required this.examId,
@@ -43,7 +51,12 @@ class ExamTakingPage extends ConsumerStatefulWidget {
     this.durationMinutes,
     this.startedAt,
     this.webGuards,
+    this.mockCamera,
   });
+
+  /// True when this session runs without a camera (simulated violations).
+  bool get mockMode =>
+      mockCamera ?? MediaPipeProctoringService.mockCameraFromEnvironment;
 
   @override
   ConsumerState<ExamTakingPage> createState() => _ExamTakingPageState();
@@ -58,6 +71,19 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// server copy (what grading reads) is written by [ExamRepository.saveAnswer].
   final Map<String, int> _answers = <String, int>{};
 
+  /// Free-text answers (fill-in-the-blank), keyed by question id. `_savedText`
+  /// holds what the server confirmed, so the UI can tell "typed" from "stored"
+  /// and only writes when they differ.
+  final Map<String, String> _textAnswers = <String, String>{};
+  final Map<String, String> _savedText = <String, String>{};
+
+  /// Question ids whose answer the server has confirmed — either shape. Drives
+  /// the "N answered" count and the submit dialog's summary.
+  final Set<String> _savedQuestions = <String>{};
+
+  /// In-flight guard for a text autosave (one at a time).
+  bool _savingText = false;
+
   int _currentIndex = 0;
   bool _loading = true;
 
@@ -66,6 +92,10 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// with a retry, because silently running an unproctored exam is worse than
   /// not starting it.
   String? _blockingError;
+
+  /// True when [_blockingError] is a permission problem the student can fix in
+  /// the OS settings, so the blocking screen also offers "Open settings".
+  bool _offerSettings = false;
 
   /// In-flight guard for the final submit (double taps, retry storms).
   bool _submitting = false;
@@ -138,7 +168,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       WidgetsBinding.instance.addPostFrameCallback((_) => _promptFullscreen());
     }
 
-    if (MediaPipeProctoringService.mockCameraFromEnvironment) {
+    if (widget.mockMode) {
       // MOCK_CAMERA=true: emulators, desktops and CI runners have no usable
       // front camera, so skip the capture pipeline entirely. The engine emits
       // simulated violations on a timer, and no snapshot source is attached —
@@ -148,24 +178,32 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       return;
     }
 
-    // Real proctoring needs a camera, so this is checked *before* opening one:
-    // a denied permission used to surface as an unhandled CameraException and
-    // left the page on its loading spinner with no way out (the exam screen has
-    // no back button by design). Mock sessions skip it above — there is no
-    // camera to grant access to — and so do web/desktop, where
-    // `permission_handler` cannot report a status and the camera plugin itself
-    // is what reports a refusal (handled by the try/catch further down).
+    // Real proctoring needs a camera *and* a microphone, so both are checked
+    // before either is opened: a denied permission used to surface as an
+    // unhandled CameraException that left the page on its loading spinner with
+    // no way out (the exam screen has no back button by design). Web/desktop are
+    // skipped here — `permission_handler` cannot report a status there, and the
+    // browser probe below plus the camera plugin are what ask for access.
     if (!kIsWeb &&
         (defaultTargetPlatform == TargetPlatform.android ||
             defaultTargetPlatform == TargetPlatform.iOS)) {
-      final missingPermissions =
-          await PermissionService().missingCriticalPermissions();
-      if (missingPermissions.isNotEmpty) {
+      final report = await PermissionService().checkCritical();
+      if (report.denied.isNotEmpty) {
+        _offerSettings = true;
         _failStart(
-          'This exam needs ${_permissionLabel(missingPermissions)} access. '
-          'Grant it in your device settings, then tap Try again.',
+          'This exam needs ${report.deniedLabel} access. Grant it in your '
+          'device settings, then tap Try again.',
         );
         return;
+      }
+      if (report.unknown.isNotEmpty) {
+        // Could not read the status (a plugin that stayed silent, a platform
+        // without the permission): keep going and let the camera plugin report
+        // the real refusal, instead of blocking a device that is fine.
+        debugPrint(
+          'ProctorGuard: could not confirm ${_permissionLabel(report.unknown)} '
+          'access — continuing with the camera plugin.',
+        );
       }
     }
 
@@ -173,9 +211,12 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     // CameraImage stream cheap at 5–8 FPS inference.
     final List<CameraDescription> cameras;
     try {
-      cameras = await availableCameras();
+      cameras = await _resolveCameras();
     } on CameraException catch (error) {
-      _failStart('No camera is available on this device (${error.code}).');
+      _failStart(
+        'Proctoring cannot start — ${_cameraFailure(error.code)}. Close anything '
+        'else using the camera or microphone, then tap Try again.',
+      );
       return;
     } catch (error) {
       debugPrint('ProctorGuard: camera enumeration failed: $error');
@@ -184,7 +225,13 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     }
 
     if (cameras.isEmpty) {
-      _failStart('No camera is available on this device.');
+      _failStart(
+        kIsWeb
+            ? 'No camera is available. Allow camera access for this site in your '
+              'browser (and check the device has one), then tap Try again.'
+            : 'No camera is available on this device. Proctoring needs a working '
+              'front camera.',
+      );
       return;
     }
 
@@ -195,14 +242,12 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     _cameraController = CameraController(
       front,
       ResolutionPreset.low,
-      enableAudio: false, // audio is a separate hook — see reportAudioLevel()
-      // ML Kit reads exactly one plane: NV21 on Android, BGRA8888 elsewhere. On
-      // the web `kIsWeb` short-circuits before ML Kit (no web implementation), so
-      // the group only has to be streamable for the self-view.
-      imageFormatGroup:
-          !kIsWeb && defaultTargetPlatform == TargetPlatform.android
-              ? ImageFormatGroup.nv21
-              : ImageFormatGroup.bgra8888,
+      // The microphone is part of the exam rather than an optional extra: this
+      // opens the audio capture session alongside the video one, so the session
+      // really holds the mic (RECORD_AUDIO on Android, the browser's mic grant on
+      // web) for as long as the attempt lasts.
+      enableAudio: true,
+      imageFormatGroup: _imageFormatGroup(),
     );
     // Every step below can fail on a real device (another app holding the
     // camera, an OEM driver quirk, a permission revoked mid-session), so the
@@ -225,8 +270,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       });
     } on CameraException catch (error) {
       _failStart(
-        'The camera could not be started (${error.code}). Close any other app '
-        'using it, then tap Try again.',
+        'Proctoring cannot start — ${_cameraFailure(error.code)}. Close anything '
+        'else using the camera or microphone, then tap Try again.',
       );
       return;
     } catch (error) {
@@ -253,6 +298,56 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// "camera and microphone", for the permission message above.
   static String _permissionLabel(List<StartupPermission> missing) =>
       missing.map((permission) => permission.name).join(' and ');
+
+  /// The pixel format ML Kit can consume, per platform.
+  ///
+  /// ML Kit reads exactly one plane (NV21 on Android, BGRA8888 on iOS); the
+  /// browser converts frames itself and has neither buffer format, so web keeps
+  /// the platform default.
+  static ImageFormatGroup _imageFormatGroup() {
+    if (kIsWeb) return ImageFormatGroup.unknown;
+    return defaultTargetPlatform == TargetPlatform.android
+        ? ImageFormatGroup.nv21
+        : ImageFormatGroup.bgra8888;
+  }
+
+  /// The camera list for this platform, asking the browser for access first when
+  /// it has not been granted yet.
+  ///
+  /// `camera_web` enumerates with `navigator.mediaDevices.enumerateDevices()` and
+  /// drops every device whose `deviceId` is empty — which is exactly what a
+  /// browser reports *before* the camera grant. A web session therefore sees an
+  /// empty list although devices obviously exist, and used to fall back to "no
+  /// camera available". One `getUserMedia` probe (see [WebCameraPermission])
+  /// unlocks enumeration, then this asks again.
+  Future<List<CameraDescription>> _resolveCameras() async {
+    final cameras = await availableCameras();
+    if (cameras.isNotEmpty || !kIsWeb) return cameras;
+
+    final probe = WebCameraPermission();
+    if (!probe.isSupported) return cameras;
+
+    debugPrint(
+      'ProctorGuard: no camera visible yet — asking the browser for access.',
+    );
+    if (!await probe.ensureAccess()) return cameras;
+
+    return availableCameras();
+  }
+
+  /// Friendly wording for the camera plugin's error codes: the raw code
+  /// (`cameraAccess`) does not tell a student what to do about it.
+  static String _cameraFailure(String? code) => switch (code) {
+        'cameraAccess' || 'CameraAccessDenied' || 'NotAllowedError' =>
+          'camera access was refused',
+        'audioAccess' || 'AudioAccessDenied' => 'microphone access was refused',
+        'cameraNotReadable' || 'NotReadableError' || 'cameraInUse' =>
+          'another app or tab is already using the camera',
+        'cameraNotFound' || 'NotFoundError' => 'no camera was found',
+        'cameraNotSupported' || 'NotSupportedError' =>
+          'this browser cannot capture video',
+        _ => 'the camera reported "${code ?? 'unknown error'}"',
+      };
 
   Future<void> _loadQuestions() async {
     try {
@@ -390,11 +485,11 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   Future<void> _retryBootstrap() async {
     setState(() {
       _blockingError = null;
+      _offerSettings = false;
       _loading = true;
     });
 
-    if (_cameraController == null &&
-        !MediaPipeProctoringService.mockCameraFromEnvironment) {
+    if (_cameraController == null && !widget.mockMode) {
       await _bootstrap();
       return;
     }
@@ -429,9 +524,69 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     }
 
     if (!mounted) return;
-    if (_currentIndex < _questions.length - 1) {
-      setState(() => _currentIndex++);
+    setState(() {
+      _savedQuestions.add(question.id);
+      if (_currentIndex < _questions.length - 1) _currentIndex++;
+    });
+  }
+
+  /// Saves the current free-text answer through `merge_submission_text_answer`.
+  ///
+  /// Returns whether the server now holds it. [advance] moves to the next
+  /// question *after* a successful save, so a failure keeps the student on the
+  /// question with their text still in the field.
+  Future<bool> _saveTextAnswer(Question question, {bool advance = false}) async {
+    if (_savingText || !mounted) return false;
+
+    final text = _textAnswers[question.id] ?? '';
+    setState(() => _savingText = true);
+
+    try {
+      await ref.read(examRepositoryProvider).saveTextAnswer(
+            submissionId: widget.submissionId,
+            questionId: question.id,
+            answer: text,
+          );
+    } catch (error) {
+      debugPrint('ProctorGuard: text answer save failed: $error');
+      if (!mounted) return false;
+      setState(() => _savingText = false);
+      _showMessage(
+        'Could not save that answer. Check your connection and tap Save again.',
+      );
+      return false;
     }
+
+    if (!mounted) return false;
+    setState(() {
+      _savingText = false;
+      _savedText[question.id] = text;
+      _savedQuestions.add(question.id);
+      if (advance && _currentIndex < _questions.length - 1) _currentIndex++;
+    });
+    return true;
+  }
+
+  /// Writes the current fill-in-the-blank answer if the server does not have it
+  /// yet. Called before navigating away and before closing the attempt: grading
+  /// reads the *server* copy, so an unsaved field would quietly score nothing.
+  Future<bool> _flushTextAnswer() async {
+    if (!mounted) return true;
+
+    final question = _questions[_currentIndex];
+    if (!question.isFillInTheBlank) return true;
+
+    final text = _textAnswers[question.id] ?? '';
+    if (_savedText[question.id] == text) return true;
+    return _saveTextAnswer(question);
+  }
+
+  /// Moves to [index], persisting the current text answer first.
+  Future<void> _goTo(int index) async {
+    if (index < 0 || index >= _questions.length) return;
+    await _flushTextAnswer();
+    if (!mounted) return;
+    setState(() => _currentIndex = index);
   }
 
   /// Closes the attempt. `timeUp` is the countdown's path: no confirmation
@@ -443,6 +598,15 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     if (!timeUp) {
       final confirmed = await _confirmSubmit();
       if (confirmed != true || !mounted) return;
+
+      // Only close the attempt once the last typed answer has landed: grading
+      // reads the server copy, so submitting now would silently drop it.
+      if (!await _flushTextAnswer()) return;
+    } else {
+      // The clock decides, so submission wins over a failed save — but still try
+      // once, because a fill-in-the-blank field is normally the only unsaved
+      // thing on screen.
+      await _flushTextAnswer();
     }
 
     setState(() => _submitting = true);
@@ -474,8 +638,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         builder: (context) => AlertDialog(
           title: const Text('Submit your exam?'),
           content: Text(
-            'You have answered ${_answers.length} of ${_questions.length} '
-            'questions. Submitting closes the attempt for good.',
+            'You have answered ${_savedQuestions.length} of '
+            '${_questions.length} questions. Submitting closes the attempt for '
+            'good.',
           ),
           actions: [
             TextButton(
@@ -520,6 +685,11 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       return _BlockingState(
         message: blockingError,
         onRetry: _retryBootstrap,
+        // Only a permission failure can be fixed in the OS settings, so the
+        // extra action appears exactly then.
+        onOpenSettings: _offerSettings
+            ? () => PermissionService().openSettings()
+            : null,
         allowExit: true,
       );
     }
@@ -560,12 +730,15 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          'Question ${_currentIndex + 1} / ${_questions.length}'
-          '${_answers.isEmpty ? '' : '  •  ${_answers.length} answered'}',
-        ),
+        // Explicit numbering on every question, both shapes: "Question 3 of 5".
+        title: Text('Question ${_currentIndex + 1} of ${_questions.length}'),
         automaticallyImplyLeading: false, // no manual exit mid-exam
         actions: [
+          if (_savedQuestions.isNotEmpty)
+            _AnsweredChip(
+              count: _savedQuestions.length,
+              total: _questions.length,
+            ),
           if (_remaining != null) _RemainingChip(remaining: _remaining!),
           if (_kioskStatus != null) _KioskBadge(status: _kioskStatus!),
         ],
@@ -579,26 +752,43 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
               children: [
                 Text(question.questionText, style: Theme.of(context).textTheme.titleLarge),
                 const SizedBox(height: 16),
-                ...List.generate(question.options.length, (i) {
-                  final isSelected = selectedOption == i;
-                  return Card(
-                    color: isSelected
-                        ? Theme.of(context).colorScheme.secondaryContainer
-                        : null,
-                    child: ListTile(
-                      key: Key('option-$i'),
-                      title: Text(question.options[i]),
-                      // Mirrors the local map, so a tap paints immediately even
-                      // while its autosave RPC is still in flight.
-                      selected: isSelected,
-                      trailing: isSelected
-                          ? const Icon(Icons.radio_button_checked)
+                if (question.isFillInTheBlank)
+                  // Fill in the blank: no options, a text field, and a "Save &
+                  // next" action (the field has no auto-advance to trigger on).
+                  _FillInTheBlankField(
+                    key: ValueKey(question.id),
+                    initialValue: _textAnswers[question.id] ?? '',
+                    saved: _savedQuestions.contains(question.id) &&
+                        _savedText[question.id] == (_textAnswers[question.id] ?? ''),
+                    enabled: !_submitting,
+                    onChanged: (value) => _textAnswers[question.id] = value,
+                    onSubmitted: (_) => _saveTextAnswer(question),
+                  )
+                else ...[
+                  ...List.generate(question.options.length, (i) {
+                    final isSelected = selectedOption == i;
+                    return Card(
+                      color: isSelected
+                          ? Theme.of(context).colorScheme.secondaryContainer
                           : null,
-                      onTap:
-                          _submitting ? null : () => _selectAnswer(i),
+                      child: ListTile(
+                        key: Key('option-$i'),
+                        title: Text(question.options[i]),
+                        // Mirrors the local map, so a tap paints immediately even
+                        // while its autosave RPC is still in flight.
+                        selected: isSelected,
+                        trailing: isSelected
+                            ? const Icon(Icons.radio_button_checked)
+                            : null,
+                        onTap: _submitting ? null : () => _selectAnswer(i),
+                      ),
+                    );
+                  }),
+                  if (question.options.isEmpty)
+                    const Text(
+                      'This question has no options yet — tell your supervisor.',
                     ),
-                  );
-                }),
+                ],
                 const Spacer(),
                 Row(
                   children: [
@@ -607,11 +797,21 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                         key: const Key('exam-previous'),
                         onPressed: _submitting
                             ? null
-                            : () => setState(() => _currentIndex--),
+                            : () => _goTo(_currentIndex - 1),
                         icon: const Icon(Icons.chevron_left),
                         label: const Text('Previous'),
                       ),
                     const Spacer(),
+                    if (question.isFillInTheBlank &&
+                        _currentIndex < _questions.length - 1)
+                      FilledButton.icon(
+                        key: const Key('exam-save-text'),
+                        onPressed: _submitting || _savingText
+                            ? null
+                            : () => _saveTextAnswer(question, advance: true),
+                        icon: const Icon(Icons.check),
+                        label: Text(_savingText ? 'Saving…' : 'Save & next'),
+                      ),
                     if (_currentIndex == _questions.length - 1)
                       FilledButton(
                         key: const Key('exam-submit'),
@@ -736,6 +936,7 @@ class _BlockingState extends StatelessWidget {
     this.icon = Icons.error_outline,
     this.onRetry,
     this.retryLabel = 'Try again',
+    this.onOpenSettings,
     this.allowExit = false,
   });
 
@@ -748,6 +949,10 @@ class _BlockingState extends StatelessWidget {
   final VoidCallback? onRetry;
   final String retryLabel;
 
+  /// Opens the OS app-settings page, for a permission the student has to change
+  /// there (Android/iOS stop prompting after a permanent denial).
+  final VoidCallback? onOpenSettings;
+
   /// Shows the "Leave" button.
   final bool allowExit;
 
@@ -755,6 +960,7 @@ class _BlockingState extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final retry = onRetry;
+    final openSettings = onOpenSettings;
 
     return Scaffold(
       appBar: AppBar(
@@ -780,8 +986,18 @@ class _BlockingState extends StatelessWidget {
                     icon: const Icon(Icons.refresh),
                     label: Text(retryLabel),
                   ),
-                if (allowExit) ...[
+                if (openSettings != null) ...[
                   if (retry != null) const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    key: const Key('exam-open-settings'),
+                    onPressed: openSettings,
+                    icon: const Icon(Icons.settings_outlined),
+                    label: const Text('Open settings'),
+                  ),
+                ],
+                if (allowExit) ...[
+                  if (retry != null || openSettings != null)
+                    const SizedBox(height: 8),
                   TextButton(
                     key: const Key('exam-leave'),
                     onPressed: () => Navigator.of(context).maybePop(),
@@ -838,5 +1054,118 @@ class _RemainingChip extends StatelessWidget {
   static String _format(int seconds) {
     final clamped = seconds < 0 ? 0 : seconds;
     return '${clamped ~/ 60}:${(clamped % 60).toString().padLeft(2, '0')}';
+  }
+}
+
+/// Text input for a fill-in-the-blank question.
+///
+/// Stateful and keyed by question id (the parent passes `ValueKey(question.id)`),
+/// so moving between questions creates a fresh controller holding *that*
+/// question's saved text instead of leaking the previous answer into the next
+/// field.
+class _FillInTheBlankField extends StatefulWidget {
+  const _FillInTheBlankField({
+    super.key,
+    required this.initialValue,
+    required this.saved,
+    required this.enabled,
+    required this.onChanged,
+    required this.onSubmitted,
+  });
+
+  final String initialValue;
+  final bool saved;
+  final bool enabled;
+  final ValueChanged<String> onChanged;
+  final ValueChanged<String> onSubmitted;
+
+  @override
+  State<_FillInTheBlankField> createState() => _FillInTheBlankFieldState();
+}
+
+class _FillInTheBlankFieldState extends State<_FillInTheBlankField> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initialValue);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Type your answer', style: theme.textTheme.labelLarge),
+        const SizedBox(height: 8),
+        TextField(
+          key: const Key('exam-text-answer'),
+          controller: _controller,
+          enabled: widget.enabled,
+          textInputAction: TextInputAction.done,
+          minLines: 1,
+          maxLines: 4,
+          // Matches the server-side cap in merge_submission_text_answer().
+          maxLength: 2000,
+          onChanged: widget.onChanged,
+          onSubmitted: widget.onSubmitted,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+            hintText: 'Your answer',
+          ),
+        ),
+        Row(
+          children: [
+            Icon(
+              widget.saved ? Icons.check_circle_outline : Icons.cloud_off_outlined,
+              size: 14,
+              color: widget.saved
+                  ? Colors.green
+                  : theme.colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 4),
+            Expanded(
+              child: Text(
+                widget.saved
+                    ? 'Answer saved'
+                    : 'Not saved yet — tap "Save & next", or Submit on the last '
+                        'question, to send it.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: widget.saved
+                      ? Colors.green
+                      : theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+/// "3 of 5 answered" chip in the exam app bar.
+class _AnsweredChip extends StatelessWidget {
+  const _AnsweredChip({required this.count, required this.total});
+
+  final int count;
+  final int total;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: 'Answers the server has stored',
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        child: Text(
+          '$count of $total answered',
+          style: Theme.of(context).textTheme.labelMedium,
+        ),
+      ),
+    );
   }
 }
