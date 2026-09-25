@@ -5,12 +5,19 @@ import type { ProctoringLogRow } from "@/types/database";
 /// Subscribes to new `proctoring_logs` rows as they're inserted, optionally
 /// scoped to a set of submission IDs (e.g. all submissions for one exam).
 /// Keeps the most recent `limit` entries, newest first.
+///
+/// The hook owns its own loading flag: the panel that renders it shows skeleton
+/// rows until the seed query resolves, instead of briefly claiming "no incidents
+/// reported yet" while the data is still in flight.
 export function useLiveIncidentFeed(submissionIds: string[] | null, limit = 100) {
   const [logs, setLogs] = useState<ProctoringLogRow[]>([]);
+  const [loading, setLoading] = useState(true);
   const idsRef = useRef(submissionIds);
   idsRef.current = submissionIds;
 
   useEffect(() => {
+    let active = true;
+
     // Seed with recent history so the feed isn't empty on first paint.
     (async () => {
       let query = supabase
@@ -22,7 +29,9 @@ export function useLiveIncidentFeed(submissionIds: string[] | null, limit = 100)
         query = query.in("submission_id", submissionIds);
       }
       const { data } = await query;
+      if (!active) return;
       if (data) setLogs(data as ProctoringLogRow[]);
+      setLoading(false);
     })();
 
     const channel = supabase
@@ -40,6 +49,7 @@ export function useLiveIncidentFeed(submissionIds: string[] | null, limit = 100)
       .subscribe();
 
     return () => {
+      active = false;
       supabase.removeChannel(channel);
     };
     // Re-subscribing per submissionIds change would drop the buffered feed;
@@ -47,5 +57,5 @@ export function useLiveIncidentFeed(submissionIds: string[] | null, limit = 100)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [limit]);
 
-  return logs;
+  return { logs, loading };
 }

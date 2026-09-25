@@ -7,6 +7,7 @@ import {
 import { supabase } from "@/lib/supabase";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { ChartSkeleton, MetricCardSkeleton } from "@/components/ui/skeleton";
 import type { ExamRow, SubmissionRow, ProctoringLogRow } from "@/types/database";
 
 function MetricCard({
@@ -124,41 +125,54 @@ export function DashboardOverview() {
     return Object.values(byDay).sort((a, b) => a.day.localeCompare(b.day));
   }, [submissions]);
 
-  if (loading) {
-    return <div className="p-6 text-sm text-slate-500">Loading dashboard…</div>;
-  }
-
-  if (error) {
-    return (
-      <div className="p-6">
-        <h1 className="mb-1 text-lg font-semibold text-slate-100">Dashboard</h1>
-        <Card className="mt-4">
-          <CardContent className="flex flex-col items-start gap-3 p-4">
-            <p className="text-sm text-alert">Could not load the dashboard: {error}</p>
-            <Button variant="outline" size="sm" onClick={() => setReloadKey((k) => k + 1)}>
-              Try again
-            </Button>
-          </CardContent>
-        </Card>
-      </div>
-    );
-  }
-
   return (
     <div className="p-6">
       <h1 className="mb-1 text-lg font-semibold text-slate-100">Dashboard</h1>
       <p className="mb-6 text-sm text-slate-500">
-        Exam activity across your organization — {publishedExamCount} published of {exams.length} exam(s)
+        {loading
+          ? "Exam activity across your organization"
+          : `Exam activity across your organization — ${publishedExamCount} published of ${exams.length} exam(s)`}
       </p>
 
+      {/* One announcement for assistive tech; the pulsing blocks stay aria-hidden. */}
+      {loading && (
+        <span role="status" className="sr-only">
+          Loading dashboard metrics
+        </span>
+      )}
+
+      {/* A failed read sits *above* the panels and leaves them mounted, so the
+          console and the retry stay reachable. */}
+      {error && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-alert/30 bg-alert/10 px-3 py-2 text-sm text-alert">
+          <span>Could not load the dashboard: {error}</span>
+          <Button variant="outline" size="sm" onClick={() => setReloadKey((k) => k + 1)}>
+            Try again
+          </Button>
+        </div>
+      )}
+
       <div className="grid grid-cols-4 gap-4">
-        <MetricCard label="Live exams now" value={String(liveExamCount)} icon={Activity} />
-        <MetricCard label="Candidates in progress" value={String(activeCandidates)} icon={Users} />
-        <MetricCard label="Incidents (24h)" value={String(incidentsToday)} icon={AlertTriangle} />
-        <MetricCard label="Disqualification rate" value={`${dqRate}%`} icon={Ban} tone="alert" />
+        {loading ? (
+          Array.from({ length: 4 }).map((_, index) => <MetricCardSkeleton key={index} />)
+        ) : (
+          <>
+            <MetricCard label="Live exams now" value={String(liveExamCount)} icon={Activity} />
+            <MetricCard label="Candidates in progress" value={String(activeCandidates)} icon={Users} />
+            <MetricCard label="Incidents (24h)" value={String(incidentsToday)} icon={AlertTriangle} />
+            <MetricCard label="Disqualification rate" value={`${dqRate}%`} icon={Ban} tone="alert" />
+          </>
+        )}
       </div>
 
       <div className="mt-6 grid grid-cols-2 gap-4">
+        {loading ? (
+          <>
+            <ChartSkeleton />
+            <ChartSkeleton bars={4} />
+          </>
+        ) : (
+          <>
         <Card>
           <CardHeader><CardTitle>Incident breakdown</CardTitle></CardHeader>
           <CardContent className="h-64">
@@ -196,6 +210,8 @@ export function DashboardOverview() {
             </ResponsiveContainer>
           </CardContent>
         </Card>
+          </>
+        )}
       </div>
     </div>
   );

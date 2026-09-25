@@ -37,13 +37,70 @@ src/
   and the completions/disqualifications timeline. A failed read is shown with a
   **Try again**, instead of quietly rendering zeros.
 - **ExamManager** — create an exam with its question bank, publish/unpublish,
-  delete, and edit an existing exam's metadata (title + duration).
+  delete, and edit an existing exam (title, duration *and* its questions).
+  Each draft question is numbered ("Question 2 of 5"), has a
+  **Multiple choice / Fill in the blank** selector, and shows either the option
+  list with its correct-option radio or the accepted answer for a typed question.
 - **LiveMonitor** — the roster for one exam with per-candidate flag counts, a
   confirmed **Disqualify** (the attempt closes irreversibly, and a refused write
   is reported instead of silently doing nothing) and an **Audit** link per
   candidate that opens `SubmissionAudit`.
-- **SubmissionAudit** — the incident timeline next to the question-by-question
-  breakdown, with the student's name in the header.
+- **SubmissionAudit** — the incident timeline next to the numbered
+  question-by-question breakdown, with the student's name in the header. A
+  fill-in-the-blank answer is compared to `correct_text_answer` exactly as
+  `submit_exam` grades it (trimmed, case-insensitive).
+
+## Loading behaviour (no blocking loaders)
+
+The console never replaces itself with a spinner. Three rules:
+
+1. **The shell paints first.** `App.tsx` renders `AppShell` (sidebar + page area)
+   on the very first frame; the session check only decides what goes *inside* the
+   page area, and while it runs the sidebar's profile tile shows a skeleton. The
+   old `RequireSupervisor` swapped the whole app — chrome included — for a
+   `min-h-screen` "Loading…" element, so the first paint looked like a hang and
+   the layout re-mounted on every auth event.
+2. **Every panel owns its own fetch, loading flag and error.** `DashboardOverview`,
+   `ExamManager`, `LiveMonitor` and `SubmissionAudit` each fetch what they render,
+   so a slow query only freezes the panel that needs it. Placeholders are skeletons
+   from `components/ui/skeleton.tsx` (`animate-pulse` + `bg-slate-800/50`) shaped
+   like the real content — metric cards, chart panels, candidate cards, feed rows,
+   table rows, audit panels — so nothing jumps when the data lands.
+3. **Errors sit next to the content, not instead of it.** A failed read renders an
+   inline banner (with **Try again** on the dashboard) *above* the panels, which
+   stay mounted and keep whatever did load. A failed read is never disguised as an
+   empty list: the roster, the incident feed and the dashboard all say what went
+   wrong.
+
+Realtime is treated as a bonus, never a gate: `useRealtimeStatus` reports
+`connecting` / `connected` / `reconnecting` through one shared copy map
+(`REALTIME_STATUS_COPY`), which drives both the sidebar footer pill and the live
+monitor's header badge — so the two can never disagree, and the badge can no
+longer claim "Live sync active" on a dead socket. Each state carries a tooltip
+explaining that on-demand loading still works; nothing about the socket can hold
+up a render.
+
+Accessibility note: skeleton blocks are `aria-hidden` and each group carries one
+`role="status"` announcement ("Loading candidates", "Loading incidents", …), so a
+screen reader hears one sentence instead of dozens of empty boxes.
+`index.css` already disables the pulse under `prefers-reduced-motion`.
+
+## Question types
+
+| Type | Stored as | Graded by |
+| --- | --- | --- |
+| `multiple_choice` | `options` jsonb + `correct_option` index | `submit_exam`: the stored index equals `correct_option` |
+| `fill_in_the_blank` | `correct_text_answer` (no options) | `submit_exam`: `lower(btrim(answer)) = lower(btrim(correct_text_answer))` |
+
+A `questions_answer_key_shape` check constraint allows exactly one answer key per
+row, so the form always sends `correct_option: null` for a typed question and
+`correct_text_answer: null` for a choice one.
+
+Editing an exam updates its questions **in place** (the row ids survive), because
+`exam_submissions.answers` is keyed by question id and `submit_exam` joins on it —
+replacing the rows would orphan every answer already recorded. For the same
+reason the form offers no delete on a question that already exists; add a new
+question instead, or create a new exam.
 
 ## Design decisions
 - **Token system, not raw slate.** `tailwind.config.ts` defines
@@ -91,9 +148,10 @@ src/
   `proctor-snapshots` bucket and writes the resulting URL onto the log row
   (see `../supabase/schema.sql` §6); if you ever flip that bucket to private,
   sign URLs server-side instead.
-- Question *editing* for an exam that already exists. `ExamManager` can change an
-  exam's title and duration, but not its questions: recorded answers reference
-  those rows by id (`submit_exam` joins on them), so replacing them would orphan
-  every answer already stored. Add a per-question edit that updates rows in place
-  instead of deleting and re-inserting.
+- Deleting a question that already exists (see "Question types" above: recorded
+  answers reference the row by id). A safe version would delete only when no
+  `exam_submissions.answers` key matches, and otherwise offer to archive it.
+- Multiple accepted wordings for a fill-in-the-blank answer. One
+  `correct_text_answer` per row today; a `text[]` (or a tolerance table) would let
+  "HyperText Transfer Protocol" and "HTTP" both count.
 - Sound-effect toggle for new incidents.

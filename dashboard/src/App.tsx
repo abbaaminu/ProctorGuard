@@ -1,42 +1,53 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { AppShell } from "@/components/layout/AppShell";
+import { PageSkeleton } from "@/components/ui/skeleton";
 import { LoginPage } from "@/pages/Login";
 import { DashboardOverview } from "@/pages/DashboardOverview";
 import { ExamManager } from "@/pages/ExamManager";
 import { LiveMonitor } from "@/pages/LiveMonitor";
 import { SubmissionAudit } from "@/pages/SubmissionAudit";
 
-function RequireSupervisor({ children }: { children: React.ReactNode }) {
+/**
+ * Routing + the console shell.
+ *
+ * The shell is deliberately *not* gated on the session check: the sidebar and
+ * the header are static, so they paint on the first frame while `useAuth`
+ * resolves the session, and only the page area shows a skeleton. The old
+ * implementation swapped the entire app for a full-screen "Loading…" element,
+ * which hid the chrome, made the first paint feel like a hang and re-mounted the
+ * layout on every auth event.
+ */
+function AppRoutes() {
   const { loading, profile } = useAuth();
 
   if (loading) {
-    return <div className="flex min-h-screen items-center justify-center bg-surface text-sm text-slate-500">Loading…</div>;
+    return (
+      <AppShell profilePending>
+        <PageSkeleton />
+      </AppShell>
+    );
   }
+
   if (!profile) {
     // Signed out, or signed in without a supervisor profile — `useAuth` puts the
     // reason (a failed profile read, a student account) in its `error`, which
     // LoginPage renders above the form. The console itself stays unreachable.
     return <LoginPage />;
   }
-  return <>{children}</>;
-}
 
-function AppRoutes() {
   return (
-    <RequireSupervisor>
-      <AppShell>
-        <Routes>
-          <Route path="/" element={<DashboardOverview />} />
-          <Route path="/exams" element={<ExamManager />} />
-          <Route path="/exams/:id/monitor" element={<LiveMonitor />} />
-          <Route path="/submissions/:id" element={<SubmissionAudit />} />
-          <Route path="/analytics" element={<DashboardOverview />} />
-          <Route path="/settings" element={<div className="p-6 text-sm text-slate-500">Settings — coming soon.</div>} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </AppShell>
-    </RequireSupervisor>
+    <AppShell>
+      <Routes>
+        <Route path="/" element={<DashboardOverview />} />
+        <Route path="/exams" element={<ExamManager />} />
+        <Route path="/exams/:id/monitor" element={<LiveMonitor />} />
+        <Route path="/submissions/:id" element={<SubmissionAudit />} />
+        <Route path="/analytics" element={<DashboardOverview />} />
+        <Route path="/settings" element={<div className="p-6 text-sm text-slate-500">Settings — coming soon.</div>} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </AppShell>
   );
 }
 

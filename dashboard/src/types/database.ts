@@ -17,20 +17,38 @@ export type ExamRow = {
   created_at: string;
 };
 
+export type QuestionType = "multiple_choice" | "fill_in_the_blank";
+
 export type QuestionRow = {
   id: string;
   exam_id: string;
   question_text: string;
+  question_type: QuestionType;
+  /** Tap targets for `multiple_choice`; empty for `fill_in_the_blank`. */
   options: string[];
-  correct_option: number;
+  /** Index into `options`. Null for a fill-in-the-blank row. */
+  correct_option: number | null;
+  /** Accepted wording for `fill_in_the_blank`. Null for a choice row. */
+  correct_text_answer: string | null;
   points: number;
 };
+
+/** Row shape of the student-facing `questions_public` view (no answer keys). */
+export type PublicQuestionRow = Omit<
+  QuestionRow,
+  "correct_option" | "correct_text_answer"
+>;
 
 export type SubmissionRow = {
   id: string;
   student_id: string;
   exam_id: string;
-  answers: Record<string, number>;
+  /**
+   * `questions.id` -> answer. A number is a 0-based choice index
+   * (`merge_submission_answer`), a string is a typed answer
+   * (`merge_submission_text_answer`).
+   */
+  answers: Record<string, number | string>;
   status: SubmissionStatus;
   score: number | null;
   started_at: string;

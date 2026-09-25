@@ -5,9 +5,18 @@ import { supabase } from "@/lib/supabase";
 import { useExamSubmissions } from "@/hooks/useExamSubmissions";
 import { useLiveIncidentFeed } from "@/hooks/useLiveIncidentFeed";
 import { useAccountNames } from "@/hooks/useAccountNames";
+import {
+  REALTIME_STATUS_COPY,
+  useRealtimeStatus,
+} from "@/hooks/useRealtimeStatus";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge, statusTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  CandidateCardSkeleton,
+  FeedRowSkeleton,
+  Skeleton,
+} from "@/components/ui/skeleton";
 import { cn, formatTime, shortId, timeElapsed } from "@/lib/utils";
 import type { ExamRow, SubmissionRow } from "@/types/database";
 
@@ -40,12 +49,24 @@ export function LiveMonitor() {
   /** Action-level failure: a disqualify that the server refused, say. */
   const [actionError, setActionError] = useState<string | null>(null);
 
-  const { submissions, error: rosterError, disqualify } = useExamSubmissions(examId ?? "");
+  // The header badge reports the actual socket state instead of a hardcoded
+  // "Live sync active": Realtime only affects *streaming*, and the badge says so.
+  const realtimeStatus = useRealtimeStatus();
+  const badgeCopy = REALTIME_STATUS_COPY[realtimeStatus];
+
+  const {
+    submissions,
+    loading: rosterLoading,
+    error: rosterError,
+    disqualify,
+  } = useExamSubmissions(examId ?? "");
   const submissionIds = useMemo(() => submissions.map((s) => s.id), [submissions]);
-  const logs = useLiveIncidentFeed(submissionIds.length ? submissionIds : null);
+  const { logs, loading: feedLoading } = useLiveIncidentFeed(
+    submissionIds.length ? submissionIds : null
+  );
   // `id -> name` so the roster and the feed read like a class list instead of a
   // wall of uuids (RLS lets a supervisor read every profile row).
-  const names = useAccountNames();
+  const { names, loading: namesLoading } = useAccountNames();
 
   useEffect(() => {
     if (!examId) return;
@@ -111,23 +132,38 @@ export function LiveMonitor() {
     <div className="flex h-screen flex-col">
       <header className="flex h-14 shrink-0 items-center justify-between border-b border-border bg-surface-raised px-6">
         <div className="flex items-center gap-3">
-          <h1 className="text-sm font-semibold text-slate-100">{exam?.title ?? "Loading exam…"}</h1>
-          <span className="flex items-center gap-1 text-xs text-slate-500">
-            <Clock size={12} /> {exam?.duration_minutes} min
-          </span>
+          {exam ? (
+            <>
+              <h1 className="text-sm font-semibold text-slate-100">{exam.title}</h1>
+              <span className="flex items-center gap-1 text-xs text-slate-500">
+                <Clock size={12} /> {exam.duration_minutes} min
+              </span>
+            </>
+          ) : (
+            // The header never says "Loading exam…": it shows the shape of the
+            // title and swaps in the real one when the row arrives.
+            <Skeleton className="h-4 w-52" />
+          )}
         </div>
-        <div className="flex items-center gap-1.5 rounded-full border border-ok/30 bg-ok/10 px-2.5 py-1 text-xs text-ok">
-          <span className="h-1.5 w-1.5 rounded-full bg-ok animate-pulseDot" />
-          Live sync active
+        <div
+          title={badgeCopy.hint}
+          className={cn(
+            "flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs",
+            badgeCopy.badge
+          )}
+        >
+          <span className={cn("h-1.5 w-1.5 rounded-full bg-current", status === "connected" && "animate-pulseDot")} />
+          {badgeCopy.label}
         </div>
       </header>
 
       <div className="flex flex-1 overflow-hidden">
         {/* Left: candidate roster */}
         <div className="flex-1 overflow-y-auto p-5">
-          <p className="mb-3 text-xs font-medium uppercase tracking-wide text-slate-500">
-            Candidates ({submissions.length})
-          </p>
+          <div className="mb-3 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+            <span>Candidates{rosterLoading ? "" : ` (${submissions.length})`}</span>
+            {rosterLoading && <Skeleton className="h-3 w-6" />}
+          </div>
 
           {rosterError && (
             <div className="mb-3 rounded-md border border-alert/30 bg-alert/10 px-3 py-2 text-sm text-alert">
@@ -140,7 +176,13 @@ export function LiveMonitor() {
             </div>
           )}
 
-          {submissions.length === 0 && !rosterError ? (
+          {rosterLoading ? (
+            <div className="grid grid-cols-3 gap-3" role="status" aria-label="Loading candidates">
+              {Array.from({ length: 3 }).map((_, index) => (
+                <CandidateCardSkeleton key={index} />
+              ))}
+            </div>
+          ) : submissions.length === 0 && !rosterError ? (
             <p className="text-sm text-slate-500">No student has started this exam yet.</p>
           ) : (
             <div className="grid grid-cols-3 gap-3">
@@ -148,9 +190,13 @@ export function LiveMonitor() {
                 <Card key={s.id} className={cn(s.status === "disqualified" && "border-alert/40")}>
                   <CardContent className="p-3.5">
                     <div className="mb-2 flex items-center justify-between gap-2">
-                      <span className="truncate text-sm font-medium text-slate-200">
-                        {labelFor(s.student_id)}
-                      </span>
+                      {namesLoading ? (
+                        <Skeleton className="h-4 w-28" />
+                      ) : (
+                        <span className="truncate text-sm font-medium text-slate-200">
+                          {labelFor(s.student_id)}
+                        </span>
+                      )}
                       <Badge tone={statusTone(s.status)}>{s.status}</Badge>
                     </div>
                     <div className="flex items-center justify-between text-xs text-slate-500">
@@ -199,10 +245,17 @@ export function LiveMonitor() {
             <span className="text-xs text-slate-500">{logs.length}</span>
           </div>
           <div className="h-[calc(100vh-56px-49px)] overflow-y-auto">
-            {logs.length === 0 && (
+            {feedLoading && (
+              <div role="status" aria-label="Loading incidents">
+                {Array.from({ length: 5 }).map((_, index) => (
+                  <FeedRowSkeleton key={index} />
+                ))}
+              </div>
+            )}
+            {!feedLoading && logs.length === 0 && (
               <p className="p-4 text-sm text-slate-500">No incidents reported yet.</p>
             )}
-            {logs.map((log) => (
+            {!feedLoading && logs.map((log) => (
               <div
                 key={log.id}
                 className="animate-rowIn flex items-start gap-2.5 border-b border-border px-4 py-3"

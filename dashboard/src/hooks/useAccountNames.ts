@@ -13,10 +13,14 @@ import type { UserRow } from "@/types/database";
  */
 export function useAccountNames() {
   const [names, setNames] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
     const { data } = await supabase.from("users").select("id, name, email");
-    if (!data) return;
+    if (!data) {
+      setLoading(false);
+      return;
+    }
     setNames(
       Object.fromEntries(
         (data as Pick<UserRow, "id" | "name" | "email">[]).map((row) => [
@@ -25,6 +29,7 @@ export function useAccountNames() {
         ])
       )
     );
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -50,5 +55,5 @@ export function useAccountNames() {
     };
   }, [load]);
 
-  return names;
+  return { names, loading };
 }

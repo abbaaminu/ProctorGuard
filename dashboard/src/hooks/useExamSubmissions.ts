@@ -11,11 +11,17 @@ import type { SubmissionRow } from "@/types/database";
  */
 export function useExamSubmissions(examId: string) {
   const [submissions, setSubmissions] = useState<SubmissionRow[]>([]);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!examId) return;
+    if (!examId) {
+      // No id to query: stop the skeleton rather than pulsing forever.
+      setLoading(false);
+      return;
+    }
     let active = true;
+    setLoading(true);
 
     (async () => {
       const { data, error: loadError } = await supabase
@@ -26,10 +32,12 @@ export function useExamSubmissions(examId: string) {
       if (!active) return;
       if (loadError) {
         setError(loadError.message);
+        setLoading(false);
         return;
       }
       setError(null);
       setSubmissions((data as SubmissionRow[]) ?? []);
+      setLoading(false);
     })();
 
     const channel = supabase
@@ -82,6 +90,6 @@ export function useExamSubmissions(examId: string) {
     return true;
   }
 
-  return { submissions, error, disqualify };
+  return { submissions, loading, error, disqualify };
 }
 
