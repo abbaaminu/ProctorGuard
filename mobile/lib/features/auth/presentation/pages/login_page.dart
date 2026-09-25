@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../../../core/services/supabase_service.dart';
+import '../../../../core/widgets/responsive_layout.dart';
 
 /// Signature of the auth call the form performs.
 ///
@@ -118,106 +119,109 @@ class _LoginPageState extends State<LoginPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
+    // A larger brand mark once the viewport is wider than a large phone.
+    final wide =
+        ResponsiveSizing.viewportOf(context).width >= Breakpoints.medium;
+
     return Scaffold(
+      // `ResponsiveScrollView` replaces the old
+      // `Center > SingleChildScrollView > ConstrainedBox(maxWidth: 420)`: it
+      // fills the viewport (no wasted top gap), scrolls as soon as the on-screen
+      // keyboard or a short landscape window makes the form taller than the
+      // screen, and clamps the form to a readable column instead of stretching a
+      // phone layout across a monitor. Gutters grow with the viewport.
       body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            // Web/desktop: keep the form a readable width instead of
-            // stretching a phone layout across a monitor.
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 420),
-              child: Form(
-                key: _formKey,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Icon(
-                      Icons.school_outlined,
-                      size: 48,
-                      color: theme.colorScheme.primary,
-                    ),
-                    const SizedBox(height: 12),
-                    Text(
-                      'Exam Proctor',
-                      textAlign: TextAlign.center,
-                      style: theme.textTheme.headlineSmall,
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      'Sign in to take or supervise an exam',
-                      textAlign: TextAlign.center,
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                    const SizedBox(height: 24),
-                    TextFormField(
-                      key: const Key('login-email'),
-                      controller: _emailController,
-                      enabled: !_submitting,
-                      keyboardType: TextInputType.emailAddress,
-                      textInputAction: TextInputAction.next,
-                      autocorrect: false,
-                      autofillHints: const [AutofillHints.email],
-                      decoration: const InputDecoration(
-                        labelText: 'Email',
-                        prefixIcon: Icon(Icons.alternate_email),
-                        border: OutlineInputBorder(),
-                      ),
-                      validator: _validateEmail,
-                    ),
-                    const SizedBox(height: 16),
-                    TextFormField(
-                      key: const Key('login-password'),
-                      controller: _passwordController,
-                      enabled: !_submitting,
-                      obscureText: _obscurePassword,
-                      textInputAction: TextInputAction.done,
-                      autofillHints: const [AutofillHints.password],
-                      decoration: InputDecoration(
-                        labelText: 'Password',
-                        prefixIcon: const Icon(Icons.lock_outline),
-                        border: const OutlineInputBorder(),
-                        suffixIcon: IconButton(
-                          // Exam passwords get typed on phones: let the student
-                          // check what they typed before submitting.
-                          onPressed: _submitting
-                              ? null
-                              : () => setState(
-                                    () => _obscurePassword = !_obscurePassword,
-                                  ),
-                          icon: Icon(
-                            _obscurePassword
-                                ? Icons.visibility_outlined
-                                : Icons.visibility_off_outlined,
-                          ),
-                          tooltip: _obscurePassword
-                              ? 'Show password'
-                              : 'Hide password',
-                        ),
-                      ),
-                      validator: _validatePassword,
-                      onFieldSubmitted: (_) => _signIn(),
-                    ),
-                    const SizedBox(height: 24),
-                    FilledButton(
-                      key: const Key('login-submit'),
-                      // Null while in flight: disabled is the first line of
-                      // defence against a double submit (see _signIn).
-                      onPressed: _submitting ? null : _signIn,
-                      child: _submitting
-                          ? const SizedBox(
-                              height: 20,
-                              width: 20,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Text('Sign in'),
-                    ),
-                  ],
+        child: ResponsiveScrollView(
+          maxWidth: 440,
+          child: Form(
+            key: _formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Icon(
+                  Icons.school_outlined,
+                  size: wide ? 64 : 48,
+                  color: theme.colorScheme.primary,
                 ),
-              ),
+                const SizedBox(height: 12),
+                Text(
+                  'Exam Proctor',
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.headlineSmall,
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Sign in to take or supervise an exam',
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                TextFormField(
+                  key: const Key('login-email'),
+                  controller: _emailController,
+                  enabled: !_submitting,
+                  keyboardType: TextInputType.emailAddress,
+                  textInputAction: TextInputAction.next,
+                  autocorrect: false,
+                  autofillHints: const [AutofillHints.email],
+                  decoration: const InputDecoration(
+                    labelText: 'Email',
+                    prefixIcon: Icon(Icons.alternate_email),
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: _validateEmail,
+                ),
+                const SizedBox(height: 16),
+                TextFormField(
+                  key: const Key('login-password'),
+                  controller: _passwordController,
+                  enabled: !_submitting,
+                  obscureText: _obscurePassword,
+                  textInputAction: TextInputAction.done,
+                  autofillHints: const [AutofillHints.password],
+                  decoration: InputDecoration(
+                    labelText: 'Password',
+                    prefixIcon: const Icon(Icons.lock_outline),
+                    border: const OutlineInputBorder(),
+                    suffixIcon: IconButton(
+                      // Exam passwords get typed on phones: let the student
+                      // check what they typed before submitting.
+                      onPressed: _submitting
+                          ? null
+                          : () => setState(
+                                () => _obscurePassword = !_obscurePassword,
+                              ),
+                      icon: Icon(
+                        _obscurePassword
+                            ? Icons.visibility_outlined
+                            : Icons.visibility_off_outlined,
+                      ),
+                      tooltip: _obscurePassword
+                          ? 'Show password'
+                          : 'Hide password',
+                    ),
+                  ),
+                  validator: _validatePassword,
+                  onFieldSubmitted: (_) => _signIn(),
+                ),
+                const SizedBox(height: 24),
+                FilledButton(
+                  key: const Key('login-submit'),
+                  // Null while in flight: disabled is the first line of
+                  // defence against a double submit (see _signIn).
+                  onPressed: _submitting ? null : _signIn,
+                  child: _submitting
+                      ? const SizedBox(
+                          height: 20,
+                          width: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Sign in'),
+                ),
+              ],
             ),
           ),
         ),

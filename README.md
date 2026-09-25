@@ -50,11 +50,23 @@ Both apps read/write the same tables, so a submission a student makes in
       repository secrets, or delete the workflow if you are on a paid plan.
 - [ ] **Verify both builds.** `cd mobile && flutter analyze && flutter test`, then
       `cd dashboard && npm run build`.
+- [ ] **Deploy the dashboard with the right Vercel settings.** The Vercel project's
+      **Root Directory must be `dashboard`**: that is what gives the build a
+      `package.json` to run and what makes `dashboard/vercel.json` apply (it pins
+      Build Command `npm run build` and Output Directory `dist` — the Vite
+      defaults, stated explicitly so a mis-detected framework preset cannot
+      change them). Its SPA rewrite sends unknown paths to `index.html`, so a hard
+      refresh on `/exams/:id/monitor` or `/submissions/:id` loads the console
+      instead of Vercel's 404. Static files still win over that rewrite (Vercel
+      resolves the file system *before* the rewrites phase), so `/assets/*.js` and
+      `/icon.png` are unaffected. Also set `VITE_SUPABASE_URL` and
+      `VITE_SUPABASE_ANON_KEY` as project environment variables —
+      `src/lib/supabase.ts` throws at boot without them.
 
 ## Verifying a change
 
 ```
-cd mobile   && flutter analyze && flutter test     # 87 tests, no device needed
+cd mobile   && flutter analyze && flutter test     # 109 tests, no device needed
 cd dashboard && npm run build                      # tsc -b && vite build
 ```
 

@@ -103,7 +103,16 @@ void main() {
 
   /// The portal on its own, with a stub session screen so the routing contract
   /// can be asserted without a camera.
-  Widget portal({required ExamPageBuilder builder, String? name = 'Aisha Bello'}) =>
+  ///
+  /// [gate] stands in for the mandatory pre-exam hardware check: the real one
+  /// opens a camera and asks the OS for permissions, neither of which exists in a
+  /// widget test — `hardware_gate_test.dart` covers that screen directly. The
+  /// default reports "verified", which is what these routing tests are not about.
+  Widget portal({
+    required ExamPageBuilder builder,
+    String? name = 'Aisha Bello',
+    HardwareGateRequest? gate,
+  }) =>
       ProviderScope(
         overrides: [
           profileRepositoryProvider.overrideWithValue(profiles),
@@ -113,6 +122,7 @@ void main() {
           home: StudentExamPortalPage(
             studentName: name,
             examPageBuilder: builder,
+            hardwareGate: gate ?? (_, _) async => true,
           ),
         ),
       );
@@ -211,6 +221,35 @@ void main() {
       expect(find.textContaining('Could not start'), findsOneWidget);
       expect(opened, 0);
       await letSnackBarExpire(tester);
+    });
+
+    testWidgets('a refused hardware gate blocks the exam and writes nothing',
+        (tester) async {
+      var opened = 0;
+
+      await tester.pumpWidget(portal(
+        builder: (_, _) {
+          opened++;
+          return const SizedBox.shrink();
+        },
+        // What ExamHardwareGatePage reports when the camera or the microphone
+        // could not be verified.
+        gate: (_, _) async => false,
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('exam-$mat201Id')));
+      await tester.pumpAndSettle();
+
+      expect(opened, 0, reason: 'the session screen must not open');
+      expect(
+        exams.startCalls,
+        0,
+        reason: 'no submission is created before the gate passes, so there is '
+            'no orphaned ongoing attempt to resume',
+      );
+      // Still on the list, free to try again once the device is fixed.
+      expect(find.text('Student Exam Portal'), findsOneWidget);
     });
   });
 

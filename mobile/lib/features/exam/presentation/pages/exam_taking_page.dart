@@ -7,12 +7,14 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../../core/services/hardware_verification_service.dart';
 import '../../../../core/services/kiosk_service.dart';
 import '../../../../core/services/mediapipe_proctoring_service.dart';
 import '../../../../core/services/permission_service.dart';
 import '../../../../core/services/web_camera_permission.dart';
 import '../../../../core/services/web_exam_guard.dart';
 import '../../../../core/services/web_guards.dart';
+import '../../../../core/widgets/responsive_layout.dart';
 import '../../../proctoring/presentation/providers/proctoring_provider.dart';
 import '../../../proctoring/presentation/widgets/violation_overlay.dart';
 import '../../domain/entities/question.dart';
@@ -214,8 +216,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       cameras = await _resolveCameras();
     } on CameraException catch (error) {
       _failStart(
-        'Proctoring cannot start — ${_cameraFailure(error.code)}. Close anything '
-        'else using the camera or microphone, then tap Try again.',
+        'Proctoring cannot start — ${cameraFailureMessage(error.code)}. Close '
+        'anything else using the camera or microphone, then tap Try again.',
       );
       return;
     } catch (error) {
@@ -247,7 +249,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       // really holds the mic (RECORD_AUDIO on Android, the browser's mic grant on
       // web) for as long as the attempt lasts.
       enableAudio: true,
-      imageFormatGroup: _imageFormatGroup(),
+      imageFormatGroup: proctorImageFormatGroup(),
     );
     // Every step below can fail on a real device (another app holding the
     // camera, an OEM driver quirk, a permission revoked mid-session), so the
@@ -270,8 +272,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       });
     } on CameraException catch (error) {
       _failStart(
-        'Proctoring cannot start — ${_cameraFailure(error.code)}. Close anything '
-        'else using the camera or microphone, then tap Try again.',
+        'Proctoring cannot start — ${cameraFailureMessage(error.code)}. Close '
+        'anything else using the camera or microphone, then tap Try again.',
       );
       return;
     } catch (error) {
@@ -299,17 +301,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   static String _permissionLabel(List<StartupPermission> missing) =>
       missing.map((permission) => permission.name).join(' and ');
 
-  /// The pixel format ML Kit can consume, per platform.
-  ///
-  /// ML Kit reads exactly one plane (NV21 on Android, BGRA8888 on iOS); the
-  /// browser converts frames itself and has neither buffer format, so web keeps
-  /// the platform default.
-  static ImageFormatGroup _imageFormatGroup() {
-    if (kIsWeb) return ImageFormatGroup.unknown;
-    return defaultTargetPlatform == TargetPlatform.android
-        ? ImageFormatGroup.nv21
-        : ImageFormatGroup.bgra8888;
-  }
+  // `proctorImageFormatGroup()` now lives in `hardware_verification_service.dart`,
+  // so the pre-exam gate and this screen agree on the format ML Kit can read.
 
   /// The camera list for this platform, asking the browser for access first when
   /// it has not been granted yet.
@@ -335,19 +328,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     return availableCameras();
   }
 
-  /// Friendly wording for the camera plugin's error codes: the raw code
-  /// (`cameraAccess`) does not tell a student what to do about it.
-  static String _cameraFailure(String? code) => switch (code) {
-        'cameraAccess' || 'CameraAccessDenied' || 'NotAllowedError' =>
-          'camera access was refused',
-        'audioAccess' || 'AudioAccessDenied' => 'microphone access was refused',
-        'cameraNotReadable' || 'NotReadableError' || 'cameraInUse' =>
-          'another app or tab is already using the camera',
-        'cameraNotFound' || 'NotFoundError' => 'no camera was found',
-        'cameraNotSupported' || 'NotSupportedError' =>
-          'this browser cannot capture video',
-        _ => 'the camera reported "${code ?? 'unknown error'}"',
-      };
+  // `cameraFailureMessage()` now lives in `hardware_verification_service.dart`:
+  // the gate and the session screen word a refused camera identically.
 
   Future<void> _loadQuestions() async {
     try {
@@ -726,120 +708,76 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     }
 
     final question = _questions[_currentIndex];
-    final selectedOption = _answers[question.id];
 
     return Scaffold(
       appBar: AppBar(
         // Explicit numbering on every question, both shapes: "Question 3 of 5".
         title: Text('Question ${_currentIndex + 1} of ${_questions.length}'),
         automaticallyImplyLeading: false, // no manual exit mid-exam
+        // Only the clock stays here: the question number plus three chips
+        // overflow a 360 dp phone's app bar. The answered count and the kiosk
+        // badge moved into the question pane's header, where they wrap instead.
         actions: [
-          if (_savedQuestions.isNotEmpty)
-            _AnsweredChip(
-              count: _savedQuestions.length,
-              total: _questions.length,
-            ),
           if (_remaining != null) _RemainingChip(remaining: _remaining!),
-          if (_kioskStatus != null) _KioskBadge(status: _kioskStatus!),
+          const SizedBox(width: 8),
         ],
       ),
       body: Stack(
         children: [
-          Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(question.questionText, style: Theme.of(context).textTheme.titleLarge),
-                const SizedBox(height: 16),
-                if (question.isFillInTheBlank)
-                  // Fill in the blank: no options, a text field, and a "Save &
-                  // next" action (the field has no auto-advance to trigger on).
-                  _FillInTheBlankField(
-                    key: ValueKey(question.id),
-                    initialValue: _textAnswers[question.id] ?? '',
-                    saved: _savedQuestions.contains(question.id) &&
-                        _savedText[question.id] == (_textAnswers[question.id] ?? ''),
-                    enabled: !_submitting,
-                    onChanged: (value) => _textAnswers[question.id] = value,
-                    onSubmitted: (_) => _saveTextAnswer(question),
-                  )
-                else ...[
-                  ...List.generate(question.options.length, (i) {
-                    final isSelected = selectedOption == i;
-                    return Card(
-                      color: isSelected
-                          ? Theme.of(context).colorScheme.secondaryContainer
-                          : null,
-                      child: ListTile(
-                        key: Key('option-$i'),
-                        title: Text(question.options[i]),
-                        // Mirrors the local map, so a tap paints immediately even
-                        // while its autosave RPC is still in flight.
-                        selected: isSelected,
-                        trailing: isSelected
-                            ? const Icon(Icons.radio_button_checked)
-                            : null,
-                        onTap: _submitting ? null : () => _selectAnswer(i),
-                      ),
-                    );
-                  }),
-                  if (question.options.isEmpty)
-                    const Text(
-                      'This question has no options yet — tell your supervisor.',
-                    ),
-                ],
-                const Spacer(),
-                Row(
+          SafeArea(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                // Breakpoint off the *actual* box, not the window: inside a
+                // split view or a resized browser window this is what matters.
+                final wide = constraints.maxWidth >= Breakpoints.expanded;
+                final gutter = ResponsiveSizing.horizontalPadding(context);
+                final questionPane = _buildQuestionPane(question);
+
+                return Column(
                   children: [
-                    if (_currentIndex > 0)
-                      TextButton.icon(
-                        key: const Key('exam-previous'),
-                        onPressed: _submitting
-                            ? null
-                            : () => _goTo(_currentIndex - 1),
-                        icon: const Icon(Icons.chevron_left),
-                        label: const Text('Previous'),
-                      ),
-                    const Spacer(),
-                    if (question.isFillInTheBlank &&
-                        _currentIndex < _questions.length - 1)
-                      FilledButton.icon(
-                        key: const Key('exam-save-text'),
-                        onPressed: _submitting || _savingText
-                            ? null
-                            : () => _saveTextAnswer(question, advance: true),
-                        icon: const Icon(Icons.check),
-                        label: Text(_savingText ? 'Saving…' : 'Save & next'),
-                      ),
-                    if (_currentIndex == _questions.length - 1)
-                      FilledButton(
-                        key: const Key('exam-submit'),
-                        onPressed:
-                            _submitting ? null : () => _finalSubmit(),
-                        child: Text(
-                          _submitting ? 'Submitting…' : 'Submit exam',
-                        ),
-                      ),
+                    Expanded(
+                      child: wide
+                          // Desktop / tablet landscape: the self-view sits
+                          // beside the question instead of on top of it.
+                          ? Row(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                Expanded(child: questionPane),
+                                Padding(
+                                  padding:
+                                      EdgeInsets.fromLTRB(0, 16, gutter, 16),
+                                  child: SizedBox(
+                                    width: 300,
+                                    height: 220,
+                                    child: _buildCameraPane(),
+                                  ),
+                                ),
+                              ],
+                            )
+                          // Phone portrait: a compact strip above the question,
+                          // right-aligned so the text keeps the full width.
+                          : Column(
+                              children: [
+                                Padding(
+                                  padding:
+                                      EdgeInsets.fromLTRB(gutter, 12, gutter, 0),
+                                  child: Align(
+                                    alignment: Alignment.centerRight,
+                                    child: SizedBox(
+                                      width: 128,
+                                      height: 96,
+                                      child: _buildCameraPane(),
+                                    ),
+                                  ),
+                                ),
+                                Expanded(child: questionPane),
+                              ],
+                            ),
+                    ),
+                    _buildActionBar(question),
                   ],
-                ),
-              ],
-            ),
-          ),
-          // Small self-view so the student can confirm framing — also doubles
-          // as a visible reminder that the camera is active. With no camera
-          // (mock mode) an explicit placeholder goes here instead, so a
-          // simulated session can never be mistaken for real proctoring.
-          Positioned(
-            top: 8,
-            right: 8,
-            width: 90,
-            height: 120,
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: _cameraController == null
-                  ? const _MockCameraTile()
-                  : CameraPreview(_cameraController!),
+                );
+              },
             ),
           ),
           if (proctoringState.showViolationOverlay)
@@ -856,6 +794,165 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
               },
             ),
         ],
+      ),
+    );
+  }
+
+  /// The question and its answer surface.
+  ///
+  /// Scrollable by construction. It used to be a `Column` with a `Spacer` inside
+  /// a non-scrollable body, so a five-option question on a phone in landscape (or
+  /// any large accessibility text scale) overflowed — and the overflow banner
+  /// covered the last option.
+  Widget _buildQuestionPane(Question question) {
+    final theme = Theme.of(context);
+    final gutter = ResponsiveSizing.horizontalPadding(context);
+    final selectedOption = _answers[question.id];
+
+    return SingleChildScrollView(
+      padding: EdgeInsets.fromLTRB(gutter, 16, gutter, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // The counters live here rather than in the app bar: three chips plus
+          // the question number overflow a 360 dp phone's app bar, while a `Wrap`
+          // here simply folds onto a second line.
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              if (_savedQuestions.isNotEmpty)
+                _AnsweredChip(
+                  count: _savedQuestions.length,
+                  total: _questions.length,
+                ),
+              if (_kioskStatus != null) _KioskBadge(status: _kioskStatus!),
+            ],
+          ),
+          if (_savedQuestions.isNotEmpty || _kioskStatus != null)
+            const SizedBox(height: 12),
+          Text(question.questionText, style: theme.textTheme.titleLarge),
+          const SizedBox(height: 16),
+          if (question.isFillInTheBlank)
+            // Fill in the blank: no options, a text field, and a "Save &
+            // next" action (the field has no auto-advance to trigger on).
+            _FillInTheBlankField(
+              key: ValueKey(question.id),
+              initialValue: _textAnswers[question.id] ?? '',
+              saved: _savedQuestions.contains(question.id) &&
+                  _savedText[question.id] == (_textAnswers[question.id] ?? ''),
+              enabled: !_submitting,
+              onChanged: (value) => _textAnswers[question.id] = value,
+              onSubmitted: (_) => _saveTextAnswer(question),
+            )
+          else ...[
+            ...List.generate(question.options.length, (i) {
+              final isSelected = selectedOption == i;
+              return Card(
+                color: isSelected ? theme.colorScheme.secondaryContainer : null,
+                child: ListTile(
+                  key: Key('option-$i'),
+                  title: Text(question.options[i]),
+                  // Mirrors the local map, so a tap paints immediately even
+                  // while its autosave RPC is still in flight.
+                  selected: isSelected,
+                  trailing: isSelected
+                      ? const Icon(Icons.radio_button_checked)
+                      : null,
+                  onTap: _submitting ? null : () => _selectAnswer(i),
+                ),
+              );
+            }),
+            if (question.options.isEmpty)
+              const Text(
+                'This question has no options yet — tell your supervisor.',
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// The proctoring self-view.
+  ///
+  /// Three states, and only one of them is a placeholder: mock mode (an explicit
+  /// `--dart-define=MOCK_CAMERA=true` build) shows the loud MOCK tile, a live
+  /// controller shows the preview, and anything else is a hard "camera offline"
+  /// notice. There is deliberately no silent crossed-out stand-in for a real
+  /// camera that failed — that made an unproctored session look normal.
+  ///
+  /// `BoxFit.cover` inside the caller's fixed box means the preview can never
+  /// distort: whatever preview size the platform reports, the frame fills the box
+  /// and crops the excess.
+  Widget _buildCameraPane() {
+    final controller = _cameraController;
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(10),
+      child: ColoredBox(
+        color: Colors.black,
+        child: widget.mockMode
+            ? const _MockCameraTile()
+            : controller != null && controller.value.isInitialized
+                ? FittedBox(
+                    fit: BoxFit.cover,
+                    child: SizedBox(
+                      width: controller.value.previewSize?.height ?? 480,
+                      height: controller.value.previewSize?.width ?? 640,
+                      child: CameraPreview(controller),
+                    ),
+                  )
+                : const _CameraOfflineNotice(),
+      ),
+    );
+  }
+
+  /// The action bar, pinned below the question instead of scrolling with it: on
+  /// a long option list the buttons used to be pushed off the bottom of the body.
+  Widget _buildActionBar(Question question) {
+    final theme = Theme.of(context);
+    final gutter = ResponsiveSizing.horizontalPadding(context);
+
+    return Material(
+      color: theme.colorScheme.surface,
+      child: SafeArea(
+        top: false,
+        child: Container(
+          decoration: BoxDecoration(
+            border: Border(top: BorderSide(color: theme.dividerColor)),
+          ),
+          padding: EdgeInsets.fromLTRB(gutter, 8, gutter, 8),
+          child: Row(
+            children: [
+              if (_currentIndex > 0)
+                TextButton.icon(
+                  key: const Key('exam-previous'),
+                  onPressed:
+                      _submitting ? null : () => _goTo(_currentIndex - 1),
+                  icon: const Icon(Icons.chevron_left),
+                  label: const Text('Previous'),
+                ),
+              const Spacer(),
+              if (question.isFillInTheBlank &&
+                  _currentIndex < _questions.length - 1)
+                FilledButton.icon(
+                  key: const Key('exam-save-text'),
+                  onPressed: _submitting || _savingText
+                      ? null
+                      : () => _saveTextAnswer(question, advance: true),
+                  icon: const Icon(Icons.check),
+                  label: Text(_savingText ? 'Saving…' : 'Save & next'),
+                ),
+              if (_currentIndex == _questions.length - 1)
+                FilledButton(
+                  key: const Key('exam-submit'),
+                  onPressed: _submitting ? null : () => _finalSubmit(),
+                  child: Text(_submitting ? 'Submitting…' : 'Submit exam'),
+                ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -895,9 +992,39 @@ class _KioskBadge extends StatelessWidget {
   }
 }
 
-/// Sits where the camera self-view would be when there is no feed at all —
-/// i.e. `flutter run --dart-define=MOCK_CAMERA=true`. Deliberately loud: a
-/// tester should never mistake simulated violations for real detection.
+/// Shown in place of the self-view when a **real** session has no live camera.
+///
+/// Deliberately *not* a neutral camera placeholder: the blocking error above
+/// already explains what went wrong, and this tile says plainly that the feed is
+/// gone — an unproctored exam must never look like a normal one.
+class _CameraOfflineNotice extends StatelessWidget {
+  const _CameraOfflineNotice();
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        const Icon(Icons.videocam_off, color: Colors.redAccent, size: 26),
+        const SizedBox(height: 6),
+        Text(
+          'CAMERA\nOFFLINE',
+          textAlign: TextAlign.center,
+          style: Theme.of(context)
+              .textTheme
+              .labelSmall
+              ?.copyWith(color: Colors.redAccent, height: 1.2),
+        ),
+      ],
+    );
+  }
+}
+
+/// Sits where the camera self-view would be on the only path with no real
+/// hardware: `flutter run --dart-define=MOCK_CAMERA=true`. It is unreachable
+/// without that compile-time flag (a failed real camera blocks the session
+/// instead, see [_CameraOfflineNotice]), and loud on purpose — a tester should
+/// never mistake simulated violations for real detection.
 class _MockCameraTile extends StatelessWidget {
   const _MockCameraTile();
 
@@ -967,45 +1094,47 @@ class _BlockingState extends StatelessWidget {
         automaticallyImplyLeading: false,
         title: Text(title),
       ),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 420),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(icon, size: 48, color: theme.colorScheme.error),
-                const SizedBox(height: 12),
-                Text(message, textAlign: TextAlign.center),
-                const SizedBox(height: 24),
-                if (retry != null)
-                  FilledButton.icon(
-                    key: const Key('exam-retry'),
-                    onPressed: retry,
-                    icon: const Icon(Icons.refresh),
-                    label: Text(retryLabel),
-                  ),
-                if (openSettings != null) ...[
-                  if (retry != null) const SizedBox(height: 8),
-                  OutlinedButton.icon(
-                    key: const Key('exam-open-settings'),
-                    onPressed: openSettings,
-                    icon: const Icon(Icons.settings_outlined),
-                    label: const Text('Open settings'),
-                  ),
-                ],
-                if (allowExit) ...[
-                  if (retry != null || openSettings != null)
-                    const SizedBox(height: 8),
-                  TextButton(
-                    key: const Key('exam-leave'),
-                    onPressed: () => Navigator.of(context).maybePop(),
-                    child: const Text('Leave'),
-                  ),
-                ],
+      // Scrollable and width-capped: a phone in landscape, a resized desktop
+      // window or a large accessibility text scale can still reach every button.
+      // This screen is the only way out of a blocked session, so it must never
+      // clip its own actions.
+      body: SafeArea(
+        child: ResponsiveScrollView(
+          maxWidth: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Icon(icon, size: 48, color: theme.colorScheme.error),
+              const SizedBox(height: 12),
+              Text(message, textAlign: TextAlign.center),
+              const SizedBox(height: 24),
+              if (retry != null)
+                FilledButton.icon(
+                  key: const Key('exam-retry'),
+                  onPressed: retry,
+                  icon: const Icon(Icons.refresh),
+                  label: Text(retryLabel),
+                ),
+              if (openSettings != null) ...[
+                if (retry != null) const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  key: const Key('exam-open-settings'),
+                  onPressed: openSettings,
+                  icon: const Icon(Icons.settings_outlined),
+                  label: const Text('Open settings'),
+                ),
               ],
-            ),
+              if (allowExit) ...[
+                if (retry != null || openSettings != null)
+                  const SizedBox(height: 8),
+                TextButton(
+                  key: const Key('exam-leave'),
+                  onPressed: () => Navigator.of(context).maybePop(),
+                  child: const Text('Leave'),
+                ),
+              ],
+            ],
           ),
         ),
       ),

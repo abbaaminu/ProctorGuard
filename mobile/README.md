@@ -126,8 +126,14 @@ the supervisor console already renders).
 # equivalent to: flutter run --dart-define=MOCK_CAMERA=true --dart-define=... 
 ```
 
-With `MOCK_CAMERA=true` the exam page never opens a camera (the self-view shows
-a "MOCK CAMERA" tile instead) and `MediaPipeProctoringService` emits a
+With `MOCK_CAMERA=true` the pre-exam device check is skipped — its checklist says
+**MOCK HARDWARE … nothing here is proctored** and "Start Exam" is enabled without
+touching the hardware — and the exam page never opens a camera either (the
+self-view shows a "MOCK CAMERA" tile instead). The gate is the only thing that
+honours the flag: without it, a camera or a microphone that cannot be opened
+blocks the exam.
+
+`MediaPipeProctoringService` emits a
 simulated `no_face` → `looking_away` → `no_face` … gaze deviation every 12
 seconds (`-Mock` is the flag; `-MockCamera` is kept as an alias).
 That walks the **real** escalation ladder (3 strikes → auto-disqualification →
@@ -272,7 +278,13 @@ in as a different account resolves a different profile.
 `StudentExamPortalPage` lists every published exam (CS101 and MAT201 in
 `seed.sql`) through `PublishedExamList`, and on tap:
 
-* calls `startOrResumeSubmission(examId)` — the schema's
+* runs the **mandatory device check first** (`ExamHardwareGatePage`): a real
+  camera *and* a real microphone have to be opened and verified before anything
+  else happens, and "Start Exam" stays disabled until both are. Backing out — or
+  a failure — returns to the list untouched: **no submission row is created**, so
+  a student whose device cannot be proctored never leaves an `ongoing` attempt
+  behind;
+* then calls `startOrResumeSubmission(examId)` — the schema's
   `unique(student_id, exam_id)` means a second tap resumes rather than duplicates;
 * an `ongoing` attempt pushes `ExamTakingPage(examId, submissionId, durationMinutes,
   startedAt)`: the session screen with the camera (or the `MOCK_CAMERA` feed),
@@ -291,11 +303,19 @@ mid-exam, so a silent failure would strand them:
 
 | Situation | What the student sees |
 | --- | --- |
-| Camera/mic permission refused (Android/iOS) | "This exam needs camera and microphone access…" + **Try again** / **Leave** |
+| Camera/mic permission refused (Android/iOS) | "This exam needs camera and microphone access…" + **Try again** / **Leave** (the gate normally catches this before the session opens) |
 | No camera, or the camera refuses to start | the same blocking screen with the plugin's error code |
 | Question feed unreachable | "Could not load the questions for this exam." + **Try again** / **Leave** |
 | Exam has no questions yet | "No questions yet" + **Leave** (the attempt stays `ongoing`, so it can be resumed after a supervisor adds them) |
 | Clock ran out | auto-submit; if the server cannot be reached, a "Time is up" screen with **Send again** / **Leave** |
+
+There is no silent stand-in for a camera that is not working. The self-view shows
+a live preview, the loud **MOCK CAMERA** tile *only* in an explicit `MOCK_CAMERA`
+build, or a red **CAMERA OFFLINE** tile underneath the blocking error — the
+neutral crossed-out placeholder that made an unproctored session look normal is
+gone, and `_cameraFailure`/`_imageFormatGroup` live in
+`core/services/hardware_verification_service.dart` so the gate and the session
+screen word a refused camera identically.
 
 Details worth knowing:
 
@@ -352,6 +372,42 @@ repositories: role parsing, both routes, the loading state, the retry after a
 failure, the disqualified guard, and the exam/submission ids handed to the session
 screen. `mobile/test/exam_taking_page_test.dart` covers the blocking state and its
 retry/leave actions.
+
+## Responsive layout (Android phone + desktop browser)
+
+The same screens run on a 320 dp phone and on a 1440 px Chrome/Edge window, so
+the layouts are driven by the **available width** (`LayoutBuilder` +
+`MediaQuery.sizeOf`) rather than by the platform. `core/widgets/responsive_layout.dart`
+holds the shared pieces:
+
+* `Breakpoints` / `ResponsiveSizing` — 600 dp and 900 dp breakpoints, and gutters
+  that grow from 16 dp (phone) to 24/32 dp (tablet/desktop), so a phone layout is
+  never stretched across a monitor.
+* `ResponsiveContent` — centres and width-clamps a pane (the exam list and the
+  greeting are capped at 720 dp instead of spanning the whole window).
+* `ResponsiveScrollView` — fills the viewport, centres its content while it fits
+  and scrolls the moment it does not (landscape phone, on-screen keyboard, large
+  text scale). The sign-in form and every blocking screen use it.
+
+Per screen:
+
+* **Sign In** — the old `Center > SingleChildScrollView > ConstrainedBox(420)`
+  became `ResponsiveScrollView(maxWidth: 440)`; the brand mark scales with the
+  viewport and the fields, not the container, set the height.
+* **Exam Portal** — greeting and tiles share one centred 720 dp column.
+* **Exam session** — `LayoutBuilder` decides between one column (phone: the
+  self-view is a compact 128x96 strip above the question) and two (>= 900 dp: a
+  300x220 preview pane beside it). The question/option list scrolls inside
+  `Expanded`, the action bar is pinned below it (so "Submit exam" can no longer be
+  pushed off-screen by a long option list), and the app bar carries only the
+  countdown — the answered count and kiosk badge moved into a `Wrap` in the
+  question header, which is what used to overflow a 360 dp app bar. The preview
+  uses `BoxFit.cover`, so it fills its box whatever aspect ratio the platform
+  reports instead of distorting.
+
+`mobile/test/hardware_gate_test.dart` and the two viewport tests in
+`mobile/test/exam_taking_page_test.dart` pump these screens at 320x568, 360x640
+and 1440x900 and fail on any `RenderFlex` overflow.
 
 ## Web authentication (and startup safety)
 

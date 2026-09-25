@@ -211,6 +211,41 @@ void main() {
       // Back on the launcher: the session screen closed itself.
       expect(find.text('open exam'), findsOneWidget);
     });
+
+    testWidgets('fits a small phone viewport without overflowing',
+        (tester) async {
+      // 360x640 dp: a common small Android phone. The options used to sit in a
+      // non-scrollable Column with a Spacer, so the action row was pushed off
+      // the bottom edge as soon as a question had a few options.
+      tester.view.physicalSize = const Size(360, 640);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Question 1 of 2'), findsOneWidget);
+      expect(find.byKey(const Key('option-2')), findsOneWidget);
+      // A RenderFlex overflow surfaces as an exception here.
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('fits a desktop browser viewport', (tester) async {
+      tester.view.physicalSize = const Size(1440, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Question 1 of 2'), findsOneWidget);
+      expect(find.byKey(const Key('option-1')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
   });
 }
 

@@ -2,11 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart' show SupabaseService;
+import '../../../../core/widgets/responsive_layout.dart';
 import '../../../proctoring/presentation/providers/proctoring_provider.dart';
 import '../../domain/entities/exam.dart';
 import '../../domain/entities/submission.dart';
 import '../providers/exam_providers.dart';
 import '../widgets/published_exam_list.dart';
+import 'exam_hardware_gate_page.dart';
 import 'exam_taking_page.dart';
 
 /// Builds the exam session screen for a started submission.
@@ -14,6 +16,17 @@ import 'exam_taking_page.dart';
 /// Injectable so widget tests can assert the routing contract (which examId and
 /// submissionId were handed over) without opening a camera.
 typedef ExamPageBuilder = Widget Function(String examId, String submissionId);
+
+/// Runs the mandatory hardware check and reports whether the student may start.
+///
+/// Injectable for the same reason [ExamPageBuilder] is: the real screen opens a
+/// camera and asks the OS for permissions, which a widget test cannot do. The
+/// portal calls this **before** creating a submission, so a refused gate leaves
+/// no `ongoing` attempt behind.
+typedef HardwareGateRequest = Future<bool> Function(
+  BuildContext context,
+  Exam exam,
+);
 
 /// The student home: every published exam (CS101, MAT201, …) and the state of
 /// this student's own attempt at each one.
@@ -29,6 +42,7 @@ class StudentExamPortalPage extends ConsumerStatefulWidget {
     super.key,
     this.studentName,
     this.examPageBuilder,
+    this.hardwareGate,
     this.onSignOut,
   });
 
@@ -37,6 +51,10 @@ class StudentExamPortalPage extends ConsumerStatefulWidget {
 
   /// Defaults to [ExamTakingPage].
   final ExamPageBuilder? examPageBuilder;
+
+  /// Defaults to pushing [ExamHardwareGatePage]. Returns true only when a real
+  /// camera *and* microphone were verified.
+  final HardwareGateRequest? hardwareGate;
 
   /// Sign-out shown in the app bar (the gate owns the Supabase call).
   final VoidCallback? onSignOut;
@@ -53,6 +71,15 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
 
   Future<void> _openExam(Exam exam) async {
     if (_openingExamId != null) return;
+
+    // The hardware gate runs *first*: no submission row is created and no
+    // session screen is pushed until a real camera and microphone have been
+    // verified. Refusing here (or backing out of the gate) leaves the student on
+    // the list with nothing written to the server.
+    final gate = widget.hardwareGate ?? _pushHardwareGate;
+    final verified = await gate(context, exam);
+    if (!mounted || !verified) return;
+
     setState(() => _openingExamId = exam.id);
 
     try {
@@ -101,6 +128,18 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
     }
   }
 
+  /// The production gate: pushes [ExamHardwareGatePage] and reports whether the
+  /// student may start. A dismissed screen (system back, `false`) counts as "not
+  /// verified".
+  Future<bool> _pushHardwareGate(BuildContext context, Exam exam) async {
+    final verified = await Navigator.of(context).push<bool>(
+      MaterialPageRoute<bool>(
+        builder: (_) => ExamHardwareGatePage(exam: exam),
+      ),
+    );
+    return verified ?? false;
+  }
+
   void _showMessage(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -142,13 +181,31 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _PortalGreeting(name: widget.studentName ?? fallback),
+          // A centred, readable column: on a desktop browser the greeting and the
+          // tiles would otherwise stretch the whole width of the monitor.
+          ResponsiveContent(
+            maxWidth: 720,
+            alignment: Alignment.center,
+            padding: EdgeInsets.fromLTRB(
+              ResponsiveSizing.horizontalPadding(context),
+              16,
+              ResponsiveSizing.horizontalPadding(context),
+              12,
+            ),
+            child: _PortalGreeting(name: widget.studentName ?? fallback),
+          ),
           const Divider(height: 1),
           Expanded(
-            child: PublishedExamList(
-              onOpen: _openExam,
-              openingExamId: _openingExamId,
-              emptyMessage: 'No exams are available for you right now.',
+            child: ResponsiveContent(
+              maxWidth: 720,
+              padding: EdgeInsets.symmetric(
+                horizontal: ResponsiveSizing.horizontalPadding(context),
+              ),
+              child: PublishedExamList(
+                onOpen: _openExam,
+                openingExamId: _openingExamId,
+                emptyMessage: 'No exams are available for you right now.',
+              ),
             ),
           ),
         ],
@@ -157,6 +214,8 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
   }
 }
 
+/// The greeting, sized to whatever width the wrapper gives it (the wrapper owns
+/// the gutters, so a desktop browser and a phone share this layout).
 class _PortalGreeting extends StatelessWidget {
   const _PortalGreeting({this.name});
 
@@ -167,24 +226,22 @@ class _PortalGreeting extends StatelessWidget {
     final theme = Theme.of(context);
     final clean = (name ?? '').trim();
 
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            clean.isEmpty ? 'Welcome' : 'Welcome, $clean',
-            style: theme.textTheme.titleMedium,
-          ),
-          const SizedBox(height: 4),
-          Text(
-            'Pick an exam to begin. Your camera and the exam guards start as '
-            'soon as the session opens.',
-            style: theme.textTheme.bodySmall
-                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-          ),
-        ],
-      ),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          clean.isEmpty ? 'Welcome' : 'Welcome, $clean',
+          style: theme.textTheme.titleMedium,
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'Pick an exam to begin. You will be asked to check that your camera '
+          'and microphone work before the exam starts — the exam guards then '
+          'run for the whole session.',
+          style: theme.textTheme.bodySmall
+              ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+        ),
+      ],
     );
   }
 }
