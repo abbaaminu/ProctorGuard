@@ -4,8 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Proctor — Supervisor Console</title>
-    <!-- Custom Favicon -->
-    <link rel="icon" type="image/png" href="/icon.png" />
+    <!--
+      Favicon. The file must exist with this exact case (`public/icon.png`):
+      Vercel serves from a case-sensitive filesystem, so `Icon.png` used to 404
+      there even though Windows resolved it locally. A relative URL also keeps
+      the link working if the console is ever served from a sub-path.
+    -->
+    <link rel="icon" type="image/png" href="./icon.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   </head>

@@ -1,13 +1,18 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { Plus, Radio, Trash2, Monitor, Pencil, X } from "lucide-react";
+import { Plus, Radio, Trash2, Monitor, Pencil, X, Globe, EyeOff, Loader2 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/hooks/useAuth";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton, TableSkeleton } from "@/components/ui/skeleton";
+import { Toast, type ToastTone } from "@/components/ui/toast";
+import { cn } from "@/lib/utils";
 import type { ExamRow, QuestionRow, QuestionType } from "@/types/database";
+
+/** An `exams` row plus the question count the table shows next to it. */
+type ExamListRow = ExamRow & { question_count: number };
 
 interface DraftQuestion {
   /** Set when the row already exists: edit mode updates it **in place** by id. */
@@ -431,11 +436,32 @@ function ExamFormModal({
 }
 
 export function ExamManager() {
-  const [exams, setExams] = useState<(ExamRow & { question_count: number })[]>([]);
+  const [exams, setExams] = useState<ExamListRow[]>([]);
   const [createOpen, setCreateOpen] = useState(false);
   const [editing, setEditing] = useState<ExamRow | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Ids whose publish write is still in flight.
+   *
+   * A set rather than a single id: two rows may be toggled without waiting on
+   * each other, but a double-click on the *same* row must not queue two writes
+   * (the second would flip the value back).
+   */
+  const [publishingIds, setPublishingIds] = useState<ReadonlySet<string>>(
+    () => new Set<string>()
+  );
+  /**
+   * The console keeps a single toast slot (`ui/toast.tsx` explains why there is
+   * no stack): a new message replaces the previous one instead of piling up.
+   */
+  const [toast, setToast] = useState<{ id: number; tone: ToastTone; message: string } | null>(null);
+  const toastId = useRef(0);
+
+  function showToast(tone: ToastTone, message: string) {
+    toastId.current += 1;
+    setToast({ id: toastId.current, tone, message });
+  }
 
   async function loadExams() {
     setLoading(true);
@@ -469,19 +495,75 @@ export function ExamManager() {
 
   useEffect(() => { loadExams(); }, []);
 
-  async function togglePublish(exam: ExamRow) {
-    setError(null);
-    const { error: updateError } = await supabase
-      .from("exams")
-      .update({ is_published: !exam.is_published })
-      .eq("id", exam.id);
+  /**
+   * Flip `exams.is_published` for one row.
+   *
+   * The badge moves **first** (optimistic): a supervisor who just clicked
+   * Publish should see "Published" without waiting on a round trip. What makes
+   * that safe is the rollback — a write the server does not accept puts the old
+   * value back and says why.
+   *
+   * `.select("id")` is load-bearing. `exams_update_owner` only lets the
+   * supervisor who *created* an exam write to it, and a policy-filtered UPDATE
+   * matches zero rows **without raising** — PostgREST reports success. Asking
+   * for the written row back is the only way to tell "published" apart from
+   * "silently matched nothing", which is exactly the failure mode the old
+   * `loadExams()` round trip used to hide behind an unchanged badge.
+   */
+  async function togglePublish(exam: ExamListRow) {
+    if (publishingIds.has(exam.id)) return; // this row's write is already open
 
-    if (updateError) {
-      // A refused write used to be silent: the badge simply did not change.
-      setError(`Could not update "${exam.title}": ${updateError.message}`);
-      return;
+    const nextPublished = !exam.is_published;
+
+    setError(null);
+    setPublishingIds((prev) => new Set(prev).add(exam.id));
+    setExams((prev) =>
+      prev.map((e) => (e.id === exam.id ? { ...e, is_published: nextPublished } : e))
+    );
+
+    const rollback = () =>
+      setExams((prev) =>
+        prev.map((e) => (e.id === exam.id ? { ...e, is_published: exam.is_published } : e))
+      );
+
+    try {
+      const { data, error: updateError } = await supabase
+        .from("exams")
+        .update({ is_published: nextPublished })
+        .eq("id", exam.id)
+        .select("id");
+
+      if (updateError || !data?.length) {
+        rollback();
+        setError(
+          updateError
+            ? `Could not update "${exam.title}": ${updateError.message}`
+            : `Could not update "${exam.title}": the server refused the write — only the supervisor who created an exam may publish or unpublish it.`
+        );
+        return;
+      }
+
+      showToast(
+        "ok",
+        nextPublished
+          ? `"${exam.title}" is published — students can see it now.`
+          : `"${exam.title}" is unpublished — it is hidden from students again.`
+      );
+    } catch (err) {
+      // A dropped connection rejects rather than resolving with `error`.
+      rollback();
+      setError(
+        err instanceof Error
+          ? `Could not update "${exam.title}": ${err.message}`
+          : `Could not update "${exam.title}".`
+      );
+    } finally {
+      setPublishingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(exam.id);
+        return next;
+      });
     }
-    await loadExams();
   }
 
   async function deleteExam(exam: ExamRow) {
@@ -540,14 +622,38 @@ export function ExamManager() {
                 <td className="px-4 py-2.5 text-slate-400">{exam.duration_minutes} min</td>
                 <td className="px-4 py-2.5 text-slate-400">{exam.question_count}</td>
                 <td className="px-4 py-2.5">
-                  <button onClick={() => togglePublish(exam)}>
-                    <Badge tone={exam.is_published ? "ongoing" : "neutral"}>
-                      {exam.is_published ? "Published" : "Draft"}
-                    </Badge>
-                  </button>
+                  <Badge tone={exam.is_published ? "ongoing" : "neutral"}>
+                    {exam.is_published ? "Published" : "Draft"}
+                  </Badge>
                 </td>
                 <td className="px-4 py-2.5">
                   <div className="flex justify-end gap-1">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className={cn(
+                        "mr-1 gap-1.5",
+                        exam.is_published
+                          ? "text-slate-300"
+                          : "border-accent/40 text-accent hover:bg-accent/10"
+                      )}
+                      title={
+                        exam.is_published
+                          ? "Unpublish — hide this exam from students"
+                          : "Publish — make this exam visible to students"
+                      }
+                      disabled={publishingIds.has(exam.id)}
+                      onClick={() => togglePublish(exam)}
+                    >
+                      {publishingIds.has(exam.id) ? (
+                        <Loader2 size={14} className="animate-spin" />
+                      ) : exam.is_published ? (
+                        <EyeOff size={14} />
+                      ) : (
+                        <Globe size={14} />
+                      )}
+                      {exam.is_published ? "Unpublish" : "Publish"}
+                    </Button>
                     <Link to={`/exams/${exam.id}/monitor`}>
                       <Button variant="ghost" size="icon" title="Live monitor"><Monitor size={15} /></Button>
                     </Link>
@@ -578,6 +684,15 @@ export function ExamManager() {
           exam={editing}
           onClose={() => setEditing(null)}
           onSaved={loadExams}
+        />
+      )}
+
+      {toast && (
+        <Toast
+          id={toast.id}
+          tone={toast.tone}
+          message={toast.message}
+          onDismiss={() => setToast(null)}
         />
       )}
     </div>

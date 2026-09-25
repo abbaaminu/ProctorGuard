@@ -21,7 +21,7 @@ submission with 3 proctoring logs. Log in with
 ## Structure
 ```
 src/
-  components/ui/       Badge, Card, Button — shadcn-style primitives
+  components/ui/       Badge, Card, Button, Toast — shadcn-style primitives
   components/layout/   Sidebar (nav + realtime pill + profile tile), AppShell
   hooks/               useAuth (role guard), useRealtimeStatus,
                         useLiveIncidentFeed, useExamSubmissions,
@@ -38,6 +38,10 @@ src/
   **Try again**, instead of quietly rendering zeros.
 - **ExamManager** — create an exam with its question bank, publish/unpublish,
   delete, and edit an existing exam (title, duration *and* its questions).
+  **Publish / Unpublish** is an explicit per-row button that writes
+  `exams.is_published` optimistically: the badge moves to *Published* before the
+  round trip (and rolls back with a reason if the server refuses), then confirms
+  with a short-lived toast.
   Each draft question is numbered ("Question 2 of 5"), has a
   **Multiple choice / Fill in the blank** selector, and shows either the option
   list with its correct-option radio or the accepted answer for a typed question.
@@ -135,12 +139,21 @@ question instead, or create a new exam.
 - **Empty is not an error.** Every panel distinguishes "nothing has happened yet"
   from "the read failed": the roster, the incident feed and the dashboard all
   surface the underlying message with a retry instead of an empty list.
-- **Visual ping instead of a toast.** New incidents flash the feed
-  header background briefly (0.5s) instead of stacking toasts, since a
-  supervisor's eyes are expected to already be on this panel during a
-  live session. A sound-effect toggle is stubbed as a further step —
-  wire an `<audio>` element behind a Switch in the header once you have
-  an alert sound asset.
+- **Visual ping instead of a toast — in the live feed.** New incidents flash the
+  feed header background briefly (0.5s) instead of stacking toasts, since a
+  supervisor's eyes are expected to already be on this panel during a live
+  session. A *user-initiated* write is the exception: the ExamManager publish
+  toggle confirms with one short-lived toast (`components/ui/toast.tsx` — a
+  single slot, never a stack), because there the supervisor is looking at the row
+  they just clicked and the action is atomic rather than a stream. A sound-effect
+  toggle is stubbed as a further step — wire an `<audio>` element behind a Switch
+  in the header once you have an alert sound asset.
+- **A refused write has to be visible.** `exams_update_owner` lets only the
+  supervisor who created an exam write to it, and PostgREST reports a
+  policy-filtered `UPDATE` as *success* while matching **zero rows**. The publish
+  toggle therefore asks for the written row back (`.select("id")`) and treats an
+  empty result as a failure — that is the other half of the optimistic badge:
+  without a real rollback, "Published" would only be a guess.
 
 ## Not yet wired (left as clearly-marked next steps)
 - Snapshot images assume `snapshot_url` is a public or signed Supabase

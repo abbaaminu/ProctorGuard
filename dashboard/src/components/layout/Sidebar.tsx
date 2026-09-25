@@ -30,7 +30,20 @@ export function Sidebar({
   return (
     <aside className="fixed inset-y-0 left-0 z-30 flex w-56 flex-col border-r border-border bg-surface-raised">
       <div className="flex h-14 items-center gap-2 border-b border-border px-4">
-        <div className="h-2 w-2 rounded-full bg-accent shadow-glow" />
+        {/*
+          Brand mark from `public/icon.png`. `BASE_URL` (rather than a bare
+          "/icon.png" or a document-relative path) keeps the reference correct on
+          any route and under any configured `base`, and the file name matches
+          the favicon's case exactly so case-sensitive hosts serve it.
+          `alt=""` because the adjacent wordmark already announces the name.
+        */}
+        <img
+          src={`${import.meta.env.BASE_URL}icon.png`}
+          alt=""
+          width={24}
+          height={24}
+          className="h-6 w-6 shrink-0 rounded-md object-contain shadow-glow"
+        />
         <span className="text-sm font-semibold tracking-tight text-slate-100">Proctor</span>
       </div>
 
