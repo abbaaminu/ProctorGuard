@@ -7,38 +7,10 @@ import {
 import { supabase } from "@/lib/supabase";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { MetricCard } from "@/components/ui/metric-card";
 import { ChartSkeleton, MetricCardSkeleton } from "@/components/ui/skeleton";
+import { incidentLabel } from "@/lib/incidents";
 import type { ExamRow, SubmissionRow, ProctoringLogRow } from "@/types/database";
-
-function MetricCard({
-  label, value, icon: Icon, tone = "default",
-}: { label: string; value: string; icon: typeof Activity; tone?: "default" | "alert" }) {
-  return (
-    <Card>
-      <CardContent className="flex items-center justify-between p-4">
-        <div>
-          <p className="text-xs font-medium text-slate-500">{label}</p>
-          <p className="mt-1 text-2xl font-semibold tabular-nums text-slate-100">{value}</p>
-        </div>
-        <div
-          className={`flex h-9 w-9 items-center justify-center rounded-md ${
-            tone === "alert" ? "bg-alert/15 text-alert" : "bg-accent/15 text-accent"
-          }`}
-        >
-          <Icon size={18} />
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-const INCIDENT_LABELS: Record<string, string> = {
-  looking_away: "Looking away",
-  multiple_faces: "Multiple faces",
-  no_face: "No face",
-  app_minimized: "App minimized",
-  audio_noise: "Audio noise",
-};
 
 export function DashboardOverview() {
   const [exams, setExams] = useState<ExamRow[]>([]);
@@ -105,7 +77,7 @@ export function DashboardOverview() {
       counts[l.action_type] = (counts[l.action_type] ?? 0) + 1;
     });
     return Object.entries(counts).map(([type, count]) => ({
-      type: INCIDENT_LABELS[type] ?? type,
+      type: incidentLabel(type),
       count,
     }));
   }, [logs]);
@@ -152,7 +124,7 @@ export function DashboardOverview() {
         </div>
       )}
 
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         {loading ? (
           Array.from({ length: 4 }).map((_, index) => <MetricCardSkeleton key={index} />)
         ) : (
@@ -165,7 +137,7 @@ export function DashboardOverview() {
         )}
       </div>
 
-      <div className="mt-6 grid grid-cols-2 gap-4">
+      <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
         {loading ? (
           <>
             <ChartSkeleton />
@@ -175,7 +147,11 @@ export function DashboardOverview() {
           <>
         <Card>
           <CardHeader><CardTitle>Incident breakdown</CardTitle></CardHeader>
-          <CardContent className="h-64">
+          <CardContent
+            className="h-64"
+            role="img"
+            aria-label="Bar chart: incidents by type in the last 24 hours"
+          >
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={incidentBreakdown}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1E2430" vertical={false} />
@@ -193,7 +169,11 @@ export function DashboardOverview() {
 
         <Card>
           <CardHeader><CardTitle>Completions vs. disqualifications</CardTitle></CardHeader>
-          <CardContent className="h-64">
+          <CardContent
+            className="h-64"
+            role="img"
+            aria-label="Line chart: completed and disqualified attempts per day"
+          >
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={timeline}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1E2430" vertical={false} />

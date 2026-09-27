@@ -1,4 +1,10 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:exam_proctor/core/services/audio_monitor.dart';
+import 'package:exam_proctor/core/services/key_value_store.dart';
 import 'package:exam_proctor/core/services/kiosk_service.dart';
+import 'package:exam_proctor/core/services/web_guards.dart';
 import 'package:exam_proctor/features/exam/domain/entities/exam.dart';
 import 'package:exam_proctor/features/exam/domain/entities/question.dart';
 import 'package:exam_proctor/features/exam/domain/entities/submission.dart';
@@ -6,13 +12,14 @@ import 'package:exam_proctor/features/exam/domain/repositories/exam_repository.d
 import 'package:exam_proctor/features/exam/presentation/pages/exam_taking_page.dart';
 import 'package:exam_proctor/features/proctoring/domain/entities/violation.dart';
 import 'package:exam_proctor/features/proctoring/domain/repositories/proctoring_repository.dart';
+import 'package:exam_proctor/features/proctoring/presentation/providers/audio_monitoring_provider.dart';
 import 'package:exam_proctor/features/proctoring/presentation/providers/proctoring_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// The exam session screen, in two halves:
+/// The exam session screen, in three parts:
 ///
 ///  * **blocking states** — it deliberately has no back button, so every way it
 ///    can fail (permission refused, camera unavailable, questions unreachable)
@@ -21,10 +28,15 @@ import 'package:flutter_test/flutter_test.dart';
 ///  * **questions** — numbering ("Question 2 of 2"), multiple-choice tap targets,
 ///    the fill-in-the-blank text field, and the rule that submitting flushes an
 ///    unsaved text answer first (grading reads the server copy).
+///  * **audio proctoring** — the microphone chip, and the rule that a blocked or
+///    unplugged microphone is a visible, answerable prompt rather than a silent
+///    gap in proctoring.
 ///
 /// The question half runs with `mockCamera: true`, which is the documented "no
 /// camera here" path (emulators, desktop, CI) and keeps the camera plugin out of
-/// the test.
+/// the test. The microphone is always injected ([_FakeAudioSource]) for the same
+/// reason: a Dart VM test has no audio plugin, and this screen opens a capture
+/// session as part of its bootstrap.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -45,14 +57,33 @@ void main() {
   );
 
   late _StubExamRepository exams;
+  late _SilentProctoringRepository proctoring;
+  late InMemoryKeyValueStore store;
 
   /// The session screen behind a launcher route, so submitting can actually pop
   /// back (popping the *root* route is not what production does).
-  Widget pageUnderTest({bool mockCamera = true}) => ProviderScope(
+  Widget pageUnderTest({
+    bool mockCamera = true,
+    WebGuards? webGuards,
+    DateTime Function()? clock,
+    AudioLevelSource? audioSource,
+  }) =>
+      ProviderScope(
         overrides: [
           examRepositoryProvider.overrideWithValue(exams),
-          proctoringRepositoryProvider
-              .overrideWithValue(_SilentProctoringRepository()),
+          proctoringRepositoryProvider.overrideWithValue(proctoring),
+          // In memory, so a test decides exactly what is already "on the device"
+          // (see the resume test) and so the offline queue never touches a real
+          // SharedPreferences, which a VM test binding has no plugin for.
+          keyValueStoreProvider.overrideWithValue(store),
+          // The microphone has no plugin behind it on the Dart VM, and this screen
+          // starts a capture session as part of its bootstrap
+          // (`_startAudioMonitoring`), so the source is injected the same way the
+          // browser guards are: each test states what the microphone does rather
+          // than inheriting "unavailable" from a missing plugin.
+          audioLevelSourceProvider.overrideWithValue(
+            audioSource ?? _FakeAudioSource(),
+          ),
         ],
         child: MaterialApp(
           home: Builder(
@@ -65,6 +96,8 @@ void main() {
                         examId: 'exam-1',
                         submissionId: 'sub-1',
                         mockCamera: mockCamera,
+                        webGuards: webGuards,
+                        clock: clock,
                       ),
                     ),
                   ),
@@ -80,6 +113,8 @@ void main() {
     exams = _StubExamRepository(
       questions: const <Question>[multipleChoice, fillInTheBlank],
     );
+    proctoring = _SilentProctoringRepository();
+    store = InMemoryKeyValueStore();
 
     // Neither channel has a plugin behind it in a test run, and inside the test
     // binding's fake-async zone a real platform reply never arrives — so both are
@@ -104,6 +139,228 @@ void main() {
       const MethodChannel('plugins.flutter.io/camera'),
       null,
     );
+  });
+
+  group('offline resilience (requirement 1)', () {
+    /// Bounded pumps instead of `pumpAndSettle`: while the queue has work and the
+    /// network is down, a retry loop is *supposed* to keep running, so "settled" is
+    /// not a state this screen reaches (and a dead connection must not be able to
+    /// spin a test, or a device, forever).
+    Future<void> pumpNetwork(WidgetTester tester, Duration time) async {
+      await tester.pump();
+      await tester.pump(time);
+      await tester.pump();
+    }
+
+    testWidgets('an offline save is kept, announced, and synced on recovery',
+        (tester) async {
+      exams.online = false;
+
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('option-1')));
+      await pumpNetwork(tester, const Duration(milliseconds: 100));
+
+      // The answer is on the device, so the session carries on...
+      expect(find.text('Question 2 of 2'), findsOneWidget);
+      expect(find.text('1 of 2 answered'), findsOneWidget);
+      // ...the student is told exactly where it is...
+      expect(find.byKey(const Key('exam-sync-banner')), findsOneWidget);
+      expect(find.textContaining('Offline - syncing locally'), findsOneWidget);
+      // ...and the server was never reached.
+      expect(exams.optionAnswers, isEmpty);
+
+      // The connection comes back: the queue drains itself, with no user action.
+      exams.online = true;
+      await pumpNetwork(tester, const Duration(seconds: 3));
+
+      expect(exams.optionAnswers, <String>['q-1=1']);
+      expect(find.byKey(const Key('exam-sync-banner')), findsNothing);
+    });
+
+    testWidgets('a typed answer survives the trip and the queue', (tester) async {
+      // Two questions, so the text one is not the last: "Save & next" only exists
+      // while there is somewhere to advance to.
+      exams = _StubExamRepository(
+        questions: const <Question>[fillInTheBlank, multipleChoice],
+        online: false,
+      );
+
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byKey(const Key('exam-text-answer')), 'HTTP');
+      await tester.tap(find.byKey(const Key('exam-save-text')));
+      await pumpNetwork(tester, const Duration(milliseconds: 100));
+
+      expect(exams.textAnswers, isEmpty);
+      expect(find.textContaining('Offline - syncing locally'), findsOneWidget);
+
+      exams.online = true;
+      await pumpNetwork(tester, const Duration(seconds: 3));
+
+      expect(exams.textAnswers, <String>['q-2=HTTP']);
+    });
+
+    testWidgets('a resumed attempt paints what the device already holds',
+        (tester) async {
+      // What a previous (killed) session left behind: the drafts, plus the queue
+      // row that says the server still owes the student an answer.
+      store = InMemoryKeyValueStore(values: <String, String>{
+        'draft.choices': jsonEncode(<String, dynamic>{
+          'sub-1': <String, dynamic>{'q-1': 2},
+        }),
+        'draft.text': jsonEncode(<String, dynamic>{
+          'sub-1': <String, dynamic>{'q-2': 'HyperText Transfer Protocol'},
+        }),
+      });
+
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      // Both shapes come back from the device, and the "answered" counter knows
+      // it before the server is asked anything.
+      expect(find.text('2 of 2 answered'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('exam-next')));
+      await tester.pumpAndSettle();
+
+      final field = tester.widget<TextField>(
+        find.byKey(const Key('exam-text-answer')),
+      );
+      expect(field.controller?.text, 'HyperText Transfer Protocol');
+      expect(find.text('Answer saved'), findsOneWidget);
+    });
+  });
+
+  group('fullscreen enforcement (requirement 3)', () {
+    late _FakeWebGuards guards;
+    late DateTime now;
+
+    setUp(() {
+      guards = _FakeWebGuards();
+      now = DateTime.utc(2026, 6, 1, 9);
+    });
+
+    /// Opens the session and moves the clock past the guards' 5s start-up grace,
+    /// so an emitted fullscreen exit is a real event rather than start-up noise.
+    ///
+    /// The clock has to be moved by hand: a widget test advances *fake* time, and
+    /// the guard's grace window reads the wall clock (the same clock a real exam
+    /// uses to decide that two minutes in the background is not a start-up blip).
+    Future<void> openPastStartupGrace(WidgetTester tester) async {
+      await tester.pumpWidget(
+        pageUnderTest(webGuards: guards, clock: () => now),
+      );
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+      now = now.add(const Duration(seconds: 6));
+      await tester.pump();
+    }
+
+    testWidgets('leaving fullscreen counts down instead of logging at once',
+        (tester) async {
+      await openPastStartupGrace(tester);
+      expect(find.text('Fullscreen required'), findsNothing);
+
+      guards.emit(WebGuardEvent.fullscreenExited);
+      await tester.pump();
+      await tester.pump();
+
+      // Blocking overlay with the countdown, and no strike yet.
+      expect(find.text('Fullscreen required'), findsOneWidget);
+      expect(find.byKey(const Key('fullscreen-countdown')), findsOneWidget);
+      expect(find.byKey(const Key('fullscreen-return')), findsOneWidget);
+      expect(proctoring.violations, isEmpty);
+
+      // Coming back inside the window (what the button or the browser does) is
+      // not a violation.
+      guards.emit(WebGuardEvent.fullscreenEntered);
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.text('Fullscreen required'), findsNothing);
+      expect(proctoring.violations, isEmpty);
+    });
+
+    testWidgets('staying out of fullscreen costs exactly one strike',
+        (tester) async {
+      await openPastStartupGrace(tester);
+
+      guards.emit(WebGuardEvent.fullscreenExited);
+      await tester.pump();
+      expect(proctoring.violations, isEmpty);
+
+      // Past the 5s window: the visible countdown reaches zero and the page hands
+      // the expired window to the guard, which logs the strike once.
+      now = now.add(const Duration(seconds: 6));
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump();
+
+      expect(proctoring.violations.single.type.dbValue, 'app_minimized');
+      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      expect(find.text('Fullscreen required'), findsNothing);
+    });
+  });
+
+  group('browser lockdown (requirement 4)', () {
+    late _FakeWebGuards guards;
+
+    setUp(() => guards = _FakeWebGuards());
+
+    Future<void> openSession(WidgetTester tester) async {
+      await tester.pumpWidget(pageUnderTest(webGuards: guards));
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('the attempt runs with the DOM lockdown armed', (tester) async {
+      await openSession(tester);
+
+      expect(guards.lockdownActive, isTrue);
+      expect(guards.lockdownStarts, 1);
+
+      // Leaving the session has to release it: a student whose exam ended (or
+      // whose bootstrap failed) must get their browser back.
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump();
+
+      expect(guards.lockdownStops, 1);
+      expect(guards.lockdownActive, isFalse);
+    });
+
+    testWidgets('a blocked copy is logged as copy_paste_attempt',
+        (tester) async {
+      await openSession(tester);
+
+      guards.emit(WebGuardEvent.copyBlocked);
+      await tester.pump();
+      await tester.pump();
+
+      expect(proctoring.violations.single.type.dbValue, 'copy_paste_attempt');
+      expect(find.text('Warning 1 / 3'), findsOneWidget);
+    });
+
+    testWidgets('a suppressed menu and a devtools panel are separate strikes',
+        (tester) async {
+      await openSession(tester);
+
+      guards.emit(WebGuardEvent.contextMenuBlocked);
+      await tester.pump();
+      await tester.pump();
+      guards.emit(WebGuardEvent.devtoolsDetected);
+      await tester.pump();
+      await tester.pump();
+
+      expect(
+        proctoring.violations.map((violation) => violation.type.dbValue),
+        <String>['right_click_blocked', 'devtools_detected'],
+      );
+      expect(find.text('Warning 2 / 3'), findsOneWidget);
+    });
   });
 
   group('blocking states', () {
@@ -146,6 +403,32 @@ void main() {
       expect(exams.optionAnswers, <String>['q-1=1']);
       expect(find.text('Question 2 of 2'), findsOneWidget);
       expect(find.text('1 of 2 answered'), findsOneWidget);
+    });
+
+    testWidgets('Next and Previous move between questions without scrolling',
+        (tester) async {
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      // First question: Next is available, Previous is not yet.
+      expect(find.text('Question 1 of 2'), findsOneWidget);
+      expect(find.byKey(const Key('exam-next')), findsOneWidget);
+      expect(find.byKey(const Key('exam-previous')), findsNothing);
+
+      await tester.tap(find.byKey(const Key('exam-next')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Question 2 of 2'), findsOneWidget);
+      // Last question replaces Next with Submit, and offers Previous.
+      expect(find.byKey(const Key('exam-next')), findsNothing);
+      expect(find.byKey(const Key('exam-submit')), findsOneWidget);
+      expect(find.byKey(const Key('exam-previous')), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('exam-previous')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Question 1 of 2'), findsOneWidget);
     });
 
     testWidgets('renders a text field for fill-in-the-blank and saves it',
@@ -247,6 +530,129 @@ void main() {
       expect(tester.takeException(), isNull);
     });
   });
+
+  group('audio proctoring', () {
+    /// A taller-than-default surface for the tests that read the prompt.
+    ///
+    /// The prompt is a snack bar pinned to the bottom of the Scaffold, and this
+    /// screen is dense enough that the default 800x600 test viewport leaves it
+    /// below the root render tree - where `tap` refuses to hit it.
+    void useTallSurface(WidgetTester tester) {
+      tester.view.physicalSize = const Size(1000, 1200);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+    }
+
+    /// Drops the current prompt and lets its dismiss animation finish.
+    ///
+    /// The prompt stays up for 8s, and a timer that outlives the test is a failure
+    /// ("A Timer is still pending..."), so a test that reads a prompt it does not
+    /// dismiss through its action closes it here.
+    Future<void> dismissPrompt(WidgetTester tester) async {
+      ScaffoldMessenger.of(
+        tester.element(find.byType(Scaffold).last),
+      ).hideCurrentSnackBar();
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('the microphone state is always on screen', (tester) async {
+      final source = _FakeAudioSource();
+
+      await tester.pumpWidget(pageUnderTest(audioSource: source));
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      // The chip is part of the exam's chrome rather than an optional extra...
+      expect(find.byKey(const Key('audio-indicator')), findsOneWidget);
+      // ...and it says the session really holds the microphone, with the live meter.
+      expect(find.text('Mic live'), findsOneWidget);
+      expect(find.byKey(const Key('audio-indicator-meter')), findsOneWidget);
+      expect(source.begins, 1);
+      // A quiet room is not a violation: audio proctoring must not strike just
+      // because it started listening.
+      expect(proctoring.violations, isEmpty);
+    });
+
+    testWidgets('a lost microphone prompts to reconnect instead of going quiet',
+        (tester) async {
+      useTallSurface(tester);
+      final source = _FakeAudioSource();
+
+      await tester.pumpWidget(pageUnderTest(audioSource: source));
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+      expect(find.text('Mic live'), findsOneWidget);
+
+      // The headset is unplugged, or the OS revokes the grant mid-session.
+      source.fail();
+      // Settled, not merely pumped: the prompt slides in, and a snack bar caught
+      // mid-entrance is not where the tap lands.
+      await tester.pumpAndSettle();
+
+      expect(find.text('Mic lost'), findsOneWidget);
+      expect(find.text('Reconnect'), findsOneWidget);
+
+      // The prompt's action re-opens the session. Tapping it also closes the
+      // snack bar, so no timer is left behind.
+      await tester.tap(find.text('Reconnect'));
+      await tester.pumpAndSettle();
+
+      expect(source.begins, 2);
+      expect(find.text('Mic live'), findsOneWidget);
+      // A microphone that went away is not itself a strike - it is an unproctored
+      // gap the student is asked to close.
+      expect(proctoring.violations, isEmpty);
+    });
+
+    testWidgets('tapping a lost microphone reopens it', (tester) async {
+      useTallSurface(tester);
+      final source = _FakeAudioSource();
+
+      await tester.pumpWidget(pageUnderTest(audioSource: source));
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      source.fail();
+      await tester.pump();
+      await tester.pump();
+      await dismissPrompt(tester);
+
+      await tester.tap(find.byKey(const Key('audio-indicator-retry')));
+      await tester.pumpAndSettle();
+
+      expect(source.begins, 2);
+      expect(find.text('Mic live'), findsOneWidget);
+      // Nothing to retry while levels are flowing: the chip is not a button then,
+      // so a stray tap cannot throw the room calibration away.
+      expect(find.byKey(const Key('audio-indicator-retry')), findsNothing);
+    });
+
+    testWidgets('a refused microphone offers the OS settings page',
+        (tester) async {
+      useTallSurface(tester);
+      final source = _FakeAudioSource(granted: false);
+
+      await tester.pumpWidget(pageUnderTest(audioSource: source));
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Mic blocked'), findsOneWidget);
+      // Re-asking cannot help after two "don't allow"s, so the fix is the settings
+      // page - offered on the chip and again in the prompt.
+      expect(find.byKey(const Key('audio-indicator-settings')), findsOneWidget);
+      expect(find.text('Settings'), findsOneWidget);
+      expect(source.begins, 0);
+
+      // The settings action asks the OS to open this app's permission page (a no-op
+      // on the test VM, where PermissionService swallows the missing plugin): the
+      // point is that a refusal is offered the only fix it has.
+      await tester.tap(find.byKey(const Key('audio-indicator-settings')));
+      await tester.pumpAndSettle();
+
+      await dismissPrompt(tester);
+      expect(proctoring.violations, isEmpty);
+    });
+  });
 }
 
 /// One assertion describing the whole blocking state, so a failure says what the
@@ -284,10 +690,17 @@ Future<void> pumpBootstrap(WidgetTester tester) async {
 
 /// Serves a fixed question list and records every answer write, so a test can
 /// assert what the server was told — and in which order.
+/// Serves a fixed question list and records every answer write, so a test can
+/// assert what the server was told.
+///
+/// [online] is the flaky-network switch: with it off every write throws, which is
+/// exactly what the offline queue has to absorb (the first guarantee in the
+/// `OfflineSyncService` contract).
 class _StubExamRepository implements ExamRepository {
-  _StubExamRepository({this.questions = const <Question>[]});
+  _StubExamRepository({this.questions = const <Question>[], this.online = true});
 
   final List<Question> questions;
+  bool online;
   final List<String> optionAnswers = <String>[];
   final List<String> textAnswers = <String>[];
   final List<String> submitted = <String>[];
@@ -308,6 +721,7 @@ class _StubExamRepository implements ExamRepository {
     required String questionId,
     required int selectedOption,
   }) async {
+    if (!online) throw const _NoNetwork();
     optionAnswers.add('$questionId=$selectedOption');
   }
 
@@ -317,11 +731,13 @@ class _StubExamRepository implements ExamRepository {
     required String questionId,
     required String answer,
   }) async {
+    if (!online) throw const _NoNetwork();
     textAnswers.add('$questionId=$answer');
   }
 
   @override
   Future<void> submitExam(String submissionId) async {
+    if (!online) throw const _NoNetwork();
     submitted.add(submissionId);
   }
 
@@ -331,14 +747,140 @@ class _StubExamRepository implements ExamRepository {
 
 /// Accepts violations without a backend (nothing in these tests reaches it).
 class _SilentProctoringRepository implements ProctoringRepository {
+  final List<Violation> violations = <Violation>[];
+
   @override
   Future<({int warningCount, bool disqualified})> logViolation({
     required String submissionId,
     required Violation violation,
-  }) async =>
-      (warningCount: 1, disqualified: false);
+  }) async {
+    violations.add(violation);
+    return (
+      warningCount: violations.length,
+      disqualified: violations.length >= 3,
+    );
+  }
 
   @override
   Stream<List<Map<String, dynamic>>> watchLogs(String submissionId) =>
       const Stream<List<Map<String, dynamic>>>.empty();
+}
+
+/// What an unreachable Supabase call looks like to the repository layer.
+class _NoNetwork implements Exception {
+  const _NoNetwork();
+
+  @override
+  String toString() => 'SocketException: network is unreachable';
+}
+
+/// Controllable stand-in for the DOM-backed browser guards, so the fullscreen
+/// countdown can be driven from the VM (where no DOM exists at all).
+class _FakeWebGuards implements WebGuards {
+  final StreamController<WebGuardEvent> controller =
+      StreamController<WebGuardEvent>.broadcast();
+
+  bool inFullscreen = false;
+
+  /// Whether the exam page armed the DOM lockdown at all, and how often it did:
+  /// a session that never releases it would leave the student's browser blocked.
+  bool lockdownActive = false;
+  int lockdownStarts = 0;
+  int lockdownStops = 0;
+
+  void emit(WebGuardEvent event) => controller.add(event);
+
+  @override
+  bool get isSupported => true;
+
+  @override
+  bool get isFullscreen => inFullscreen;
+
+  @override
+  Stream<WebGuardEvent> get events => controller.stream;
+
+  @override
+  bool get supportsExamLockdown => true;
+
+  @override
+  void startExamLockdown() {
+    lockdownStarts++;
+    lockdownActive = true;
+  }
+
+  @override
+  void stopExamLockdown() {
+    lockdownStops++;
+    lockdownActive = false;
+  }
+
+  @override
+  Future<bool> enterFullscreen() async => inFullscreen = true;
+
+  @override
+  Future<void> exitFullscreen() async => inFullscreen = false;
+
+  @override
+  void dispose() {}
+}
+
+/// A microphone with no platform channel behind it, and enough controls to
+/// reproduce every way the real one misbehaves.
+///
+/// It exists because `flutter test` runs on the Dart VM: the real
+/// `RecordAudioLevelSource` would resolve straight to "unavailable" there, so the
+/// exam screen's capture session is injected (see [audioLevelSourceProvider]) and
+/// each test states what the microphone does.
+class _FakeAudioSource implements AudioLevelSource {
+  _FakeAudioSource({this.granted = true});
+
+  /// What [requestAccess] answers. False is the "student tapped Don't allow" path.
+  bool granted;
+
+  /// What the capture session reports once someone is reading it.
+  ///
+  /// Quiet by default: -60 dBFS cannot trip the noise detector, whose threshold is
+  /// clamped to at most -45 dBFS, so merely opening the microphone is never a strike.
+  double level = -60;
+
+  /// How many capture sessions were opened (the first start, plus every reconnect).
+  int begins = 0;
+
+  // The level is reported from `onListen`, not from `begin()`: the monitor
+  // subscribes *after* begin() returns, and a broadcast controller drops events
+  // with no listener - so a level sent from begin() would be lost and a working
+  // microphone would look dead.
+  late final StreamController<double> _levels =
+      StreamController<double>.broadcast(onListen: _reportLevel);
+
+  void _reportLevel() => scheduleMicrotask(() {
+        if (!_levels.isClosed) _levels.add(level);
+      });
+
+  /// The headset being unplugged, the OS revoking the grant, another app taking the
+  /// input device: an error on the capture stream, which the monitor reads as
+  /// `interrupted` rather than as silence.
+  void fail() {
+    if (!_levels.isClosed) _levels.addError(StateError('device gone'));
+  }
+
+  @override
+  bool get isSupported => true;
+
+  @override
+  Stream<double> get levels => _levels.stream;
+
+  @override
+  Future<bool> requestAccess() async => granted;
+
+  @override
+  Future<void> begin() async => begins++;
+
+  @override
+  Future<void> end() async {}
+
+  @override
+  void dispose() {
+    if (!_levels.isClosed) _levels.close();
+  }
 }

@@ -13,5 +13,12 @@
     "strict": true,
     "paths": { "@/*": ["./src/*"] }
   },
-  "include": ["src"]
+  "include": ["src"],
+  /*
+   * `vite.config.ts` / `tailwind.config.ts` are Node-side build tooling and live
+   * in their own project (see `tsconfig.node.json`): that is where `types:
+   * ["node"]` comes from, and referencing it means `tsc -b` checks the config
+   * files as well as `src`.
+   */
+  "references": [{ "path": "./tsconfig.node.json" }]
 }

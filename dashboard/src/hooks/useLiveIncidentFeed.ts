@@ -12,6 +12,7 @@ import type { ProctoringLogRow } from "@/types/database";
 export function useLiveIncidentFeed(submissionIds: string[] | null, limit = 100) {
   const [logs, setLogs] = useState<ProctoringLogRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const idsRef = useRef(submissionIds);
   idsRef.current = submissionIds;
 
@@ -28,9 +29,20 @@ export function useLiveIncidentFeed(submissionIds: string[] | null, limit = 100)
       if (submissionIds && submissionIds.length > 0) {
         query = query.in("submission_id", submissionIds);
       }
-      const { data } = await query;
+      // A failed seed read used to be indistinguishable from "nothing has
+      // happened yet" — the panel simply said "No incidents reported yet." The
+      // message is now returned so the monitor can render it, which is the same
+      // contract the roster and the dashboard already follow ("empty is not an
+      // error").
+      const { data, error: seedError } = await query;
       if (!active) return;
-      if (data) setLogs(data as ProctoringLogRow[]);
+      if (seedError) {
+        setError(seedError.message);
+        setLoading(false);
+        return;
+      }
+      setError(null);
+      setLogs((data as ProctoringLogRow[]) ?? []);
       setLoading(false);
     })();
 
@@ -57,5 +69,5 @@ export function useLiveIncidentFeed(submissionIds: string[] | null, limit = 100)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [limit]);
 
-  return { logs, loading };
+  return { logs, loading, error };
 }

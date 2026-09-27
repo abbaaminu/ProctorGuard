@@ -27,10 +27,19 @@ class ProctoringRepositoryImpl implements ProctoringRepository {
     // p_snapshot_url is optional server-side; when the evidence upload failed
     // (or the session is a mock one) it is null and the log row just carries
     // no picture.
+    //
+    // p_client_timestamp and p_client_event_id are what make the offline retry
+    // honest: the first records *when the violation happened* (the row's
+    // `timestamp` stays the server's receipt time, which is the column the
+    // dashboard orders by), and the second is the idempotency key that stops a
+    // replayed row from becoming a second strike (see the unique index on
+    // proctoring_logs.client_event_id).
     final rows = await _client.rpc('register_violation', params: {
       'p_submission_id': submissionId,
       'p_action_type': violation.type.dbValue,
       'p_snapshot_url': violation.snapshotUrl,
+      'p_client_timestamp': violation.timestamp.toUtc().toIso8601String(),
+      'p_client_event_id': violation.clientEventId,
     }) as List<dynamic>;
 
     final row = rows.first as Map<String, dynamic>;

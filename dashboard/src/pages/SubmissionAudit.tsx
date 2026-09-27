@@ -7,15 +7,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge, statusTone } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatTime } from "@/lib/utils";
+import { incidentLabel } from "@/lib/incidents";
 import type { SubmissionRow, ProctoringLogRow, QuestionRow } from "@/types/database";
-
-const INCIDENT_LABELS: Record<string, string> = {
-  looking_away: "Looking away",
-  multiple_faces: "Multiple faces",
-  no_face: "No face",
-  app_minimized: "App minimized",
-  audio_noise: "Audio noise",
-};
 
 /**
  * Mirrors the grading in `submit_exam()` for a fill-in-the-blank answer: the
@@ -156,7 +149,7 @@ export function SubmissionAudit() {
                     <div className="flex items-center gap-2">
                       <AlertOctagon size={13} className="text-alert" />
                       <span className="text-sm font-medium text-slate-200">
-                        {INCIDENT_LABELS[log.action_type] ?? log.action_type}
+                        {incidentLabel(log.action_type)}
                       </span>
                       <span className="font-mono text-[11px] text-slate-500">{formatTime(log.timestamp)}</span>
                     </div>

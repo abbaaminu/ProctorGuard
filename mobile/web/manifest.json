@@ -1,12 +1,12 @@
 {
-    "name": "exam_proctor",
-    "short_name": "exam_proctor",
+    "name": "ProctorGuard — Exam Proctoring",
+    "short_name": "ProctorGuard",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
-    "orientation": "portrait-primary",
+    "background_color": "#3F51B5",
+    "theme_color": "#3F51B5",
+    "description": "Take AI-proctored exams with on-device face and microphone monitoring.",
+    "orientation": "any",
     "prefer_related_applications": false,
     "icons": [
         {

@@ -5,7 +5,8 @@
 lib/
   core/services/           # Supabase bootstrap, permissions, ML Kit face-
                             # detection engine, lifecycle observer, kiosk bridge,
-                            # browser guards (tab switch/blur/fullscreen)
+                            # browser guards (tab switch/blur/fullscreen),
+                            # microphone level monitor + audio-noise rules
   features/
     auth/                   # sign-in form, `users.role` profile lookup,
                             # post-login RoleGate router
@@ -133,6 +134,11 @@ self-view shows a "MOCK CAMERA" tile instead). The gate is the only thing that
 honours the flag: without it, a camera or a microphone that cannot be opened
 blocks the exam.
 
+`MOCK_CAMERA` does not mock the microphone either: audio proctoring still opens its own
+session, so a build with no input device shows `Mic unavailable` on the chip. Add
+`--dart-define=AUDIO_MONITORING=false` for a demo or CI run that has no microphone at
+all — the chip then reads `Audio off`, and the exam is otherwise unaffected.
+
 `MediaPipeProctoringService` emits a
 simulated `no_face` → `looking_away` → `no_face` … gaze deviation every 12
 seconds (`-Mock` is the flag; `-MockCamera` is kept as an alias).
@@ -167,7 +173,8 @@ What it listens to, and what each event becomes:
 | --- | --- | --- |
 | `visibilitychange` | `document.visibilityState == 'hidden'` (other tab, minimised window, discarded page) | `app_minimized` |
 | `blur` on `window` | focus left while the document stays `visible` (second monitor, another app in front) | `app_minimized` |
-| `fullscreenchange` | left fullscreen **after** entering it (ESC, F11) | `app_minimized` |
+| `fullscreenchange` | left fullscreen **after** entering it (ESC, F11) | `app_minimized`, after a 5s countdown (below) |
+| `fullscreenchange` | fullscreen came back | none — it cancels that countdown |
 
 `blur` is suppressed while the document is hidden, so one tab switch is one event
 rather than two.
@@ -176,7 +183,7 @@ rather than two.
 page drives: it requests fullscreen when the session starts, forwards events to
 `ProctoringNotifier.reportAppMinimized()`, and `stop()` leaves fullscreen and
 detaches the listeners, so a finished exam neither traps the student nor keeps
-counting strikes. Two deliberate mitigations:
+counting strikes. Three deliberate mitigations:
 
 - **Start-up grace (5s).** Opening an exam legitimately disturbs focus — camera
   permission prompt, fullscreen transition, the browser's media indicator. Those
@@ -187,6 +194,18 @@ counting strikes. Two deliberate mitigations:
   gesture** for `requestFullscreen()`, so an automatic attempt from a navigation
   often fails — the page then shows a "Fullscreen is required for this exam"
   prompt whose button *is* that gesture, and the guard is armed from there.
+- **A fullscreen exit gets a 5-second countdown, not an instant strike.** It is the
+  one signal that is recoverable by the student in a couple of seconds, so
+  `WebExamGuard.fullscreenGrace` opens a window: `FullscreenLockOverlay` covers the
+  exam (blocking, so nothing can be read or typed behind it), counts down from 5,
+  and its **Return to fullscreen** button supplies the gesture Chromium needs.
+  Coming back inside the window logs nothing (`fullscreenEntered` cancels the
+  window); letting it run out logs exactly one `app_minimized`. The guard owns the
+  deadline and a `Timer` backstop, the page owns the pixels, and
+  `expireFullscreenGrace()` is idempotent so the two racing is harmless. A session
+  that ends mid-countdown logs nothing at all (leaving fullscreen on the way out is
+  not cheating), and `reassertFullscreen()` re-opens the window when the page comes
+  back to the foreground still out of fullscreen.
 
 That makes this enforcement rather than suggestion: on Chrome and Edge, switching
 tabs, blurring the window or dropping out of fullscreen each log a violation
@@ -201,6 +220,63 @@ flutter build web -t tool/web_guard_smoke.dart
 ```
 
 (It imports `WebGuards`, so `web_guards_web.dart` stays reachable.)
+
+## Offline resilience (answers, violations, the banner)
+
+An exam is the worst place to lose a network: a dropped connection used to mean an
+answer that never reached the server (grading reads the server copy) and a
+proctoring row that silently vanished. `core/services/offline_sync_service.dart`
+(`OfflineSyncService`) is now the single write path for both, and it is
+**local-first**: the device is written first, the network is caught up afterwards.
+
+| Step | What happens |
+| --- | --- |
+| Student taps an option | `ExamSyncBanner` stays quiet; `cacheChoice` writes the draft **and** a queue row to `KeyValueStore`, and the session advances immediately |
+| Student types | `cacheTextDraft` mirrors the keystroke into the draft cache (no network write — the server does not need every character) |
+| "Save & next" / keyboard done | `cacheText` does the same, plus a queue row |
+| The write reaches Supabase | the queue row is dropped, the banner disappears |
+| The write fails | the row stays queued, the banner turns into **"Offline - syncing locally"**, and the session carries on |
+| The connection comes back | the queue drains by itself: the browser's `online` event, the app's resume hook (`AppLifecycleListener`), or the retry backoff (2s, doubling to 60s) |
+| Submit, with the queue still full | the attempt is *held*, not lost: a "Waiting for a connection" screen with **Submit again** / **Leave**, and leaving keeps the attempt `ongoing` with its answers on the device |
+
+Details worth knowing:
+
+- **One instance, one queue, app-scoped.** `offlineSyncServiceProvider` lives in
+  `core/di/providers.dart` (next to the repository providers, which moved there so
+  the service and the notifier cannot form an import cycle; `proctoring_provider.dart`
+  re-exports them, so every existing import site is unchanged). Because it is not
+  `autoDispose`, work cached during an exam survives leaving the screen, a browser
+  refresh and a restart — the queue and the drafts are on disk.
+- **`KeyValueStore` never throws.** `shared_preferences` is the production store
+  (localStorage on web, prefs/plist on mobile); a runtime that refuses it — private
+  mode, partitioned storage, a `flutter test` binding with no plugin — degrades to
+  an in-memory map for the session instead of failing a save.
+- **Timers only run while there is something to send.** An idle session schedules
+  nothing, so a finished exam does no background work (and a widget test never ends
+  with a pending timer).
+- **Violations ride the same queue, with an idempotency key.** A failing
+  `register_violation` call is queued with the client-minted `clientEventId` of that
+  one event, and the retry replays it unchanged: the `on conflict` in
+  `supabase/schema.sql` inserts the row or nothing, so a lost response cannot turn
+  one violation into two strikes. `ProctoringNotifier` still counts the strike
+  optimistically and the UI still warns; `ViolationOutbox.deferredRulings` hands it
+  the server's ruling when the row does land, which is how a third strike taken
+  offline still ends the attempt.
+- **The server keeps the authoritative timeline.** Every row carries
+  `client_timestamp` (when the violation happened on the device) *and* the server's
+  own `timestamp`, so a violation delivered late is still placed correctly in the
+  audit trail without trusting a device clock for ordering.
+- **The banner says what it knows.** It appears only while something is queued, and
+  it distinguishes "Syncing your answers…" from "Offline - syncing locally"; it
+  repaints only when what it renders actually changes, so an offline exam does not
+  spin frames for as long as the connection is down.
+
+`mobile/test/offline_sync_service_test.dart` covers the queue rules (durability
+before the network, drain on recovery, backoff without help, one queued row per
+question, restore after a restart, corrupt-storage tolerance, the same event id on
+retry, a bounded queue, and the probe's events);
+`mobile/test/exam_taking_page_test.dart` covers what the student sees (the banner,
+the answer kept and later synced, the resumed draft) and the fullscreen countdown.
 
 ## Verifying the native kiosk bridge without a full APK build
 
@@ -329,15 +405,38 @@ Details worth knowing:
   `"HTTP"`). A typed answer is written by "Save & next", the keyboard's done
   action, or the submit flush below — the field shows "Answer saved" once the
   server has it.
+* **One question per screen, with Previous/Next.** The session is paginated
+  rather than one long scroll: the app bar shows "Question X of Y", the action
+  bar carries a prominent **Previous** and **Next** (multiple choice) or
+  **Save & next** (typed answer), and **Submit exam** replaces Next on the last
+  question. Moving between questions flushes an unsaved typed answer first, so
+  navigating never drops one.
 * **`exams.duration_minutes` is enforced.** The countdown is anchored on
   `exam_submissions.started_at` (not on "now"), so a resumed attempt keeps its
   remaining time and one that is already past its deadline is submitted on the
   first tick. The chip in the app bar turns amber under 5 minutes and red under 1.
+* **Camera loss pauses proctoring and prompts the student.** The page listens to
+  the `CameraController`; if the feed reports an error mid-session it calls
+  `ProctoringNotifier.setCameraActive(false)`, which drops further `GazeSignal`s,
+  clears the engine's grace windows and shows a "restore the camera" prompt - an
+  offline feed no longer accumulates `no_face`/`looking_away` strikes. Frames
+  that arrive before the stream is live are ignored too
+  (`MediaPipeProctoringService.setStreamActive`), so initialising a camera is
+  never read as "no face".
 * **The camera session includes the microphone.** `CameraController` is created
   with `enableAudio: true`, so the attempt holds the microphone (RECORD_AUDIO on
   Android, the browser's mic grant on web) alongside the video stream. A denied
   microphone blocks the session exactly like a denied camera, and **Open
   settings** appears when the OS will not prompt again.
+* **Speaking is proctored from the microphone's own level, and the chip always says
+  what the room sounds like.** A second, independent capture session
+  (`AudioMonitor`, `record`'s `getAmplitude()`) streams dBFS samples into
+  `AudioNoiseDetector`, which measures the room's own noise floor first and then
+  treats *sustained* speech above it as `audio_noise`. No audio is ever written to a
+  file. A lost or refused microphone is **not** a strike — it is an unproctored gap —
+  so the page prompts **Reconnect** (**Open settings** when the OS will not ask
+  again) rather than letting proctoring go quietly dark. The state machine and the
+  rules are in [Microphone proctoring](#microphone-proctoring-levels-not-recordings).
 * **Web: access is requested *before* the camera is enumerated.** `camera_web`
   drops every device whose `deviceId` is empty, which is exactly what a browser
   reports *before* the camera grant — so `availableCameras()` legitimately
@@ -346,13 +445,19 @@ Details worth knowing:
   `WebCameraPermission` now runs one `getUserMedia` probe (releasing the probe
   tracks immediately) and the enumeration is retried, so the browser's own
   prompt appears instead.
-* **Answers are painted locally and saved through the RPCs.** A failed autosave
-  says so and *stays on the question* instead of advancing past the only chance to
-  save that answer — grading reads the server copy.
+* **Answers are painted locally and saved through the RPCs.** The tap is durable
+  on the device first (`OfflineSyncService`), so the round-trip to Supabase is off
+  the critical path and a dropped connection no longer costs the answer — the
+  banner reports the sync instead of an error and the session carries on. Grading
+  still reads the *server* copy, which is why the submit path below refuses to
+  close an attempt whose queue has not drained.
 * **Submitting goes through `submit_exam`** (see `../supabase/schema.sql`): the
   server grades both shapes and closes the attempt, and `score` is never written
   by the client. There is no student `UPDATE` policy on `exam_submissions` at
-  all. Submitting flushes an unsaved fill-in-the-blank answer first.
+  all. Submitting flushes an unsaved fill-in-the-blank answer first and then
+  requires the queue to be empty: if the answers cannot reach the server, the
+  attempt stays `ongoing` behind a "Waiting for a connection" screen rather than
+  closing with half of them missing.
 * **Retry re-runs only the failed stage** — the permissions, camera, kiosk pin or
   question feed that already succeeded is not reopened.
 * **The kiosk bridge and permission status queries are time-boxed**
@@ -463,11 +568,31 @@ the 3-strike rule:
 
 | Detector | Signal | `action_type` |
 | --- | --- | --- |
-| ML Kit face detection | no face / several faces / head pose off-axis | `no_face`, `multiple_faces`, `looking_away` |
+| ML Kit face detection | no face / several faces / head pose off-axis, each held for a grace window before it counts | `no_face`, `multiple_faces`, `looking_away` |
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
 | `WebGuards` (Chrome/Edge) | tab hidden, window blurred, or HTML5 fullscreen left | `app_minimized` |
-| `reportAudioLevel(double)` | dBFS above threshold, sustained | `audio_noise` |
+| `AudioMonitor` + `AudioNoiseDetector` | a `record` capture session streams dBFS samples; the room's own floor is measured first, then speech sustained above it ([details below](#microphone-proctoring-levels-not-recordings)) | `audio_noise` |
+
+Camera signals are **sustained-threshold**, not per-frame: `looking_away` fires
+only after the head stays past ~28 deg yaw / ~30 deg pitch for 3s, and `no_face`
+after the face is missing for 3s - each episode reports once, so a blink, a
+dropped frame or a glance at the keyboard cannot burn a strike. `multiple_faces`
+is the exception and reports immediately. `ProctoringNotifier.setCameraActive`
+gates the whole camera set while the feed is not streaming.
+
+Audio is judged the same way, and the rules are deliberately pure Dart
+(`core/services/audio_noise_detector.dart`) so they can be tested without a
+microphone: the first 4s (`calibrationWindow`) measure the room's floor, taking the
+**median** rather than the mean so a student who starts talking immediately cannot
+drag the floor up to their own voice; the threshold becomes that floor + 12 dB
+(`speechMarginDb`), clamped to −45…−20 dBFS (`minThresholdDb`/`maxThresholdDb`)
+because a silent room's own noise floor would otherwise read as "talking"; the level
+must then stay above it for 4s *continuously* (`sustain`) — one sample below resets
+the window, which is what turns a cough, a chair creak or a breath into nothing — and
+after a strike the detector ignores the level for 5s (`cooldown`), so one long
+outburst is one strike rather than one every sample. Calibration doubles as the
+start-of-session grace period: nothing can be logged before it finishes.
 
 Kiosk bridge contract — MethodChannel `lock_task_channel`:
 
@@ -492,7 +617,69 @@ same way (`WebExamGuard` in `_bootstrap()`, `stop()` in `dispose()`).
 `mobile/test/kiosk_service_test.dart` pins this wire format (including the "our
 own unpin is not an escape" and "a single inactive blip is tolerated" rules);
 `mobile/test/web_exam_guard_test.dart` covers the browser rules;
-`mobile/test/proctoring_notifier_test.dart` covers the strike escalation.
+`mobile/test/proctoring_notifier_test.dart` covers the strike escalation. The audio
+half adds `mobile/test/audio_monitoring_test.dart` (the detector's rules and the
+monitor's state machine) and the `audio proctoring` group in
+`mobile/test/exam_taking_page_test.dart` (the chip, driven through a fake microphone).
+
+## Microphone proctoring (levels, not recordings)
+
+`AudioMonitor` (`core/services/audio_monitor.dart`) opens its own capture session
+through `record`, alongside the camera's audio track, and feeds `getAmplitude()`
+samples — four a second (`sampleInterval`) — to `AudioNoiseDetector`. That session
+**streams PCM and writes no file**: the bytes are drained and thrown away (never
+analysed, never stored), so all that leaves the microphone is a stream of decibel
+numbers. Nothing about the room is recorded, buffered to disk or uploaded.
+
+The monitor is a small state machine rather than a bag of futures, because every way
+a microphone can fail has to land somewhere the student can act:
+
+| Situation | State | Chrome shows | Recovery |
+| --- | --- | --- | --- |
+| Streaming levels | `monitoring` | `Mic live` + live meter | — |
+| Asking for access / waiting for the first sample | `starting` | `Mic starting` | — |
+| Student or OS refuses access | `permissionDenied` | `Mic blocked` | **Open settings** — the OS will not prompt twice |
+| No capture path on this platform | `unavailable` | `Mic unavailable` | retry, or carry on |
+| Device cannot be opened (busy, no input) | `unavailable` | `Mic unavailable` | retry |
+| Bridge never answers (8s `startTimeout`) | `unavailable` | `Mic unavailable` | retry |
+| No levels at all for 4s (`levelTimeout`) | `unavailable` | `Mic unavailable` | retry — never pretends to monitor |
+| Stream dies mid-session (headset unplugged, grant revoked, another app took the input) | `interrupted` | `Mic lost` | **Reconnect** prompt |
+| `--dart-define=AUDIO_MONITORING=false` | `disabled` | `Audio off` | — |
+
+Two of those rows are the point of the feature. A device that cannot be opened, or
+that never reports a single level, is reported as `unavailable` instead of looking
+exactly like an empty room — **not listening must never be mistaken for quiet**. And
+losing the microphone is *not* a strike: it is an unproctored gap, so it surfaces as a
+prompt with an action, and the session's violation count only ever counts sustained
+speech. A refused or unavailable microphone never blocks the exam either; it is
+visible and recoverable, never fatal.
+
+Every wait in the monitor is time-boxed, the release included. `record` sends all of its
+platform calls through a single permit, so a call the device never answered — the
+microphone pulled out mid-session — would queue the next one behind it *forever*, and the
+reconnect is precisely the action that has to keep working. A release that does not come
+back inside 3s (`endTimeout`) is logged and given up on; the start that follows asks the
+device itself and reports what it finds, inside `startTimeout`.
+
+`AudioMonitoringNotifier` (`features/proctoring/.../audio_monitoring_provider.dart`)
+joins the two halves: the monitor owns the device, the detector owns the rules, and a
+confirmed ruling is handed to `ProctoringNotifier.reportAudioNoise()`, so
+`audio_noise` takes exactly the same path as `no_face` or `app_minimized` — overlay,
+server-side count via `register_violation`, 3-strike escalation and the offline queue
+included. `ProctoringNotifier.reportAudioLevel(double)` — the notifier's own
+threshold-plus-sustain counter (`audioNoiseThresholdDb`/`audioNoiseSustain`) — predates
+the detector and stays for a source that classifies its own levels; the shipped
+pipeline goes through the detector above, so what decides is *this room's* measured
+floor rather than a constant that has to be right for every device. `retry()` re-opens
+the session *and* resets the detector, because a new microphone (a headset, another
+room) is a new noise floor: reusing the old one would either deafen or over-sensitise
+the room the student actually moved to.
+
+The seam is `audioLevelSourceProvider`, which is `null` in the app — meaning "the real
+`record` source" — and is overridden with a fake in tests. `flutter test` runs on the
+Dart VM, where no audio plugin is registered, so injecting a source is the only way to
+drive a working microphone, a refused one, or one unplugged mid-session, instead of
+asserting on a chip that can only ever say `unavailable`.
 
 ## Key design decisions worth knowing about
 - **Server-enforced escalation.** The 3-strike disqualify rule lives in
@@ -544,12 +731,13 @@ own unpin is not an escape" and "a single inactive blip is tolerated" rules);
   `riverpod_annotation`/`riverpod_generator`, `freezed`/`freezed_annotation`,
   `json_annotation`/`json_serializable` and `build_runner` were never imported
   by any file, so they were dropped to keep `pub get`/build times (and the
-  dependency surface) small. Re-add them as each feature lands — most
-  notably `noise_meter`, whose hooks already exist:
-  `ProctoringNotifier.reportAudioLevel(double)` (dBFS samples above
-  `audioNoiseThresholdDb`, sustained for `audioNoiseSustain`, become
-  `audio_noise` strikes) and `reportAudioNoise()` for a source that
-  classifies noise itself.
+  dependency surface) small. Re-add them as each feature lands. Audio proctoring is
+  the case in point: its hooks already existed
+  (`ProctoringNotifier.reportAudioNoise()` and the `audio_noise` action type), and
+  when the detector landed it added `record` (^7.1.1) — the one package that exposes
+  amplitude on every target this app ships to — rather than `noise_meter`, which is
+  still unused. `ProctoringNotifier.reportAudioLevel(double)` remains for a source
+  that classifies levels itself.
 - **Android specifics for the camera pipeline.** ML Kit needs `minSdkVersion`
   21+ (Flutter's default is 24) and its byte-buffer API accepts a single plane
   only, so the exam page requests `ImageFormatGroup.nv21` on Android and

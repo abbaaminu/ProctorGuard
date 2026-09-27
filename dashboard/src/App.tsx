@@ -7,6 +7,7 @@ import { DashboardOverview } from "@/pages/DashboardOverview";
 import { ExamManager } from "@/pages/ExamManager";
 import { LiveMonitor } from "@/pages/LiveMonitor";
 import { SubmissionAudit } from "@/pages/SubmissionAudit";
+import { Analytics } from "@/pages/Analytics";
 
 /**
  * Routing + the console shell.
@@ -43,8 +44,9 @@ function AppRoutes() {
         <Route path="/exams" element={<ExamManager />} />
         <Route path="/exams/:id/monitor" element={<LiveMonitor />} />
         <Route path="/submissions/:id" element={<SubmissionAudit />} />
-        <Route path="/analytics" element={<DashboardOverview />} />
-        <Route path="/settings" element={<div className="p-6 text-sm text-slate-500">Settings — coming soon.</div>} />
+        {/* A real report page. This used to render `DashboardOverview`, so the
+            "Analytics" nav item silently showed the dashboard again. */}
+        <Route path="/analytics" element={<Analytics />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </AppShell>

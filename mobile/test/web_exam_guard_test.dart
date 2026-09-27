@@ -24,20 +24,26 @@ void main() {
 
   late _FakeWebGuards guards;
   final seen = <WebGuardEvent>[];
+  final fullscreen = <String>[];
 
   setUp(() {
     guards = _FakeWebGuards();
     seen.clear();
+    fullscreen.clear();
   });
 
   WebExamGuard newGuard({
     Duration grace = Duration.zero,
+    Duration fullscreenGrace = const Duration(seconds: 30),
     DateTime Function()? clock,
   }) =>
       WebExamGuard(
         guards: guards,
         onViolation: seen.add,
+        onFullscreenExitPending: () => fullscreen.add('pending'),
+        onFullscreenRestored: () => fullscreen.add('restored'),
         startupGrace: grace,
+        fullscreenGrace: fullscreenGrace,
         clock: clock,
       );
 
@@ -77,7 +83,8 @@ void main() {
       expect(notifier.state.showViolationOverlay, isTrue);
     });
 
-    test('blur and a fullscreen exit are strikes as well', () async {
+    test('a window blur is a strike straight away, a fullscreen exit is not',
+        () async {
       final guard = newGuard();
       addTearDown(guard.stop);
       await guard.start();
@@ -86,10 +93,89 @@ void main() {
       guards.emit(WebGuardEvent.fullscreenExited);
       await pumpEventQueue();
 
-      expect(seen, <WebGuardEvent>[
-        WebGuardEvent.windowBlurred,
-        WebGuardEvent.fullscreenExited,
-      ]);
+      // The blur is logged immediately; the fullscreen exit only opens the
+      // countdown - the student is not penalised for a recoverable slip.
+      expect(seen, <WebGuardEvent>[WebGuardEvent.windowBlurred]);
+      expect(fullscreen, <String>['pending']);
+      expect(guard.fullscreenExitPending, isTrue);
+      expect(guard.fullscreenExitDeadline, isNotNull);
+    });
+
+    test('a fullscreen exit that runs out becomes one strike', () async {
+      final guard = newGuard();
+      addTearDown(guard.stop);
+      await guard.start();
+
+      guards.emit(WebGuardEvent.fullscreenExited);
+      await pumpEventQueue();
+      expect(seen, isEmpty);
+
+      // What the exam page does when its visible countdown hits zero.
+      guard.expireFullscreenGrace();
+      guard.expireFullscreenGrace(); // racing the guard's own timer: still one
+      await pumpEventQueue();
+
+      expect(seen, <WebGuardEvent>[WebGuardEvent.fullscreenExited]);
+      expect(guard.fullscreenExitPending, isFalse);
+      expect(guard.fullscreenExitDeadline, isNull);
+    });
+
+    test('the guard\'s own timer expires the window without the page',
+        () async {
+      final guard = newGuard(fullscreenGrace: const Duration(milliseconds: 30));
+      addTearDown(guard.stop);
+      await guard.start();
+
+      guards.emit(WebGuardEvent.fullscreenExited);
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+
+      expect(seen, <WebGuardEvent>[WebGuardEvent.fullscreenExited]);
+    });
+
+    test('coming back to fullscreen inside the window cancels it', () async {
+      final guard = newGuard();
+      addTearDown(guard.stop);
+      await guard.start();
+
+      guards.emit(WebGuardEvent.fullscreenExited);
+      await pumpEventQueue();
+      expect(fullscreen, <String>['pending']);
+
+      guards.emit(WebGuardEvent.fullscreenEntered);
+      await pumpEventQueue();
+
+      expect(fullscreen, <String>['pending', 'restored']);
+      expect(guard.fullscreenExitPending, isFalse);
+      expect(seen, isEmpty, reason: 'nothing was logged');
+    });
+
+    test('reassertFullscreen restarts the window when the page comes back',
+        () async {
+      final guard = newGuard();
+      addTearDown(guard.stop);
+      await guard.start();
+      expect(guard.fullscreenEnteredThisSession, isTrue);
+
+      // The page was backgrounded and is not in fullscreen any more, but no
+      // `fullscreenchange` reached us (the browser was not looking).
+      guards.inFullscreen = false;
+      guard.reassertFullscreen();
+
+      expect(guard.fullscreenExitPending, isTrue);
+      expect(fullscreen, <String>['pending']);
+    });
+
+    test('a session that ends mid-countdown logs nothing', () async {
+      final guard = newGuard();
+      await guard.start();
+
+      guards.emit(WebGuardEvent.fullscreenExited);
+      await pumpEventQueue();
+      expect(guard.fullscreenExitPending, isTrue);
+
+      await guard.stop();
+      expect(guard.fullscreenExitPending, isFalse);
+      expect(seen, isEmpty);
     });
 
     test('start() asks for fullscreen once, the prompt can ask again',
@@ -157,6 +243,77 @@ void main() {
     });
   });
 
+  group('exam lockdown', () {
+    test('start() arms the lockdown before asking for fullscreen', () async {
+      final guard = newGuard();
+      addTearDown(guard.stop);
+
+      expect(guards.lockdownActive, isFalse);
+      expect(await guard.start(), isTrue);
+      expect(guards.lockdownStarts, 1);
+      expect(guards.lockdownActive, isTrue);
+      expect(guards.enterCalls, 1);
+    });
+
+    test('a blocked copy is a strike even inside the startup grace', () async {
+      // The bootstrap script blocks attempts made *before* Flutter boots, and
+      // startExamLockdown() replays them - i.e. inside the grace window. A copy
+      // cannot be caused by the camera prompt or the fullscreen transition, so
+      // unlike a blur it is never filtered.
+      final guard = newGuard(grace: const Duration(seconds: 5));
+      addTearDown(guard.stop);
+      await guard.start();
+
+      guards.emit(WebGuardEvent.copyBlocked);
+      guards.emit(WebGuardEvent.windowBlurred); // start-up noise: ignored
+      await pumpEventQueue();
+
+      expect(seen, <WebGuardEvent>[WebGuardEvent.copyBlocked]);
+    });
+
+    test('every lockdown event reaches onViolation as itself', () async {
+      final guard = newGuard();
+      addTearDown(guard.stop);
+      await guard.start();
+
+      for (final event in <WebGuardEvent>[
+        WebGuardEvent.cutBlocked,
+        WebGuardEvent.pasteBlocked,
+        WebGuardEvent.contextMenuBlocked,
+        WebGuardEvent.devtoolsDetected,
+      ]) {
+        guards.emit(event);
+      }
+      await pumpEventQueue();
+
+      // Passed through unchanged: the page, not the guard, decides which
+      // violation each one costs (copy/cut/paste share `copy_paste_attempt`).
+      expect(seen, <WebGuardEvent>[
+        WebGuardEvent.cutBlocked,
+        WebGuardEvent.pasteBlocked,
+        WebGuardEvent.contextMenuBlocked,
+        WebGuardEvent.devtoolsDetected,
+      ]);
+    });
+
+    test('stop() releases the lockdown, and only once', () async {
+      final guard = newGuard();
+      await guard.start();
+      expect(guards.lockdownActive, isTrue);
+
+      await guard.stop();
+      expect(guards.lockdownStops, 1);
+      expect(
+        guards.lockdownActive,
+        isFalse,
+        reason: 'a finished exam must not keep the browser blocked',
+      );
+
+      await guard.stop(); // idempotent
+      expect(guards.lockdownStops, 1);
+    });
+  });
+
   group('non-web platforms', () {
     test('report "not supported" and never touch fullscreen', () async {
       // On the VM the factory hands back UnsupportedWebGuards — exactly what
@@ -190,6 +347,12 @@ class _FakeWebGuards implements WebGuards {
   int exitCalls = 0;
   bool disposed = false;
 
+  /// The DOM lockdown: armed for the length of one attempt, and it has to be
+  /// released again or the student's browser stays blocked ([stopExamLockdown]).
+  bool lockdownActive = false;
+  int lockdownStarts = 0;
+  int lockdownStops = 0;
+
   void emit(WebGuardEvent event) => controller.add(event);
 
   @override
@@ -200,6 +363,21 @@ class _FakeWebGuards implements WebGuards {
 
   @override
   Stream<WebGuardEvent> get events => controller.stream;
+
+  @override
+  bool get supportsExamLockdown => true;
+
+  @override
+  void startExamLockdown() {
+    lockdownStarts++;
+    lockdownActive = true;
+  }
+
+  @override
+  void stopExamLockdown() {
+    lockdownStops++;
+    lockdownActive = false;
+  }
 
   @override
   Future<bool> enterFullscreen() async {

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'core/services/lockdown_bootstrap.dart';
 import 'core/services/permission_service.dart';
 import 'core/services/supabase_service.dart';
 import 'core/widgets/setup_required_page.dart';
@@ -35,6 +36,20 @@ Future<void> main() async {
   unawaited(requestStartupPermissions());
 
   final client = SupabaseService.instance.clientOrNull;
+
+  // The web lockdown script (`web/index.html`) blocks the clipboard, the context
+  // menu and the developer-tools shortcuts from the moment the page loads - the
+  // window in which this app is not running yet, which a reload reopens. This is
+  // the signal that ends that presumption, and it is deliberately sent here, one
+  // statement before the first frame: everything before it is the app's own
+  // startup (the engine, `SupabaseService.init`, the loader), where nothing on
+  // the page is the student's yet. From here on only an armed exam locks the
+  // page; what the script denied while it was waiting is queued, not lost, and
+  // the exam that arms the lockdown claims it.
+  //
+  // Synchronous and never throwing: a no-op off the web, and a host without the
+  // bootstrap script is simply not told anything (see [LockdownBootstrap]).
+  LockdownBootstrap().markAppBooted();
 
   runApp(
     ProviderScope(

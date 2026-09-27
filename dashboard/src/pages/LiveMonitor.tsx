@@ -18,15 +18,8 @@ import {
   Skeleton,
 } from "@/components/ui/skeleton";
 import { cn, formatTime, shortId, timeElapsed } from "@/lib/utils";
+import { incidentLabel } from "@/lib/incidents";
 import type { ExamRow, SubmissionRow } from "@/types/database";
-
-const INCIDENT_LABELS: Record<string, string> = {
-  looking_away: "Looking away",
-  multiple_faces: "Multiple faces",
-  no_face: "No face",
-  app_minimized: "App minimized",
-  audio_noise: "Audio noise",
-};
 
 function SnapshotModal({ url, onClose }: { url: string; onClose: () => void }) {
   return (
@@ -61,12 +54,14 @@ export function LiveMonitor() {
     disqualify,
   } = useExamSubmissions(examId ?? "");
   const submissionIds = useMemo(() => submissions.map((s) => s.id), [submissions]);
-  const { logs, loading: feedLoading } = useLiveIncidentFeed(
-    submissionIds.length ? submissionIds : null
-  );
+  const {
+    logs,
+    loading: feedLoading,
+    error: feedError,
+  } = useLiveIncidentFeed(submissionIds.length ? submissionIds : null);
   // `id -> name` so the roster and the feed read like a class list instead of a
   // wall of uuids (RLS lets a supervisor read every profile row).
-  const { names, loading: namesLoading } = useAccountNames();
+  const { names, loading: namesLoading, error: namesError } = useAccountNames();
 
   useEffect(() => {
     if (!examId) return;
@@ -175,6 +170,13 @@ export function LiveMonitor() {
               {actionError}
             </div>
           )}
+          {/* Display names are a nicety: the roster falls back to a short id, so
+              this says *why* rather than pretending the id is the student. */}
+          {namesError && (
+            <p className="mb-3 text-xs text-warn">
+              Candidate names could not be loaded — showing short ids instead.
+            </p>
+          )}
 
           {rosterLoading ? (
             <div className="grid grid-cols-3 gap-3" role="status" aria-label="Loading candidates">
@@ -252,10 +254,15 @@ export function LiveMonitor() {
                 ))}
               </div>
             )}
-            {!feedLoading && logs.length === 0 && (
+            {!feedLoading && feedError && (
+              <p className="p-4 text-sm text-alert">
+                Could not load incidents: {feedError}
+              </p>
+            )}
+            {!feedLoading && !feedError && logs.length === 0 && (
               <p className="p-4 text-sm text-slate-500">No incidents reported yet.</p>
             )}
-            {!feedLoading && logs.map((log) => (
+            {!feedLoading && !feedError && logs.map((log) => (
               <div
                 key={log.id}
                 className="animate-rowIn flex items-start gap-2.5 border-b border-border px-4 py-3"
@@ -264,7 +271,7 @@ export function LiveMonitor() {
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center justify-between">
                     <span className="text-sm font-medium text-slate-200">
-                      {INCIDENT_LABELS[log.action_type] ?? log.action_type}
+                      {incidentLabel(log.action_type)}
                     </span>
                     <span className="font-mono text-[11px] text-slate-500">{formatTime(log.timestamp)}</span>
                   </div>

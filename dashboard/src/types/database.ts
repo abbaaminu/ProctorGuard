@@ -61,6 +61,19 @@ export type ProctoringLogRow = {
   action_type: string;
   snapshot_url: string | null;
   timestamp: string;
+  /**
+   * When the violation happened *on the student's device* (`register_violation`'s
+   * `p_client_timestamp`). It differs from `timestamp` when the app logged the
+   * violation offline and the queue delivered it later; null for rows written by a
+   * client that predates the offline queue.
+   */
+  client_timestamp?: string | null;
+  /**
+   * Idempotency key of that one violation. The offline retry replays it, and the
+   * RPC's `on conflict` turns a replayed call into no-op instead of a second
+   * strike, so this is what makes a late-delivered row trustworthy.
+   */
+  client_event_id?: string | null;
 };
 
 // Minimal typed shape for @supabase/supabase-js generics. In a real project

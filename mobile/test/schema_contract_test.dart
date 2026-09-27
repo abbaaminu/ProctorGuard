@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:exam_proctor/core/services/supabase_service.dart';
@@ -15,7 +16,8 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 /// side cannot drift from the unified production schema:
 ///  * `register_violation` argument names/values and its returned
 ///    `warning_count` / `disqualified` fields;
-///  * the five `action_type` strings the check constraint allows;
+///  * every `action_type` string the check constraint allows (the five camera
+///    and lifecycle ones plus the six enterprise lockdown/device ones);
 ///  * the `proctor-snapshots` upload path convention and JPEG content type.
 class _RecordingTransport extends http.BaseClient {
   final List<http.BaseRequest> requests = <http.BaseRequest>[];
@@ -58,9 +60,10 @@ void main() {
         submissionId: 'sub-1',
         violation: Violation(
           type: ViolationType.lookingAway,
-          timestamp: DateTime.utc(2026, 1, 1),
+          timestamp: DateTime.utc(2026, 1, 1, 10, 30),
           snapshotUrl: 'https://mock.supabase.co/storage/v1/object/public/'
               'proctor-snapshots/sub-1/looking_away_1.jpg',
+          clientEventId: '9f1a4d0e-0f6b-4a1e-9a2b-6c2d2b7a3f11',
         ),
       );
 
@@ -73,10 +76,18 @@ void main() {
         'p_submission_id',
         'p_action_type',
         'p_snapshot_url',
+        'p_client_timestamp',
+        'p_client_event_id',
       });
       expect(body['p_submission_id'], 'sub-1');
       expect(body['p_action_type'], 'looking_away');
       expect(body['p_snapshot_url'], contains('/proctor-snapshots/sub-1/'));
+      // The *detection* time travels with the row, so a violation delivered late
+      // by the offline queue is still placed correctly in the audit trail
+      // (`timestamp` on the row remains the server's receipt time).
+      expect(body['p_client_timestamp'], '2026-01-01T10:30:00.000Z');
+      // Idempotency key: replaying this exact call must not add a second strike.
+      expect(body['p_client_event_id'], '9f1a4d0e-0f6b-4a1e-9a2b-6c2d2b7a3f11');
 
       expect(result.warningCount, 2);
       expect(result.disqualified, isFalse);
@@ -112,8 +123,39 @@ void main() {
           'no_face',
           'app_minimized',
           'audio_noise',
+          'copy_paste_attempt',
+          'right_click_blocked',
+          'devtools_detected',
+          'secondary_display_detected',
+          'virtual_camera_detected',
+          'idle_afk',
         ],
       );
+    });
+
+    test('fromDb is the exact inverse, so a queued row is never dropped', () {
+      // A queued violation whose type cannot be mapped is dropped by the offline
+      // sync service rather than mis-logged, so the round-trip has to be total
+      // over the enum - including the six enterprise values.
+      for (final type in ViolationType.values) {
+        expect(ViolationType.fromDb(type.dbValue), type);
+      }
+    });
+
+    test('schema.sql allows every action_type the client can send', () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      // `register_violation` inserts into a check-constrained column, so a value
+      // the enum knows and the constraint does not is a 23514 raised at the
+      // moment of the strike - the worst possible time to discover drift.
+      for (final type in ViolationType.values) {
+        expect(
+          sql,
+          contains("'${type.dbValue}'"),
+          reason: '${type.dbValue} is missing from the schema',
+        );
+      }
     });
   });
 
@@ -332,4 +374,43 @@ void main() {
       expect(question.options, isEmpty);
     });
   });
+
+  group('schema.sql carries the offline-retry contract', () {
+    test('the log table, the RPC and the dedupe index agree with the client',
+        () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      // The two columns `ProctoringRepositoryImpl` now sends.
+      expect(sql, contains('add column if not exists client_timestamp timestamptz'));
+      expect(sql, contains('add column if not exists client_event_id uuid'));
+      expect(sql, contains('p_client_timestamp timestamptz default null'));
+      expect(sql, contains('p_client_event_id  uuid default null'));
+
+      // The idempotency key only works with the partial unique index behind it.
+      expect(sql, contains('idx_logs_client_event_id'));
+      expect(
+        sql,
+        contains('on conflict (client_event_id) where client_event_id is not null '
+            'do nothing'),
+      );
+
+      // And the old 3-argument overload has to be dropped, or every call becomes
+      // ambiguous now that a 5-argument defaulted version exists.
+      expect(
+        sql,
+        contains('drop function if exists public.register_violation(uuid, text, text);'),
+      );
+    });
+  });
+}
+
+/// Reads `supabase/schema.sql`, which sits next to `mobile/` in the repository.
+///
+/// A checkout that only contains the app returns null and the test above passes
+/// without pretending to have checked anything - the point of this half of the
+/// contract is to catch drift while both halves are present.
+String? schemaSql() {
+  final file = File('../supabase/schema.sql');
+  return file.existsSync() ? file.readAsStringSync() : null;
 }

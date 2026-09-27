@@ -1,0 +1,36 @@
+{
+  /*
+   * The build tooling, which is not app code: `vite.config.ts` (the `@` alias
+   * through `path` / `__dirname`) and `tailwind.config.ts`.
+   *
+   * It is a separate project from `src` because these files run in Node, not in
+   * a browser tab — `"types": ["node"]` is what resolves `path` and `__dirname`
+   * from `@types/node`. Before this file existed, no tsconfig claimed
+   * `vite.config.ts` at all: the editor reported TS2307 ("Cannot find module
+   * 'path'") and TS2304 ("Cannot find name '__dirname'"), while `tsc -b` stayed
+   * silent because `tsconfig.json` only includes `src`.
+   *
+   * `tsconfig.json` references this project, so `npm run build` (tsc -b && vite
+   * build) type-checks it too. A referenced project has to be `composite` and
+   * may not disable emit, so the declaration output is parked in
+   * `node_modules/.tmp` — nothing is written next to the config files.
+   */
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "./node_modules/.tmp/tsconfig.node",
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "strict": true
+  },
+  "include": ["vite.config.ts", "tailwind.config.ts"]
+}

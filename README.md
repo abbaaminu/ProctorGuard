@@ -65,14 +65,22 @@ Both apps read/write the same tables, so a submission a student makes in
 
 ## Verifying a change
 
+A fresh clone has never had its dependencies installed, so run `flutter pub get`
+once (and `npm install` in `dashboard/`) **before** the checks below — with an
+empty pub cache `flutter analyze` reports hundreds of phantom errors
+(`Target of URI doesn't exist: 'package:flutter_riverpod/...'`) that are all just
+missing packages, not broken code.
+
 ```
-cd mobile   && flutter analyze && flutter test     # 109 tests, no device needed
-cd dashboard && npm run build                      # tsc -b && vite build
+cd mobile   && flutter pub get && flutter analyze && flutter test   # 176 tests, no device needed
+cd dashboard && npm install && npm run build                       # tsc -b && vite build
 ```
 
 The Flutter suite pins the client↔database contract (`mobile/test/schema_contract_test.dart`:
-RPC names, argument names and the `action_type` values), so a schema change that
-breaks the app fails there rather than at runtime.
+RPC names, argument names — including the `register_violation` idempotency key and
+client timestamp — and the `action_type` values), so a schema change that breaks the
+app fails there rather than at runtime. It reads `supabase/schema.sql` directly for
+that half of the check, so re-run `flutter test` after editing the schema.
 
 ## Pushing to GitHub
 From this folder:

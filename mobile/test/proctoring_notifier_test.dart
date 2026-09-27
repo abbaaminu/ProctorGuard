@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:exam_proctor/core/services/mediapipe_proctoring_service.dart';
+import 'package:exam_proctor/core/services/offline_sync_service.dart';
 import 'package:exam_proctor/features/exam/domain/entities/exam.dart';
 import 'package:exam_proctor/features/exam/domain/entities/question.dart';
 import 'package:exam_proctor/features/exam/domain/entities/submission.dart';
@@ -136,6 +138,218 @@ void main() {
       expect(forcedExits, 1);
     });
   });
+
+  group('camera gate', () {
+    test('gaze signals are ignored while the camera feed is offline',
+        () async {
+      final repo = _RecordingProctoringRepository();
+      final engine = MediaPipeProctoringService(
+        mockCamera: true,
+        mockInterval: const Duration(milliseconds: 20),
+      );
+      final notifier = _notifier(proctoringRepo: repo, engine: engine);
+      addTearDown(notifier.dispose);
+
+      notifier.setCameraActive(false);
+      expect(notifier.state.cameraPaused, isTrue);
+
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(repo.violations, isEmpty);
+      expect(notifier.state.warningCount, 0);
+
+      notifier.setCameraActive(true);
+      expect(notifier.state.cameraPaused, isFalse);
+
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(repo.violations, isNotEmpty);
+    });
+  });
+
+  group('violation outbox (requirement 4)', () {
+    test('a violation that could not be delivered still counts locally',
+        () async {
+      final outbox = _FakeOutbox(reachable: false);
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        outbox: outbox,
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportAppMinimized();
+      await pumpEventQueue();
+
+      // The strike is shown and counted even though the row is only queued on the
+      // device: losing the warning UI because the network is down would be worse
+      // than a count that is briefly local.
+      expect(notifier.state.warningCount, 1);
+      expect(notifier.state.showViolationOverlay, isTrue);
+      expect(outbox.logged, hasLength(1));
+      // Every event carries an id, which is what makes the retry idempotent.
+      expect(outbox.logged.single.clientEventId, isNotNull);
+    });
+
+    test('a ruling delivered late raises the count but never lowers it',
+        () async {
+      final outbox = _FakeOutbox();
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        outbox: outbox,
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportAppMinimized();
+      await pumpEventQueue();
+      expect(notifier.state.warningCount, 1);
+
+      outbox.emitRuling(warningCount: 2);
+      await pumpEventQueue();
+      expect(notifier.state.warningCount, 2);
+
+      // A deferred ruling can be older than a live one that already arrived: it
+      // must not walk the ladder back down.
+      outbox.emitRuling(warningCount: 1);
+      await pumpEventQueue();
+      expect(notifier.state.warningCount, 2);
+    });
+
+    test('a third strike delivered late ends the attempt', () async {
+      final examRepo = _RecordingExamRepository();
+      var forcedExits = 0;
+      final outbox = _FakeOutbox();
+
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        examRepo: examRepo,
+        outbox: outbox,
+        onForceExit: () => forcedExits++,
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportAppMinimized();
+      await pumpEventQueue();
+
+      outbox.emitRuling(warningCount: 3, disqualified: true);
+      await pumpEventQueue();
+
+      expect(notifier.state.disqualified, isTrue);
+      expect(examRepo.disqualified, <String>['sub-1']);
+      expect(forcedExits, 1);
+    });
+
+    test('a ruling for another session is ignored', () async {
+      final outbox = _FakeOutbox();
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        outbox: outbox,
+      );
+      addTearDown(notifier.dispose);
+
+      outbox.emitRuling(
+        submissionId: 'sub-9',
+        warningCount: 3,
+        disqualified: true,
+      );
+      await pumpEventQueue();
+
+      expect(notifier.state.disqualified, isFalse);
+      expect(notifier.state.warningCount, 0);
+    });
+  });
+
+  group('browser lockdown + device signals', () {
+    test('each signal keeps its own action_type on the server', () async {
+      // The enterprise set is six *different* pieces of evidence: a clipboard
+      // attempt, a suppressed context menu, a developer-tools panel, a second
+      // screen, a substituted camera and an idle device. All six enter through the
+      // same `report*` entry points the browser guard and the integrity poll call,
+      // and each has to reach the log with its own value.
+      final repo = _RecordingProctoringRepository(disqualifyAfter: 100);
+      final notifier = _notifier(proctoringRepo: repo);
+      addTearDown(notifier.dispose);
+
+      notifier.reportCopyPasteAttempt();
+      await pumpEventQueue();
+      notifier.reportRightClickBlocked();
+      await pumpEventQueue();
+      notifier.reportDevtoolsDetected();
+      await pumpEventQueue();
+      notifier.reportSecondaryDisplayDetected();
+      await pumpEventQueue();
+      notifier.reportVirtualCameraDetected();
+      await pumpEventQueue();
+      notifier.reportIdleAfk();
+      await pumpEventQueue();
+
+      expect(
+        repo.violations.map((violation) => violation.type.dbValue).toList(),
+        <String>[
+          'copy_paste_attempt',
+          'right_click_blocked',
+          'devtools_detected',
+          'secondary_display_detected',
+          'virtual_camera_detected',
+          'idle_afk',
+        ],
+      );
+      expect(notifier.state.warningCount, 6);
+      expect(notifier.state.lastViolation, ViolationType.idleAfk);
+      expect(notifier.state.showViolationOverlay, isTrue);
+    });
+
+    test('the debounce is per type, not per session', () async {
+      final repo = _RecordingProctoringRepository(disqualifyAfter: 100);
+      final notifier = _notifier(proctoringRepo: repo);
+      addTearDown(notifier.dispose);
+
+      // Three *different* signals inside one 2s debounce window: all three are
+      // evidence. One shared stamp (the first shape of this) would have swallowed
+      // whichever arrived second.
+      notifier.reportCopyPasteAttempt();
+      notifier.reportRightClickBlocked();
+      notifier.reportIdleAfk();
+      await pumpEventQueue();
+      expect(repo.violations, hasLength(3));
+
+      // A repeat of a type already logged inside the window is the same event...
+      notifier.reportCopyPasteAttempt();
+      await pumpEventQueue();
+      expect(repo.violations, hasLength(3));
+
+      // ...while the same type after the window is a new one.
+      await Future<void>.delayed(const Duration(milliseconds: 2100));
+      notifier.reportCopyPasteAttempt();
+      await pumpEventQueue();
+      expect(repo.violations, hasLength(4));
+    });
+
+    test('lockdown strikes count towards the same 3-strike rule', () async {
+      final repo = _RecordingProctoringRepository();
+      final examRepo = _RecordingExamRepository();
+      var forcedExits = 0;
+      final notifier = _notifier(
+        proctoringRepo: repo,
+        examRepo: examRepo,
+        onForceExit: () => forcedExits++,
+      );
+      addTearDown(notifier.dispose);
+
+      // Three different types, so what separates them is the evidence, not the
+      // debounce: the escalation rule is the same one the camera signals feed.
+      notifier.reportCopyPasteAttempt();
+      await pumpEventQueue();
+      notifier.reportRightClickBlocked();
+      await pumpEventQueue();
+      expect(notifier.state.disqualified, isFalse);
+
+      notifier.reportDevtoolsDetected();
+      await pumpEventQueue();
+
+      expect(notifier.state.warningCount, 3);
+      expect(notifier.state.disqualified, isTrue);
+      expect(examRepo.disqualified, <String>['sub-1']);
+      expect(forcedExits, 1);
+    });
+  });
 }
 
 /// Builds a notifier wired to fakes. The uploader fails loudly: with no
@@ -143,6 +357,8 @@ void main() {
 ProctoringNotifier _notifier({
   required ProctoringRepository proctoringRepo,
   ExamRepository? examRepo,
+  MediaPipeProctoringService? engine,
+  ViolationOutbox? outbox,
   void Function()? onForceExit,
   Duration audioNoiseSustain = const Duration(seconds: 2),
 }) {
@@ -150,7 +366,8 @@ ProctoringNotifier _notifier({
     submissionId: 'sub-1',
     proctoringRepo: proctoringRepo,
     examRepo: examRepo ?? _RecordingExamRepository(),
-    engine: MediaPipeProctoringService(),
+    engine: engine ?? MediaPipeProctoringService(),
+    outbox: outbox,
     onForceExit: onForceExit ?? () {},
     uploadSnapshot: ({
       required String submissionId,
@@ -160,6 +377,51 @@ ProctoringNotifier _notifier({
         fail('no snapshot source is attached in these tests'),
     audioNoiseSustain: audioNoiseSustain,
   );
+}
+
+/// A [ViolationOutbox] a test can drive: [reachable] decides whether a live
+/// delivery succeeds, and [emitRuling] is the "the queue delivered it later"
+/// signal the notifier has to reconcile (see the requirement-4 group).
+class _FakeOutbox implements ViolationOutbox {
+  _FakeOutbox({this.reachable = true});
+
+  final bool reachable;
+  final List<Violation> logged = <Violation>[];
+  final StreamController<ViolationRuling> _rulings =
+      StreamController<ViolationRuling>.broadcast();
+
+  @override
+  Future<ViolationRuling?> log({
+    required String submissionId,
+    required Violation violation,
+  }) async {
+    logged.add(violation);
+    if (!reachable) return null; // queued on the device, retried later
+    return ViolationRuling(
+      submissionId: submissionId,
+      violation: violation,
+      warningCount: logged.length,
+      disqualified: false,
+    );
+  }
+
+  void emitRuling({
+    String submissionId = 'sub-1',
+    required int warningCount,
+    bool disqualified = false,
+  }) =>
+      _rulings.add(ViolationRuling(
+        submissionId: submissionId,
+        violation: Violation(
+          type: ViolationType.appMinimized,
+          timestamp: DateTime.utc(2026, 1, 1),
+        ),
+        warningCount: warningCount,
+        disqualified: disqualified,
+      ));
+
+  @override
+  Stream<ViolationRuling> get deferredRulings => _rulings.stream;
 }
 
 /// Stands in for `supabase.rpc('register_violation', ...)`: the server owns the

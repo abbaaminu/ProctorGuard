@@ -21,14 +21,23 @@ submission with 3 proctoring logs. Log in with
 ## Structure
 ```
 src/
-  components/ui/       Badge, Card, Button, Toast — shadcn-style primitives
+  components/ui/       Badge, Card, Button, Toast, MetricCard, Skeleton —
+                        shadcn-style primitives
   components/layout/   Sidebar (nav + realtime pill + profile tile), AppShell
   hooks/               useAuth (role guard), useRealtimeStatus,
                         useLiveIncidentFeed, useExamSubmissions,
                         useAccountNames (id -> "Aisha Bello")
+  lib/incidents.ts     action_type -> label, shared by every incident panel
   pages/               Login, DashboardOverview, ExamManager,
-                        LiveMonitor, SubmissionAudit
+                        LiveMonitor, SubmissionAudit, Analytics
 ```
+
+Every nav entry has a real page behind it: `/analytics` renders `Analytics`
+(previously it re-rendered `DashboardOverview`, so the nav item was a no-op), and
+the dead `Settings — coming soon` route is gone rather than sitting in the
+sidebar. `/analytics` reports per exam — attempts, in-progress, completed,
+disqualifications, the DQ rate and incident counts over a 30-day window — sorted
+most-flagged first, with each exam linking straight to its live monitor.
 
 ## What each page does
 
@@ -53,6 +62,13 @@ src/
   question-by-question breakdown, with the student's name in the header. A
   fill-in-the-blank answer is compared to `correct_text_answer` exactly as
   `submit_exam` grades it (trimmed, case-insensitive).
+- **Analytics** — one row per exam: attempts, in progress, completed,
+  disqualified, DQ rate (with a bar) and incidents, sorted most-flagged first so
+  the exam that needs attention is at the top. Each title links to that exam's
+  live monitor. The incident columns are windowed to the last 30 days
+  (`WINDOW_DAYS`) because `proctoring_logs` only grows — an unbounded "all time"
+  read would get slower every term — while attempts and scores come from
+  `exam_submissions`, which is bounded by the roster.
 
 ## Loading behaviour (no blocking loaders)
 
@@ -65,16 +81,22 @@ The console never replaces itself with a spinner. Three rules:
    `min-h-screen` "Loading…" element, so the first paint looked like a hang and
    the layout re-mounted on every auth event.
 2. **Every panel owns its own fetch, loading flag and error.** `DashboardOverview`,
-   `ExamManager`, `LiveMonitor` and `SubmissionAudit` each fetch what they render,
-   so a slow query only freezes the panel that needs it. Placeholders are skeletons
-   from `components/ui/skeleton.tsx` (`animate-pulse` + `bg-slate-800/50`) shaped
-   like the real content — metric cards, chart panels, candidate cards, feed rows,
-   table rows, audit panels — so nothing jumps when the data lands.
+   `ExamManager`, `LiveMonitor`, `SubmissionAudit` and `Analytics` each fetch what
+   they render, so a slow query only freezes the panel that needs it. Placeholders
+   are skeletons from `components/ui/skeleton.tsx` (`animate-pulse` +
+   `bg-slate-800/50`) shaped like the real content — metric cards, chart panels,
+   candidate cards, feed rows, table rows, audit panels — so nothing jumps when the
+   data lands.
 3. **Errors sit next to the content, not instead of it.** A failed read renders an
-   inline banner (with **Try again** on the dashboard) *above* the panels, which
-   stay mounted and keep whatever did load. A failed read is never disguised as an
-   empty list: the roster, the incident feed and the dashboard all say what went
-   wrong.
+   inline banner (with **Try again** on the dashboard and analytics pages) *above*
+   the panels, which stay mounted and keep whatever did load. A failed read is never
+   disguised as an empty list: the roster, the dashboard and the analytics table all
+   say what went wrong. The live monitor's incident feed and its `id -> name` map
+   used to be the exception — `useLiveIncidentFeed` and `useAccountNames` swallowed
+   the error and reported "No incidents reported yet." over a broken query, which is
+   exactly the misreading this rule exists to prevent; both now return an `error`
+   that the monitor renders (the roster falls back to a short id meanwhile, and says
+   so).
 
 Realtime is treated as a bonus, never a gate: `useRealtimeStatus` reports
 `connecting` / `connected` / `reconnecting` through one shared copy map
@@ -154,6 +176,23 @@ question instead, or create a new exam.
   toggle therefore asks for the written row back (`.select("id")`) and treats an
   empty result as a failure — that is the other half of the optimistic badge:
   without a real rollback, "Published" would only be a guess.
+
+## Bundle
+
+`vite.config.ts` splits the vendor trees into their own chunks (`react`,
+`charts`, `supabase`) via `build.rollupOptions.output.manualChunks`. Everything
+used to land in a single ~850 kB chunk, which Vite warned about, so any one-line
+page change invalidated React, Recharts, d3, lodash and the Supabase client along
+with it. The production build is now four chunks — app ~83 kB, react ~164 kB,
+supabase ~227 kB, charts ~384 kB (all under the 500 kB warning threshold) — so a
+deploy re-downloads only the small app chunk while the vendor chunks stay cached.
+
+## Incident labels
+
+`lib/incidents.ts` is the single `action_type -> label` map (`incidentLabel()`),
+used by the dashboard's breakdown chart, the live monitor's feed and the
+submission audit. It used to be copy-pasted into all three pages, so adding a
+violation type meant remembering three files.
 
 ## Not yet wired (left as clearly-marked next steps)
 - Snapshot images assume `snapshot_url` is a public or signed Supabase

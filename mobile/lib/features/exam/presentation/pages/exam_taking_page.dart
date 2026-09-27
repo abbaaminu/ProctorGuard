@@ -4,20 +4,33 @@ import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, kIsWeb;
+// Only the binding is taken from here: the pointer *events* this page forwards
+// to the idle watcher already arrive through Material's re-export, and a bare
+// `show` keeps the gesture arena's other names out of this file's scope.
+import 'package:flutter/gestures.dart' show GestureBinding;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../../core/di/providers.dart';
+import '../../../../core/services/afk_watcher.dart';
+import '../../../../core/services/audio_monitor.dart';
+import '../../../../core/services/hardware_integrity_service.dart';
 import '../../../../core/services/hardware_verification_service.dart';
 import '../../../../core/services/kiosk_service.dart';
 import '../../../../core/services/mediapipe_proctoring_service.dart';
+import '../../../../core/services/offline_sync_service.dart';
 import '../../../../core/services/permission_service.dart';
 import '../../../../core/services/web_camera_permission.dart';
 import '../../../../core/services/web_exam_guard.dart';
 import '../../../../core/services/web_guards.dart';
 import '../../../../core/widgets/responsive_layout.dart';
+import '../../../proctoring/presentation/providers/audio_monitoring_provider.dart';
 import '../../../proctoring/presentation/providers/proctoring_provider.dart';
+import '../../../proctoring/presentation/widgets/audio_monitor_indicator.dart';
+import '../../../proctoring/presentation/widgets/fullscreen_lock_overlay.dart';
 import '../../../proctoring/presentation/widgets/violation_overlay.dart';
 import '../../domain/entities/question.dart';
+import '../widgets/exam_sync_banner.dart';
 
 /// Route arguments: examId + submissionId (submission is created/resumed
 /// by ExamRepository *before* navigating here — see exam list page) plus the
@@ -39,6 +52,13 @@ class ExamTakingPage extends ConsumerStatefulWidget {
   /// DOM) does not exist.
   final WebGuards? webGuards;
 
+  /// Clock the browser-guard timings read: the start-up grace and the fullscreen
+  /// countdown. Null means the wall clock, which is what production uses.
+  ///
+  /// A widget test's fake time does not move `DateTime.now()`, so a test that wants
+  /// to watch the countdown run out passes a clock it can move itself.
+  final DateTime Function()? clock;
+
   /// Overrides `--dart-define=MOCK_CAMERA=true` for this session.
   ///
   /// The dart-define is a compile-time constant, so this is what lets a widget
@@ -53,6 +73,7 @@ class ExamTakingPage extends ConsumerStatefulWidget {
     this.durationMinutes,
     this.startedAt,
     this.webGuards,
+    this.clock,
     this.mockCamera,
   });
 
@@ -66,6 +87,13 @@ class ExamTakingPage extends ConsumerStatefulWidget {
 
 class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   CameraController? _cameraController;
+
+  /// True while the camera is actually streaming frames to the proctoring
+  /// engine. Flips to false when the controller reports an error (device
+  /// revoked, driver crash) so tracking pauses and the student is prompted
+  /// instead of silently accruing strikes against a dead feed.
+  bool _cameraStreaming = false;
+
   List<Question> _questions = [];
 
   /// Selected option per question id, mirrored locally so a tap paints
@@ -107,6 +135,37 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// dropping the attempt.
   bool _timeUpPending = false;
 
+  /// True when the student asked to submit but the queue still owes the server
+  /// answers. Nothing is lost - the answers are on this device (and their field
+  /// text says so) - so this is a "waiting for a connection" screen with a retry,
+  /// not an error.
+  bool _offlineSubmitPending = false;
+
+  /// Local-first answer cache + durable retry queue for this session, read once
+  /// in [_bootstrap] (the same instance the notifier logs violations through).
+  OfflineSyncService? _sync;
+
+  /// Deadline of the "return to fullscreen" window, or null when fullscreen is
+  /// where it should be. The guard owns the deadline; this mirrors it for display.
+  DateTime? _fullscreenDeadline;
+
+  /// Cosmetic ticker behind the countdown above (the guard's own timer is what
+  /// guarantees the strike).
+  Timer? _fullscreenTicker;
+
+  /// Fullscreen grace the page gives the student before the exit is a violation.
+  /// The guard gets the same number, so the countdown on screen cannot disagree
+  /// with when the strike lands.
+  static const Duration fullscreenGrace = Duration(seconds: 5);
+
+  /// The clock the browser-guard timings read (see [ExamTakingPage.clock]).
+  DateTime Function() get _now => widget.clock ?? DateTime.now;
+
+  /// Wakes the queue when the OS brings the exam back to the foreground - the
+  /// mobile equivalent of the browser's `online` event, and the moment a
+  /// connection usually comes back.
+  AppLifecycleListener? _appLifecycle;
+
   /// Time left on the attempt; null when no duration was supplied.
   Duration? _remaining;
   Timer? _countdown;
@@ -120,14 +179,60 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// Browser-level guards (tab switch, blur, HTML5 fullscreen) for this session.
   WebExamGuard? _webGuard;
 
+  /// Idle detection for this session: a screen nobody has touched for
+  /// [AfkWatcher.defaultIdleThreshold] is an `idle_afk` violation.
+  AfkWatcher? _afk;
+
+  /// Whether this session's pointer route is registered on
+  /// [GestureBinding.pointerRouter]. Tracked because removing a route that was
+  /// never added *asserts* in debug builds: a bootstrap that failed before it got
+  /// as far as registering one must still be releasable.
+  bool _pointerRouteAttached = false;
+
+  /// Device-integrity probe for this session (a second display, a camera that is
+  /// not this device's own lens). Android only - see
+  /// [HardwareIntegrityService.isSupportedPlatform].
+  HardwareIntegrityService? _integrity;
+
   @override
   void initState() {
     super.initState();
+    // Distinct from the notifier's lifecycle observer, which turns *leaving* into
+    // a strike: this one only reacts to coming back.
+    _appLifecycle = AppLifecycleListener(onResume: _onAppResumed);
     _bootstrap();
+  }
+
+  /// The exam app is in the foreground again: re-assert fullscreen and push
+  /// whatever the queue is holding.
+  ///
+  /// On mobile there is no `online` event to listen to, so this is when a dropped
+  /// connection is most likely to be back - and a student who was offline for the
+  /// last ten minutes should not have to wait out a backoff timer to find out.
+  void _onAppResumed() {
+    _webGuard?.reassertFullscreen();
+    final sync = _sync;
+    if (sync != null) unawaited(sync.retryNow());
   }
 
   Future<void> _bootstrap() async {
     final notifier = ref.read(proctoringProvider(widget.submissionId).notifier);
+
+    // Local-first: load the durable cache before anything can be painted, so a
+    // resumed attempt shows the answers that were typed before the app was killed
+    // even when the server is unreachable.
+    final sync = ref.read(offlineSyncServiceProvider);
+    _sync = sync;
+    await sync.ensureHydrated();
+    _restoreCachedAnswers(sync);
+
+    // Audio proctoring starts with the session rather than with the camera: it is
+    // platform-independent (it works on the web, and in a mock-camera session too)
+    // and it never throws, so it is started without being awaited - a permission
+    // dialog stays on screen until the student answers it, and the question feed
+    // must not be held behind that. Every failure becomes a state the indicator
+    // shows and the prompt below offers a way out of.
+    unawaited(_startAudioMonitoring());
 
     // A retry re-runs this method, so whatever the previous attempt pinned or
     // subscribed to is released first — otherwise the platform would get a
@@ -157,10 +262,16 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     // something nobody notices.
     final webGuard = WebExamGuard(
       guards: widget.webGuards ?? WebGuards(),
-      onViolation: (event) {
-        notifier.reportAppMinimized();
-        if (event == WebGuardEvent.fullscreenExited) _promptFullscreen();
-      },
+      fullscreenGrace: fullscreenGrace,
+      clock: widget.clock,
+      // Which strike an event costs is a page-level decision, not the guard's:
+      // a blur and a copy attempt both arrive here, and only one of them is
+      // leaving the exam surface. See [_reportWebGuardEvent].
+      onViolation: (event) => _reportWebGuardEvent(notifier, event),
+      // Leaving fullscreen is not logged immediately: the student gets the grace
+      // window below, and only a window that runs out becomes the strike above.
+      onFullscreenExitPending: _startFullscreenCountdown,
+      onFullscreenRestored: _endFullscreenCountdown,
     );
     _webGuard = webGuard;
     final fullscreenEntered = await webGuard.start();
@@ -168,6 +279,50 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       // Chromium only grants fullscreen from a user gesture, so the automatic
       // attempt can be refused; the prompt's action button is that gesture.
       WidgetsBinding.instance.addPostFrameCallback((_) => _promptFullscreen());
+    }
+
+    // Idle detection (`idle_afk`) and device integrity (a second display, a
+    // camera that is not this device's own lens) start with the session rather
+    // than with the camera: they are about the device and the student, not about
+    // the video, so a session whose camera never came up is still watched.
+    // Released first, because a retry of this bootstrap must not leave a second
+    // watcher running behind the failed attempt's.
+    _releaseSessionWatchers();
+
+    final afk = AfkWatcher(onIdle: notifier.reportIdleAfk, clock: widget.clock);
+    _afk = afk;
+    afk.start();
+
+    // Pointer input is what keeps that idle window quiet. A router *route*
+    // rather than a `Listener` widget: this only observes (the exam's own
+    // widgets must still act on the tap), and a global route sees the whole
+    // surface - the answer options, the text fields, the scroll views, the app
+    // bar - without nesting the layout inside a wrapper. Hover and scroll-wheel
+    // events are routed here too, so a student reading with a mouse counts as
+    // present exactly as a touch does; keys are [AfkWatcher]'s own business.
+    if (!_pointerRouteAttached) {
+      _pointerRouteAttached = true;
+      GestureBinding.instance.pointerRouter.addGlobalRoute(_onPointerActivity);
+    }
+
+    // Android is the only platform with a native half for this probe; anywhere
+    // else it answers "cannot see", and an unanswered probe is silence rather
+    // than an accusation ([HardwareIntegrityService]).
+    //
+    // Mock sessions are exempt on purpose: `--dart-define=MOCK_CAMERA=true` runs
+    // on an emulator or a desktop by definition, where the camera *is*
+    // synthesised - which is an integrity finding on its own - and there is no
+    // student lens to judge.
+    if (!widget.mockMode && HardwareIntegrityService.isSupportedPlatform) {
+      final integrity = HardwareIntegrityService();
+      _integrity = integrity;
+      integrity.startMonitoring(
+        onFinding: (finding) => _reportIntegrityFinding(notifier, finding),
+        // Read per probe, not captured: only the camera controller can name the
+        // lens in use, and it does not exist until the capture pipeline below
+        // has started.
+        cameraId: _cameraInUse,
+      );
     }
 
     if (widget.mockMode) {
@@ -256,6 +411,10 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     // whole capture pipeline reports itself instead of throwing.
     try {
       await _cameraController!.initialize();
+      // Watch the controller so a mid-session failure (device revoked, driver
+      // crash) pauses proctoring and prompts the student rather than letting
+      // the engine read the dead feed as "no face".
+      _cameraController!.addListener(_onCameraValueChanged);
 
       // Route every frame through the face-detection engine owned by the
       // proctoring notifier for this session. The engine needs the camera's
@@ -270,6 +429,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
           deviceOrientation: _cameraController!.value.deviceOrientation,
         );
       });
+      // Frames are flowing: hand camera-derived tracking to the engine.
+      _setCameraStreaming(true);
     } on CameraException catch (error) {
       _failStart(
         'Proctoring cannot start — ${cameraFailureMessage(error.code)}. Close '
@@ -286,8 +447,78 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     _startCountdown();
   }
 
+  /// Paints the answers this device already holds for the attempt.
+  ///
+  /// A resumed session (crash, refresh, an offline stretch) gets its answers back
+  /// before the server is asked anything, and `putIfAbsent` means a retry of
+  /// [_bootstrap] can never overwrite what the student has changed since.
+  void _restoreCachedAnswers(OfflineSyncService sync) {
+    final choices = sync.cachedChoices(widget.submissionId);
+    final texts = sync.cachedText(widget.submissionId);
+    if ((choices.isEmpty && texts.isEmpty) || !mounted) return;
+
+    setState(() {
+      choices.forEach((id, value) => _answers.putIfAbsent(id, () => value));
+      texts.forEach((id, value) {
+        _textAnswers.putIfAbsent(id, () => value);
+        // "Saved" here means durably stored on this device; the queue owns the
+        // server copy, and the banner is what reports that part. Hiding a restored
+        // answer behind "Not saved yet" would tell the student their typing was
+        // lost when it was not.
+        _savedText.putIfAbsent(id, () => value);
+      });
+      _savedQuestions.addAll(choices.keys);
+      _savedQuestions.addAll(texts.keys);
+    });
+  }
+
+  /// Shows the blocking "return to fullscreen" overlay and starts its countdown.
+  ///
+  /// Called by the guard the moment fullscreen ends; no violation has been logged
+  /// at this point, and the only way to avoid one is to come back.
+  void _startFullscreenCountdown() {
+    if (!mounted) return;
+    _fullscreenTicker?.cancel();
+    setState(() => _fullscreenDeadline = _now().add(fullscreenGrace));
+
+    _fullscreenTicker = Timer.periodic(
+      const Duration(milliseconds: 250),
+      (_) => _tickFullscreenCountdown(),
+    );
+  }
+
+  void _tickFullscreenCountdown() {
+    final deadline = _fullscreenDeadline;
+    if (!mounted || deadline == null) return;
+
+    if (_now().isBefore(deadline)) {
+      setState(() {}); // repaint the remaining seconds
+      return;
+    }
+
+    // Out of time: hand it to the guard, which logs the `app_minimized` strike
+    // exactly once (its own timer is the backstop for a page that never ticks),
+    // then take the overlay down so the violation overlay is what the student
+    // reads next.
+    _webGuard?.expireFullscreenGrace();
+    _endFullscreenCountdown();
+  }
+
+  /// Hides the overlay: either the student returned to fullscreen inside the grace
+  /// window, or the window ran out and became a strike.
+  void _endFullscreenCountdown() {
+    _fullscreenTicker?.cancel();
+    _fullscreenTicker = null;
+    if (!mounted) {
+      _fullscreenDeadline = null;
+      return;
+    }
+    setState(() => _fullscreenDeadline = null);
+  }
+
   /// Ends the bootstrap in the blocking-error state (see [_blockingError]).
   void _failStart(String message) {
+    _cameraController?.removeListener(_onCameraValueChanged);
     _cameraController?.dispose();
     _cameraController = null;
     if (!mounted) return;
@@ -295,6 +526,104 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       _loading = false;
       _blockingError = message;
     });
+  }
+
+  /// Camera controller listener: pausing on error, resuming once frames flow
+  /// again. A feed that reports `hasError` no longer gets read as "no face", and
+  /// a recovered stream re-arms proctoring with fresh grace windows.
+  void _onCameraValueChanged() {
+    final controller = _cameraController;
+    if (controller == null) return;
+    final value = controller.value;
+
+    if (value.hasError) {
+      _setCameraStreaming(false);
+    } else if (_cameraStreaming == false &&
+        value.isInitialized &&
+        value.isStreamingImages) {
+      _setCameraStreaming(true);
+    }
+  }
+
+  /// Keeps [_cameraStreaming] and the notifier's camera gate in sync.
+  ///
+  /// Going offline pauses camera-derived violation tracking (see
+  /// [ProctoringNotifier.setCameraActive]) and tells the student why, so a
+  /// broken feed cannot quietly accumulate disqualification flags. Mock sessions
+  /// never reach here (no camera is opened) and keep tracking on.
+  void _setCameraStreaming(bool streaming) {
+    if (_cameraStreaming == streaming) return;
+    _cameraStreaming = streaming;
+    if (!mounted) return;
+
+    ref
+        .read(proctoringProvider(widget.submissionId).notifier)
+        .setCameraActive(streaming);
+
+    if (!streaming) {
+      _showMessage(
+        'Camera feed lost. Proctoring is paused - restore the camera to keep '
+        'your attempt.',
+      );
+    }
+  }
+
+  /// Opens the microphone capture session for this attempt (see [AudioMonitor]).
+  ///
+  /// Idempotent: [AudioMonitor.start] is a no-op while levels are already flowing,
+  /// so every bootstrap - including the retry after a blocking error - can call it
+  /// without stacking a second session.
+  Future<void> _startAudioMonitoring() async {
+    if (!mounted) return;
+    await ref
+        .read(audioMonitoringProvider(widget.submissionId).notifier)
+        .start();
+  }
+
+  /// Re-opens the microphone: the student tapped the indicator, or came back from
+  /// the OS settings page.
+  ///
+  /// Recalibrates from scratch, because a microphone that was just unplugged and
+  /// plugged back in - or a student who moved rooms - is a new noise floor, and the
+  /// old one would either deafen or over-sensitise the detector.
+  Future<void> _retryAudioMonitoring() async {
+    if (!mounted) return;
+    await ref
+        .read(audioMonitoringProvider(widget.submissionId).notifier)
+        .retry();
+  }
+
+  /// Tells the student that audio proctoring needs them, with the one action that
+  /// fixes it.
+  ///
+  /// Only a refusal and a lost device prompt: those are the two states the student
+  /// can act on, and the requirement is that a disconnected microphone is a
+  /// visible, answerable prompt rather than a silent gap in proctoring.
+  /// `unavailable` (no capture path on this platform, a desktop without a
+  /// microphone) stays on the indicator - nagging a device that cannot report
+  /// levels would be noise.
+  void _promptAudioAttention(AudioMonitoringState state) {
+    if (!mounted) return;
+    final denied = state.monitor == AudioMonitorState.permissionDenied;
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content:
+              Text(state.message ?? 'Audio proctoring needs your attention.'),
+          duration: const Duration(seconds: 8),
+          action: SnackBarAction(
+            // A refusal cannot be fixed by asking again (Android and iOS stop
+            // prompting after two "don't allow"s), so that state gets the settings
+            // page instead of a retry - the same split the blocking screen makes.
+            label: denied ? 'Settings' : 'Reconnect',
+            onPressed: () => denied
+                ? unawaited(PermissionService().openSettings())
+                : unawaited(_retryAudioMonitoring()),
+          ),
+        ),
+      );
   }
 
   /// "camera and microphone", for the permission message above.
@@ -427,12 +756,22 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   void dispose() {
     _countdown?.cancel();
     _countdown = null;
+    _fullscreenTicker?.cancel();
+    _fullscreenTicker = null;
+    _appLifecycle?.dispose();
+    _appLifecycle = null;
+    _cameraController?.removeListener(_onCameraValueChanged);
     _cameraController?.stopImageStream();
     _cameraController?.dispose();
 
     // Unpin before releasing the bridge: `stopLock` tells the platform the exit
     // is intentional, so finishing the exam is not logged as an escape.
     unawaited(_releaseKiosk());
+
+    // And the same for this session's watchers: the idle window and the
+    // integrity poll belong to the attempt that just ended, so neither may
+    // survive it (a strike logged from a closed exam would land on nobody).
+    _releaseSessionWatchers();
 
     // Same idea in the browser: leave fullscreen and drop the DOM listeners, so
     // a finished exam neither traps the student nor keeps counting strikes.
@@ -461,6 +800,94 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     kiosk.dispose();
   }
 
+  /// Releases the idle watcher and the device-integrity probe.
+  ///
+  /// Called by [dispose] and at the start of [_bootstrap]: a retry of the
+  /// bootstrap re-runs the whole session setup, so without this the watcher the
+  /// failed attempt started would keep its timer - and its key handler - behind
+  /// the session that replaced it. Both are idempotent, so releasing a session
+  /// that never started one is harmless.
+  void _releaseSessionWatchers() {
+    _afk?.stop();
+    _afk = null;
+    // Guarded: this also runs for a bootstrap that never reached the
+    // registration below, and `removeGlobalRoute` asserts on a route it does not
+    // know (see [_pointerRouteAttached]).
+    if (_pointerRouteAttached) {
+      _pointerRouteAttached = false;
+      GestureBinding.instance.pointerRouter
+          .removeGlobalRoute(_onPointerActivity);
+    }
+    _integrity?.stopMonitoring();
+    _integrity = null;
+  }
+
+  /// Any pointer event - a tap, a drag, a hover, a scroll - is somebody at the
+  /// device, which is what keeps [AfkWatcher] quiet. Registered while the
+  /// attempt runs; see [_bootstrap].
+  void _onPointerActivity(PointerEvent event) => _afk?.noteActivity();
+
+  /// The id of the camera actually feeding this attempt, or null while the
+  /// capture pipeline is still coming up.
+  ///
+  /// Android's integrity probe uses it to be exact about *which* lens is being
+  /// judged: one known to be external is a stronger finding than one merely
+  /// attached. It is read on every probe rather than handed over once, so a
+  /// session that re-opens its camera is judged by the lens it is using now
+  /// (see [HardwareIntegrityService.startMonitoring]).
+  String? _cameraInUse() => _cameraController?.description.name;
+
+  /// Turns one browser-guard event into the violation it is evidence of.
+  ///
+  /// The guard knows *that* something happened; which strike it costs depends on
+  /// what it was, and that is a page-level mapping because one callback carries
+  /// two different families of events: leaving the exam surface (a tab switch, a
+  /// window blur, a fullscreen exit whose countdown ran out) is
+  /// `app_minimized`, while the lockdown's own events - a refused copy, cut or
+  /// paste, a suppressed context menu, a developer-tools panel - are the
+  /// attempts themselves, and each has its own violation type on the server.
+  void _reportWebGuardEvent(ProctoringNotifier notifier, WebGuardEvent event) {
+    switch (event) {
+      case WebGuardEvent.tabHidden:
+      case WebGuardEvent.windowBlurred:
+      case WebGuardEvent.fullscreenExited:
+        notifier.reportAppMinimized();
+      case WebGuardEvent.copyBlocked:
+      case WebGuardEvent.cutBlocked:
+      case WebGuardEvent.pasteBlocked:
+        // Three DOM events, one behaviour: the student tried to move content
+        // through the clipboard.
+        notifier.reportCopyPasteAttempt();
+      case WebGuardEvent.contextMenuBlocked:
+        notifier.reportRightClickBlocked();
+      case WebGuardEvent.devtoolsDetected:
+        notifier.reportDevtoolsDetected();
+      case WebGuardEvent.fullscreenEntered:
+        // Bookkeeping: it closes a pending countdown and is never a strike (the
+        // guard never routes it here either).
+        break;
+    }
+  }
+
+  /// Turns one device-integrity finding into its violation: a second display is
+  /// `secondary_display_detected`, a camera that is not this device's own lens is
+  /// `virtual_camera_detected`.
+  ///
+  /// The service reports a finding when it appears rather than while it lasts
+  /// (see [HardwareIntegrityService.startMonitoring]), so this is a straight
+  /// mapping and needs no dedupe of its own.
+  void _reportIntegrityFinding(
+    ProctoringNotifier notifier,
+    HardwareFinding finding,
+  ) {
+    switch (finding) {
+      case HardwareFinding.secondaryDisplay:
+        notifier.reportSecondaryDisplayDetected();
+      case HardwareFinding.virtualCamera:
+        notifier.reportVirtualCameraDetected();
+    }
+  }
+
   /// Retry for the blocking states: re-runs only the stage that failed, so a
   /// camera that is already streaming (and the kiosk pin that came with it) is
   /// never reopened.
@@ -483,20 +910,17 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   Future<void> _selectAnswer(int optionIndex) async {
     final question = _questions[_currentIndex];
 
-    // Paint first: the round-trip below must not gate the tap feedback.
+    // Paint first: nothing below is allowed to gate the tap feedback.
     setState(() => _answers[question.id] = optionIndex);
 
     try {
-      await ref.read(examRepositoryProvider).saveAnswer(
-            submissionId: widget.submissionId,
-            questionId: question.id,
-            selectedOption: optionIndex,
-          );
+      // Local first: this resolves once the answer is durable on the device, so a
+      // dropped connection no longer costs the student the choice they just made.
+      await _persistChoice(question.id, optionIndex);
     } catch (error) {
-      // Grading reads the *server* copy of the answers, so a failed autosave
-      // means this answer is not stored yet. Say so and stay on the question so
-      // the student can tap their choice again — advancing would move past the
-      // only chance to save it.
+      // Only reachable without a queue (see [_persistChoice]). Grading reads the
+      // *server* copy, so stay on the question instead of advancing past the only
+      // chance to save it.
       debugPrint('ProctorGuard: answer autosave failed: $error');
       _showMessage(
         'Could not save that answer. Check your connection and tap your choice '
@@ -512,11 +936,63 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     });
   }
 
-  /// Saves the current free-text answer through `merge_submission_text_answer`.
+  /// Durable write for a multiple-choice answer.
   ///
-  /// Returns whether the server now holds it. [advance] moves to the next
-  /// question *after* a successful save, so a failure keeps the student on the
-  /// question with their text still in the field.
+  /// The queue is the normal path: it stores the answer locally and syncs it in
+  /// the background, reporting a failure through the banner instead of throwing.
+  /// Without one (a host that wired no offline layer) this is the old
+  /// straight-to-SQL call, whose failure is again shown to the student.
+  Future<void> _persistChoice(String questionId, int optionIndex) {
+    final sync = _sync;
+    if (sync == null) {
+      return ref.read(examRepositoryProvider).saveAnswer(
+            submissionId: widget.submissionId,
+            questionId: questionId,
+            selectedOption: optionIndex,
+          );
+    }
+    return sync.cacheChoice(
+      submissionId: widget.submissionId,
+      questionId: questionId,
+      selectedOption: optionIndex,
+    );
+  }
+
+  /// Durable write for a fill-in-the-blank answer: "Save & next", the keyboard's
+  /// done action, and the flush before submitting all go through here.
+  Future<void> _persistText(String questionId, String text) {
+    final sync = _sync;
+    if (sync == null) {
+      return ref.read(examRepositoryProvider).saveTextAnswer(
+            submissionId: widget.submissionId,
+            questionId: questionId,
+            answer: text,
+          );
+    }
+    return sync.cacheText(
+      submissionId: widget.submissionId,
+      questionId: questionId,
+      text: text,
+    );
+  }
+
+  /// Mirrors a keystroke into the local cache, with **no** network write: an
+  /// answer that is still being typed has to survive the app being killed too, but
+  /// the server does not need every character.
+  void _cacheDraftText(String questionId, String value) {
+    _textAnswers[questionId] = value;
+    _sync?.cacheTextDraft(
+      submissionId: widget.submissionId,
+      questionId: questionId,
+      text: value,
+    );
+  }
+
+  /// Saves the current free-text answer through the local-first queue.
+  ///
+  /// Returns whether the answer is now durable. [advance] moves to the next
+  /// question *after* the local write, so a failure (no queue and no network) still
+  /// keeps the student on the question with their text intact.
   Future<bool> _saveTextAnswer(Question question, {bool advance = false}) async {
     if (_savingText || !mounted) return false;
 
@@ -524,11 +1000,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     setState(() => _savingText = true);
 
     try {
-      await ref.read(examRepositoryProvider).saveTextAnswer(
-            submissionId: widget.submissionId,
-            questionId: question.id,
-            answer: text,
-          );
+      await _persistText(question.id, text);
     } catch (error) {
       debugPrint('ProctorGuard: text answer save failed: $error');
       if (!mounted) return false;
@@ -549,9 +1021,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     return true;
   }
 
-  /// Writes the current fill-in-the-blank answer if the server does not have it
+  /// Writes the current fill-in-the-blank answer if the cache does not have it
   /// yet. Called before navigating away and before closing the attempt: grading
-  /// reads the *server* copy, so an unsaved field would quietly score nothing.
+  /// reads the server copy, and the queue is what gets it there.
   Future<bool> _flushTextAnswer() async {
     if (!mounted) return true;
 
@@ -581,15 +1053,21 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       final confirmed = await _confirmSubmit();
       if (confirmed != true || !mounted) return;
 
-      // Only close the attempt once the last typed answer has landed: grading
-      // reads the server copy, so submitting now would silently drop it.
+      // Only close the attempt once the last typed answer is durable: grading
+      // reads the server copy, so submitting without it would drop it silently.
       if (!await _flushTextAnswer()) return;
     } else {
-      // The clock decides, so submission wins over a failed save — but still try
+      // The clock decides, so submission wins over a failed save - but still try
       // once, because a fill-in-the-blank field is normally the only unsaved
       // thing on screen.
       await _flushTextAnswer();
     }
+
+    // Everything the student typed is on the device by now; make sure it is on the
+    // server before the attempt closes. A queue that cannot drain means the
+    // network is gone (or the last retry is still in flight), and nothing the
+    // student typed is lost by *not* submitting yet.
+    if (!await _drainedBeforeSubmit(timeUp: timeUp)) return;
 
     setState(() => _submitting = true);
     try {
@@ -599,6 +1077,10 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       if (!mounted) return;
       _countdown?.cancel();
       _countdown = null;
+      // The server owns the answers now, so the drafts for this attempt are only
+      // clutter. Queued violations are deliberately kept (see clearSession).
+      await _sync?.clearSession(widget.submissionId);
+      if (!mounted) return;
       Navigator.of(context).pop();
     } catch (error) {
       debugPrint('ProctorGuard: submit failed: $error');
@@ -606,6 +1088,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       setState(() {
         _submitting = false;
         _timeUpPending = timeUp;
+        _offlineSubmitPending = !timeUp;
       });
       if (!timeUp) {
         _showMessage(
@@ -613,6 +1096,53 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         );
       }
     }
+  }
+
+  /// Returns whether it is safe to close the attempt, holding it back otherwise.
+  ///
+  /// The hold is not an error state: the answers are already durable locally, so
+  /// the student sees "waiting for a connection" with a retry (and can leave - the
+  /// attempt stays `ongoing` and its answers are still on the device when they
+  /// come back).
+  Future<bool> _drainedBeforeSubmit({required bool timeUp}) async {
+    final sync = _sync;
+    if (sync == null) return true; // no queue: nothing to drain
+
+    await sync.flush();
+    if (!sync.state.hasPending) return true;
+    if (!mounted) return false;
+
+    setState(() {
+      _submitting = false;
+      _timeUpPending = timeUp;
+      _offlineSubmitPending = !timeUp;
+    });
+    return false;
+  }
+
+  /// The "waiting for a connection" screen's retry: drain the queue and, when it
+  /// is empty, go straight back to submitting (no second confirmation dialog -
+  /// the student already asked).
+  Future<void> _retryOfflineSubmit() async {
+    setState(() {
+      _offlineSubmitPending = false;
+      _submitting = false;
+    });
+
+    final sync = _sync;
+    if (sync != null) await sync.flush();
+    if (!mounted) return;
+
+    if (sync != null && sync.state.hasPending) {
+      setState(() => _offlineSubmitPending = true);
+      _showMessage(
+        'Still offline - your answers are safe on this device. Reconnect and '
+        'tap Submit again.',
+      );
+      return;
+    }
+
+    await _finalSubmit();
   }
 
   Future<bool?> _confirmSubmit() => showDialog<bool>(
@@ -651,6 +1181,10 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   Widget build(BuildContext context) {
     final proctoringState = ref.watch(proctoringProvider(widget.submissionId));
 
+    // The app-wide offline queue: the banner renders its state, and watching it
+    // here is also what keeps the instance the notifier logs violations through.
+    final sync = ref.watch(offlineSyncServiceProvider);
+
     // A disqualification ends the session server-side; the overlay explains it
     // and its Exit button pops the route. All this listener has to do is stop
     // the clock and clear the signal, so it cannot leak into a later exam.
@@ -660,6 +1194,26 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       _countdown = null;
       ref.read(forceExitSignalProvider.notifier).state = null;
     });
+
+    // Audio proctoring for this attempt. Watching it is what keeps the
+    // `autoDispose` microphone session alive for as long as the exam screen is
+    // (see `audioMonitoringProvider`); the question pane's header renders it.
+    final audioState = ref.watch(audioMonitoringProvider(widget.submissionId));
+
+    // A refusal or a lost device is announced once per transition, so a microphone
+    // that goes away mid-exam prompts the student instead of leaving a silent hole
+    // in proctoring. Listening to the *change* is what keeps it once - the
+    // optimistic rebuilds that follow all report the same state.
+    ref.listen<AudioMonitoringState>(
+      audioMonitoringProvider(widget.submissionId),
+      (previous, next) {
+        if (previous?.monitor == next.monitor) return;
+        if (next.monitor == AudioMonitorState.permissionDenied ||
+            next.monitor == AudioMonitorState.interrupted) {
+          _promptAudioAttention(next);
+        }
+      },
+    );
 
     // --- Blocking states (each one offers a way out) --------------------
     final blockingError = _blockingError;
@@ -685,6 +1239,20 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
             'the server yet.',
         onRetry: () => _finalSubmit(timeUp: true),
         retryLabel: 'Send again',
+        allowExit: true,
+      );
+    }
+
+    if (_offlineSubmitPending) {
+      return _BlockingState(
+        key: const Key('exam-offline-submit'),
+        icon: Icons.cloud_off,
+        title: 'Waiting for a connection',
+        message: 'Every answer is saved on this device, so nothing is lost. '
+            'Reconnect to hand the attempt in - it will go through as soon as '
+            'the answers reach the server.',
+        onRetry: _retryOfflineSubmit,
+        retryLabel: 'Submit again',
         allowExit: true,
       );
     }
@@ -731,10 +1299,13 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                 // split view or a resized browser window this is what matters.
                 final wide = constraints.maxWidth >= Breakpoints.expanded;
                 final gutter = ResponsiveSizing.horizontalPadding(context);
-                final questionPane = _buildQuestionPane(question);
+                final questionPane = _buildQuestionPane(question, audioState);
 
                 return Column(
                   children: [
+                    // Above the question, so "your work is safe, it just has not
+                    // reached the server yet" is the first thing on screen.
+                    ExamSyncBanner(service: sync),
                     Expanded(
                       child: wide
                           // Desktop / tablet landscape: the self-view sits
@@ -793,6 +1364,15 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                 }
               },
             ),
+          // Above the violation overlay: while this countdown is running nothing
+          // has been logged yet, and the only thing the student should be able to
+          // do is come back to fullscreen (which is also the user gesture the
+          // browser needs to grant it).
+          if (_fullscreenDeadline != null)
+            FullscreenLockOverlay(
+              remaining: _fullscreenDeadline!.difference(_now()),
+              onReturnToFullscreen: () => _webGuard?.requestFullscreen(),
+            ),
         ],
       ),
     );
@@ -804,7 +1384,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// a non-scrollable body, so a five-option question on a phone in landscape (or
   /// any large accessibility text scale) overflowed — and the overflow banner
   /// covered the last option.
-  Widget _buildQuestionPane(Question question) {
+  Widget _buildQuestionPane(Question question, AudioMonitoringState audioState) {
     final theme = Theme.of(context);
     final gutter = ResponsiveSizing.horizontalPadding(context);
     final selectedOption = _answers[question.id];
@@ -828,10 +1408,24 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                   total: _questions.length,
                 ),
               if (_kioskStatus != null) _KioskBadge(status: _kioskStatus!),
+              // Always present, in every build: "the microphone is being
+              // monitored" is part of the exam's state rather than an optional
+              // extra, and its absence is the one silent failure this screen must
+              // not have. Tapping it re-opens a microphone that was blocked or
+              // unplugged; the settings action appears only for a refusal, the one
+              // case where asking again cannot help.
+              AudioMonitorIndicator(
+                key: const Key('audio-indicator'),
+                state: audioState,
+                onRetry: () => unawaited(_retryAudioMonitoring()),
+                onOpenSettings:
+                    audioState.monitor == AudioMonitorState.permissionDenied
+                        ? () => unawaited(PermissionService().openSettings())
+                        : null,
+              ),
             ],
           ),
-          if (_savedQuestions.isNotEmpty || _kioskStatus != null)
-            const SizedBox(height: 12),
+          const SizedBox(height: 12),
           Text(question.questionText, style: theme.textTheme.titleLarge),
           const SizedBox(height: 16),
           if (question.isFillInTheBlank)
@@ -843,7 +1437,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
               saved: _savedQuestions.contains(question.id) &&
                   _savedText[question.id] == (_textAnswers[question.id] ?? ''),
               enabled: !_submitting,
-              onChanged: (value) => _textAnswers[question.id] = value,
+              // Keystrokes go to the durable cache (no network write): losing the
+              // app must not lose an answer that is still being typed.
+              onChanged: (value) => _cacheDraftText(question.id, value),
               onSubmitted: (_) => _saveTextAnswer(question),
             )
           else ...[
@@ -894,7 +1490,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         color: Colors.black,
         child: widget.mockMode
             ? const _MockCameraTile()
-            : controller != null && controller.value.isInitialized
+            : controller != null &&
+                    controller.value.isInitialized &&
+                    !controller.value.hasError
                 ? FittedBox(
                     fit: BoxFit.cover,
                     child: SizedBox(
@@ -934,6 +1532,21 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                   label: const Text('Previous'),
                 ),
               const Spacer(),
+              // Explicit per-question navigation. A multiple-choice answer still
+              // saves (and advances) on tap, but the student always has a
+              // prominent Next to move on without answering or after reviewing;
+              // a typed answer uses "Save & next", which persists through
+              // merge_submission_text_answer before it moves.
+              if (!question.isFillInTheBlank &&
+                  _currentIndex < _questions.length - 1)
+                FilledButton.icon(
+                  key: const Key('exam-next'),
+                  onPressed:
+                      _submitting ? null : () => _goTo(_currentIndex + 1),
+                  icon: const Icon(Icons.chevron_right),
+                  iconAlignment: IconAlignment.end,
+                  label: const Text('Next'),
+                ),
               if (question.isFillInTheBlank &&
                   _currentIndex < _questions.length - 1)
                 FilledButton.icon(
@@ -1287,7 +1900,7 @@ class _AnsweredChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Tooltip(
-      message: 'Answers the server has stored',
+      message: 'Answers stored for this attempt',
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8),
         child: Text(

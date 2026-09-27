@@ -4,7 +4,7 @@ import 'dart:ui' show Size;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart'
-    show TargetPlatform, defaultTargetPlatform, kIsWeb;
+    show TargetPlatform, defaultTargetPlatform, kIsWeb, visibleForTesting;
 import 'package:flutter/services.dart' show DeviceOrientation;
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 
@@ -35,13 +35,16 @@ enum GazeSignal { centered, lookingAway, noFace, multipleFaces }
 class MediaPipeProctoringService {
   MediaPipeProctoringService({
     this.inferenceInterval = const Duration(milliseconds: 150), // ~6-7 FPS
-    this.offCenterThresholdDegrees = 20.0,
+    this.offCenterThresholdDegrees = 28.0,
+    this.pitchThresholdDegrees = 30.0,
     this.lookAwayGraceDuration = const Duration(seconds: 3),
+    this.noFaceGraceDuration = const Duration(seconds: 3),
     this.sensorOrientation = 90,
     this.lensDirection = CameraLensDirection.front,
     this.mockCamera = mockCameraFromEnvironment,
     this.mockInterval = const Duration(seconds: 12),
-  }) {
+    DateTime Function()? clock,
+  }) : _clock = clock ?? DateTime.now {
     if (mockCamera) _startMockFeed();
   }
 
@@ -53,8 +56,29 @@ class MediaPipeProctoringService {
       bool.fromEnvironment('MOCK_CAMERA');
 
   final Duration inferenceInterval;
+
+  /// Yaw (left/right head turn) tolerance in degrees. Relaxed to ~28 so a quick
+  /// glance sideways, or turning toward a second screen, is not an instant
+  /// violation - only a turn that stays past this for [lookAwayGraceDuration] is.
   final double offCenterThresholdDegrees;
+
+  /// Pitch (up/down head tilt) tolerance in degrees. Deliberately a little wider
+  /// than [offCenterThresholdDegrees]: looking down at a keyboard or notes while
+  /// reading and typing is normal exam behaviour, not cheating.
+  final double pitchThresholdDegrees;
+
+  /// How long the head must stay past the yaw/pitch tolerances before a
+  /// [GazeSignal.lookingAway] is emitted (once per episode).
   final Duration lookAwayGraceDuration;
+
+  /// How long the face must stay missing before a [GazeSignal.noFace] is
+  /// emitted (once per episode). This is the time grace period: a blink, a
+  /// dropped frame or a hand sweeping past the lens no longer burns a strike.
+  final Duration noFaceGraceDuration;
+
+  /// Injectable time source, so the grace windows can be exercised in tests
+  /// without waiting wall-clock seconds.
+  final DateTime Function() _clock;
 
   /// Whether this instance drives [signals] from the simulated feed instead of
   /// ML Kit inference. Injectable so tests can switch it on without a
@@ -86,7 +110,23 @@ class MediaPipeProctoringService {
       );
 
   DateTime _lastInferenceAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// Sustained-window bookkeeping. Each condition gets its own "since" stamp
+  /// plus an "already flagged" latch, so one long episode yields exactly one
+  /// signal - the student has to come back before the same condition can be
+  /// reported again. That is what stops a sustained absence or head turn from
+  /// stacking up disqualification flags.
   DateTime? _offCenterSince;
+  DateTime? _faceMissingSince;
+  bool _lookAwayFlagged = false;
+  bool _noFaceFlagged = false;
+
+  /// Whether the camera stream is actually delivering frames. Flipped by the
+  /// exam page through [setStreamActive], so frames that arrive before the
+  /// stream is live (or after it has been lost) are ignored instead of being
+  /// read as "no face".
+  bool _streamActive = true;
+
   bool _busy = false;
   bool _disposed = false;
 
@@ -123,6 +163,27 @@ class MediaPipeProctoringService {
     lensDirection = camera.lensDirection;
   }
 
+  /// Tells the engine whether the camera stream is live.
+  ///
+  /// While `false` - the controller is initialising, was blocked, or the feed
+  /// was lost - [onCameraFrame] ignores incoming frames and every sustained
+  /// window is cleared, so an offline camera can never be mistaken for a missing
+  /// face. Turning it back on restarts the grace windows from scratch.
+  void setStreamActive(bool active) {
+    _streamActive = active;
+    if (!active) resetSustained();
+  }
+
+  /// Clears every sustained-window timer and latch. Called when the camera goes
+  /// offline (see [setStreamActive]) and whenever the notifier pauses tracking,
+  /// so resuming never inherits a half-elapsed grace window.
+  void resetSustained() {
+    _offCenterSince = null;
+    _faceMissingSince = null;
+    _lookAwayFlagged = false;
+    _noFaceFlagged = false;
+  }
+
   /// Feed every camera frame here; internal throttling decides whether it
   /// actually runs inference. Call from `CameraController.startImageStream`
   /// and pass `CameraController.value.deviceOrientation` so frames can be
@@ -135,6 +196,10 @@ class MediaPipeProctoringService {
     // camera in mock mode); ignore any stragglers so that testing stays
     // deterministic.
     if (mockCamera) return;
+
+    // Initialising / offline camera: ignore frames rather than reporting a
+    // phantom "no face". The exam page flips this with [setStreamActive].
+    if (!_streamActive) return;
 
     final now = DateTime.now();
     if (_busy || now.difference(_lastInferenceAt) < inferenceInterval) return;
@@ -305,14 +370,49 @@ class MediaPipeProctoringService {
     return (yaw, pitch);
   }
 
+  /// Feeds one inference result through the grace/debounce logic.
+  ///
+  /// Exposed beyond [onCameraFrame] so the sustained-threshold behaviour can be
+  /// unit-tested without a camera or ML Kit.
+  @visibleForTesting
+  void handleResult(FaceFrameResult result) => _handleResult(result);
+
+  /// Applies the time grace period to one detection result.
+  ///
+  /// A single frame is never enough to flag the student: [GazeSignal.noFace]
+  /// and [GazeSignal.lookingAway] are only emitted once the condition has held
+  /// for [noFaceGraceDuration] / [lookAwayGraceDuration] respectively, and each
+  /// episode emits at most once. The student has to return (a `centered` result
+  /// or a visible face) before the same condition can be reported again, so a
+  /// blink, a dropped frame, or one glance at the keyboard cannot accumulate
+  /// multiple disqualification flags.
   void _handleResult(FaceFrameResult result) {
+    final now = _clock();
+
     if (result.faceCount == 0) {
+      // Face missing: a *sustained* absence becomes noFace. Without a face the
+      // head can no longer be "off centre", so close that window.
       _offCenterSince = null;
-      _signalController.add(GazeSignal.noFace);
+      _lookAwayFlagged = false;
+
+      _faceMissingSince ??= now;
+      if (!_noFaceFlagged &&
+          now.difference(_faceMissingSince!) >= noFaceGraceDuration) {
+        _noFaceFlagged = true;
+        _signalController.add(GazeSignal.noFace);
+      }
       return;
     }
+
+    // A face is visible again: close the missing-face episode so a later
+    // absence is measured (and reported) from scratch.
+    _faceMissingSince = null;
+    _noFaceFlagged = false;
+
     if (result.faceCount > 1) {
+      // Two people in frame is unambiguous, so it is reported immediately.
       _offCenterSince = null;
+      _lookAwayFlagged = false;
       _signalController.add(GazeSignal.multipleFaces);
       return;
     }
@@ -320,21 +420,20 @@ class MediaPipeProctoringService {
     final yaw = result.yawDegrees ?? 0;
     final pitch = result.pitchDegrees ?? 0;
     final isOffCenter = yaw.abs() > offCenterThresholdDegrees ||
-        pitch.abs() > offCenterThresholdDegrees;
+        pitch.abs() > pitchThresholdDegrees;
 
     if (!isOffCenter) {
       _offCenterSince = null;
+      _lookAwayFlagged = false;
       _signalController.add(GazeSignal.centered);
       return;
     }
 
-    _offCenterSince ??= DateTime.now();
-    final sustained = DateTime.now().difference(_offCenterSince!) >= lookAwayGraceDuration;
-    if (sustained) {
+    _offCenterSince ??= now;
+    if (!_lookAwayFlagged &&
+        now.difference(_offCenterSince!) >= lookAwayGraceDuration) {
+      _lookAwayFlagged = true;
       _signalController.add(GazeSignal.lookingAway);
-      // Reset so we don't fire a violation every single frame while the
-      // student remains turned away — the BLoC layer debounces per-warning.
-      _offCenterSince = DateTime.now();
     }
   }
 

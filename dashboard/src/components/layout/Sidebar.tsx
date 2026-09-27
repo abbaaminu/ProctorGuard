@@ -1,5 +1,5 @@
 import { NavLink } from "react-router-dom";
-import { LayoutDashboard, ClipboardList, BarChart3, Settings, Circle } from "lucide-react";
+import { LayoutDashboard, ClipboardList, BarChart3, Circle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -7,11 +7,17 @@ import {
   useRealtimeStatus,
 } from "@/hooks/useRealtimeStatus";
 
+/**
+ * Sidebar navigation.
+ *
+ * Every entry here has a real page behind it — a nav item that lands on a
+ * placeholder ("Settings — coming soon") makes the console look unfinished, so
+ * it is added when the page is, not before.
+ */
 const navItems = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/exams", label: "Exams", icon: ClipboardList },
   { to: "/analytics", label: "Analytics", icon: BarChart3 },
-  { to: "/settings", label: "Settings", icon: Settings },
 ];
 
 export function Sidebar({

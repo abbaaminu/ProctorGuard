@@ -14,16 +14,25 @@ import type { UserRow } from "@/types/database";
 export function useAccountNames() {
   const [names, setNames] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    const { data } = await supabase.from("users").select("id, name, email");
-    if (!data) {
+    const { data, error: loadError } = await supabase
+      .from("users")
+      .select("id, name, email");
+    if (loadError) {
+      // A display name is a nicety, not the data a panel exists to show — but the
+      // fallback ("Student ab12cd34") must never be mistaken for the real name,
+      // so the failure is reported instead of silently degrading.
+      setError(loadError.message);
       setLoading(false);
       return;
     }
+    setError(null);
+    const rows = (data as Pick<UserRow, "id" | "name" | "email">[] | null) ?? [];
     setNames(
       Object.fromEntries(
-        (data as Pick<UserRow, "id" | "name" | "email">[]).map((row) => [
+        rows.map((row) => [
           row.id,
           row.name?.trim() || row.email || "Unknown account",
         ])
@@ -55,5 +64,5 @@ export function useAccountNames() {
     };
   }, [load]);
 
-  return { names, loading };
+  return { names, loading, error };
 }

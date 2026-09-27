@@ -26,6 +26,19 @@ class UnsupportedWebGuards implements WebGuards {
   @override
   Stream<WebGuardEvent> get events => const Stream<WebGuardEvent>.empty();
 
+  /// No DOM to block events on, so there is no lockdown to enforce. Android has
+  /// lock task (see [KioskService]) and a copy/paste block of its own; iOS and
+  /// desktop have neither, and reporting "supported" would promise a guarantee
+  /// this platform cannot keep.
+  @override
+  bool get supportsExamLockdown => false;
+
+  @override
+  void startExamLockdown() {}
+
+  @override
+  void stopExamLockdown() {}
+
   @override
   Future<bool> enterFullscreen() async => false;
 

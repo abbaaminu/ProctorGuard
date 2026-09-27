@@ -83,14 +83,27 @@ void main() {
 
       await Future<void>.delayed(const Duration(milliseconds: 250));
 
-      expect(uploads.first, 'sub-1/no_face/4');
-      expect(proctoringRepo.violations, hasLength(1)); // notifier debounce
-      final logged = proctoringRepo.violations.single;
+      // The simulated feed alternates no_face / looking_away every 20 ms and the
+      // notifier's debounce is *per type* (2 s each, see `_lastLoggedAt`): inside
+      // this window that is one violation of each kind, not one in total. A single
+      // shared stamp used to swallow whichever signal arrived second.
+      expect(
+        proctoringRepo.violations.map((violation) => violation.type).toList(),
+        <ViolationType>[ViolationType.noFace, ViolationType.lookingAway],
+      );
+
+      // The frame captured for the first one travels with it.
+      final logged = proctoringRepo.violations.first;
       expect(logged.type, ViolationType.noFace);
       expect(
         logged.snapshotUrl,
         'https://cdn.test/proctor-snapshots/sub-1/no_face.jpg',
       );
+      // One upload per violation, named after the violation's action_type.
+      expect(uploads.toSet(), <String>{
+        'sub-1/no_face/4',
+        'sub-1/looking_away/4',
+      });
     });
 
     test('logs the violation (without a URL) when capture yields nothing',
@@ -119,8 +132,19 @@ void main() {
 
       await Future<void>.delayed(const Duration(milliseconds: 250));
 
-      expect(proctoringRepo.violations, hasLength(1));
-      expect(proctoringRepo.violations.single.snapshotUrl, isNull);
+      // Same alternating feed, same two violations - and neither carries a URL,
+      // because there was no frame to upload. The rows are still written: the
+      // strike happened whether or not the evidence could be attached to it.
+      expect(
+        proctoringRepo.violations.map((violation) => violation.type).toList(),
+        <ViolationType>[ViolationType.noFace, ViolationType.lookingAway],
+      );
+      expect(
+        proctoringRepo.violations.every(
+          (violation) => violation.snapshotUrl == null,
+        ),
+        isTrue,
+      );
     });
   });
 }

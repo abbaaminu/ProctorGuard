@@ -18,29 +18,237 @@
 
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="A new Flutter project.">
+  <meta name="description" content="ProctorGuard student client — take AI-proctored exams with on-device face and microphone monitoring.">
+  <meta name="theme-color" content="#3F51B5">
 
   <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <meta name="apple-mobile-web-app-title" content="exam_proctor">
+  <meta name="apple-mobile-web-app-title" content="ProctorGuard">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
 
   <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
 
-  <title>exam_proctor</title>
+  <title>ProctorGuard — Exam Proctoring</title>
   <link rel="manifest" href="manifest.json">
 </head>
 <body>
   <!--
-    You can customize the "flutter_bootstrap.js" script.
-    This is useful to provide a custom configuration to the Flutter loader
-    or to give the user feedback during the initialization process.
+    ProctorGuard exam lockdown, first half. The second half is Dart
+    (lib/core/services/web_guards_web.dart), which installs the reporter and arms
+    the lockdown for the length of one attempt.
 
-    For more details:
-    * https://docs.flutter.dev/platform-integration/web/initialization
+    This script exists because it runs *before* Flutter does, and the window in
+    which the app is not running yet is the window a determined student can act
+    in - on a reload of an exam page that window reopens. What it does:
+
+      * Denies `copy`, `cut`, `paste`, the context menu and the Chromium
+        developer-tools shortcuts while the app is booting. Nothing is rendered
+        yet, so blocking costs the student nothing - but the attempt is kept.
+      * Stops presuming as soon as Dart says it is running
+        (`proctorGuardAppBooted`, called from `main()` out of `LockdownBootstrap`,
+        just before `runApp`), so the login screen and every other page served
+        from here keep their clipboard and their right-click. From there on only
+        an armed exam locks anything, and an unarmed page is not interfered with
+        at all.
+      * While the lockdown *is* armed, hands every denied event straight to Dart
+        (`proctorGuardReporter`), which turns it into a violation. One exception:
+        view-source (`Ctrl+U`) is refused without being reported - it is not a
+        developer-tools panel, which is what that violation means. See the note
+        on `onKeyDown` below.
+      * Returns what it denied before Dart could be told to the first exam that
+        arms the lockdown in this page session. A session that never starts an
+        exam never claims any of it.
+
+    The *other* way out - a developer-tools panel - is a different mechanism, in
+    Dart: no page can ask the browser whether DevTools is open, so
+    `web_guards_web.dart` watches the viewport geometry for a docked panel while
+    an exam is armed. This script's job is the keyboard route to it.
+
+    Deliberately plain ES5-ish JavaScript: it is the one part of the lockdown a
+    host may have to read or adapt in its own index.html, and it has to run on the
+    browsers this app is deployed to without a build step. It has to stay a
+    classic script (never `type="module"`): Dart looks these globals up by name on
+    `window`, and a module would keep them out of that scope.
+
+    Flutter's own loader banner is documented at
+    https://docs.flutter.dev/platform-integration/web/initialization
   -->
+  <script>
+    (function () {
+      'use strict';
+
+      // --- State -----------------------------------------------------------
+
+      // How many blocked events are remembered for the first exam that arms the
+      // lockdown in this page session. A student cannot produce fifty events
+      // while a page loads; the cap is here so a page whose keys are being
+      // mashed cannot grow the queue without bound.
+      var QUEUE_LIMIT = 50;
+
+      // Dart is running (`proctorGuardAppBooted`), and an exam holds the lockdown
+      // (`enableProctorGuardLockdown`, released by `disableProctorGuardLockdown`).
+      var booted = false;
+      var armed = false;
+
+      // Events blocked before Dart could be told about them; handed over, once,
+      // to the exam that arms the lockdown next.
+      var queue = [];
+
+      // `Cmd` on macOS, `Ctrl` everywhere else. Read once: this only decides
+      // which keyboard chords are the developer-tools ones.
+      var isMac = /Mac|iPhone|iPad|iPod/.test(
+        navigator.platform || navigator.userAgent || ''
+      );
+
+      // Blocking is on while the app is not running yet - nothing is rendered, so
+      // there is no copy to make and no panel to inspect, and it is the attempt
+      // that is being kept - and for as long as an exam holds the lockdown. In
+      // between (the login screen, the exam list) the page behaves like any
+      // other one, which is what `booted` buys.
+      function blocking() {
+        return armed || !booted;
+      }
+
+      function remember(name) {
+        if (queue.length >= QUEUE_LIMIT) queue.shift();
+        queue.push(name);
+      }
+
+      // Hands one blocked event to Dart, or queues it until there is a Dart to
+      // hand it to. A reporter that throws is a bug on the Dart side; the event
+      // is still evidence, so it is queued rather than dropped.
+      function report(name) {
+        var reporter = window.proctorGuardReporter;
+        if (typeof reporter === 'function') {
+          try {
+            reporter(name);
+            return;
+          } catch (error) {
+            // Fall through to the queue.
+          }
+        }
+        remember(name);
+      }
+
+      // Stops a DOM event and records the attempt. `stopPropagation` matters as
+      // much as `preventDefault` here: the clipboard event must not reach
+      // Flutter's own text field, and only a capture-phase listener at the
+      // document gets there first.
+      function deny(event, name) {
+        event.preventDefault();
+        event.stopPropagation();
+        report(name);
+      }
+
+      // --- Listeners -------------------------------------------------------
+
+      function onCopy(event) {
+        if (blocking()) deny(event, 'copy');
+      }
+
+      function onCut(event) {
+        if (blocking()) deny(event, 'cut');
+      }
+
+      function onPaste(event) {
+        if (blocking()) deny(event, 'paste');
+      }
+
+      // The context menu is refused, but propagation is deliberately left alone:
+      // Flutter still decides what a long-press means inside its own widgets,
+      // exactly as in the no-bootstrap fallback in `web_guards_web.dart`.
+      function onContextMenu(event) {
+        if (!blocking()) return;
+        event.preventDefault();
+        report('contextmenu');
+      }
+
+      // Which developer-tools affordance a keystroke is, or null. `F12` on every
+      // platform; `Ctrl+Shift+I/J/C` on Windows/Linux and `Cmd+Opt+I/J/C` on
+      // macOS - each platform's own chord and nothing else, so a chord that
+      // platform does not define for DevTools cannot be mistaken for one.
+      function shortcutKind(event) {
+        var key = (event.key || '').toLowerCase();
+
+        if (key === 'f12') return 'devtools';
+
+        if (!(isMac ? event.metaKey : event.ctrlKey)) return null;
+
+        // View source: `Ctrl+U` / `Cmd+U`.
+        if (key === 'u') return 'viewSource';
+
+        if (!(isMac ? event.altKey : event.shiftKey)) return null;
+        if (key === 'i' || key === 'j' || key === 'c') return 'devtools';
+        return null;
+      }
+
+      // Refusing a shortcut and reporting one are two different decisions. The
+      // developer-tools chords are reported as `devtools`, which is what Dart
+      // turns that name into. View source is *not*: the schema's
+      // `devtools_detected` means a developer-tools panel is open (see
+      // `supabase/migrations/update_proctoring_action_types.sql`), and a
+      // keystroke that was blocked outright must not cost a student a strike on a
+      // heuristic. A host whose policy differs can report `'devtools'` for it
+      // here instead.
+      function onKeyDown(event) {
+        if (!blocking()) return;
+
+        var kind = shortcutKind(event);
+        if (kind === null) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        // A held key repeats: the block happens every time, the report does not.
+        if (event.repeat) return;
+        if (kind === 'devtools') report('devtools');
+      }
+
+      // --- The half Dart talks to -----------------------------------------
+
+      // `LockdownBootstrap.markAppBooted()`, called from `main()` just before
+      // `runApp`: the page stops being a document and becomes the app, so the
+      // clipboard, the context menu and the shortcuts are handed back and from
+      // here on only an armed exam takes them away. What was denied until now
+      // stays in the queue for the exam that arms the lockdown next.
+      window.proctorGuardAppBooted = function () {
+        booted = true;
+      };
+
+      // The installed contract: Dart assigns its callback here *before* it
+      // enables the lockdown, and clears it when the attempt is released.
+      window.proctorGuardReporter = null;
+
+      // `WebGuards.startExamLockdown()`, for the length of one attempt.
+      window.enableProctorGuardLockdown = function () {
+        armed = true;
+      };
+
+      // `WebGuards.stopExamLockdown()` and its `dispose()`.
+      window.disableProctorGuardLockdown = function () {
+        armed = false;
+      };
+
+      // Drained by `WebGuards.startExamLockdown()`: what is in here belongs to
+      // the attempt that is starting now.
+      window.drainProctorGuardBlockedEvents = function () {
+        var drained = queue;
+        queue = [];
+        return drained;
+      };
+
+      // Registered once, at load, and left in place for the life of the page:
+      // every handler above returns immediately unless `blocking()`, so an
+      // unarmed page pays one function call per event and nothing else.
+      document.addEventListener('copy', onCopy, true);
+      document.addEventListener('cut', onCut, true);
+      document.addEventListener('paste', onPaste, true);
+      document.addEventListener('contextmenu', onContextMenu, true);
+      document.addEventListener('keydown', onKeyDown, true);
+    })();
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

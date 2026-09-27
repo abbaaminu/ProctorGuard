@@ -22,6 +22,18 @@ class ViolationOverlay extends StatelessWidget {
         ViolationType.noFace => 'Your face is not visible to the camera.',
         ViolationType.appMinimized => 'Switching apps during the exam is not allowed.',
         ViolationType.audioNoise => 'Unusual background noise detected.',
+        ViolationType.copyPasteAttempt =>
+          'Copying from, or pasting into, the exam is not allowed.',
+        ViolationType.rightClickBlocked =>
+          'The right-click menu is disabled during the exam.',
+        ViolationType.devtoolsDetected =>
+          'Browser developer tools are not allowed during the exam.',
+        ViolationType.secondaryDisplayDetected =>
+          'A second screen is connected. Disconnect it to continue.',
+        ViolationType.virtualCameraDetected =>
+          'The camera in use is not this device\'s own lens.',
+        ViolationType.idleAfk =>
+          'You have been away from the exam. Keep interacting with the screen.',
         null => 'Proctoring violation detected.',
       };
 

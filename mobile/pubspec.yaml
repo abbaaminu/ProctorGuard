@@ -17,12 +17,27 @@ dependencies:
   # Backend
   supabase_flutter: ^2.5.6
 
+  # Offline resilience: the local-first answer cache and the retry queues behind
+  # it (`lib/core/services/offline_sync_service.dart`). Already a transitive
+  # dependency of supabase_flutter - it is how the SDK persists the auth session -
+  # so declaring it directly adds no download, and it is the one store that works
+  # on web (localStorage) and on mobile/desktop alike.
+  shared_preferences: ^2.5.5
+
   # Desktop Window & Fullscreen Control
   window_manager: ^0.5.2
 
   # Camera / on-device AI
   camera: ^0.12.1
   google_mlkit_face_detection: ^0.15.1
+
+  # Microphone: the exam session samples the room's loudness (dBFS) to catch
+  # sustained talking. `record` is the one package that exposes amplitude on every
+  # target this app ships to (Android, iOS, web, Windows, macOS, Linux - see
+  # `core/services/audio_monitor.dart`), and the session streams PCM instead of
+  # writing a file, so **no audio is ever stored** - only the decibel numbers the
+  # detector reads are kept, in memory.
+  record: ^7.1.1
 
   # Permissions & lifecycle
   permission_handler: ^11.3.1

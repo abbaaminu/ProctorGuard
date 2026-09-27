@@ -21,7 +21,10 @@
 --     (3-strike rule) are the only writers of status/score/submitted_at, and
 --     both re-check that the caller owns the submission.
 --   * Evidence is append-only for clients: `proctoring_logs` has no INSERT
---     policy, so register_violation() is the single write path.
+--     policy, so register_violation() is the single write path. That RPC is
+--     idempotent per `client_event_id`, which is what lets the app queue a
+--     violation it could not deliver and replay it later without inventing a
+--     second strike (see `client_timestamp` / `client_event_id` in section 5).
 -- =====================================================================
 
 create extension if not exists "uuid-ossp";
@@ -371,11 +374,83 @@ create table if not exists public.proctoring_logs (
   id             uuid primary key default uuid_generate_v4(),
   submission_id  uuid not null references public.exam_submissions(id) on delete cascade,
   action_type    text not null check (
-                   action_type in ('looking_away','multiple_faces','no_face','app_minimized','audio_noise')
+                   action_type in (
+                     -- Camera / session signals
+                     'looking_away','multiple_faces','no_face','app_minimized','audio_noise',
+                     -- Browser exam lockdown (copy/paste, right-click, devtools)
+                     'copy_paste_attempt','right_click_blocked','devtools_detected',
+                     -- Device integrity (second display, virtual camera)
+                     'secondary_display_detected','virtual_camera_detected',
+                     -- Inactivity
+                     'idle_afk'
+                   )
                  ),
   timestamp      timestamptz not null default now(),
   snapshot_url   text
 );
+
+-- The list above only applies to a database that does not have the table yet:
+-- `create table if not exists` cannot widen a constraint that already exists.
+-- This is the same refresh as
+-- ../supabase/migrations/update_proctoring_action_types.sql, repeated here so
+-- re-running this single file also upgrades an older installation (the mobile
+-- app refuses to log a violation whose action_type the server would reject) -
+-- keep the two lists, and `ViolationType` in ../mobile, in step.
+--
+-- The drop is by *definition* and the add is NOT VALID + VALIDATE, so this is
+-- safe to re-run and safe on a table that already holds rows: no rewrite, and a
+-- pre-existing unknown action_type surfaces as a validation error instead of
+-- being silently rewritten.
+do $$
+declare
+  v_constraint text;
+begin
+  for v_constraint in
+    select con.conname
+      from pg_constraint con
+      join pg_class rel on rel.oid = con.conrelid
+      join pg_namespace nsp on nsp.oid = rel.relnamespace
+     where nsp.nspname = 'public'
+       and rel.relname = 'proctoring_logs'
+       and con.contype = 'c'
+       and pg_get_constraintdef(con.oid) like '%action_type%'
+  loop
+    execute format('alter table public.proctoring_logs drop constraint %I', v_constraint);
+  end loop;
+end $$;
+
+alter table public.proctoring_logs
+  add constraint proctoring_logs_action_type_check
+  check (
+    action_type in (
+      'looking_away','multiple_faces','no_face','app_minimized','audio_noise',
+      'copy_paste_attempt','right_click_blocked','devtools_detected',
+      'secondary_display_detected','virtual_camera_detected','idle_afk'
+    )
+  ) not valid;
+
+alter table public.proctoring_logs
+  validate constraint proctoring_logs_action_type_check;
+
+-- Two columns the offline retry needs, added for databases created before them.
+--
+--   * `client_timestamp` is *when the violation happened on the student's device*.
+--     `timestamp` stays the server's receipt time on purpose: it is the column the
+--     supervisor console orders by, and it cannot be moved by a wrong device clock.
+--     Recording both is what makes a late delivery (a violation taken while the
+--     exam app was offline) distinguishable from a late detection.
+--   * `client_event_id` is the idempotency key `register_violation` deduplicates
+--     on. Without it, replaying a call whose response was lost would append a
+--     second row - and so a second strike - for the same event.
+--
+-- The unique index is partial because the column is null for rows written by a
+-- client that predates the offline queue (and for direct SQL by a supervisor).
+alter table public.proctoring_logs add column if not exists client_timestamp timestamptz;
+alter table public.proctoring_logs add column if not exists client_event_id uuid;
+
+create unique index if not exists idx_logs_client_event_id
+  on public.proctoring_logs(client_event_id)
+  where client_event_id is not null;
 
 alter table public.proctoring_logs enable row level security;
 
@@ -499,10 +574,18 @@ end $$;
 -- 3-argument version exists.
 drop function if exists public.register_violation(uuid, text);
 
+-- The pre-offline-queue signature. Adding the two new *defaulted* parameters below
+-- would otherwise leave two candidates for a 3-argument named call and Postgres
+-- answers that with "function register_violation(...) is not unique", so the old
+-- shape is dropped before the new one is created.
+drop function if exists public.register_violation(uuid, text, text);
+
 create or replace function public.register_violation(
-  p_submission_id uuid,
-  p_action_type   text,
-  p_snapshot_url  text default null
+  p_submission_id    uuid,
+  p_action_type      text,
+  p_snapshot_url     text default null,
+  p_client_timestamp timestamptz default null,
+  p_client_event_id  uuid default null
 )
 returns table(warning_count int, disqualified boolean)
 language plpgsql
@@ -541,8 +624,23 @@ begin
     return;
   end if;
 
-  insert into public.proctoring_logs (submission_id, action_type, snapshot_url)
-  values (p_submission_id, p_action_type, p_snapshot_url);
+  -- `on conflict` + the unique index on client_event_id is what makes the
+  -- client's offline retry safe: the same event replayed inserts nothing, and the
+  -- strike count below is read from the table, so a retry can never turn one
+  -- violation into two strikes. A client that reuses an id on purpose only
+  -- suppresses its own strike - and a client that controls the app can skip
+  -- calling this at all, so the idempotency key costs the rule nothing.
+  insert into public.proctoring_logs (
+    submission_id, action_type, snapshot_url, client_timestamp, client_event_id
+  )
+  values (
+    p_submission_id,
+    p_action_type,
+    p_snapshot_url,
+    coalesce(p_client_timestamp, now()),
+    p_client_event_id
+  )
+  on conflict (client_event_id) where client_event_id is not null do nothing;
 
   select count(*) into v_count
   from public.proctoring_logs

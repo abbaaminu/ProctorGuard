@@ -83,11 +83,148 @@ void main() {
     });
   });
 
+  group('time grace period', () {
+    late DateTime now;
+
+    setUp(() => now = DateTime(2026, 1, 1, 12));
+
+    /// An engine whose sustained windows advance with [now] instead of the wall
+    /// clock, so a 3-second grace can be exercised instantly.
+    MediaPipeProctoringService clocked() {
+      final engine = MediaPipeProctoringService(clock: () => now);
+      addTearDown(engine.dispose);
+      return engine;
+    }
+
+    test('a single missing-face frame is not a violation', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      engine.handleResult(const FaceFrameResult(faceCount: 0));
+      await pumpEventQueue();
+
+      expect(seen, isEmpty);
+    });
+
+    test('a sustained missing face logs no_face exactly once', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      engine.handleResult(const FaceFrameResult(faceCount: 0)); // t0
+      now = now.add(const Duration(seconds: 2));
+      engine.handleResult(const FaceFrameResult(faceCount: 0)); // still inside
+      now = now.add(const Duration(seconds: 1)); // t0 + 3s
+      engine.handleResult(const FaceFrameResult(faceCount: 0)); // sustained
+      now = now.add(const Duration(seconds: 30));
+      engine.handleResult(const FaceFrameResult(faceCount: 0)); // same episode
+
+      await pumpEventQueue();
+      expect(seen, <GazeSignal>[GazeSignal.noFace]);
+    });
+
+    test('the face returning re-arms a fresh absence episode', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      engine.handleResult(const FaceFrameResult(faceCount: 0));
+      now = now.add(const Duration(seconds: 3));
+      engine.handleResult(const FaceFrameResult(faceCount: 0)); // no_face #1
+
+      engine.handleResult(const FaceFrameResult(faceCount: 1)); // visible again
+      engine.handleResult(const FaceFrameResult(faceCount: 0)); // fresh episode
+      now = now.add(const Duration(seconds: 3));
+      engine.handleResult(const FaceFrameResult(faceCount: 0)); // no_face #2
+
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.noFace),
+        hasLength(2),
+      );
+    });
+
+    test('a minor head turn or a look down stays centered', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      // 25 deg yaw and 29 deg pitch sit inside the relaxed tolerances.
+      const inside =
+          FaceFrameResult(faceCount: 1, yawDegrees: 25, pitchDegrees: 29);
+      engine.handleResult(inside);
+      now = now.add(const Duration(seconds: 10));
+      engine.handleResult(inside);
+
+      await pumpEventQueue();
+      expect(seen, isNot(contains(GazeSignal.lookingAway)));
+      expect(seen, contains(GazeSignal.centered));
+    });
+
+    test('a sustained off-axis turn logs looking_away exactly once', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      const away = FaceFrameResult(faceCount: 1, yawDegrees: 45);
+      engine.handleResult(away);
+      now = now.add(const Duration(seconds: 3));
+      engine.handleResult(away);
+      now = now.add(const Duration(seconds: 30));
+      engine.handleResult(away); // still away: no repeat
+
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+      );
+    });
+
+    test('two faces are reported immediately, without a grace window',
+        () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      engine.handleResult(const FaceFrameResult(faceCount: 2));
+      await pumpEventQueue();
+
+      expect(seen, <GazeSignal>[GazeSignal.multipleFaces]);
+    });
+
+    test('resetSustained clears a half-elapsed window', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      engine.handleResult(const FaceFrameResult(faceCount: 0));
+      now = now.add(const Duration(seconds: 2));
+      engine.resetSustained();
+      now = now.add(const Duration(seconds: 1));
+      engine.handleResult(const FaceFrameResult(faceCount: 0));
+
+      await pumpEventQueue();
+      expect(seen, isEmpty);
+    });
+  });
+
   group('engine defaults', () {
     test('match the documented throttle / threshold / grace contract', () {
       expect(engine.inferenceInterval, const Duration(milliseconds: 150));
-      expect(engine.offCenterThresholdDegrees, 20.0);
+      // Relaxed tolerances: a turn under ~28 deg, and looking down under ~30 deg
+      // to read/type, must not flag the student.
+      expect(engine.offCenterThresholdDegrees, 28.0);
+      expect(engine.pitchThresholdDegrees, 30.0);
       expect(engine.lookAwayGraceDuration, const Duration(seconds: 3));
+      expect(engine.noFaceGraceDuration, const Duration(seconds: 3));
     });
 
     test('expose a broadcast signal stream and leak nothing on dispose', () {

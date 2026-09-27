@@ -5,12 +5,21 @@ import 'package:camera/camera.dart';
 import 'package:flutter/services.dart' show DeviceOrientation;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../../core/di/providers.dart';
 import '../../../../core/services/exam_lifecycle_observer.dart';
 import '../../../../core/services/mediapipe_proctoring_service.dart';
+import '../../../../core/services/offline_sync_service.dart';
 import '../../../../core/services/supabase_service.dart';
+import '../../../../core/utils/uuid.dart';
 import '../../domain/entities/violation.dart';
 import '../../domain/repositories/proctoring_repository.dart';
 import '../../../exam/domain/repositories/exam_repository.dart';
+
+// The repository providers are declared in `core/di/providers.dart` (see the note
+// there) and re-exported here, so `main.dart` and every existing import site keeps
+// working without knowing about the move.
+export '../../../../core/di/providers.dart'
+    show examRepositoryProvider, proctoringRepositoryProvider;
 
 /// How the notifier asks the exam page for a still frame when it needs
 /// evidence: the page owns the camera, the notifier just knows when to ask.
@@ -24,11 +33,17 @@ class ProctoringState {
   final ViolationType? lastViolation;
   final bool disqualified;
 
+  /// True while camera-derived tracking is paused because the feed is
+  /// initialising, blocked or lost. The exam page watches this to prompt the
+  /// student instead of letting an unproctored session look normal.
+  final bool cameraPaused;
+
   const ProctoringState({
     this.warningCount = 0,
     this.showViolationOverlay = false,
     this.lastViolation,
     this.disqualified = false,
+    this.cameraPaused = false,
   });
 
   ProctoringState copyWith({
@@ -36,12 +51,14 @@ class ProctoringState {
     bool? showViolationOverlay,
     ViolationType? lastViolation,
     bool? disqualified,
+    bool? cameraPaused,
   }) =>
       ProctoringState(
         warningCount: warningCount ?? this.warningCount,
         showViolationOverlay: showViolationOverlay ?? this.showViolationOverlay,
         lastViolation: lastViolation ?? this.lastViolation,
         disqualified: disqualified ?? this.disqualified,
+        cameraPaused: cameraPaused ?? this.cameraPaused,
       );
 }
 
@@ -49,19 +66,36 @@ class ProctoringState {
 /// implements the section-3 escalation contract:
 ///   - on violation: warningCount += 1, show full-screen overlay, log to DB
 ///   - at warningCount >= 3: auto-submit as 'disqualified' + forced exit
+///
+/// Every signal — camera, audio, lifecycle, the browser's exam lockdown and the
+/// device-integrity probes — enters through the `report*` methods below, so the
+/// strike counter, the evidence upload and the disqualification rule live in
+/// exactly one place.
+///
+/// Violations are delivered through a [ViolationOutbox] rather than straight to
+/// the repository, so "the network is gone" queues the row instead of losing it
+/// (see [OfflineSyncService]). Without an injected outbox the notifier falls back
+/// to [DirectViolationOutbox] over [proctoringRepo], which is the behaviour it had
+/// before the offline layer - and what the unit tests exercise.
 class ProctoringNotifier extends StateNotifier<ProctoringState> {
   ProctoringNotifier({
     required this.submissionId,
-    required this._proctoringRepo,
+    required ProctoringRepository proctoringRepo,
     required this._examRepo,
     required this._engine,
     required this._onForceExit,
     required this._uploadSnapshot,
+    ViolationOutbox? outbox,
     this.snapshotTimeout = const Duration(seconds: 5),
     this.audioNoiseThresholdDb = -25.0,
     this.audioNoiseSustain = const Duration(seconds: 2),
-  })  : super(const ProctoringState()) {
+  })  : _outbox = outbox ?? DirectViolationOutbox(proctoringRepo),
+        super(const ProctoringState()) {
     _gazeSub = _engine.signals.listen(_handleGazeSignal);
+    // A violation the queue delivered after the fact still carries the server's
+    // ruling: that is how a third strike taken while the network was down ends
+    // the attempt instead of being discovered only in the audit log.
+    _rulingsSub = _outbox.deferredRulings.listen(_handleDeferredRuling);
     // Same entry point the browser guards and the kiosk escape use, so there is
     // exactly one place that decides what "left the exam" means.
     _lifecycleObserver = ExamLifecycleObserver(
@@ -70,7 +104,7 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   }
 
   final String submissionId;
-  final ProctoringRepository _proctoringRepo;
+  final ViolationOutbox _outbox;
   final ExamRepository _examRepo;
   final MediaPipeProctoringService _engine;
   final void Function() _onForceExit;
@@ -95,10 +129,24 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   SnapshotSource? _snapshotSource;
 
   late final StreamSubscription<GazeSignal> _gazeSub;
+  late final StreamSubscription<ViolationRuling> _rulingsSub;
   late final ExamLifecycleObserver _lifecycleObserver;
 
-  DateTime? _lastLoggedAt;
+  /// When each violation type was last logged, so [_dedupeWindow] applies **per
+  /// type**.
+  ///
+  /// One shared stamp (the first shape of this) swallowed distinct signals: a
+  /// student who pastes while the camera reports looking away produces two
+  /// different events, and whichever arrived second was dropped as if it were a
+  /// repeat of the first.
+  final Map<ViolationType, DateTime> _lastLoggedAt =
+      <ViolationType, DateTime>{};
   static const _dedupeWindow = Duration(seconds: 2);
+
+  /// Whether camera-derived signals are currently being evaluated. The exam
+  /// page flips this off when the feed is initialising, blocked or lost so an
+  /// offline camera cannot silently accumulate disqualification flags.
+  bool _cameraActive = true;
 
   /// Hands over the page's still-frame grabber, so violations can attach
   /// evidence. Call once, right after `startImageStream`.
@@ -106,7 +154,31 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     _snapshotSource = capture;
   }
 
+  /// Pauses or resumes camera-derived violation tracking.
+  ///
+  /// Called with `false` while the camera feed is offline/initialising and with
+  /// `true` once frames are flowing again. While paused, [GazeSignal]s are
+  /// dropped and the engine's grace windows are cleared, so a lost camera shows
+  /// the student a prompt rather than quietly logging `no_face`/`looking_away`
+  /// strikes for a stream that is not even running.
+  void setCameraActive(bool active) {
+    if (_cameraActive == active) return;
+    _cameraActive = active;
+    // A resume must not inherit a stale dedupe stamp or a half-elapsed grace
+    // window from before the camera dropped out.
+    _lastLoggedAt.clear();
+    _engine.setStreamActive(active);
+    state = state.copyWith(cameraPaused: !active);
+  }
+
+  /// Whether camera-derived signals are currently being evaluated.
+  bool get cameraActive => _cameraActive;
+
   void _handleGazeSignal(GazeSignal signal) {
+    // Camera offline/initialising: ignore every face signal until the page
+    // confirms the feed is live again.
+    if (!_cameraActive) return;
+
     switch (signal) {
       case GazeSignal.centered:
         return; // no violation
@@ -157,6 +229,52 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   /// and the auto-disqualification rule stay in one place.
   void reportAppMinimized() => _registerViolation(ViolationType.appMinimized);
 
+  /// The student tried to move content through the clipboard while the exam
+  /// lockdown was on: a copy, a cut or a paste (browser build).
+  ///
+  /// All three are the same violation — `copy_paste_attempt` — because they are
+  /// the same attempt to get question text out of the exam, or an answer into it,
+  /// and the browser reports them as three DOM events rather than three
+  /// behaviours.
+  void reportCopyPasteAttempt() =>
+      _registerViolation(ViolationType.copyPasteAttempt);
+
+  /// The browser's context menu was suppressed: `right_click_blocked`.
+  ///
+  /// Nothing was served, and that is the point — the menu is the route to "view
+  /// source", "inspect" and the browser's own paste, so reaching for it is the
+  /// evidence.
+  void reportRightClickBlocked() =>
+      _registerViolation(ViolationType.rightClickBlocked);
+
+  /// A developer-tools panel is open over the exam: `devtools_detected`.
+  ///
+  /// The caller decides when the geometry is conclusive (see `WebGuards`); this
+  /// only records it.
+  void reportDevtoolsDetected() =>
+      _registerViolation(ViolationType.devtoolsDetected);
+
+  /// A second display is attached to this device (Android: HDMI/DP, casting,
+  /// screen mirroring): `secondary_display_detected`.
+  ///
+  /// Reported when it appears, not while it stays attached (see
+  /// `HardwareIntegrityService`), so one monitor left plugged in is one event.
+  void reportSecondaryDisplayDetected() =>
+      _registerViolation(ViolationType.secondaryDisplayDetected);
+
+  /// The camera feeding this attempt is not the device's own lens — an external
+  /// (USB) camera, or an emulator's virtual one: `virtual_camera_detected`.
+  void reportVirtualCameraDetected() =>
+      _registerViolation(ViolationType.virtualCameraDetected);
+
+  /// No keyboard or pointer activity for the idle window: `idle_afk`.
+  ///
+  /// Somebody may still be in front of the screen (reading, or thinking), and
+  /// that is why the window is minutes rather than seconds — but a device nobody
+  /// is touching is also what a student handing their phone to someone else looks
+  /// like from here, so it is logged rather than ignored.
+  void reportIdleAfk() => _registerViolation(ViolationType.idleAfk);
+
   /// Hands the engine the camera metadata it needs to upright incoming frames
   /// before detection. Call once right after choosing the front camera.
   void engineAttachCamera(CameraDescription camera) =>
@@ -178,12 +296,13 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     if (state.disqualified) return; // already ended, ignore stray signals
 
     // Debounce so one sustained condition doesn't spam multiple identical
-    // log rows within the same couple of seconds.
+    // log rows within the same couple of seconds. Per type: see [_lastLoggedAt].
     final now = DateTime.now();
-    if (_lastLoggedAt != null && now.difference(_lastLoggedAt!) < _dedupeWindow) {
+    final lastLogged = _lastLoggedAt[type];
+    if (lastLogged != null && now.difference(lastLogged) < _dedupeWindow) {
       return;
     }
-    _lastLoggedAt = now;
+    _lastLoggedAt[type] = now;
 
     // Show the full-screen alert immediately (optimistic UI) — the student
     // must see the warning before any camera/storage/network round-trip.
@@ -198,27 +317,49 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     // delay the escalation below.
     final snapshotUrl = await _captureAndUploadSnapshot(type);
 
-    try {
-      final result = await _proctoringRepo.logViolation(
-        submissionId: submissionId,
-        violation: Violation(
-          type: type,
-          timestamp: now,
-          snapshotUrl: snapshotUrl,
-        ),
-      );
+    // Hand the row to the outbox: it either reaches the backend now (and returns
+    // the authoritative ruling) or is queued with this event's id and replayed
+    // later. One id per event is what keeps a retry from writing a second strike
+    // for the same violation (`proctoring_logs.client_event_id` is unique).
+    final ruling = await _outbox.log(
+      submissionId: submissionId,
+      violation: Violation(
+        type: type,
+        timestamp: now,
+        snapshotUrl: snapshotUrl,
+        clientEventId: uuidV4(),
+      ),
+    );
 
-      // Reconcile with the server's authoritative count (source of truth —
-      // protects against a client that raced ahead or fell behind).
-      state = state.copyWith(warningCount: result.warningCount);
-
-      if (result.disqualified) {
-        await _forceDisqualify();
-      }
-    } catch (_) {
-      // Network failure: local count still stands, and the RPC call is
-      // idempotent-safe to retry — in production, queue for retry here.
+    if (ruling == null) {
+      // Queued: the strike is durable on this device and will be delivered by the
+      // retry loop, so the optimistic count above is left as it stands.
+      return;
     }
+
+    // Reconcile with the server's authoritative count (source of truth -
+    // protects against a client that raced ahead or fell behind).
+    state = state.copyWith(warningCount: ruling.warningCount);
+
+    if (ruling.disqualified) {
+      await _forceDisqualify();
+    }
+  }
+
+  /// Reconciliation for a violation the queue delivered late (the student was
+  /// offline when it happened).
+  ///
+  /// The strike was already counted optimistically, so this only ever *raises* the
+  /// count - a deferred ruling can be older than a live one that arrived first -
+  /// and ends the attempt when that late delivery is what crossed the threshold.
+  void _handleDeferredRuling(ViolationRuling ruling) {
+    if (ruling.submissionId != submissionId) return; // another session's queue
+    if (state.disqualified) return; // already ended, nothing left to escalate
+
+    if (ruling.warningCount > state.warningCount) {
+      state = state.copyWith(warningCount: ruling.warningCount);
+    }
+    if (ruling.disqualified) unawaited(_forceDisqualify());
   }
 
   /// Captures a still frame and stores it in the public `proctor-snapshots`
@@ -260,6 +401,7 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   @override
   void dispose() {
     _gazeSub.cancel();
+    _rulingsSub.cancel();
     _lifecycleObserver.detach();
     _engine.dispose();
     super.dispose();
@@ -275,6 +417,9 @@ final proctoringProvider = StateNotifierProvider.autoDispose
     proctoringRepo: ref.watch(proctoringRepositoryProvider),
     examRepo: ref.watch(examRepositoryProvider),
     engine: MediaPipeProctoringService(),
+    // Durable delivery: a violation that cannot reach Supabase now is queued and
+    // retried rather than dropped (see OfflineSyncService).
+    outbox: ref.watch(violationOutboxProvider),
     onForceExit: () => ref.read(forceExitSignalProvider.notifier).state = submissionId,
     // The composition root is the right place to bind Storage; the notifier
     // itself stays free of the Supabase singleton, which keeps it unit-testable
@@ -293,14 +438,3 @@ final proctoringProvider = StateNotifierProvider.autoDispose
 /// page listens to this and performs navigation + forced logout, keeping
 /// Riverpod state changes and Navigator side effects cleanly separated.
 final forceExitSignalProvider = StateProvider<String?>((ref) => null);
-
-// --- Repository providers -------------------------------------------------
-// These are declared here for wiring clarity; in the real project they'd
-// live in core/di alongside SupabaseService.instance.client.
-final proctoringRepositoryProvider = Provider<ProctoringRepository>((ref) {
-  throw UnimplementedError('Override in ProviderScope with ProctoringRepositoryImpl(client)');
-});
-
-final examRepositoryProvider = Provider<ExamRepository>((ref) {
-  throw UnimplementedError('Override in ProviderScope with ExamRepositoryImpl(client)');
-});
