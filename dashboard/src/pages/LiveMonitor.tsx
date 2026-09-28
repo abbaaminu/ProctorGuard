@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { AlertOctagon, Ban, Clock, FileText, Image as ImageIcon, X } from "lucide-react";
+import { AlertOctagon, Ban, Clock, FileText, Image as ImageIcon, RotateCcw, X } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { useExamSubmissions } from "@/hooks/useExamSubmissions";
 import { useLiveIncidentFeed } from "@/hooks/useLiveIncidentFeed";
+import { useResetSubmission } from "@/hooks/useResetSubmission";
 import { useAccountNames } from "@/hooks/useAccountNames";
 import {
   REALTIME_STATUS_COPY,
@@ -12,6 +13,8 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge, statusTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Toast, type ToastTone } from "@/components/ui/toast";
 import {
   CandidateCardSkeleton,
   FeedRowSkeleton,
@@ -41,6 +44,21 @@ export function LiveMonitor() {
   const [flash, setFlash] = useState(false);
   /** Action-level failure: a disqualify that the server refused, say. */
   const [actionError, setActionError] = useState<string | null>(null);
+  /** The candidate whose attempt is waiting on the reset confirmation. */
+  const [pendingReset, setPendingReset] = useState<SubmissionRow | null>(null);
+  /**
+   * One toast slot, like ExamManager: a *user-initiated* write confirms with a
+   * toast here, while the incident stream keeps its visual ping. A reset is
+   * exactly that kind of write - the supervisor clicked it and needs to know it
+   * landed - and its outcome (how much evidence went) is not visible on the card.
+   */
+  const [toast, setToast] = useState<{ id: number; tone: ToastTone; message: string } | null>(null);
+  const toastId = useRef(0);
+
+  function showToast(tone: ToastTone, message: string) {
+    toastId.current += 1;
+    setToast({ id: toastId.current, tone, message });
+  }
 
   // The header badge reports the actual socket state instead of a hardcoded
   // "Live sync active": Realtime only affects *streaming*, and the badge says so.
@@ -52,7 +70,9 @@ export function LiveMonitor() {
     loading: rosterLoading,
     error: rosterError,
     disqualify,
+    reload: reloadRoster,
   } = useExamSubmissions(examId ?? "");
+  const { resetSubmission, resetting } = useResetSubmission();
   const submissionIds = useMemo(() => submissions.map((s) => s.id), [submissions]);
   const {
     logs,
@@ -121,6 +141,42 @@ export function LiveMonitor() {
         `Could not disqualify ${label}. The attempt is unchanged — check that you are a supervisor for this exam.`
       );
     }
+  }
+
+  /**
+   * Clear one attempt so the student can start over: the submission, its answers
+   * and its proctoring evidence all go.
+   *
+   * The confirmation is a dialog rather than `window.confirm` for the same
+   * reason as the disqualify above - and one step further: the supervisor gets a
+   * spinner while the write is in flight, and a refused delete is reported
+   * instead of leaving the card on screen with no explanation.
+   */
+  async function handleReset() {
+    if (!pendingReset || resetting) return;
+    const target = pendingReset;
+    const label = labelFor(target.student_id);
+
+    setActionError(null);
+    const outcome = await resetSubmission(target.id);
+    setPendingReset(null);
+
+    if (!outcome.ok) {
+      setActionError(`Could not reset ${label}'s attempt: ${outcome.error}.`);
+      return;
+    }
+
+    // The row is gone on the server, so re-read the roster rather than waiting
+    // for a realtime DELETE that the exam filter may never deliver: the card
+    // should disappear because the supervisor clicked, not eventually.
+    reloadRoster();
+    const snapshots = outcome.snapshots > 0 ? ` and ${outcome.snapshots} snapshot(s)` : "";
+    showToast(
+      outcome.storageWarning ? "alert" : "ok",
+      outcome.storageWarning
+        ? `Cleared ${label}'s attempt and ${outcome.incidents} incident(s), but ${outcome.storageWarning}.`
+        : `Cleared ${label}'s attempt: ${outcome.incidents} incident(s)${snapshots} deleted. They can start the exam again.`
+    );
   }
 
   return (
@@ -217,11 +273,19 @@ export function LiveMonitor() {
                       >
                         <FileText size={12} /> Audit
                       </Link>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="ml-auto"
+                        disabled={resetting}
+                        onClick={() => setPendingReset(s)}
+                      >
+                        <RotateCcw size={13} /> Reset
+                      </Button>
                       {s.status === "ongoing" && (
                         <Button
                           variant="destructive"
                           size="sm"
-                          className="ml-auto"
                           onClick={() => handleDisqualify(s)}
                         >
                           <Ban size={13} /> Disqualify
@@ -301,6 +365,34 @@ export function LiveMonitor() {
       </div>
 
       {snapshot && <SnapshotModal url={snapshot} onClose={() => setSnapshot(null)} />}
+
+      <ConfirmDialog
+        open={pendingReset !== null}
+        title={pendingReset ? `Reset ${labelFor(pendingReset.student_id)}'s attempt?` : ""}
+        confirmLabel="Reset attempt"
+        busyLabel="Clearing…"
+        busy={resetting}
+        onConfirm={handleReset}
+        onCancel={() => setPendingReset(null)}
+      >
+        <p>
+          The submission, its answers and every proctoring incident recorded against it are
+          deleted for good, and the student can start the exam again from a fresh attempt.
+        </p>
+        <p>
+          A student who is mid-exam is logged out of it, and any snapshot images of this attempt
+          are removed from Storage too. This cannot be undone.
+        </p>
+      </ConfirmDialog>
+
+      {toast && (
+        <Toast
+          id={toast.id}
+          tone={toast.tone}
+          message={toast.message}
+          onDismiss={() => setToast(null)}
+        />
+      )}
     </div>
   );
 }

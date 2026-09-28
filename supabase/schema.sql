@@ -325,6 +325,7 @@ drop policy if exists "submissions_insert_own" on public.exam_submissions;
 drop policy if exists "submissions_insert_own_ongoing" on public.exam_submissions;
 drop policy if exists "submissions_update_own_ongoing" on public.exam_submissions;
 drop policy if exists "submissions_update_supervisor" on public.exam_submissions;
+drop policy if exists "submissions_delete_supervisor" on public.exam_submissions;
 
 -- Read: your own attempt, or any attempt when you are a supervisor. The console
 -- roster/audit and the mobile live monitor both need the wide read, and
@@ -363,6 +364,25 @@ create policy "submissions_update_supervisor"
     or public.is_supervisor()
   )
   with check (
+    exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
+    or public.is_supervisor()
+  );
+
+-- Resetting one attempt (the console's "Reset attempt" on the submission audit)
+-- is a DELETE of this row: the score, the stored answers, the roster card and -
+-- through the `on delete cascade` on proctoring_logs.submission_id - the
+-- incident log are all cleared together. The child table needs no twin policy:
+-- referential actions run outside row security, so this one policy is what lets
+-- the evidence go with the attempt.
+--
+-- Same audience as the update policy above: the exam's author, or a supervisor.
+-- Students are deliberately left out. A student who could delete their own row
+-- would be able to erase a graded attempt - and the evidence behind a
+-- disqualification - and then simply start the exam again.
+create policy "submissions_delete_supervisor"
+  on public.exam_submissions for delete
+  to authenticated
+  using (
     exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
     or public.is_supervisor()
   );
@@ -494,6 +514,7 @@ on conflict (id) do update
 drop policy if exists "Proctor snapshots read access" on storage.objects;
 drop policy if exists "Proctor snapshots upload access" on storage.objects;
 drop policy if exists "Proctor snapshots upload own ongoing session" on storage.objects;
+drop policy if exists "Proctor snapshots supervisor purge" on storage.objects;
 
 -- Read: the student who owns the submission, or any supervisor (public buckets
 -- already serve /object/public/... without a policy; this covers list()/download()
@@ -530,8 +551,28 @@ create policy "Proctor snapshots upload own ongoing session"
     )
   );
 
--- Deliberately no update/delete policy: snapshots are evidence, so like the
--- log rows they hang off they are append-only for clients.
+-- No update policy: a stored snapshot is never rewritten.
+--
+-- Delete is one deliberate exception, and it exists for exactly one action - the
+-- console's "Reset attempt". That action deletes the submission row first (the
+-- DELETE that `submissions_delete_supervisor` authorizes, whose cascade takes
+-- the log rows with it) and then has to drop the stills those rows pointed at: a
+-- reset that left a student's images in a public bucket would not be a reset.
+--
+-- This policy is therefore necessarily broader than the two above - it cannot be
+-- anchored to the submission folder, because by this point that folder no longer
+-- resolves to a submission row. Supervisor-only is no wider than the delete
+-- policy it serves (a supervisor can already delete any attempt, log rows
+-- included), and it is what keeps the console from leaving orphaned blobs
+-- behind: deleting the `storage.objects` rows without the Storage API would do
+-- precisely that.
+create policy "Proctor snapshots supervisor purge"
+  on storage.objects for delete
+  to authenticated
+  using (
+    bucket_id = 'proctor-snapshots'
+    and public.is_supervisor()
+  );
 
 -- ---------------------------------------------------------------------
 -- Indexes

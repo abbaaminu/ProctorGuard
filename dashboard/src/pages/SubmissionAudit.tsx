@@ -1,11 +1,15 @@
-import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
-import { CheckCircle2, XCircle, AlertOctagon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Link, useParams } from "react-router-dom";
+import { CheckCircle2, XCircle, AlertOctagon, RotateCcw } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { useAccountNames } from "@/hooks/useAccountNames";
+import { useResetSubmission } from "@/hooks/useResetSubmission";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge, statusTone } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Toast, type ToastTone } from "@/components/ui/toast";
 import { formatTime } from "@/lib/utils";
 import { incidentLabel } from "@/lib/incidents";
 import type { SubmissionRow, ProctoringLogRow, QuestionRow } from "@/types/database";
@@ -26,7 +30,19 @@ export function SubmissionAudit() {
   const [questions, setQuestions] = useState<QuestionRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  /** True once the attempt is gone: there is nothing left on this page to audit. */
+  const [cleared, setCleared] = useState(false);
+  const [confirmingReset, setConfirmingReset] = useState(false);
   const { names } = useAccountNames();
+  const { resetSubmission, resetting } = useResetSubmission();
+  /** One toast slot, the way the rest of the console does it (`ui/toast.tsx`). */
+  const [toast, setToast] = useState<{ id: number; tone: ToastTone; message: string } | null>(null);
+  const toastId = useRef(0);
+
+  function showToast(tone: ToastTone, message: string) {
+    toastId.current += 1;
+    setToast({ id: toastId.current, tone, message });
+  }
 
   useEffect(() => {
     if (!submissionId) {
@@ -69,6 +85,41 @@ export function SubmissionAudit() {
       active = false;
     };
   }, [submissionId]);
+
+  /**
+   * Clear the attempt: the submission, its answers and its proctoring evidence
+   * all go, and the student can start the exam again from scratch.
+   *
+   * The confirmation is a real dialog rather than `window.confirm` because the
+   * blast radius is worth spelling out — how many incidents are on file, that the
+   * images go too — and because a *refused* delete has to be reported: otherwise
+   * the page would simply look unchanged, with no reason given.
+   */
+  async function handleReset() {
+    if (!submission || resetting) return;
+    const label = names[submission.student_id] ?? "this student";
+
+    // The dialog stays open while the write is in flight (buttons disable, the
+    // confirm button shows a spinner): closing it first would leave the
+    // supervisor looking at an unchanged page with no sign anything happened.
+    const outcome = await resetSubmission(submission.id);
+    setConfirmingReset(false);
+
+    if (!outcome.ok) {
+      showToast("alert", `Could not reset the attempt: ${outcome.error}.`);
+      return;
+    }
+
+    setCleared(true);
+    const snapshots =
+      outcome.snapshots > 0 ? ` and ${outcome.snapshots} snapshot(s)` : "";
+    showToast(
+      outcome.storageWarning ? "alert" : "ok",
+      outcome.storageWarning
+        ? `Cleared ${label}'s attempt and ${outcome.incidents} incident(s), but ${outcome.storageWarning}.`
+        : `Cleared ${label}'s attempt: ${outcome.incidents} incident(s)${snapshots} deleted. They can start the exam again.`
+    );
+  }
 
   if (loading) {
     return (
@@ -115,6 +166,31 @@ export function SubmissionAudit() {
     );
   }
 
+  if (cleared && submission) {
+    return (
+      <div className="p-6">
+        <h1 className="mb-1 text-lg font-semibold text-slate-100">Attempt cleared</h1>
+        <p className="mb-4 max-w-xl text-sm text-slate-400">
+          The submission, its stored answers and every proctoring incident recorded against it
+          are deleted, and the student can start the exam again from a fresh attempt. Nothing
+          from this attempt can be restored.
+        </p>
+        <Link to={`/exams/${submission.exam_id}/monitor`} className="text-sm text-accent hover:underline">
+          Back to the exam monitor
+        </Link>
+
+        {toast && (
+          <Toast
+            id={toast.id}
+            tone={toast.tone}
+            message={toast.message}
+            onDismiss={() => setToast(null)}
+          />
+        )}
+      </div>
+    );
+  }
+
   if (!submission) return <div className="p-6 text-sm text-slate-500">Submission not found.</div>;
 
   return (
@@ -132,6 +208,15 @@ export function SubmissionAudit() {
           <span className="text-lg font-semibold text-slate-100">
             {submission.score != null ? `${submission.score} pts` : "—"}
           </span>
+          <Button
+            variant="destructive"
+            size="sm"
+            disabled={resetting}
+            onClick={() => setConfirmingReset(true)}
+          >
+            <RotateCcw size={13} />
+            Reset attempt
+          </Button>
         </div>
       </div>
 
@@ -220,6 +305,35 @@ export function SubmissionAudit() {
           </CardContent>
         </Card>
       </div>
+
+      <ConfirmDialog
+        open={confirmingReset}
+        title={`Reset ${names[submission.student_id] ?? "this student"}'s attempt?`}
+        confirmLabel="Reset attempt"
+        busyLabel="Clearing…"
+        busy={resetting}
+        onConfirm={handleReset}
+        onCancel={() => setConfirmingReset(false)}
+      >
+        <p>
+          The submission, its stored answers and its {logs.length} proctoring incident
+          {logs.length === 1 ? "" : "s"} are deleted for good, and the student can start the
+          exam again from a fresh attempt.
+        </p>
+        <p>
+          A student who is mid-exam is logged out of it, and any snapshot images of this attempt
+          are removed from Storage too. This cannot be undone.
+        </p>
+      </ConfirmDialog>
+
+      {toast && (
+        <Toast
+          id={toast.id}
+          tone={toast.tone}
+          message={toast.message}
+          onDismiss={() => setToast(null)}
+        />
+      )}
     </div>
   );
 }

@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import type { SubmissionRow } from "@/types/database";
 
 /**
- * One exam's roster, live.
+ * One exam's roster, live: the initial read, realtime patches on top of it, and
+ * an explicit `reload()` for a write the console already knows about (a reset).
  *
  * Errors used to be swallowed (`const { data } = await ...`), which made a
  * failed read indistinguishable from an exam nobody has started — so the load
@@ -13,6 +14,16 @@ export function useExamSubmissions(examId: string) {
   const [submissions, setSubmissions] = useState<SubmissionRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  /** Bumped by `reload()` to re-run the read below; the channel is left alone. */
+  const [reloadToken, setReloadToken] = useState(0);
+  /**
+   * Which exam the cards on screen belong to.
+   *
+   * A re-read of the *same* exam keeps them up (only a changed exam shows the
+   * skeleton again), so a reset that calls `reload()` does not blank a live
+   * supervisor's roster for a round trip.
+   */
+  const loadedExamRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!examId) {
@@ -21,7 +32,8 @@ export function useExamSubmissions(examId: string) {
       return;
     }
     let active = true;
-    setLoading(true);
+    // A failed first read leaves this null, so a retry still shows the skeleton.
+    if (loadedExamRef.current !== examId) setLoading(true);
 
     (async () => {
       const { data, error: loadError } = await supabase
@@ -37,8 +49,23 @@ export function useExamSubmissions(examId: string) {
       }
       setError(null);
       setSubmissions((data as SubmissionRow[]) ?? []);
+      loadedExamRef.current = examId;
       setLoading(false);
     })();
+
+    return () => {
+      active = false;
+    };
+  }, [examId, reloadToken]);
+
+  /**
+   * Realtime is deliberately its own effect: a `reload()` must not tear the
+   * channel down and up again, or it would drop the events buffered in between —
+   * the same reason the incident feed filters client-side instead of
+   * re-subscribing on every roster change.
+   */
+  useEffect(() => {
+    if (!examId) return;
 
     const channel = supabase
       .channel(`exam_submissions_${examId}`)
@@ -63,10 +90,18 @@ export function useExamSubmissions(examId: string) {
       .subscribe();
 
     return () => {
-      active = false;
       supabase.removeChannel(channel);
     };
   }, [examId]);
+
+  /**
+   * Re-read the roster now.
+   *
+   * Called after a write the console knows changed a row (a reset attempt) so
+   * the list is right immediately, instead of depending on a realtime DELETE
+   * that the `exam_id` filter may never deliver.
+   */
+  const reload = useCallback(() => setReloadToken((token) => token + 1), []);
 
   /**
    * Supervisor intervention: close an ongoing attempt as disqualified.
@@ -90,6 +125,6 @@ export function useExamSubmissions(examId: string) {
     return true;
   }
 
-  return { submissions, loading, error, disqualify };
+  return { submissions, loading, error, disqualify, reload };
 }
 

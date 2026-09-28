@@ -2,9 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import type { ProctoringLogRow } from "@/types/database";
 
-/// Subscribes to new `proctoring_logs` rows as they're inserted, optionally
+/// Subscribes to `proctoring_logs` as they're written *and* deleted, optionally
 /// scoped to a set of submission IDs (e.g. all submissions for one exam).
 /// Keeps the most recent `limit` entries, newest first.
+///
+/// Deletes matter since a supervisor can clear a whole attempt ("Reset
+/// attempt"): the FK cascade takes that attempt's rows, and a feed still showing
+/// incidents for a submission that no longer exists would be evidence for an
+/// exam nobody can open any more.
 ///
 /// The hook owns its own loading flag: the panel that renders it shows skeleton
 /// rows until the seed query resolves, instead of briefly claiming "no incidents
@@ -47,7 +52,7 @@ export function useLiveIncidentFeed(submissionIds: string[] | null, limit = 100)
     })();
 
     const channel = supabase
-      .channel("proctoring_logs_inserts")
+      .channel("proctoring_logs_feed")
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "proctoring_logs" },
@@ -56,6 +61,18 @@ export function useLiveIncidentFeed(submissionIds: string[] | null, limit = 100)
           const scope = idsRef.current;
           if (scope && scope.length > 0 && !scope.includes(row.submission_id)) return;
           setLogs((prev) => [row, ...prev].slice(0, limit));
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "proctoring_logs" },
+        (payload) => {
+          // A DELETE payload carries only the primary key - there is no row left
+          // to send, and row security cannot be re-evaluated against it - which
+          // is all this needs: drop it from the buffer.
+          const removedId = (payload.old as { id?: string } | null)?.id;
+          if (!removedId) return;
+          setLogs((prev) => prev.filter((log) => log.id !== removedId));
         }
       )
       .subscribe();

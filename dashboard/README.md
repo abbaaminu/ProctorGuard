@@ -21,11 +21,12 @@ submission with 3 proctoring logs. Log in with
 ## Structure
 ```
 src/
-  components/ui/       Badge, Card, Button, Toast, MetricCard, Skeleton —
-                        shadcn-style primitives
+  components/ui/       Badge, Card, Button, Toast, ConfirmDialog, MetricCard,
+                        Skeleton — shadcn-style primitives
   components/layout/   Sidebar (nav + realtime pill + profile tile), AppShell
   hooks/               useAuth (role guard), useRealtimeStatus,
                         useLiveIncidentFeed, useExamSubmissions,
+                        useResetSubmission (clear one attempt),
                         useAccountNames (id -> "Aisha Bello")
   lib/incidents.ts     action_type -> label, shared by every incident panel
   pages/               Login, DashboardOverview, ExamManager,
@@ -56,12 +57,16 @@ most-flagged first, with each exam linking straight to its live monitor.
   list with its correct-option radio or the accepted answer for a typed question.
 - **LiveMonitor** — the roster for one exam with per-candidate flag counts, a
   confirmed **Disqualify** (the attempt closes irreversibly, and a refused write
-  is reported instead of silently doing nothing) and an **Audit** link per
-  candidate that opens `SubmissionAudit`.
+  is reported instead of silently doing nothing), a confirmed **Reset** that
+  clears one attempt outright, and an **Audit** link per candidate that opens
+  `SubmissionAudit`.
 - **SubmissionAudit** — the incident timeline next to the numbered
   question-by-question breakdown, with the student's name in the header. A
   fill-in-the-blank answer is compared to `correct_text_answer` exactly as
-  `submit_exam` grades it (trimmed, case-insensitive).
+  `submit_exam` grades it (trimmed, case-insensitive). Its header carries
+  **Reset attempt** (see *Resetting an attempt* below), and a successful reset
+  replaces the page with a short "attempt cleared" note linking back to the
+  monitor, since there is nothing left to audit.
 - **Analytics** — one row per exam: attempts, in progress, completed,
   disqualified, DQ rate (with a bar) and incidents, sorted most-flagged first so
   the exam that needs attention is at the top. Each title links to that exam's
@@ -165,7 +170,7 @@ question instead, or create a new exam.
   feed header background briefly (0.5s) instead of stacking toasts, since a
   supervisor's eyes are expected to already be on this panel during a live
   session. A *user-initiated* write is the exception: the ExamManager publish
-  toggle confirms with one short-lived toast (`components/ui/toast.tsx` — a
+  toggle and the **Reset** actions confirm with one short-lived toast (`components/ui/toast.tsx` — a
   single slot, never a stack), because there the supervisor is looking at the row
   they just clicked and the action is atomic rather than a stream. A sound-effect
   toggle is stubbed as a further step — wire an `<audio>` element behind a Switch
@@ -176,6 +181,65 @@ question instead, or create a new exam.
   toggle therefore asks for the written row back (`.select("id")`) and treats an
   empty result as a failure — that is the other half of the optimistic badge:
   without a real rollback, "Published" would only be a guess.
+
+## Resetting an attempt
+
+A supervisor can clear one student's attempt — **Reset** on the monitor's roster
+card, or **Reset attempt** on the submission audit. It is the counterpart to
+**Disqualify**: disqualify closes an attempt and *keeps* the evidence, reset
+deletes the attempt and the evidence with it, and afterwards the student can
+start the exam again. It exists for the crashed laptop, the mis-assigned retake
+and the test run that must not stay on the roster.
+
+The confirmation is a real dialog (`components/ui/confirm-dialog.tsx`, the only
+modal in the app) rather than `window.confirm`, because a destructive action can
+name its own blast radius: the incident count, the stored answers, the snapshot
+images, and the fact that a mid-exam student is logged out of it. The dialog
+stays open while the write is in flight — both buttons disable, the confirm
+button shows a spinner — so a slow request never looks like a dead click.
+
+`useResetSubmission` does its three steps in the only order that works:
+
+1. **Read the evidence first.** The attempt's `proctoring_logs` rows go with the
+   submission (FK cascade), and `snapshot_url` is the only record of which
+   objects in `proctor-snapshots` belonged to it: lost, they could never be
+   cleaned up. Object paths are derived from the bucket segment of the URL, so
+   both the `/object/public/...` and `/object/sign/...?token=...` shapes work,
+   and a URL that is not ours (a hand-seeded placeholder) is skipped rather than
+   failing the whole reset.
+2. **Delete the submission** with `.select("id")`, so a DELETE that RLS filtered
+   out — PostgREST reports it as *success* while matching zero rows — is told
+   apart from a real one and reported, instead of being toasted as a reset that
+   never happened. Same zero-row check as the publish toggle, for the same
+   reason.
+3. **Purge the stills** through the Storage API; deleting the `storage.objects`
+   rows in SQL would drop the metadata and leave the blob in the bucket. This
+   step is best effort on purpose: the attempt is already gone at that point, so
+   a Storage failure is surfaced as a *warning* ("…but N snapshot images could
+   not be removed") instead of a "the reset failed" that would be a lie, or a
+   silence that would leave an orphaned image in a public bucket.
+
+Schema side (`../supabase/schema.sql` — re-run it to pick these up; both are
+`drop policy if exists` + `create policy`, so the documented idempotent re-run
+applies them):
+
+- `submissions_delete_supervisor` is the new DELETE policy: the exam's author or
+  a supervisor, never the student. A student who could delete their own row could
+  erase a graded attempt — and the evidence behind a disqualification — and then
+  simply start the exam again.
+- `proctoring_logs` needs no twin policy: referential actions run outside row
+  security, which is exactly why the one policy on the parent is enough to let
+  the evidence go with the attempt.
+- `Proctor snapshots supervisor purge` is the supervisor-only Storage DELETE that
+  step 3 needs. It deliberately cannot be anchored to the submission folder,
+  because by then that folder no longer resolves to a submission row.
+
+The roster refreshes through `useExamSubmissions().reload()` rather than waiting
+for a realtime DELETE that the `exam_id` filter may never deliver — the row is
+gone on the server the moment the supervisor clicked, and the card should
+disappear because of that, not eventually. `useLiveIncidentFeed` now handles
+deleted rows too, so an incident belonging to an attempt that no longer exists
+cannot linger in the feed.
 
 ## Bundle
 
