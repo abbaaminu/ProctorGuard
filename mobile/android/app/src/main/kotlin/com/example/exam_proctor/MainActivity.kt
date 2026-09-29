@@ -3,6 +3,7 @@ package com.example.exam_proctor
 import android.app.ActivityManager
 import android.app.admin.DevicePolicyManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.display.DisplayManager
@@ -217,19 +218,48 @@ class MainActivity : FlutterActivity() {
         emptyList()
     }
 
+    /**
+     * Whether this device can run a plug-in (USB/HDMI) camera at all.
+     *
+     * The public platform answers this two ways, both permission-free:
+     * `PackageManager.FEATURE_CAMERA_EXTERNAL` is the capability the device
+     * advertises — the very flag the framework's own system-only
+     * `CameraManager.isExternalCameraSupported()` consults — and a camera on the
+     * list that reports an external lens (see [isExternalFacingCamera]) proves it
+     * in practice, which also covers a device that takes a USB camera without
+     * declaring the feature.
+     */
     private fun externalCameraSupported(): Boolean =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S_V2) {
-            try {
-                (getSystemService(Context.CAMERA_SERVICE) as CameraManager)
-                    .isExternalCameraSupported
-            } catch (_: Exception) {
-                false
-            }
-        } else {
-            // There is no API to ask before 32 ("does this device take USB
-            // cameras?"), so the attachable-camera list answers the same question.
-            cameraIds().any { isExternalFacingCamera(it) }
-        }
+        hasExternalCameraFeature() || cameraIds().any { isExternalFacingCamera(it) }
+
+    private fun hasExternalCameraFeature(): Boolean = try {
+        packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_EXTERNAL)
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * True when [cameraId] is a plug-in lens rather than one of this device's own
+     * lenses.
+     *
+     * Two public readings, and neither window needs the camera permission.
+     * `INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL` (API 28) is the level the platform
+     * reports for a USB camera attached to a device that supports them, and
+     * `LENS_FACING_EXTERNAL` (API 32) is the lens facing such a camera carries;
+     * a built-in lens reports neither, so an older device simply answers `false`.
+     * An id that cannot be read (detached since the camera list was taken) is not
+     * a finding.
+     */
+    private fun isExternalFacingCamera(cameraId: String): Boolean = try {
+        val characteristics = (getSystemService(Context.CAMERA_SERVICE) as CameraManager)
+            .getCameraCharacteristics(cameraId)
+        characteristics.get(CameraCharacteristics.LENS_FACING) ==
+            CameraCharacteristics.LENS_FACING_EXTERNAL ||
+            characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ==
+            CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL
+    } catch (_: Exception) {
+        false
+    }
 
     /**
      * Why the camera feeding this attempt counts as virtual, or null when it is
