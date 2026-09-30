@@ -12,6 +12,11 @@ export type ProfileRow = {
   role: UserRole;
   full_name: string;
   email: string;
+  /**
+   * `profiles.created_at`, set by the database. Optional because a trimmed
+   * `select` (or a hand-built object) may omit it — the roster orders by it.
+   */
+  created_at?: string;
 };
 
 export type ExamRow = {

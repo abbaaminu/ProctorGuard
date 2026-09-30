@@ -23,6 +23,7 @@ export function AppShell({
       <Sidebar
         userName={profile?.full_name || "Staff console"}
         userEmail={profile?.email ?? ""}
+        role={profile?.role ?? null}
         pending={profilePending}
       />
       <main className="ml-56 min-h-screen">{children}</main>

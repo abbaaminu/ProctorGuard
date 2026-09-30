@@ -21,8 +21,10 @@ proctor/
 
 Roles live in the `public.user_role` enum: `student`, `lecturer`, `supervisor`
 and `admin`. Students take exams in the mobile app, `lecturer` and `supervisor`
-sign into this console (`is_staff()`), and `admin` additionally gets a roster and
-role-management screen in the mobile app.
+sign into this console (`is_staff()`), and `admin` additionally gets the roster and
+role-management screen — in the mobile app, and as the dashboard's one admin-only
+page (`/accounts`). Every signed-in account leaves the console from the sidebar
+footer's **Sign out**, which ends the session and puts the login form back.
 
 ## Getting started
 1. Create a Supabase project, run `supabase/schema.sql` in its SQL editor,
@@ -44,7 +46,10 @@ Both apps read/write the same tables, so a submission a student makes in
 
 ## Production checklist
 
-`supabase/schema.sql` is idempotent — re-run it whenever it changes. Beyond that:
+`supabase/migrations/` holds the same statements packaged for a project that is
+already deployed, where re-running all of `schema.sql` is too blunt. Run the
+migrations you have not run yet — each one says what it does and how to verify
+it. Beyond that:
 
 - [ ] **Turn off public sign-ups** (Supabase → Authentication → Sign In /
       Providers). The schema lets a self-provisioned account create *only* a
@@ -57,6 +62,14 @@ Both apps read/write the same tables, so a submission a student makes in
       Admin Dashboard. RLS rejects `role in ('admin','lecturer','supervisor')`
       written from a client, so a staff row written by hand has to come from the
       SQL editor or the Edge Function — not from the Flutter/React apps.
+- [ ] **Give the API roles their privileges on `public`** on any project created
+      before §0 of `schema.sql` existed. Without them PostgREST answers every
+      request with `401 {"code":"42501","message":"permission denied for schema
+      public"}` *before* a policy is looked at: sign-in still succeeds (GoTrue
+      never touches `public`), and the console then reports that it cannot read
+      profiles, for every account. Run
+      `supabase/migrations/grant_api_roles_public_schema.sql` once in the SQL
+      editor — a fresh `schema.sql` includes the same statements.
 - [ ] **Deploy `admin-create-user`** (`supabase functions deploy admin-create-user`).
       It is the only path that mints a staff login: it re-reads the caller's JWT
       against `profiles` with the anon key, refuses anything that is not an

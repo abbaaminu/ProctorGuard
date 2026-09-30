@@ -30,6 +30,40 @@
 -- =====================================================================
 
 create extension if not exists "uuid-ossp";
+-- ---------------------------------------------------------------------
+-- 0. API PRIVILEGES (before the first table exists)
+-- ---------------------------------------------------------------------
+-- PostgREST reaches `public` as `anon` / `authenticated` / `service_role`, and
+-- a row security policy is only consulted once those roles hold the *ordinary*
+-- privileges: USAGE on the schema, then SELECT/INSERT/UPDATE/DELETE on the
+-- object. A database without them refuses every statement before RLS runs,
+-- answering `401 {"code":"42501","message":"permission denied for schema
+-- public"}` — which is what made the console report that no account could read
+-- its profile, for every account, while sign-in itself kept succeeding. (The
+-- symptom, and the copy to run against an already-deployed project, are in
+-- supabase/migrations/grant_api_roles_public_schema.sql.)
+--
+-- It sits above the first `create table` so the ALTER DEFAULT PRIVILEGES apply
+-- to everything this file goes on to create; the blanket grants are what cover
+-- objects that already exist, since schema.sql is re-runnable.
+--
+-- Nothing here widens what a caller can *see*: the policies below remain the
+-- only thing that decides rows, which is why `anon` still reads zero rows from
+-- `profiles` (its one SELECT policy is `to authenticated`).
+grant usage on schema public to postgres, anon, authenticated, service_role;
+
+grant all privileges on all tables    in schema public to postgres, anon, authenticated, service_role;
+grant all privileges on all sequences in schema public to postgres, anon, authenticated, service_role;
+grant all privileges on all functions in schema public to postgres, anon, authenticated, service_role;
+
+alter default privileges in schema public
+  grant all privileges on tables to postgres, anon, authenticated, service_role;
+alter default privileges in schema public
+  grant all privileges on sequences to postgres, anon, authenticated, service_role;
+alter default privileges in schema public
+  grant all privileges on functions to postgres, anon, authenticated, service_role;
+
+
 
 -- ---------------------------------------------------------------------
 -- 1. PROFILES (profile table, 1:1 with auth.users)

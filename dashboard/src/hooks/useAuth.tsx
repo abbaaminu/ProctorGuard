@@ -8,45 +8,17 @@ import {
   type ReactNode,
 } from "react";
 import { supabase } from "@/lib/supabase";
-import type { ProfileRow, UserRole } from "@/types/database";
-
-/**
- * The roles this console serves — `is_staff()` in `supabase/schema.sql`. A
- * student can sign in, but is blocked below rather than shown staff-scoped data.
- */
-const STAFF_ROLES: readonly UserRole[] = ["admin", "lecturer", "supervisor"];
-
-/**
- * PostgREST / GoTrue codes that mean "this session is not allowed to do that".
- *
- * `42501` is `insufficient_privilege` — an RLS policy (or the
- * `profiles_guard_role_change` trigger) refusing the statement. `PGRST301` /
- * `PGRST302` are PostgREST's own "the JWT expired" / "no JWT was sent" answers.
- * All three are terminal: retrying with the same session cannot succeed.
- */
-const PERMISSION_CODES = new Set(["42501", "PGRST301", "PGRST302"]);
-
-/** The two error shapes these calls can answer with (`AuthError`, `PostgrestError`). */
-interface QueryError {
-  message?: string;
-  code?: string | null;
-}
-
-interface ProfileResult {
-  profile: ProfileRow | null;
-  /** A sentence for the user, or null when the profile loaded. */
-  message: string | null;
-  /**
-   * The account itself is the problem — no profile row, a refused read, or a
-   * non-staff role — so re-reading with the same session cannot help, and the
-   * session should be ended rather than left dangling behind the login form.
-   */
-  fatal: boolean;
-}
-
-function isPermissionError(code: string | null | undefined): boolean {
-  return code != null && PERMISSION_CODES.has(code);
-}
+import type { ProfileRow } from "@/types/database";
+import { STAFF_ROLES } from "@/lib/roles";
+import {
+  isPermissionError,
+  isSchemaOrTableDenial,
+  isUnknownTableError,
+  signOutErrorMessage,
+  NO_API_ACCESS_MESSAGE,
+  UNKNOWN_TABLE_MESSAGE,
+  type ApiError,
+} from "@/lib/api-errors";
 
 /**
  * Turns an `auth.signInWithPassword` failure into a sentence a staff member can
@@ -57,7 +29,7 @@ function isPermissionError(code: string | null | undefined): boolean {
  * non-existent email and a stale account: the server refuses to say which emails
  * exist, and the form must not become an oracle for that either.
  */
-function authErrorMessage(error: QueryError): string {
+function authErrorMessage(error: ApiError): string {
   const code = (error.code ?? "").toLowerCase();
   const message = (error.message ?? "").trim();
   const lower = message.toLowerCase();
@@ -76,11 +48,32 @@ function authErrorMessage(error: QueryError): string {
   return message || "Sign-in failed. Check your email and password and try again.";
 }
 
+interface ProfileResult {
+  profile: ProfileRow | null;
+  /** A sentence for the user, or null when the profile loaded. */
+  message: string | null;
+  /**
+   * The account itself is the problem — no profile row, a refused read, or a
+   * non-staff role — so re-reading with the same session cannot help, and the
+   * session should be ended rather than left dangling behind the login form.
+   */
+  fatal: boolean;
+}
+
 interface AuthState {
   loading: boolean;
   profile: ProfileRow | null;
   error: string | null;
   signIn: (email: string, password: string) => Promise<void>;
+  /**
+   * Ends the session. Clearing `profile` *is* the return to the login screen —
+   * `AppRoutes` renders `LoginPage` whenever there is no profile — so no caller
+   * navigates, and no caller has to know which route it was on.
+   *
+   * Rejects with a ready sentence when the session could **not** be ended: see
+   * `signOutErrorMessage` for why a failure keeps the console on screen instead
+   * of showing a login form over a session that is still live.
+   */
   signOut: () => Promise<void>;
 }
 
@@ -112,7 +105,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const readProfile = useCallback(
     async (userId: string): Promise<ProfileResult> => {
       let data: ProfileRow | null = null;
-      let readError: QueryError | null = null;
+      let readError: ApiError | null = null;
       try {
         const response = await supabase
           .from("profiles")
@@ -133,6 +126,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
 
       if (readError) {
+        // The project is misconfigured, not the person: every account fails the
+        // same way and nothing about the credentials is wrong, so the session is
+        // left alone — once an administrator fixes the database, a reload lands
+        // in the console instead of a second round of sign-in. Only the
+        // *account* faults below sign out.
+        if (isSchemaOrTableDenial(readError)) {
+          return { profile: null, fatal: false, message: NO_API_ACCESS_MESSAGE };
+        }
+        if (isUnknownTableError(readError)) {
+          return { profile: null, fatal: false, message: UNKNOWN_TABLE_MESSAGE };
+        }
+
         if (isPermissionError(readError.code)) {
           return {
             profile: null,
@@ -228,7 +233,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
    */
   const loadProfile = useCallback(async () => {
     let userId: string | null = null;
-    let sessionError: QueryError | null = null;
+    let sessionError: ApiError | null = null;
     try {
       const { data, error: getSessionError } = await supabase.auth.getSession();
       sessionError = getSessionError;
@@ -297,7 +302,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   async function signOut() {
-    await supabase.auth.signOut();
+    // `auth.signOut()` answers `{ error }` for a revoke the server refused and
+    // *throws* when the request never arrived, so both are folded into one path
+    // here: in either case the SDK has kept the stored session, which is exactly
+    // what the caller has to be told about rather than assume away.
+    let failure: ApiError | null = null;
+    try {
+      const { error: signOutError } = await supabase.auth.signOut();
+      failure = signOutError;
+    } catch (thrown) {
+      failure = thrown && typeof thrown === "object" ? (thrown as ApiError) : { message: String(thrown) };
+    }
+    if (failure) throw new Error(signOutErrorMessage(failure));
+
     if (!mountedRef.current) return;
     setProfile(null);
     // The message belongs to the account that just left — a fresh login page must

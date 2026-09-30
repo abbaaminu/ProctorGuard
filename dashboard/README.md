@@ -13,28 +13,45 @@ Uses the shared schema at `../supabase/schema.sql` — run that once in the
 Supabase SQL editor before starting either app in this monorepo. It already
 includes `questions.points` and `exam_submissions.submitted_at`.
 
+§0 of that file is the part a project created before it existed will *not* have:
+the `grant`s that let PostgREST's `anon`/`authenticated` roles reach the schema
+at all. Without them every request answers `401 {"code":"42501","message":
+"permission denied for schema public"}` and this console cannot read any
+account — run `../supabase/migrations/grant_api_roles_public_schema.sql` once in
+the SQL editor to apply them. See **Login** below for what the form shows until
+you do.
+
 `../supabase/seed.sql` then loads mock testing data: 5 profiles (admin, lecturer,
 supervisor and 2 students), 2 published exams with 5 questions each, and one
 disqualified submission with 3 proctoring logs. Log in with
-`supervisor@proctor.test` / `Proctor123!` to see it in this console — the admin
-(`admin@proctor.test`) and lecturer (`lecturer@proctor.test`) logins use the same
-demo password and reach the same console, since `is_staff()` in the schema treats
-all three staff roles alike.
+`supervisor@proctor.test` / `Proctor123!` to see it in this console — the lecturer
+(`lecturer@proctor.test`) login uses the same demo password and reaches the same
+console, since `is_staff()` in the schema treats all three staff roles alike. The
+admin (`admin@proctor.test`) reaches it too, plus one page the other two do not
+have: **Accounts**.
 
 ## Structure
 ```
 src/
   components/ui/       Badge, Card, Button, Toast, ConfirmDialog, MetricCard,
                         Skeleton — shadcn-style primitives
-  components/layout/   Sidebar (nav + realtime pill + profile tile), AppShell
+  components/layout/   Sidebar (role-aware nav + realtime pill + profile tile
+                        + Sign out), AppShell, RequireAdmin (fence for the
+                        admin-only route), SignOutButton (ends the session)
   hooks/               useAuth (session, role guard, sign-in errors),
                         useRealtimeStatus,
                         useLiveIncidentFeed, useExamSubmissions,
                         useResetSubmission (clear one attempt),
-                        useAccountNames (id -> "Aisha Bello")
+                        useAccountNames (id -> "Aisha Bello"),
+                        useAccounts (roster + role writes)
   lib/incidents.ts     action_type -> label, shared by every incident panel
+  lib/roles.ts         the `public.user_role` vocabulary: labels, the admin
+                        test, the role-change verdict and warning
+  lib/api-errors.ts    a server refusal -> a sentence (deployment fault vs
+                        account fault), shared by useAuth and useAccounts
   pages/               Login, DashboardOverview, ExamManager,
-                        LiveMonitor, SubmissionAudit, Analytics
+                        LiveMonitor, SubmissionAudit, Analytics,
+                        AccountRoster (administrator only)
 ```
 
 Every nav entry has a real page behind it: `/analytics` renders `Analytics`
@@ -44,13 +61,27 @@ sidebar. `/analytics` reports per exam — attempts, in-progress, completed,
 disqualifications, the DQ rate and incident counts over a 30-day window — sorted
 most-flagged first, with each exam linking straight to its live monitor.
 
+One entry is role-conditional: **Accounts** (`/accounts`, the `Users` icon) is
+rendered only when `profile.role === "admin"`, and `RequireAdmin` sends anyone
+else who types that address by hand back to `/`.
+
+The other thing in the chrome that is not a page is the sidebar footer's
+**Sign out** (`components/layout/SignOutButton.tsx`), directly under the profile
+tile and available to every signed-in role. It calls `useAuth().signOut` and
+nothing else: clearing `profile` is what puts the login screen back, so the
+control does not know or care which page it was pressed from.
+
 ## What each page does
 
 - **Login** — the staff sign-in form, and the only screen the console shows
   without a session. Every refusal lands here as a sentence — a wrong password or
   an email that does not exist, an unconfirmed address, a profile row that is
   missing, a profile read the server refused, or a signed-in student — never as a
-  raw PostgREST body.
+  raw PostgREST body. Two of those sentences describe the *deployment* rather
+  than the account — a database whose API cannot reach the schema
+  (`permission denied for schema public`) or one whose API does not know
+  `public.profiles` yet — and they name the file an administrator has to run,
+  because until it has been run no account at all can be served.
 - **DashboardOverview** — live metrics (`Live exams now` counts exams with an
   `ongoing` submission, not merely published ones), the 24h incident breakdown
   and the completions/disqualifications timeline. A failed read is shown with a
@@ -83,6 +114,17 @@ most-flagged first, with each exam linking straight to its live monitor.
   (`WINDOW_DAYS`) because `proctoring_logs` only grows — an unbounded "all time"
   read would get slower every term — while attempts and scores come from
   `exam_submissions`, which is bounded by the roster.
+- **Accounts (administrator only)** — the roster: every `profiles` row with the
+  role it signs in with. A role is moved with a per-row select and an explicit
+  **Save**, confirmed by a dialog that spells out what the new role can do before
+  anything is written, and the administrator's own row carries no control at all
+  (demoting yourself would revoke the page that undoes it). A refused write is
+  reported in the page banner with a **Try again** rather than a toast that
+  disappears — and the write asks for the row back, because a policy-filtered
+  `UPDATE` matches zero rows while PostgREST still reports success. **Add an
+  account** goes through `admin-create-user`, the only way to mint a non-student
+  login. See *Role-based rendering* under Design decisions for why nothing else in
+  the console is branched on role.
 
 ## Loading behaviour (no blocking loaders)
 
@@ -169,9 +211,21 @@ question instead, or create a new exam.
   `register_violation` applies the 3-strike rule — so the roster shows the
   server's numbers. The console's own write path is a supervisor intervention
   (the confirmed **Disqualify**), which `submissions_update_supervisor` allows.
-- **Names, not uuids.** `useAccountNames` maps `users.id -> name` and refetches on
-  any `users` change, so the roster and the incident feed read like a class list.
-  RLS is what makes that safe: only a supervisor may read every profile row.
+- **Names, not uuids.** `useAccountNames` maps `profiles.id -> full_name` — falling
+  back to the email, then "Unknown account" — and refetches on any `profiles` change,
+  so the roster and the incident feed read like a class list. RLS is what makes
+  that safe: only staff (admin, lecturer or supervisor) may read every profile row.
+- **Role-based rendering is the exception, not the rule.** The dashboard, exams,
+  monitoring, analytics and the audit trail are `is_staff()` screens that all
+  three staff roles share, so the *only* branch on `profile.role` in the console
+  is the Accounts entry and its route — `lib/roles.ts` holds the vocabulary from
+  `public.user_role` and the single predicate (`canManageAccounts`) that the
+  sidebar, the route fence and the page all ask. The Flutter app splits the same
+  way (`RoleGate` -> `SupervisorExamPickerPage` / `AdminDashboardPage`). Rendering
+  is never the boundary: `profiles_admin_all` is `is_admin()` and
+  `profiles_guard_role_change` raises `42501` for anyone below admin, so a fence
+  bypassed in devtools still gets a refusal from PostgREST instead of a granted
+  write.
 - **Empty is not an error.** Every panel distinguishes "nothing has happened yet"
   from "the read failed": the roster, the incident feed and the dashboard all
   surface the underlying message with a retry instead of an empty list.
@@ -188,7 +242,20 @@ question instead, or create a new exam.
   same message. That is `RoleGate`'s *Sign out* escape hatch in the Flutter app,
   done for the user here because this console shows a login screen rather than a
   dedicated error page. Only a *connection* failure keeps the session, since
-  re-reading it can actually succeed.
+  re-reading it can actually succeed. A *deployment* fault keeps the session too
+  — a missing schema/table grant (`permission denied for schema public`) or a
+  `public.profiles` the API has never seen — because the account is fine and the
+  fix happens server-side: signing the person out would only throw away a valid
+  session for a database an administrator is about to repair.
+- **Signing out by hand obeys the same rule as signing out automatically.** The
+  footer control is a thin layer over `useAuth().signOut`, which *reports* rather
+  than assumes: supabase-js clears the stored session only once its revoke call
+  has succeeded, so a refusal or a dropped connection means the session is still
+  live on the device. The console therefore stays where it is and says so in the
+  footer — inline, not in a toast that would vanish before it was read, and not
+  by painting the login form over a live session, which is the trap the bullet
+  above describes. There is no `navigate()` anywhere in the path: `profile` going
+  null is what renders `LoginPage`, so the button works from any route.
 - **Visual ping instead of a toast — in the live feed.** New incidents flash the
   feed header background briefly (0.5s) instead of stacking toasts, since a
   supervisor's eyes are expected to already be on this panel during a live

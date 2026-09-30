@@ -8,6 +8,8 @@ import { ExamManager } from "@/pages/ExamManager";
 import { LiveMonitor } from "@/pages/LiveMonitor";
 import { SubmissionAudit } from "@/pages/SubmissionAudit";
 import { Analytics } from "@/pages/Analytics";
+import { AccountRoster } from "@/pages/AccountRoster";
+import { RequireAdmin } from "@/components/layout/RequireAdmin";
 
 /**
  * Routing + the console shell.
@@ -47,6 +49,20 @@ function AppRoutes() {
         {/* A real report page. This used to render `DashboardOverview`, so the
             "Analytics" nav item silently showed the dashboard again. */}
         <Route path="/analytics" element={<Analytics />} />
+        {/* The one administrator-only route. The sidebar does not render its
+            link for a supervisor, and `RequireAdmin` sends a hand-typed address
+            back to the dashboard; the `profiles` policies and the
+            `profiles_guard_role_change` trigger are what actually refuse a
+            non-admin, so this fence is about where a staff member lands, not
+            about what they are allowed to do. */}
+        <Route
+          path="/accounts"
+          element={
+            <RequireAdmin>
+              <AccountRoster />
+            </RequireAdmin>
+          }
+        />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </AppShell>
