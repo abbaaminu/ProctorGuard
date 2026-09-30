@@ -27,7 +27,8 @@ src/
   components/ui/       Badge, Card, Button, Toast, ConfirmDialog, MetricCard,
                         Skeleton — shadcn-style primitives
   components/layout/   Sidebar (nav + realtime pill + profile tile), AppShell
-  hooks/               useAuth (role guard), useRealtimeStatus,
+  hooks/               useAuth (session, role guard, sign-in errors),
+                        useRealtimeStatus,
                         useLiveIncidentFeed, useExamSubmissions,
                         useResetSubmission (clear one attempt),
                         useAccountNames (id -> "Aisha Bello")
@@ -45,6 +46,11 @@ most-flagged first, with each exam linking straight to its live monitor.
 
 ## What each page does
 
+- **Login** — the staff sign-in form, and the only screen the console shows
+  without a session. Every refusal lands here as a sentence — a wrong password or
+  an email that does not exist, an unconfirmed address, a profile row that is
+  missing, a profile read the server refused, or a signed-in student — never as a
+  raw PostgREST body.
 - **DashboardOverview** — live metrics (`Live exams now` counts exams with an
   `ongoing` submission, not merely published ones), the 24h incident breakdown
   and the completions/disqualifications timeline. A failed read is shown with a
@@ -169,6 +175,20 @@ question instead, or create a new exam.
 - **Empty is not an error.** Every panel distinguishes "nothing has happened yet"
   from "the read failed": the roster, the incident feed and the dashboard all
   surface the underlying message with a retry instead of an empty list.
+- **A session this console cannot use is ended, not left dangling.** `useAuth`
+  reads `public.profiles` with `maybeSingle()`, so an account whose row does not
+  exist is an ordinary zero-row answer — `profiles_select_own_or_staff` filters it
+  out at HTTP `200` — instead of the `PGRST116` error `.single()` turned it into.
+  Every outcome then becomes a sentence: the credentials (`Incorrect email or
+  password.`, deliberately one wording for a wrong password and an email that does
+  not exist, since the server will not say which), a missing row, a *refused* read
+  (`42501` / `PGRST301`), or a student account. A row-less, refused or non-staff
+  account is also signed out: a login form drawn over a live session is a form
+  that can never succeed, because every retry re-fails and every refresh loops the
+  same message. That is `RoleGate`'s *Sign out* escape hatch in the Flutter app,
+  done for the user here because this console shows a login screen rather than a
+  dedicated error page. Only a *connection* failure keeps the session, since
+  re-reading it can actually succeed.
 - **Visual ping instead of a toast — in the live feed.** New incidents flash the
   feed header background briefly (0.5s) instead of stacking toasts, since a
   supervisor's eyes are expected to already be on this panel during a live
