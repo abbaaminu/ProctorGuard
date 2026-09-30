@@ -1,0 +1,31 @@
+# Release signing material for `mobile/android/app/build.gradle.kts`.
+#
+# Copy this file to `key.properties` (same directory) and fill it in, then keep the
+# real file and the keystore out of version control - both are already listed in the
+# repository's `.gitignore`. The release build type fails with instructions until this
+# exists, because the alternative is an APK signed with the shared Android debug key:
+# anyone can forge an "upgrade" of that app, camera permission and kiosk pin included.
+#
+# Generate the keystore once, from `mobile/android/`:
+#
+#   keytool -genkey -v -keystore upload-keystore.jks -storetype JKS ^
+#     -keyalg RSA -keysize 2048 -validity 10000 -alias upload
+#
+# Then record where it is and how to open it:
+#
+#   storeFile=../upload-keystore.jks
+#   storePassword=<the keystore password>
+#   keyAlias=upload
+#   keyPassword=<the key password>
+#
+# `storeFile` is resolved relative to `mobile/android/`, so `../upload-keystore.jks`
+# puts the keystore next to (not inside) the Android project.
+#
+# Losing this keystore means losing the ability to update the app on Play; leaking it
+# means anyone can publish as you. Back it up somewhere that is not this repository,
+# and use an upload key (Play App Signing keeps the real signing key in Google's
+# hands) so a leaked key can be rotated.
+storeFile=../upload-keystore.jks
+storePassword=change-me
+keyAlias=upload
+keyPassword=change-me

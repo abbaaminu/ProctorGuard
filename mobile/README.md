@@ -85,11 +85,11 @@ run them, use
 `powershell -ExecutionPolicy Bypass -File .\run_app.ps1`.
 
 `build_apk.ps1` warns when the Android SDK is missing or incomplete
-(`flutter doctor` needs a green Android toolchain), then prints the artifact
-paths and the `adb install -r` line. Release builds are still signed with the
-debug keystore until a real signing config is added to
-`android/app/build.gradle.kts`, so those APKs are for testing, not for the
-Play Store.
+(`flutter doctor` needs a green Android toolchain), checks for release signing
+material *before* it spends time on `pub get`, then prints the artifact paths and
+the `adb install -r` line. A release APK is signed with the keystore named by
+`android/key.properties`; without that file Gradle refuses the build (see
+"Release builds" below).
 
 > These values are compiled into the binary: use the **publishable/anon** key
 > only. Never the `service_role`/secret key — anyone who unpacks the APK would
@@ -666,11 +666,14 @@ joins the two halves: the monitor owns the device, the detector owns the rules, 
 confirmed ruling is handed to `ProctoringNotifier.reportAudioNoise()`, so
 `audio_noise` takes exactly the same path as `no_face` or `app_minimized` — overlay,
 server-side count via `register_violation`, 3-strike escalation and the offline queue
-included. `ProctoringNotifier.reportAudioLevel(double)` — the notifier's own
-threshold-plus-sustain counter (`audioNoiseThresholdDb`/`audioNoiseSustain`) — predates
-the detector and stays for a source that classifies its own levels; the shipped
-pipeline goes through the detector above, so what decides is *this room's* measured
-floor rather than a constant that has to be right for every device. `retry()` re-opens
+included. The notifier used to carry its own threshold-plus-sustain counter
+(`reportAudioLevel` with `audioNoiseThresholdDb`/`audioNoiseSustain`), written before the
+detector landed; it was deleted rather than kept as a second path, because two places
+deciding what "too loud" means is two places to get it wrong — and the surviving one
+measures *this room's* floor instead of a constant that would have to be right for every
+device. `reportAudioNoise()` is therefore the notifier's only audio entry point, and
+`mobile/test/proctoring_notifier_test.dart` guards against the old method being
+reintroduced. `retry()` re-opens
 the session *and* resets the detector, because a new microphone (a headset, another
 room) is a new noise floor: reusing the old one would either deafen or over-sensitise
 the room the student actually moved to.
@@ -680,6 +683,57 @@ The seam is `audioLevelSourceProvider`, which is `null` in the app — meaning "
 Dart VM, where no audio plugin is registered, so injecting a source is the only way to
 drive a working microphone, a refused one, or one unplugged mid-session, instead of
 asserting on a chip that can only ever say `unavailable`.
+
+## Release builds (signing, shrinking, ABIs)
+
+The release build type is not the debug one with a different name. Signing material is
+required, R8 shrinks the app, and the Android platform policy is enforced by the merge —
+here is what a deployer has to do and what the build refuses to do:
+
+```powershell
+cd mobile\android
+keytool -genkey -v -keystore upload-keystore.jks -storetype JKS `
+  -keyalg RSA -keysize 2048 -validity 10000 -alias upload
+Copy-Item key.properties.example key.properties   # then fill in the four values
+```
+
+`key.properties` names the keystore and its passwords; `..\build_apk.ps1` (which wraps
+`flutter build apk --release --split-per-abi --dart-define=...`) then signs with it.
+Without that file the build **fails on purpose**, with the keytool command in the error:
+the shared Android debug key is public, so an APK signed with it can be replaced by a
+forged "upgrade" that already has camera permission and the kiosk pin. Both
+`android/key.properties` and the `.jks` are git-ignored; keep a copy of the keystore
+outside this repository, because losing it means losing the ability to update the
+published app. `proctorGuard.debugSigning=true` in `android/gradle.properties` is the
+written-down opt-out for a throwaway demo build and never for one a student runs.
+
+- **R8 is on** (`isMinifyEnabled`/`isShrinkResources`), with the keeps in
+  `android/app/proguard-rules.pro`. The build writes
+  `build/app/outputs/mapping/release/mapping.txt` — keep that file per release, it is
+  the only way to read a crash report from a student's phone (the rules keep
+  `SourceFile`/`LineNumberTable` precisely for that). ML Kit face detection and the
+  `record` capture path are the two surfaces a shrinker can break *silently* (every face
+  signal degrading to `no_face`), so a release APK gets one on-device pass over face
+  detection and the mic on a real phone before it goes to a school.
+- **Ship `--split-per-abi`** (the script's default) or an app bundle. A plain
+  `--target-platform android-arm64` build still carries the plugins' armeabi-v7a and
+  x86_64 `.so` files while holding `libflutter.so`/`libapp.so` for arm64 only, so a
+  32-bit phone installs it happily and then crashes on startup — arm64 phones are fine,
+  32-bit ones need the split (or `-Single` for one universal APK).
+- **`android/gradle.properties` asks the Gradle daemon for `-Xmx8G`** with a 4G
+  metaspace (Flutter's template default). On a machine with less free RAM than that the
+  daemon never comes up and `flutter build apk --release` sits on
+  `Running Gradle task 'assembleRelease'...` indefinitely, with nothing in the log —
+  lower those numbers for such a machine, or override per run with
+  `-Porg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=1g"`. `gradlew --stop` clears
+  daemons left behind by earlier builds.
+- **The Android surface is asserted by a test.**
+  `mobile/test/android_manifest_contract_test.dart` fails if the merged manifest regains
+  `SYSTEM_ALERT_WINDOW`, drops `allowBackup="false"`, loses the `networkSecurityConfig`
+  reference, or if that config ever permits cleartext outside loopback.
+- **iOS has no target.** `mobile/ios/README.md` records that decision and the checklist
+  for porting to it; the Dart services degrade to `granted: false` / `unavailable`
+  instead of throwing, so nothing in `lib/` has to change first.
 
 ## Key design decisions worth knowing about
 - **Server-enforced escalation.** The 3-strike disqualify rule lives in
@@ -736,8 +790,8 @@ asserting on a chip that can only ever say `unavailable`.
   (`ProctoringNotifier.reportAudioNoise()` and the `audio_noise` action type), and
   when the detector landed it added `record` (^7.1.1) — the one package that exposes
   amplitude on every target this app ships to — rather than `noise_meter`, which is
-  still unused. `ProctoringNotifier.reportAudioLevel(double)` remains for a source
-  that classifies levels itself.
+  still unused. The notifier's own `reportAudioLevel(double)` went the same way once
+  the detector existed — see "Microphone proctoring" above.
 - **Android specifics for the camera pipeline.** ML Kit needs `minSdkVersion`
   21+ (Flutter's default is 24) and its byte-buffer API accepts a single plane
   only, so the exam page requests `ImageFormatGroup.nv21` on Android and

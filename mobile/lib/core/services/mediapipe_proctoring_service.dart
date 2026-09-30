@@ -201,7 +201,11 @@ class MediaPipeProctoringService {
     // phantom "no face". The exam page flips this with [setStreamActive].
     if (!_streamActive) return;
 
-    final now = DateTime.now();
+    // The injected clock, the same one the grace windows below are measured
+    // against: one time base for the whole engine, so a host (or a test) that
+    // supplies its own cannot have the throttle and the escalation rules
+    // disagree about how much time has passed.
+    final now = _clock();
     if (_busy || now.difference(_lastInferenceAt) < inferenceInterval) return;
 
     _busy = true;
@@ -387,6 +391,13 @@ class MediaPipeProctoringService {
   /// blink, a dropped frame, or one glance at the keyboard cannot accumulate
   /// multiple disqualification flags.
   void _handleResult(FaceFrameResult result) {
+    // An inference that was already on the wire when the session ended still
+    // lands here: `onCameraFrame` fire-and-forgets it (`.then(_handleResult)`), so
+    // a frame captured before the page was popped can arrive after [dispose] ran.
+    // Adding to the closed controller throws into that detached chain, and the
+    // grace windows underneath measure a session that no longer exists.
+    if (_disposed || _signalController.isClosed) return;
+
     final now = _clock();
 
     if (result.faceCount == 0) {

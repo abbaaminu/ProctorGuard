@@ -233,4 +233,46 @@ void main() {
       expect(engine.dispose, returnsNormally); // idempotent
     });
   });
+
+  group('teardown', () {
+    test('a face frame that lands after dispose is dropped, not channelled',
+        () async {
+      // `handleResult` is reached from the camera stream and from a `faceDetector`
+      // future that was already on the wire when the page was popped, so a result can
+      // arrive after `dispose()` closed `signals`. Adding to a closed controller throws
+      // into that detached chain, where nothing is left to catch it.
+      final engine = MediaPipeProctoringService();
+      addTearDown(engine.dispose);
+
+      engine.dispose();
+
+      // A centred face is the shape that emits immediately (no grace window), so this is
+      // the shortest path to the closed controller.
+      expect(
+        () => engine.handleResult(const FaceFrameResult(faceCount: 1)),
+        returnsNormally,
+      );
+      await pumpEventQueue();
+
+      expect(await engine.signals.toList(), isEmpty);
+    });
+
+    test('a sustained window is neither measured nor reported after dispose',
+        () async {
+      // The grace windows underneath are the disqualification path: a `no_face` episode
+      // that keeps accumulating after teardown would be reported against a session that
+      // has already ended.
+      var now = DateTime(2026, 1, 1, 12);
+      final engine = MediaPipeProctoringService(clock: () => now);
+      addTearDown(engine.dispose);
+
+      engine.handleResult(const FaceFrameResult(faceCount: 0));
+      engine.dispose();
+      now = now.add(const Duration(seconds: 30)); // well past the grace window
+      engine.handleResult(const FaceFrameResult(faceCount: 0));
+
+      await pumpEventQueue();
+      expect(await engine.signals.toList(), isEmpty);
+    });
+  });
 }

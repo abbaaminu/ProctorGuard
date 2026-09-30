@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:exam_proctor/core/services/mediapipe_proctoring_service.dart';
@@ -38,41 +39,57 @@ void main() {
   });
 
   group('audio noise hook', () {
-    test('a single loud blip is not a strike', () async {
+    test('a classified strike is logged as audio_noise', () async {
       final repo = _RecordingProctoringRepository();
-      final notifier = _notifier(
-        proctoringRepo: repo,
-        audioNoiseSustain: const Duration(milliseconds: 60),
-      );
+      final notifier = _notifier(proctoringRepo: repo);
       addTearDown(notifier.dispose);
 
-      notifier.reportAudioLevel(-70); // quiet
-      notifier.reportAudioLevel(-10); // blip: opens the window
-      notifier.reportAudioLevel(-70); // hush again: window resets
-      await Future<void>.delayed(const Duration(milliseconds: 80));
-      await pumpEventQueue();
-
-      expect(repo.violations, isEmpty);
-      expect(notifier.state.warningCount, 0);
-    });
-
-    test('sustained noise logs audio_noise once', () async {
-      final repo = _RecordingProctoringRepository();
-      final notifier = _notifier(
-        proctoringRepo: repo,
-        audioNoiseSustain: const Duration(milliseconds: 60),
-      );
-      addTearDown(notifier.dispose);
-
-      notifier.reportAudioLevel(-10);
-      await Future<void>.delayed(const Duration(milliseconds: 80));
-      notifier.reportAudioLevel(-10); // still loud, past the sustain window
+      // The rules (calibration, sustain, cooldown) live in `AudioNoiseDetector`
+      // and are tested there; what this asserts is the *join*: a classified
+      // episode becomes an `audio_noise` violation through the same ladder as
+      // every other signal. `AudioMonitoringNotifier` is the production caller.
+      notifier.reportAudioNoise();
       await pumpEventQueue();
 
       expect(repo.violations.single.type, ViolationType.audioNoise);
       expect(repo.violations.single.type.dbValue, 'audio_noise');
       expect(notifier.state.warningCount, 1);
       expect(notifier.state.showViolationOverlay, isTrue);
+    });
+
+    test('the notifier declares no second noise rule', () {
+      // Regression guard for the deleted `reportAudioLevel(double)`: it was an
+      // independent threshold + sustain implementation while the shipping audio
+      // path classified with `AudioNoiseDetector`, i.e. two rules for one event.
+      // The source is the contract here - a re-added method would compile fine and
+      // only show up as behaviour drift months later.
+      //
+      // The match is on the *declaration*, not the name: the doc comment on
+      // `reportAudioNoise` names the deleted method to explain why it is gone.
+      final source = File(
+        'lib/features/proctoring/presentation/providers/proctoring_provider.dart',
+      );
+      if (!source.existsSync()) return; // running from outside the package root
+
+      final text = source.readAsStringSync();
+      expect(
+        text,
+        isNot(matches(RegExp(r'void\s+reportAudioLevel\b'))),
+        reason: 'raw levels must be classified by AudioNoiseDetector, not here',
+      );
+      expect(text, contains('AudioNoiseDetector'));
+    });
+
+    test('repeats inside the debounce window are one violation', () async {
+      final repo = _RecordingProctoringRepository(disqualifyAfter: 100);
+      final notifier = _notifier(proctoringRepo: repo);
+      addTearDown(notifier.dispose);
+
+      notifier.reportAudioNoise();
+      notifier.reportAudioNoise();
+      await pumpEventQueue();
+
+      expect(repo.violations, hasLength(1));
     });
   });
 
@@ -350,6 +367,187 @@ void main() {
       expect(forcedExits, 1);
     });
   });
+
+  group('teardown (the session that is already gone)', () {
+    test('a violation still in flight at dispose does not write state', () async {
+      // `proctoringProvider` is autoDispose, so the notifier is torn down while a
+      // violation's round-trip is still on the wire - the student closes the exam
+      // screen right after a strike. Touching `state` after that used to assert in
+      // debug and silently drop the server's reconciliation in release.
+      final outbox = _DeferredOutbox();
+      var forcedExits = 0;
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        outbox: outbox,
+        onForceExit: () => forcedExits++,
+      );
+
+      notifier.reportAppMinimized(); // starts the (hanging) log call
+      await pumpEventQueue();
+      expect(outbox.logged, hasLength(1)); // the row is already on its way
+
+      notifier.dispose(); // the exam page was popped mid-flight
+      outbox.complete(warningCount: 3, disqualified: true);
+      await pumpEventQueue();
+
+      // The session is over: no late exit fires for it (the force-exit signal is
+      // read through the provider container, which is gone with the page), and -
+      // the regression this test exists for - nothing throws.
+      expect(forcedExits, 0);
+    });
+
+    test('a ruling from the queue is ignored after dispose', () async {
+      final outbox = _DeferredOutbox();
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        outbox: outbox,
+      );
+
+      notifier.reportAppMinimized();
+      await pumpEventQueue();
+      outbox.complete(warningCount: 1);
+      await pumpEventQueue();
+
+      notifier.dispose();
+      outbox.emitRuling(warningCount: 3, disqualified: true);
+      await pumpEventQueue();
+
+      // Passing is the assertion: the shared offline queue outlives every session
+      // it fed, so a replay into a disposed notifier must not throw.
+    });
+
+    test('a strike whose evidence lands after dispose is not logged', () async {
+      // The still frame is the slow part of a violation - a camera that is
+      // streaming can take seconds to answer, and the upload has its own timeout
+      // - so this is the teardown race that actually happens in the field: the
+      // student closes the exam screen while the evidence is still being
+      // collected. Carrying on from there hands the outbox an RPC (or a queued
+      // replay) for a submission that has already been submitted; the count it
+      // would reconcile went away with the page.
+      final outbox = _FakeOutbox();
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        outbox: outbox,
+      );
+      final snapshot = Completer<Uint8List>();
+      notifier.attachSnapshotSource(() => snapshot.future);
+
+      notifier.reportIdleAfk();
+      await pumpEventQueue(); // parked on the still frame, nothing sent yet
+      expect(outbox.logged, isEmpty);
+
+      notifier.dispose(); // the exam page was popped
+      snapshot.complete(Uint8List.fromList(<int>[1, 2, 3]));
+      await pumpEventQueue();
+
+      expect(outbox.logged, isEmpty); // and the row never goes out
+    });
+  });
+
+  group('disqualification without a backend', () {
+    test('a third strike locks the student out even when the write fails',
+        () async {
+      // `register_violation` already set `status = 'disqualified'` server-side, so
+      // the client's `mark_disqualified` call is bookkeeping. Before the fix an
+      // offline device awaited that call and never reached the forced exit: the
+      // student sat in an exam that had already ended, waiting for the network to
+      // tell them.
+      final examRepo = _FailingExamRepository();
+      var forcedExits = 0;
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(disqualifyAfter: 1),
+        examRepo: examRepo,
+        onForceExit: () => forcedExits++,
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportAppMinimized();
+      await pumpEventQueue();
+
+      expect(notifier.state.disqualified, isTrue);
+      expect(examRepo.attempts, 1);
+      expect(forcedExits, 1);
+    });
+
+    test('a second disqualification forces exactly one exit', () async {
+      var forcedExits = 0;
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(disqualifyAfter: 1),
+        onForceExit: () => forcedExits++,
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportAppMinimized();
+      await pumpEventQueue();
+      // Any signal for a session that is already over is dropped by the same
+      // idempotence that makes `_forceDisqualify` safe to call twice: the exam
+      // page's force-exit listener is one-shot, and a second navigation would take
+      // the student out of wherever they are now.
+      notifier.reportCopyPasteAttempt();
+      await pumpEventQueue();
+
+      expect(forcedExits, 1);
+    });
+
+    test('two strikes in flight at once force exactly one exit', () async {
+      // The guard *inside* `_forceDisqualify`, not the ones at the top of its
+      // callers: two signals that arrive in the same frame both pass
+      // `!state.disqualified` before either could set it, because each is parked
+      // on its own RPC by then. The second one therefore lands on an attempt that
+      // is already over - and without the idempotency check it writes a second
+      // `mark_disqualified` and fires a second exit, navigating the student out
+      // of wherever they are by now.
+      final examRepo = _RecordingExamRepository();
+      var forcedExits = 0;
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(disqualifyAfter: 1),
+        examRepo: examRepo,
+        onForceExit: () => forcedExits++,
+      );
+      addTearDown(notifier.dispose);
+
+      // Two *types*, so the debounce cannot turn the second strike into a repeat
+      // of the first: both are real evidence, and either one crosses the
+      // threshold on its own.
+      notifier.reportAudioNoise();
+      notifier.reportAppMinimized();
+      await pumpEventQueue();
+
+      expect(notifier.state.disqualified, isTrue);
+      expect(examRepo.disqualified, <String>['sub-1']); // one bookkeeping write
+      expect(forcedExits, 1); // one lockout, one exit
+    });
+  });
+
+  group('injected clock', () {
+    test('the debounce window is measured on the injected clock', () async {
+      // The per-type debounce is a two-second contract that used to be testable
+      // only by sleeping for two seconds; with the clock injected the whole window
+      // is drivable, and a future change to it cannot hide behind wall-clock
+      // timing.
+      var now = DateTime.utc(2026, 1, 1, 9);
+      final repo = _RecordingProctoringRepository(disqualifyAfter: 100);
+      final notifier = _notifier(proctoringRepo: repo, clock: () => now);
+      addTearDown(notifier.dispose);
+
+      notifier.reportIdleAfk();
+      await pumpEventQueue();
+      expect(repo.violations, hasLength(1));
+
+      notifier.reportIdleAfk(); // same instant: the same event
+      await pumpEventQueue();
+      expect(repo.violations, hasLength(1));
+
+      now = now.add(const Duration(seconds: 3));
+      notifier.reportIdleAfk();
+      await pumpEventQueue();
+      expect(repo.violations, hasLength(2));
+
+      // The detection time that travels with the row is the injected one as well:
+      // that is the timestamp the supervisor's audit log is ordered by.
+      expect(repo.violations.last.timestamp, now);
+    });
+  });
 }
 
 /// Builds a notifier wired to fakes. The uploader fails loudly: with no
@@ -360,7 +558,7 @@ ProctoringNotifier _notifier({
   MediaPipeProctoringService? engine,
   ViolationOutbox? outbox,
   void Function()? onForceExit,
-  Duration audioNoiseSustain = const Duration(seconds: 2),
+  DateTime Function()? clock,
 }) {
   return ProctoringNotifier(
     submissionId: 'sub-1',
@@ -369,13 +567,13 @@ ProctoringNotifier _notifier({
     engine: engine ?? MediaPipeProctoringService(),
     outbox: outbox,
     onForceExit: onForceExit ?? () {},
+    clock: clock,
     uploadSnapshot: ({
       required String submissionId,
       required String actionType,
       required Uint8List bytes,
     }) async =>
         fail('no snapshot source is attached in these tests'),
-    audioNoiseSustain: audioNoiseSustain,
   );
 }
 
@@ -422,6 +620,70 @@ class _FakeOutbox implements ViolationOutbox {
 
   @override
   Stream<ViolationRuling> get deferredRulings => _rulings.stream;
+}
+
+/// A [ViolationOutbox] whose live delivery hangs until the test releases it.
+///
+/// The window between "the RPC is on the wire" and "the answer arrives" is where
+/// the notifier used to reconcile state after teardown; it cannot be driven with
+/// an outbox that answers immediately.
+class _DeferredOutbox implements ViolationOutbox {
+  final List<Violation> logged = <Violation>[];
+  final Completer<ViolationRuling?> _pending = Completer<ViolationRuling?>();
+  final StreamController<ViolationRuling> _rulings =
+      StreamController<ViolationRuling>.broadcast();
+
+  @override
+  Future<ViolationRuling?> log({
+    required String submissionId,
+    required Violation violation,
+  }) {
+    logged.add(violation);
+    return _pending.future;
+  }
+
+  /// Answers the pending [log] call, as the backend would.
+  void complete({required int warningCount, bool disqualified = false}) =>
+      _pending.complete(
+        ViolationRuling(
+          submissionId: 'sub-1',
+          violation: logged.last,
+          warningCount: warningCount,
+          disqualified: disqualified,
+        ),
+      );
+
+  void emitRuling({
+    String submissionId = 'sub-1',
+    required int warningCount,
+    bool disqualified = false,
+  }) =>
+      _rulings.add(ViolationRuling(
+        submissionId: submissionId,
+        violation: Violation(
+          type: ViolationType.appMinimized,
+          timestamp: DateTime.utc(2026, 1, 1),
+        ),
+        warningCount: warningCount,
+        disqualified: disqualified,
+      ));
+
+  @override
+  Stream<ViolationRuling> get deferredRulings => _rulings.stream;
+}
+
+/// An exam repository whose writes fail: the offline device, an expired token, or
+/// a submission row this student may no longer touch.
+class _FailingExamRepository extends _RecordingExamRepository {
+  /// How many times the write was attempted, so a test can tell "failed" from
+  /// "never tried".
+  int attempts = 0;
+
+  @override
+  Future<void> markDisqualified(String submissionId) async {
+    attempts++;
+    throw StateError('network is unreachable');
+  }
 }
 
 /// Stands in for `supabase.rpc('register_violation', ...)`: the server owns the

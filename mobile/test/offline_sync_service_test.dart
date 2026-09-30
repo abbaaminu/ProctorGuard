@@ -98,6 +98,35 @@ void main() {
       expect(sync.state.hasPending, isFalse);
     });
 
+    test('a row the server keeps refusing does not block the rows behind it',
+        () async {
+      // The head of the queue is poison: every write for this question fails.
+      // That is what a schema change, or a question an exam edit removed, looks
+      // like from here - and it must not cost the answers queued behind it.
+      exams.rejectQuestionId = 'q-1';
+
+      await sync.cacheChoice(
+        submissionId: 'sub-1',
+        questionId: 'q-1',
+        selectedOption: 1,
+      );
+      await sync.cacheText(
+        submissionId: 'sub-1',
+        questionId: 'q-2',
+        text: 'HTTP',
+      );
+
+      await sync.retryNow();
+
+      expect(exams.textAnswers, <String>['q-2=HTTP'],
+          reason: 'the rest of the queue still drains');
+      expect(exams.optionAnswers, isEmpty);
+      expect(sync.state.pendingAnswers, 1,
+          reason: 'only the refused row is still owed');
+      expect(sync.state.online, isFalse,
+          reason: 'a pass that delivered and failed is not a connection that is back');
+    });
+
     test('re-answering replaces the pending row instead of queueing twice',
         () async {
       exams.online = false;
@@ -404,6 +433,11 @@ class _FlakyExamRepository implements ExamRepository {
   final List<String> textAnswers = <String>[];
   final List<String> submitted = <String>[];
 
+  /// One question this backend refuses no matter what, the way a server-side
+  /// schema change would: the row stays queued for good while every other row
+  /// must still get through.
+  String? rejectQuestionId;
+
   @override
   Future<List<Exam>> getPublishedExams() async => <Exam>[];
 
@@ -420,7 +454,7 @@ class _FlakyExamRepository implements ExamRepository {
     required String questionId,
     required int selectedOption,
   }) async {
-    if (!online) throw const _Offline();
+    if (!online || questionId == rejectQuestionId) throw const _Offline();
     optionAnswers.add('$questionId=$selectedOption');
   }
 
@@ -430,7 +464,7 @@ class _FlakyExamRepository implements ExamRepository {
     required String questionId,
     required String answer,
   }) async {
-    if (!online) throw const _Offline();
+    if (!online || questionId == rejectQuestionId) throw const _Offline();
     textAnswers.add('$questionId=$answer');
   }
 

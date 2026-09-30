@@ -169,6 +169,95 @@ void main() {
     });
   });
 
+  group('channel contract: the pin, and one question at a time', () {
+    test('startLock asks for FLAG_SECURE, and can be told not to', () async {
+      // The Dart half of PG-4: `secure` is the argument the native side reads to set
+      // FLAG_SECURE, so screenshots, screen recording and the recents thumbnail of
+      // the exam screen are blocked while it is pinned. It is opt-out-able because
+      // losing the ability to screenshot is something a student notices - a policy
+      // decision, not a platform accident.
+      final kiosk = KioskService();
+      addTearDown(kiosk.dispose);
+
+      await kiosk.startLock();
+      expect(calls.first.arguments, <String, Object?>{'secure': true});
+
+      calls.clear();
+      final optedOut = KioskService(blockScreenshots: false);
+      addTearDown(optedOut.dispose);
+
+      await optedOut.startLock();
+      expect(calls.first.arguments, <String, Object?>{'secure': false});
+    });
+
+    test('concurrent state queries share one platform call', () async {
+      // Three callers (the exam page, the escape poll, a diagnostic) asking at the
+      // same moment used to put three identical calls on the channel, and a bridge
+      // that answers slowly answered the queued ones with the state as of a moment
+      // that had already passed.
+      var inFlight = 0;
+      var maxInFlight = 0;
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        calls.add(call);
+        if (call.method != 'isLockTaskActive') return null;
+        inFlight++;
+        if (inFlight > maxInFlight) maxInFlight = inFlight;
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+        inFlight--;
+        return true;
+      });
+      final kiosk = KioskService();
+      addTearDown(kiosk.dispose);
+
+      final answers = await Future.wait(<Future<bool>>[
+        kiosk.isLockTaskActive(),
+        kiosk.isLockTaskActive(),
+        kiosk.isLockTaskActive(),
+      ]);
+
+      expect(answers, <bool>[true, true, true]);
+      expect(
+        calls.where((c) => c.method == 'isLockTaskActive'),
+        hasLength(1),
+        reason: 'one question, one round-trip',
+      );
+      expect(maxInFlight, 1);
+    });
+
+    test('a slow bridge is asked once per answer, not once per tick', () async {
+      startLockReply = <String, Object?>{
+        'granted': true,
+        'canDetectEscape': true,
+      };
+      var inFlight = 0;
+      var maxInFlight = 0;
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        calls.add(call);
+        if (call.method == 'startLock') return startLockReply;
+        if (call.method != 'isLockTaskActive') return null;
+        inFlight++;
+        if (inFlight > maxInFlight) maxInFlight = inFlight;
+        // Slower than the poll interval below, so the next tick arrives while this
+        // call is still on the wire.
+        await Future<void>.delayed(const Duration(milliseconds: 45));
+        inFlight--;
+        return true;
+      });
+      final kiosk = KioskService(escapePollInterval: poll); // 10ms ticks
+      addTearDown(kiosk.dispose);
+
+      await kiosk.startLock();
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      final polls = calls.where((c) => c.method == 'isLockTaskActive').length;
+      expect(maxInFlight, 1, reason: 'a tick must join the call in flight');
+      // 120ms of 10ms ticks against a 45ms bridge is two or three answers; twelve
+      // would mean every tick queued another call.
+      expect(polls, greaterThanOrEqualTo(2));
+      expect(polls, lessThanOrEqualTo(4));
+    });
+  });
+
   group('escape detection', () {
     test('two inactive polls after pinning confirms an escape', () async {
       startLockReply = <String, Object?>{
@@ -286,6 +375,97 @@ void main() {
 
       expect(escapes, isEmpty);
       await expectLater(kiosk.escapes, emitsDone);
+    });
+  });
+
+  group('teardown', () {
+    test('two overlapping pins share one call and one poll', () async {
+      // The exam page and a re-bootstrap can ask for the pin at the same moment, and a
+      // pin is not as idempotent as it looks: two `startLock` messages used to arm two
+      // escape timers, and the second assignment to the timer field dropped the first -
+      // which then kept asking the platform once per interval for the rest of the run,
+      // with no handle left to cancel it.
+      startLockReply = <String, Object?>{
+        'granted': true,
+        'canDetectEscape': true,
+      };
+      var inFlight = 0;
+      var maxInFlight = 0;
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        calls.add(call);
+        if (call.method != 'startLock') return true; // stays pinned
+        inFlight++;
+        if (inFlight > maxInFlight) maxInFlight = inFlight;
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+        inFlight--;
+        return startLockReply;
+      });
+      final kiosk = KioskService(escapePollInterval: poll);
+      addTearDown(kiosk.dispose);
+
+      final results = await Future.wait(<Future<KioskResult>>[
+        kiosk.startLock(),
+        kiosk.startLock(),
+      ]);
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+
+      expect(maxInFlight, 1, reason: 'one bootstrap, one pin');
+      expect(calls.where((c) => c.method == 'startLock'), hasLength(1));
+      // Both callers act on the same answer rather than on two different moments.
+      expect(results[0].granted, isTrue);
+      expect(results[1].granted, results[0].granted);
+      expect(
+        calls.where((c) => c.method == 'isLockTaskActive').length,
+        lessThanOrEqualTo(6),
+        reason: '40ms of 10ms ticks; a stray second timer would double it',
+      );
+    });
+
+    test('a start that arrives after dispose pins nothing', () async {
+      // `stopLock()` then `dispose()` is what the exam page does on the way out, but a
+      // re-bootstrap that lost the race can still reach `startLock()` afterwards.
+      // Pinning there would hold lock task mode for a session that is over, and the
+      // handle that could unpin it is gone.
+      final kiosk = KioskService(escapePollInterval: poll);
+      kiosk.dispose();
+
+      final result = await kiosk.startLock();
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+
+      expect(result.granted, isFalse);
+      expect(result.message, contains('Android-only'));
+      expect(calls, isEmpty, reason: 'the platform half is gone');
+    });
+
+    test('a pin answered after dispose does not arm a poll', () async {
+      // The bridge is slow and the page was popped while it was answering. The answer
+      // itself is still truthful - the lock did start - but arming the escape poll here
+      // leaves a timer running against a disposed service forever.
+      final gate = Completer<void>();
+      startLockReply = <String, Object?>{
+        'granted': true,
+        'canDetectEscape': true,
+      };
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        calls.add(call);
+        if (call.method != 'startLock') return true;
+        await gate.future;
+        return startLockReply;
+      });
+      final kiosk = KioskService(escapePollInterval: poll);
+
+      final pending = kiosk.startLock();
+      kiosk.dispose();
+      gate.complete();
+      final result = await pending;
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+
+      expect(result.granted, isTrue);
+      expect(
+        calls.where((c) => c.method == 'isLockTaskActive'),
+        isEmpty,
+        reason: 'a timer armed after dispose outlives every handle that cancels it',
+      );
     });
   });
 }

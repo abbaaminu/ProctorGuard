@@ -118,6 +118,13 @@ class RecordAudioLevelSource implements AudioLevelSource {
   StreamSubscription<Uint8List>? _pcmSubscription;
   bool _disposed = false;
 
+  /// True between a successful [begin] and the [end] that releases it.
+  ///
+  /// Exists so [begin] can tell "opening the first session" from "reopening one
+  /// this source still holds" without asking the platform (a `stop()` on a
+  /// recorder that was never started throws, and logging that would be noise).
+  bool _sessionOpen = false;
+
   @override
   bool get isSupported => !_disposed;
 
@@ -137,6 +144,18 @@ class RecordAudioLevelSource implements AudioLevelSource {
   Future<void> begin() async {
     final recorder = _recorder ??= AudioRecorder();
 
+    // A second `begin()` without an `end()` in between used to overwrite the two
+    // subscriptions below without cancelling them, i.e. leak a listener per
+    // reopen while the recorder still held a session. `AudioMonitor.start()`
+    // releases the source before it reopens for exactly this reason, but the
+    // source is a public seam and must not depend on a caller remembering to.
+    if (_sessionOpen) await end();
+
+    // A `dispose` that landed while a previous session was being released has
+    // already torn this source down: opening the device after it would hold the
+    // microphone for the rest of the run with no handle left to release it.
+    if (_disposed) return;
+
     final pcm = await recorder.startStream(
       const RecordConfig(
         // Stream, not a file: see the class doc.
@@ -151,6 +170,11 @@ class RecordAudioLevelSource implements AudioLevelSource {
         noiseSuppress: false,
       ),
     );
+    // The device opened while the session was ending: `dispose` owns the recorder
+    // now, so subscribing here would leave two listeners on a stream nothing feeds
+    // any more, and `_sessionOpen = true` on a source that is already torn down.
+    if (_disposed) return;
+
     _pcmSubscription = pcm.listen(
       (_) {}, // drained and discarded on purpose
       onError: _reportError,
@@ -160,6 +184,7 @@ class RecordAudioLevelSource implements AudioLevelSource {
     _amplitudeSubscription = recorder
         .onAmplitudeChanged(sampleInterval)
         .listen((amplitude) => _emit(amplitude.current), onError: _reportError);
+    _sessionOpen = true;
   }
 
   void _emit(double decibels) {
@@ -180,6 +205,7 @@ class RecordAudioLevelSource implements AudioLevelSource {
     _amplitudeSubscription = null;
     await _pcmSubscription?.cancel();
     _pcmSubscription = null;
+    _sessionOpen = false;
 
     final recorder = _recorder;
     if (recorder == null) return;
@@ -195,6 +221,7 @@ class RecordAudioLevelSource implements AudioLevelSource {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _sessionOpen = false;
     unawaited(_amplitudeSubscription?.cancel());
     unawaited(_pcmSubscription?.cancel());
     _amplitudeSubscription = null;
@@ -350,6 +377,12 @@ class AudioMonitor {
     unawaited(_levelSubscription?.cancel());
     _levelSubscription = null;
     _currentLevel = null;
+    // The peak goes too: it is a claim about *this* capture session, and the
+    // indicator shows it next to the live level. Keeping a loud moment from a
+    // microphone that has since been replaced would report a room the student is
+    // no longer sitting in - and the reconnect path ([retry]) is exactly when the
+    // room, the headset or the device changed.
+    _peakLevel = null;
     if (_state != AudioMonitorState.idle) {
       await _releaseSource();
     }
@@ -361,6 +394,7 @@ class AudioMonitor {
       granted = await _source.requestAccess().timeout(startTimeout);
     } catch (error) {
       debugPrint('ProctorGuard audio: access could not be requested: $error');
+      if (_disposed) return _state;
       return _transition(
         AudioMonitorState.unavailable,
         kIsWeb
@@ -368,6 +402,12 @@ class AudioMonitor {
             : 'This device cannot report microphone state.',
       );
     }
+
+    // `dispose()` may have run while the permission prompt was open. Leaving here
+    // is what keeps a torn-down monitor from opening the device (and starting a
+    // level timer) for a session nobody is watching - the source guards the same
+    // race from the inside, see `RecordAudioLevelSource.begin`.
+    if (_disposed) return _state;
 
     if (!granted) {
       return _transition(
@@ -384,12 +424,18 @@ class AudioMonitor {
       await _source.begin().timeout(startTimeout);
     } catch (error) {
       debugPrint('ProctorGuard audio: could not open the microphone: $error');
+      if (_disposed) return _state;
       return _transition(
         AudioMonitorState.unavailable,
         'The microphone could not be opened. It may be in use by another app - '
         'close that app and tap the microphone to try again.',
       );
     }
+
+    // Subscribing is what makes the monitor live: a teardown that landed while the
+    // device was opening must not leave a listener, a state transition or a level
+    // timer behind on a disposed object.
+    if (_disposed) return _state;
 
     _levelSubscription = _source.levels.listen(
       _onLevel,
@@ -425,6 +471,9 @@ class AudioMonitor {
   }
 
   void _onStreamError(Object error, [StackTrace? stackTrace]) {
+    // An error from a stream a teardown already cancelled must not move a disposed
+    // monitor's state (the cancel is not awaited, so this can still arrive).
+    if (_disposed) return;
     debugPrint('ProctorGuard audio: level stream failed: $error');
     if (_state == AudioMonitorState.monitoring ||
         _state == AudioMonitorState.starting) {
@@ -437,6 +486,9 @@ class AudioMonitor {
   }
 
   void _onStreamDone() {
+    // Same as [_onStreamError]: a close that follows a teardown is not an event
+    // about this session.
+    if (_disposed) return;
     // The stream closing without us asking for it is the "headset unplugged" case.
     if (_state == AudioMonitorState.monitoring ||
         _state == AudioMonitorState.starting) {
@@ -456,6 +508,11 @@ class AudioMonitor {
   /// reconnect that called this, which is the one action a student in trouble has
   /// left.
   Future<void> stop() async {
+    // Nothing left to stop: [dispose] already cancelled the listener and released
+    // the source. This is the one path that would otherwise reach into a disposed
+    // source while the exam page is being torn down.
+    if (_disposed) return;
+
     _levelTimer?.cancel();
     _levelTimer = null;
     unawaited(_levelSubscription?.cancel());

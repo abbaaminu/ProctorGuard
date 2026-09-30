@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/services.dart' show DeviceOrientation;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -87,9 +88,9 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     required this._uploadSnapshot,
     ViolationOutbox? outbox,
     this.snapshotTimeout = const Duration(seconds: 5),
-    this.audioNoiseThresholdDb = -25.0,
-    this.audioNoiseSustain = const Duration(seconds: 2),
+    DateTime Function()? clock,
   })  : _outbox = outbox ?? DirectViolationOutbox(proctoringRepo),
+        _now = clock ?? DateTime.now,
         super(const ProctoringState()) {
     _gazeSub = _engine.signals.listen(_handleGazeSignal);
     // A violation the queue delivered after the fact still carries the server's
@@ -114,23 +115,26 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   /// log goes out without a picture rather than delaying escalation.
   final Duration snapshotTimeout;
 
-  /// Loudness (dBFS, as reported by plugins such as `noise_meter`) that counts
-  /// as suspicious background noise: -25 dBFS is roughly loud speech/shouting.
-  final double audioNoiseThresholdDb;
-
-  /// How long the level must stay above [audioNoiseThresholdDb] before it is
-  /// logged, so a single door slam does not become a strike.
-  final Duration audioNoiseSustain;
-
-  DateTime? _loudSince;
+  /// The clock this session reasons about time with.
+  ///
+  /// Injected because the one place this class looks at a clock — the per-type
+  /// debounce window below — is a contract a test has to be able to reach without
+  /// sleeping in real time. `DateTime.now` stays the production default. (The
+  /// other time-based rule, audio sustain, belongs to `AudioNoiseDetector`, which
+  /// takes its own clock for the same reason.)
+  final DateTime Function() _now;
 
   /// Set by the exam page once the camera is running. Null in mock-camera
   /// sessions (nothing to photograph) and before the camera is ready.
   SnapshotSource? _snapshotSource;
 
-  late final StreamSubscription<GazeSignal> _gazeSub;
-  late final StreamSubscription<ViolationRuling> _rulingsSub;
-  late final ExamLifecycleObserver _lifecycleObserver;
+  /// Nullable rather than `late final`: [dispose] is the one method that has to
+  /// work from *any* state, and a half-constructed notifier (a listener that
+  /// could not be attached, an observer whose `attach()` threw) is exactly where
+  /// a `late` field would turn a teardown into a `LateInitializationError`.
+  StreamSubscription<GazeSignal>? _gazeSub;
+  StreamSubscription<ViolationRuling>? _rulingsSub;
+  ExamLifecycleObserver? _lifecycleObserver;
 
   /// When each violation type was last logged, so [_dedupeWindow] applies **per
   /// type**.
@@ -162,6 +166,7 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   /// the student a prompt rather than quietly logging `no_face`/`looking_away`
   /// strikes for a stream that is not even running.
   void setCameraActive(bool active) {
+    if (!mounted) return;
     if (_cameraActive == active) return;
     _cameraActive = active;
     // A resume must not inherit a stale dedupe stamp or a half-elapsed grace
@@ -175,6 +180,10 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   bool get cameraActive => _cameraActive;
 
   void _handleGazeSignal(GazeSignal signal) {
+    // A signal that arrived after the session was torn down must not touch the
+    // state of a disposed notifier (see [_registerViolation]).
+    if (!mounted) return;
+
     // Camera offline/initialising: ignore every face signal until the page
     // confirms the feed is live again.
     if (!_cameraActive) return;
@@ -194,33 +203,18 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     }
   }
 
-  /// Feeds one amplitude sample from an audio monitor. A level above
-  /// [audioNoiseThresholdDb] that is sustained for [audioNoiseSustain] is logged
-  /// as `audio_noise`; anything quieter resets the window.
+  /// The one audio entry point: the classifier has already decided.
   ///
-  /// The audio source is intentionally not bundled (no `noise_meter`
-  /// dependency): capturing audio needs a microphone-permission-driven
-  /// recording session, so the host app forwards samples here once that plugin
-  /// is wired up. This method itself is just a comparison — safe to call per
-  /// sample.
-  void reportAudioLevel(double decibels) {
-    if (decibels < audioNoiseThresholdDb) {
-      _loudSince = null;
-      return;
-    }
-
-    final now = DateTime.now();
-    _loudSince ??= now;
-    if (now.difference(_loudSince!) >= audioNoiseSustain) {
-      // Reset the window so sustained noise re-logs at most once per
-      // `audioNoiseSustain` (the 2s dedupe below still applies).
-      _loudSince = now;
-      reportAudioNoise();
-    }
-  }
-
-  /// Direct hook for a source that already classifies noise (a plugin with its
-  /// own threshold, or a server-side detector).
+  /// There is deliberately **no** `reportAudioLevel(double)` on this class any
+  /// more. It was a second, independent implementation of "sustained loudness is a
+  /// violation" — fixed -25 dBFS threshold, its own window, `DateTime.now` — while
+  /// the audio path that actually ships classifies with `AudioNoiseDetector`
+  /// (calibrated threshold + sustain + post-strike cooldown, injected clock) and
+  /// then calls the method below. Two rules for one event, and the unused one was
+  /// the one that looked authoritative. The rule now lives in exactly one place:
+  /// the detector, owned by `AudioMonitoringNotifier`, whose strike lands here so
+  /// that audio shares the ladder, the server-side count and the offline queue
+  /// with every other violation.
   void reportAudioNoise() => _registerViolation(ViolationType.audioNoise);
 
   /// The student left the exam surface: an Android kiosk escape, a browser tab
@@ -293,11 +287,18 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
       );
 
   Future<void> _registerViolation(ViolationType type) async {
+    // Every path into this method — a camera signal, a lifecycle callback, the
+    // audio detector, a browser guard, the kiosk escape poll — can arrive after
+    // the exam page was popped, and `proctoringProvider` is autoDispose, so the
+    // notifier really is gone by then. `mounted` is the only safe gate: writing
+    // `state` on a disposed `StateNotifier` asserts in debug and silently drops
+    // the write in release.
+    if (!mounted) return;
     if (state.disqualified) return; // already ended, ignore stray signals
 
     // Debounce so one sustained condition doesn't spam multiple identical
     // log rows within the same couple of seconds. Per type: see [_lastLoggedAt].
-    final now = DateTime.now();
+    final now = _now();
     final lastLogged = _lastLoggedAt[type];
     if (lastLogged != null && now.difference(lastLogged) < _dedupeWindow) {
       return;
@@ -316,6 +317,7 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     // (some Android devices do while streaming) or an offline upload must never
     // delay the escalation below.
     final snapshotUrl = await _captureAndUploadSnapshot(type);
+    if (!mounted) return; // the page went away while the still was grabbed
 
     // Hand the row to the outbox: it either reaches the backend now (and returns
     // the authoritative ruling) or is queued with this event's id and replayed
@@ -330,6 +332,12 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
         clientEventId: uuidV4(),
       ),
     );
+
+    // This await is the long one on a slow network: a violation whose RPC is
+    // still in flight when the student's exam screen closes is exactly the race
+    // that used to reconcile the server count *after* teardown (and, in release,
+    // silently lose it).
+    if (!mounted) return;
 
     if (ruling == null) {
       // Queued: the strike is durable on this device and will be delivered by the
@@ -353,6 +361,7 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   /// count - a deferred ruling can be older than a live one that arrived first -
   /// and ends the attempt when that late delivery is what crossed the threshold.
   void _handleDeferredRuling(ViolationRuling ruling) {
+    if (!mounted) return; // the queue outlives the session it belongs to
     if (ruling.submissionId != submissionId) return; // another session's queue
     if (state.disqualified) return; // already ended, nothing left to escalate
 
@@ -387,22 +396,65 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     }
   }
 
+  /// Ends the attempt: lockout overlay, server-side status, forced exit.
+  ///
+  /// **Idempotent, and it always exits.** The disqualification is a local
+  /// consequence of the third strike — the server has already recorded
+  /// `status = 'disqualified'` inside `register_violation` — so the
+  /// `mark_disqualified` round-trip here is bookkeeping, not the decision. A
+  /// student whose confirmation cannot be persisted (offline, RLS, a token that
+  /// expired mid-exam) used to be left sitting in an exam that had already ended,
+  /// with the network as the only thing that could have told them: exactly
+  /// backwards. The exit therefore runs whether or not the write succeeded, and a
+  /// repeated call cannot fire a second exit.
   Future<void> _forceDisqualify() async {
+    if (!mounted) return;
+    if (state.disqualified) return; // already locked out: one strike, one exit
+
     state = state.copyWith(disqualified: true, showViolationOverlay: true);
-    await _examRepo.markDisqualified(submissionId);
+
+    try {
+      await _examRepo.markDisqualified(submissionId);
+    } catch (error) {
+      // Best effort, and never fatal: the authoritative status is set by the
+      // violation RPC (see above), and the offline queue replays what it can.
+      debugPrint(
+        'ProctoringNotifier: could not persist the disqualification of '
+        '$submissionId ($error) — exiting anyway.',
+      );
+    }
+
+    if (!mounted) return; // the page went away during the write
     _onForceExit();
   }
 
   void dismissOverlay() {
+    if (!mounted) return;
     if (state.disqualified) return; // can't dismiss the final lockout screen
     state = state.copyWith(showViolationOverlay: false);
   }
 
   @override
   void dispose() {
-    _gazeSub.cancel();
-    _rulingsSub.cancel();
-    _lifecycleObserver.detach();
+    // Cancel the listeners *before* the base teardown: both streams outlive this
+    // notifier (the engine is per-session, but the outbox queue is shared and
+    // replays later), so a signal arriving during teardown would otherwise reach
+    // a disposed `StateNotifier`. The mounted guards above make that safe either
+    // way; cancelling first makes it rare.
+    //
+    // Not awaited: `dispose` is synchronous, and a cancel is a cleanup signal that
+    // must not be able to hold up the exam page leaving the screen.
+    final gazeSub = _gazeSub;
+    _gazeSub = null;
+    if (gazeSub != null) unawaited(gazeSub.cancel());
+
+    final rulingsSub = _rulingsSub;
+    _rulingsSub = null;
+    if (rulingsSub != null) unawaited(rulingsSub.cancel());
+
+    final observer = _lifecycleObserver;
+    _lifecycleObserver = null;
+    observer?.detach();
     _engine.dispose();
     super.dispose();
   }

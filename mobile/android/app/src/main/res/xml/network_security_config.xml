@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Network policy for the exam app.
+
+  Every host this app talks to in production is https: `SupabaseConfig.resolveWithReason`
+  (lib/core/services/supabase_service.dart) refuses a plain-http backend outright, because
+  the publishable key and the student's session token travel on every request. Denying
+  cleartext here as well makes that a platform-level guarantee rather than a Dart-level
+  one, so a dependency that quietly falls back to http, or a compile-time dart-define that
+  slips past validation, fails instead of leaking the session over the exam room's Wi-Fi.
+
+  The one exception is loopback: a local `supabase start` stack on the developer's own
+  machine (`localhost`, `127.0.0.1`) and the Android emulator's alias for the host
+  (`10.0.2.2`) are the same trust boundary as the app itself, and the Dart-side validator
+  accepts exactly these three names and no others.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

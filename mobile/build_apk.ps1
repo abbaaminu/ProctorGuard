@@ -15,9 +15,15 @@
         app-armeabi-v7a-release.apk  - older 32-bit devices
         app-x86_64-release.apk       - emulators / some tablets
 
-    Flutter signs release builds with the debug keystore until a real signing
-    config is added to android/app/build.gradle.kts, so these APKs install via
-    `adb install -r` but are NOT Play-Store ready.
+    Release APKs are signed with the keystore named by android/key.properties
+    (see android/key.properties.example); Gradle refuses to build a release at
+    all without one, because the alternative - the shared Android debug key -
+    lets anyone sign an "upgrade" of this app, camera permission and kiosk pin
+    included. This script checks for that file up front so the failure arrives
+    with the keytool/`key.properties` steps instead of a Gradle stack trace.
+    Keep the .jks out of version control and back it up somewhere else: losing
+    it means losing the ability to update the app, leaking it means anyone can
+    publish as you.
 
     Credentials resolve in order: parameter -> environment variable -> prompt
     (see supabase_defines.ps1). They are compiled into the APK, so only the
@@ -99,6 +105,24 @@ function Get-AndroidSdkDirectory {
     return $null
 }
 
+function Get-ReleaseSigningState {
+    # Mirrors the release guard in android/app/build.gradle.kts. Returns:
+    #   'ready'   - android/key.properties exists, a real keystore will sign the APK
+    #   'debug'   - proctorGuard.debugSigning=true was opted into on purpose
+    #   'missing' - Gradle will refuse the release build (this script says why first)
+    $keyProperties = Join-Path $PSScriptRoot 'android\key.properties'
+    if (Test-Path -LiteralPath $keyProperties) { return 'ready' }
+
+    $gradleProperties = Join-Path $PSScriptRoot 'android\gradle.properties'
+    if (Test-Path -LiteralPath $gradleProperties) {
+        $optOut = Select-String -Path $gradleProperties -Pattern '^\s*proctorGuard\.debugSigning\s*=\s*true\s*$' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $optOut) { return 'debug' }
+    }
+
+    return 'missing'
+}
+
 Push-Location $PSScriptRoot
 try {
     if (-not (Test-Path (Join-Path $PSScriptRoot 'pubspec.yaml'))) {
@@ -134,6 +158,39 @@ try {
     }
     else {
         Write-Host ('  Android SDK              = {0}' -f $sdkDir)
+    }
+
+    switch (Get-ReleaseSigningState) {
+        'ready' {
+            Write-Host ('  release signing          = {0}' -f (Join-Path $PSScriptRoot 'android\key.properties'))
+        }
+        'debug' {
+            Write-Warning 'proctorGuard.debugSigning=true is set in android/gradle.properties, so this APK will be signed with the PUBLIC Android debug key. Fine for a demo on your own device; never for a build a student runs, because anyone can sign an "upgrade" of it - camera permission and kiosk pin included.'
+        }
+        'missing' {
+            $signingHelp = @(
+                'No release signing material: android/key.properties is missing.'
+                ''
+                'Gradle refuses a release build without it (android/app/build.gradle.kts) rather than sign it with the shared debug key. Copy android/key.properties.example to android/key.properties and fill it in:'
+                ''
+                '    storeFile=../upload-keystore.jks'
+                '    storePassword=<keystore password>'
+                '    keyAlias=upload'
+                '    keyPassword=<key password>'
+                ''
+                'Generate the keystore once, from mobile/android/ (keytool ships with the JDK in Android Studio):'
+                ''
+                '    keytool -genkey -v -keystore upload-keystore.jks -storetype JKS -keyalg RSA -keysize 2048 -validity 10000 -alias upload'
+                ''
+                'Both files are git-ignored; store the .jks somewhere outside this repository too. Losing it means losing the ability to update the published app, leaking it means anyone can publish as you.'
+            ) -join [Environment]::NewLine
+            if ($DryRun) {
+                Write-Warning $signingHelp
+            }
+            else {
+                throw $signingHelp
+            }
+        }
     }
 
     if ($DryRun) {

@@ -222,6 +222,35 @@ void main() {
       expect(monitor.peakLevel, isNotNull);
     });
 
+    test('a restart clears the peak of the session that just ended', () async {
+      // The peak is what the indicator's tooltip shows and what a supervisor reads
+      // when a student asks "why did I get a strike?". Carrying it across a restart
+      // would report a loud moment from a microphone that is no longer there - and
+      // the restart is exactly the reconnect path, where the headset, the room or
+      // the device may have changed.
+      final source = _FakeSource();
+      final monitor = monitorWith(source);
+      addTearDown(monitor.dispose);
+
+      await monitor.start();
+      await pumpEventQueue();
+      source.emit(-8); // a shout
+      await pumpEventQueue();
+      expect(monitor.peakLevel, -8);
+
+      await monitor.stop();
+      await monitor.start(); // the student reconnected
+      await pumpEventQueue();
+
+      // The shout belongs to the session that ended; what the peak reports now is
+      // the room this microphone is actually in.
+      expect(
+        monitor.peakLevel,
+        _FakeSource.quiet,
+        reason: 'a restart measures the new session, not the old one',
+      );
+    });
+
     test('a device that never reports a level is not called monitoring',
         () async {
       // The one failure mode proctoring must not have: a dead microphone that looks
@@ -326,6 +355,80 @@ void main() {
       // sample twice.
       expect(received, 1);
       await readings.cancel();
+    });
+
+    test('a teardown during the permission prompt never opens the device',
+        () async {
+      // The OS dialog is the longest wait on the start path, and it is exactly where a
+      // popped exam page lands: the student leaves the app to answer it, so the page is
+      // gone by the time they tap Allow. Opening the microphone there takes the device
+      // for a session nobody is watching.
+      final source = _FakeSource(accessGate: Completer<void>());
+      final monitor = monitorWith(source);
+
+      final pending = monitor.start();
+      monitor.dispose();
+      source.accessGate!.complete();
+
+      // The answer to a start nobody is waiting for: no throw, no state of its own.
+      expect(await pending, AudioMonitorState.starting);
+      await pumpEventQueue();
+
+      expect(source.begins, 0, reason: 'the device was never opened');
+      expect(monitor.message, isNull);
+      expect(monitor.isMonitoring, isFalse);
+    });
+
+    test('a teardown while the device is opening leaves no session behind',
+        () async {
+      // The same race one step later: `begin()` is the platform call that actually takes
+      // the microphone. A listener created after the teardown reads a capture session
+      // that was already released, and it outlives the handle that could cancel it -
+      // nothing else would ever close it.
+      final source =
+          _FakeSource(beginGate: Completer<void>(), closeOnDispose: false);
+      final monitor = monitorWith(source);
+
+      final pending = monitor.start();
+      await pumpEventQueue(); // the start is now inside `begin()`
+      monitor.dispose();
+      source.beginGate!.complete();
+
+      expect(await pending, AudioMonitorState.starting);
+      await pumpEventQueue();
+
+      expect(source.begins, 1, reason: 'the open was already on the wire');
+      expect(
+        source.hasListener,
+        isFalse,
+        reason: 'a subscription created here is never cancelled by anyone',
+      );
+      expect(
+        monitor.state,
+        AudioMonitorState.starting,
+        reason: 'a torn-down start reports nothing, not a disconnection',
+      );
+      expect(monitor.message, isNull);
+      expect(monitor.isMonitoring, isFalse);
+      source.finish();
+    });
+
+    test('a stop after teardown does not reach into the released source',
+        () async {
+      // `dispose()` (the page was popped) followed by `stop()` (a reconnect control that
+      // is on screen for one more frame) would otherwise ask a disposed source to release
+      // a capture session that is already gone.
+      final source = _FakeSource(emitOnListen: false);
+      final monitor = monitorWith(source);
+      await monitor.start();
+      await pumpEventQueue();
+
+      monitor.dispose();
+      monitor.dispose(); // idempotent
+      await monitor.stop();
+
+      expect(source.ends, 0, reason: 'dispose released the device, not stop');
+      expect(monitor.state, AudioMonitorState.starting);
     });
   });
 
@@ -455,6 +558,9 @@ class _FakeSource implements AudioLevelSource {
     this.beginFails = false,
     this.emitOnListen = true,
     this.endStops = false,
+    this.accessGate,
+    this.beginGate,
+    this.closeOnDispose = true,
   });
 
   /// What [requestAccess] answers. False is the "student tapped Don't allow" path.
@@ -466,6 +572,14 @@ class _FakeSource implements AudioLevelSource {
   /// True is the "another app is holding the microphone" case.
   bool beginFails;
 
+  /// When set, [requestAccess] waits for it: stands for the OS permission dialog,
+  /// which is the longest wait on the start path - the app is backgrounded to answer
+  /// it, so it is also where a popped exam page lands.
+  Completer<void>? accessGate;
+
+  /// When set, [begin] waits for it: a capture device that is slow to open.
+  Completer<void>? beginGate;
+
   /// Whether the capture session reports a level once someone is reading it.
   ///
   /// The sample it reports is [quiet] - below every threshold the detector can
@@ -476,6 +590,13 @@ class _FakeSource implements AudioLevelSource {
   /// completes. `AudioMonitor` has to time that wait out rather than queue behind
   /// it, because the release runs on the reconnect path.
   bool endStops;
+
+  /// Whether [dispose] closes the capture stream, as the real source does.
+  ///
+  /// A test that needs to *see* whether a listener was attached after the teardown
+  /// needs this false - the fake filters every event once closed, so a late `listen`
+  /// would leave no trace at all and the leak would be invisible.
+  bool closeOnDispose;
 
   /// What a real capture session reports in a quiet room.
   static const double quiet = -60;
@@ -516,12 +637,23 @@ class _FakeSource implements AudioLevelSource {
   @override
   Stream<double> get levels => _levels.stream;
 
+  /// Whether anything is reading the capture stream: the leak the teardown tests
+  /// look for, since a subscription created after the release outlives every handle
+  /// that could cancel it.
+  bool get hasListener => _levels.hasListener;
+
   @override
-  Future<bool> requestAccess() async => granted;
+  Future<bool> requestAccess() async {
+    if (accessGate != null) await accessGate!.future;
+    return granted;
+  }
 
   @override
   Future<void> begin() async {
+    // Counted before the gate: the open was attempted even when it is torn down
+    // mid-flight, which is exactly what the teardown tests assert on.
     begins++;
+    if (beginGate != null) await beginGate!.future;
     if (beginFails) throw StateError('device busy');
   }
 
@@ -534,6 +666,6 @@ class _FakeSource implements AudioLevelSource {
 
   @override
   void dispose() {
-    if (!_levels.isClosed) _levels.close();
+    if (closeOnDispose && !_levels.isClosed) _levels.close();
   }
 }

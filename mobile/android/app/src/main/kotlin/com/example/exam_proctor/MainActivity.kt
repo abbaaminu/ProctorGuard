@@ -23,9 +23,19 @@ import io.flutter.plugin.common.MethodChannel
  * channel `lock_task_channel`).
  *
  *   startLock           -> startLockTask() + immersive mode + keep screen on
- *   stopLock            -> stopLockTask() + restore status/navigation bars
+ *                          + FLAG_SECURE (argument `secure`, see below)
+ *   stopLock            -> stopLockTask() + restore status/navigation bars and
+ *                          clear FLAG_SECURE
  *   isLockTaskActive    -> ActivityManager.lockTaskModeState != NONE
  *   isLockTaskPermitted -> DevicePolicyManager.isLockTaskPermitted(packageName)
+ *
+ * Two details of that pin are deliberate. `startLock` blocks screenshots
+ * (`FLAG_SECURE`) while the exam runs, because a photographed question is the one
+ * exam leak the platform can prevent outright; the Dart side decides whether to ask
+ * for it (`KioskService.blockScreenshots`) and this side defaults it on. And because
+ * Android drops lock task mode whenever the activity is stopped, `onResume` re-pins
+ * a session that asked for the pin and no longer has it (`locksRequested`), so the
+ * second half of an exam is not quietly unproctored.
  *
  * Android exposes no public "lock task ended" callback on Activity
  * (DeviceAdminReceiver has one, but that requires device-owner status), so the
@@ -51,6 +61,17 @@ import io.flutter.plugin.common.MethodChannel
  */
 class MainActivity : FlutterActivity() {
 
+    /**
+     * True between a successful `startLock` and the `stopLock` that ends it.
+     *
+     * Android drops lock task mode when the activity is stopped - a phone call, an
+     * OEM dialog, the platform un-pinning itself to show a permission prompt - and
+     * never puts it back on the way in. This flag is what tells a resume whether
+     * *this app asked* to be pinned (so it has to be re-applied) or the student is
+     * simply using the app (so pinning must not be forced on them).
+     */
+    private var locksRequested = false
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
@@ -59,9 +80,30 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result -> handleIntegrity(call, result) }
     }
 
+    /**
+     * Re-pins the exam as soon as the activity is interactive again.
+     *
+     * Runs on every resume, and does nothing unless a session asked for the pin
+     * (see [locksRequested]) and the platform has actually lost it: `startLockTask`
+     * on an already-pinned activity is an error, and re-pinning a student who is
+     * simply reading the exam is not this method's business.
+     */
+    override fun onResume() {
+        super.onResume()
+        if (!locksRequested) return
+        if (isLockTaskActive()) return
+        try {
+            startLockTask()
+        } catch (_: Exception) {
+            // Refused this time (device policy, another activity on top): the Dart
+            // escape poll sees the missing pin and reports it as a violation, which
+            // is the honest outcome - the exam is not pinned.
+        }
+    }
+
     private fun handle(call: MethodCall, result: MethodChannel.Result) = when (call.method) {
         // Long names kept so an older Dart build can still pin the app.
-        "startLock", "startLockTask" -> result.success(startLock())
+        "startLock", "startLockTask" -> result.success(startLock(call))
         "stopLock", "stopLockTask" -> {
             stopLock()
             result.success(null)
@@ -71,16 +113,26 @@ class MainActivity : FlutterActivity() {
         else -> result.notImplemented()
     }
 
-    private fun startLock(): HashMap<String, Any?> {
+    private fun startLock(call: MethodCall): HashMap<String, Any?> {
         val reply = HashMap<String, Any?>()
         val strict = isLockTaskPermitted()
+        // Screenshot blocking is the one kiosk guarantee a *student* notices, so the
+        // Dart side states it explicitly (`KioskService.blockScreenshots`) rather
+        // than this side assuming it. Defaults to on for an older Dart build that
+        // sends no argument at all.
+        val secure = call.argument<Boolean>("secure") ?: true
         reply["strict"] = strict
         // getLockTaskModeState() is API 23+, so Dart can only poll for escapes
         // from there on (Flutter's default minSdk is 24 anyway).
         reply["canDetectEscape"] = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
         try {
             applyImmersiveMode(true)
+            applyScreenshotBlock(secure)
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            // Set before pinning: if `startLockTask()` is accepted but the platform
+            // engages lock task mode a moment later (it does), a resume in that
+            // window must still be allowed to re-pin.
+            locksRequested = true
             startLockTask()
             reply["granted"] = true
             reply["message"] = if (strict) {
@@ -90,6 +142,7 @@ class MainActivity : FlutterActivity() {
             }
         } catch (error: Exception) {
             // Not in the foreground, or the platform refused to pin.
+            locksRequested = false
             reply["granted"] = false
             reply["message"] = error.message ?: error.javaClass.simpleName
         }
@@ -97,13 +150,34 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun stopLock() {
+        // The exam is over: a later resume must not re-pin it.
+        locksRequested = false
         try {
             stopLockTask()
         } catch (_: Exception) {
             // Not pinned, or already unpinned: still restore the chrome below.
         }
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        applyScreenshotBlock(false)
         applyImmersiveMode(false)
+    }
+
+    /**
+     * Sets or clears `FLAG_SECURE` on this window for the duration of the exam.
+     *
+     * While it is set, this activity's content cannot be captured: screenshots,
+     * screen recording, and the thumbnail Android places in the recents switcher all
+     * come back blank or black. That is exactly the intent for an exam - a
+     * photographed question is an exam leak, and the recents thumbnail is a
+     * screenshot the student never had to press a button for - which is why it is
+     * applied by `startLock` and cleared by `stopLock` rather than by the theme.
+     */
+    private fun applyScreenshotBlock(block: Boolean) {
+        if (block) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
     }
 
     private fun applyImmersiveMode(hide: Boolean) {

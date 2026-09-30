@@ -2,8 +2,16 @@
 
     <uses-permission android:name="android.permission.CAMERA"/>
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- NOTE: `SYSTEM_ALERT_WINDOW` used to be declared here and is deliberately
+         gone. Nothing in the app ever drew a system overlay (the exam's own
+         "fullscreen required" and violation screens are Flutter widgets inside this
+         activity), so the permission bought nothing and cost two things: a
+         sensitive-permission review on every store submission, and a standing
+         "this app may draw over other apps" grant that is itself a proctoring
+         bypass surface. `PermissionService` still asks for it as a best-effort,
+         non-critical permission, so a device that denies it changes nothing about
+         whether an exam can start. -->
     <!-- Keeps the proctoring session (camera pipeline) alive if the OS
          tries to suspend background work; pair with a foreground service
          notification ("Exam in progress — proctoring active") for
@@ -16,7 +24,16 @@
 
     <application
         android:label="Exam Proctor"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:networkSecurityConfig="@xml/network_security_config">
+        <!-- `allowBackup="false"`: the persisted Supabase session (an access token
+             plus a refresh token) and the offline violation queue are the student's
+             credentials and the school's audit trail. Auto-backup copies both into
+             the student's Google Drive, where they outlive the exam, the device and
+             the school's control — and `adb backup` on a debug build would pull the
+             same data off the device. The cost is deliberate: a student who migrates
+             to a new phone signs in again instead of being restored into an exam. -->
 
         <activity
             android:name=".MainActivity"

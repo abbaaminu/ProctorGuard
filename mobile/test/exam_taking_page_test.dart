@@ -361,6 +361,60 @@ void main() {
       );
       expect(find.text('Warning 2 / 3'), findsOneWidget);
     });
+
+    testWidgets('a log the server refuses cannot hold the attempt open',
+        (tester) async {
+      proctoring.online = false; // evidence is refused, the answers are not
+      await openSession(tester);
+
+      // A strike the server will not take: it goes to the durable queue instead
+      // of being lost, and the banner says so.
+      guards.emit(WebGuardEvent.copyBlocked);
+      await tester.pump();
+      await tester.pump();
+
+      expect(proctoring.violations, isEmpty);
+      expect(find.byKey(const Key('exam-sync-banner')), findsOneWidget);
+
+      // The strike is announced over the session, so acknowledge it first: the
+      // overlay is modal on purpose (a warning has to be seen). Any message the
+      // page put behind it (a SnackBar) shares the bottom of the screen with the
+      // action bar, so it is cleared too.
+      await tester.tap(find.text('I understand, continue'));
+      await tester.pumpAndSettle();
+      ScaffoldMessenger.of(
+        tester.element(find.byType(Scaffold).last),
+      ).hideCurrentSnackBar();
+      await tester.pumpAndSettle();
+
+      // Submitting is about the *answers*: they are the copy grading reads, and
+      // they have all reached the server. The queued strike still counts after
+      // the attempt closes (`register_violation` takes the final state of a
+      // closed attempt), so it is no reason to strand a finished student on a
+      // "waiting for a connection" screen. (Submit lives on the last question.)
+      await tester.tap(find.byKey(const Key('exam-next')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('exam-submit')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('exam-submit-confirm')));
+      await tester.pumpAndSettle();
+
+      expect(exams.submitted, <String>['sub-1']);
+      expect(find.byKey(const Key('exam-offline-submit')), findsNothing);
+
+      // And the evidence was only late, never dropped: the backoff delivers it
+      // once the server is taking writes again. A minute is past `maxRetryDelay`,
+      // so whatever delay the failed passes had backed off to has elapsed.
+      proctoring.online = true;
+      await tester.pump();
+      await tester.pump(const Duration(minutes: 1));
+      await tester.pump();
+
+      expect(
+        proctoring.violations.map((violation) => violation.type.dbValue),
+        contains('copy_paste_attempt'),
+      );
+    });
   });
 
   group('blocking states', () {
@@ -745,8 +799,10 @@ class _StubExamRepository implements ExamRepository {
   Future<void> markDisqualified(String submissionId) async {}
 }
 
-/// Accepts violations without a backend (nothing in these tests reaches it).
+/// Accepts violations without a backend, with the flaky-network switch the submit
+/// gate needs: a log the server refuses has to be queued, not lost.
 class _SilentProctoringRepository implements ProctoringRepository {
+  bool online = true;
   final List<Violation> violations = <Violation>[];
 
   @override
@@ -754,6 +810,7 @@ class _SilentProctoringRepository implements ProctoringRepository {
     required String submissionId,
     required Violation violation,
   }) async {
+    if (!online) throw const _NoNetwork();
     violations.add(violation);
     return (
       warningCount: violations.length,

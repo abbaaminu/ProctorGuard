@@ -220,6 +220,17 @@ class SyncState {
 
   bool get hasPending => pending > 0;
 
+  /// Whether an answer the *grader* will read is still owed to the server.
+  ///
+  /// Answers and evidence are not the same promise. An answer has to reach the
+  /// server before the attempt closes, because grading reads the server's copy;
+  /// a queued violation is still delivered - and still counted - afterwards
+  /// (`register_violation` reports the final state of an already closed attempt
+  /// rather than raising). Whoever decides whether an attempt may end asks this
+  /// question, not [hasPending]: one log row the server refuses must not be able
+  /// to strand a student whose work is otherwise finished.
+  bool get hasPendingAnswers => pendingAnswers > 0;
+
   bool get isSynced => pending == 0;
 
   /// The headline the exam banner shows: the work is safe on this device but has
@@ -294,6 +305,19 @@ class OfflineSyncService implements ViolationOutbox {
   /// Upper bound on the violation queue, oldest dropped first: a device that has
   /// been offline for hours must not grow an unbounded row.
   final int maxQueuedViolations;
+
+  /// How many rows may fail inside one delivery pass before the pass gives up on
+  /// the rest of the queue.
+  ///
+  /// A pass stops at a failure because a failed write *almost always* means the
+  /// connection is gone - but "almost" is not "always": a server can keep
+  /// refusing one row (a schema change, a question an exam edit removed, an
+  /// attempt a supervisor reset) while accepting every other one. Stopping dead
+  /// on that row used to hold up everything queued behind it for good, including
+  /// evidence logged minutes later. A device that is genuinely offline still
+  /// fails this many rows inside the same tick and leaves the pass just as
+  /// promptly.
+  static const int maxPassFailures = 3;
 
   late final ExamRepository _exams;
   late final ProctoringRepository _proctoring;
@@ -505,11 +529,15 @@ class OfflineSyncService implements ViolationOutbox {
     _notify();
   }
 
-  /// One delivery attempt per queued row, stopping at the first failure: a failed
-  /// write almost always means the network is gone, so hammering the rest would
-  /// only add latency.
+  /// One delivery attempt per queued row, oldest first.
+  ///
+  /// The pass stops after [maxPassFailures] failures rather than at the first
+  /// one: a connection that is down fails that many rows inside the same tick,
+  /// while a single row the server keeps refusing no longer holds up the rows
+  /// behind it (see [maxPassFailures]).
   Future<void> _drain() async {
     var deliveredAny = false;
+    var failures = 0;
 
     for (final pending in List<PendingAnswer>.of(_answers)) {
       if (_disposed) return;
@@ -530,7 +558,10 @@ class OfflineSyncService implements ViolationOutbox {
       } catch (error) {
         debugPrint('ProctorGuard: answer still queued ($error)');
         _offline('Could not sync your answers yet.');
-        return;
+        // The row stays queued either way; only the *pass* gives up, and only
+        // after [maxPassFailures] rows have failed in it.
+        if (++failures >= maxPassFailures) return;
+        continue;
       }
 
       _answers.remove(pending);
@@ -562,11 +593,14 @@ class OfflineSyncService implements ViolationOutbox {
         debugPrint('ProctorGuard: violation still queued ($error)');
         await _persistViolations();
         _offline('Could not deliver a proctoring log yet.');
-        return;
+        if (++failures >= maxPassFailures) return;
       }
     }
 
-    if (deliveredAny) {
+    // Only a pass that finished cleanly proves the connection is back: one that
+    // delivered *and* failed is still a device with something stuck, and the
+    // banner has to keep saying so.
+    if (deliveredAny && failures == 0) {
       _lastSyncedAt = _now();
       _lastError = null;
       _online = true;

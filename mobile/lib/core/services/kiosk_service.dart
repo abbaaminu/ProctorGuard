@@ -46,8 +46,10 @@ class KioskResult {
 ///
 /// Channel `lock_task_channel`:
 ///  * `startLock` / `stopLock` — pin/unpin the app (`startLockTask()` /
-///    `stopLockTask()`), hide the status + navigation bars and keep the screen
-///    awake for the duration of the exam.
+///    `stopLockTask()`), hide the status + navigation bars, keep the screen
+///    awake and (while [blockScreenshots] is set) block screenshots and screen
+///    recording with `FLAG_SECURE` for the duration of the exam. The `secure`
+///    argument is what asks for the last one.
 ///  * `isLockTaskActive` / `isLockTaskPermitted` — capability queries, also used
 ///    to poll for escapes (see [escapes]).
 ///  * [escapes] — Android has no public "lock task ended" callback on `Activity`
@@ -61,10 +63,24 @@ class KioskResult {
 /// Create one instance per exam session (the exam page owns it) so the escape
 /// poll only runs while the exam is on screen.
 class KioskService {
-  KioskService({this.escapePollInterval = const Duration(seconds: 1)});
+  KioskService({
+    this.escapePollInterval = const Duration(seconds: 1),
+    this.blockScreenshots = true,
+  });
 
   static const String channelName = 'lock_task_channel';
   static const MethodChannel _channel = MethodChannel(channelName);
+
+  /// Whether the native side is asked to set `FLAG_SECURE` while the exam is
+  /// pinned, so screenshots, screen recording and the recents thumbnail of the
+  /// exam screen are blocked for the duration of the attempt.
+  ///
+  /// Sent as the `secure` argument of `startLock` and cleared by `stopLock`. It
+  /// is an explicit field rather than a hard-coded constant because it is the one
+  /// kiosk guarantee a *student* notices (they can no longer screenshot a
+  /// question), so turning it off has to be a deliberate product decision rather
+  /// than a platform accident.
+  final bool blockScreenshots;
 
   /// Upper bound on a *command* round-trip (`startLock` / `stopLock`).
   ///
@@ -92,12 +108,35 @@ class KioskService {
   bool _pinningConfirmed = false;
   int _consecutiveInactive = 0;
 
+  /// The lock-task state query currently on the wire, if any.
+  ///
+  /// [escapePollInterval] is a *tick*, not a deadline: a device whose platform
+  /// takes longer than one interval to answer used to queue a second, third and
+  /// fourth identical `isLockTaskActive` call behind the first, and Android
+  /// answers those queued calls with the state *at the time it gets to them*. A
+  /// queued answer is therefore both stale and, in the worst case, a false escape
+  /// report. Joining the call already in flight makes one question one round-trip,
+  /// which is also what keeps a pinned exam from adding platform traffic.
+  Future<bool?>? _stateQuery;
+
+  /// The [startLock] currently on the wire, if any.
+  ///
+  /// A pin is not as idempotent as it looks: two overlapping `startLock` calls
+  /// used to send two `startLock` messages and arm two escape polls, and the
+  /// second assignment to [_poll] dropped the first timer on the floor — a timer
+  /// that kept asking the platform once per interval for the rest of the run with
+  /// no handle left to cancel it. Joining the call in flight makes one exam
+  /// bootstrap one pin and one poll, and both callers act on the same answer.
+  Future<KioskResult>? _startInFlight;
+
   /// Emitted when lock task ends *without* [stopLock] having been called, i.e.
   /// the student left the exam instead of finishing it.
   Stream<KioskExitReason> get escapes => _exits.stream;
 
   Future<void> _checkStillPinned() async {
-    final active = await _isLockTaskActiveOrNull();
+    // Shared with any other caller asking about the pin at this instant (see
+    // [_lockTaskState]): one tick, one platform round-trip.
+    final active = await _lockTaskState();
     if (_disposed || _stopping) return;
 
     // The platform did not answer in time: inconclusive, not "the student
@@ -130,18 +169,67 @@ class KioskService {
     _poll = null;
   }
 
+  /// Asks the platform whether lock task mode is active, joining the question
+  /// already in flight instead of starting a second one (see [_stateQuery]).
+  ///
+  /// The answer is still time-boxed by [stateQueryTimeout] inside
+  /// [_isLockTaskActiveOrNull]; a caller that arrives mid-flight simply waits for
+  /// the same answer rather than for a fresh one, so `isLockTaskActive()` cannot
+  /// be answered from a *different* moment than the poll is judging.
+  Future<bool?> _lockTaskState() {
+    final inFlight = _stateQuery;
+    if (inFlight != null) return inFlight;
+
+    final query = _isLockTaskActiveOrNull();
+    _stateQuery = query;
+    return query.whenComplete(() {
+      // Only clear our own slot: a `startLock` that reset the field while this
+      // query was on the wire must not have its newer query thrown away.
+      if (identical(_stateQuery, query)) _stateQuery = null;
+    });
+  }
+
   /// Pins the app for an exam session. Never throws: unsupported platforms
   /// (iOS, desktop, web) and refused pinning both come back with
   /// `granted: false` so the session can continue with a warning.
-  Future<KioskResult> startLock() async {
+  ///
+  /// Overlapping calls share the one round-trip already on the wire (see
+  /// [_startInFlight]). A call that arrives after [dispose] reports
+  /// [KioskResult.unsupported] instead of pinning anything: the platform half it
+  /// would talk to is gone, and a pin armed from here would outlive the session
+  /// that asked for it.
+  Future<KioskResult> startLock() {
+    if (_disposed) return Future<KioskResult>.value(KioskResult.unsupported);
+
+    final inFlight = _startInFlight;
+    if (inFlight != null) return inFlight;
+
+    final start = _startLock();
+    _startInFlight = start;
+    return start.whenComplete(() {
+      // Only clear our own slot: a start that began *after* this one answered
+      // must not have its in-flight call discarded here.
+      if (identical(_startInFlight, start)) _startInFlight = null;
+    });
+  }
+
+  Future<KioskResult> _startLock() async {
     _stopping = false;
     _pinningConfirmed = false;
     _consecutiveInactive = 0;
+    // Any query left over from a previous session describes the *previous* pin.
+    _stateQuery = null;
     _stopPolling();
 
     try {
       final reply = await _channel
-          .invokeMapMethod<String, dynamic>('startLock')
+          .invokeMapMethod<String, dynamic>(
+            'startLock',
+            // The pin itself is the platform's job; this is the one thing the
+            // Dart side has to state explicitly, because blocking screenshots is
+            // a policy decision rather than a consequence of pinning (PG-4).
+            <String, Object?>{'secure': blockScreenshots},
+          )
           .timeout(commandTimeout);
       if (reply == null || reply.isEmpty) return KioskResult.unsupported;
       final result = KioskResult(
@@ -150,6 +238,11 @@ class KioskService {
         canDetectEscape: reply['canDetectEscape'] == true,
         message: reply['message'] as String?,
       );
+      // A `dispose` that landed while the bridge was answering wins: the timer
+      // armed just below has no handle left to cancel it, and it would keep
+      // asking a torn-down engine about a session that already ended.
+      if (_disposed) return result;
+
       // Only worth polling when pinning actually engaged and the platform can
       // report its lock task state.
       if (result.granted && result.canDetectEscape) {
@@ -191,12 +284,15 @@ class KioskService {
   /// True while the platform reports lock task mode as active.
   ///
   /// Time-boxed ([stateQueryTimeout]); a bridge that does not answer is
-  /// reported as `false`. Use [_isLockTaskActiveOrNull] where "unknown" and
-  /// "not pinned" must be told apart.
-  Future<bool> isLockTaskActive() async =>
-      (await _isLockTaskActiveOrNull()) ?? false;
+  /// reported as `false`. Use [_lockTaskState] where "unknown" and
+  /// "not pinned" must be told apart, and note that this shares the escape
+  /// poll's in-flight query rather than starting one of its own.
+  Future<bool> isLockTaskActive() async => (await _lockTaskState()) ?? false;
 
-  /// The same query, with `null` meaning "the platform did not answer".
+  /// The raw platform query, with `null` meaning "the platform did not answer".
+  ///
+  /// Private on purpose: [_lockTaskState] is the only caller, so a query is never
+  /// started twice for the same moment (see [_stateQuery]).
   Future<bool?> _isLockTaskActiveOrNull() async {
     try {
       return await _channel

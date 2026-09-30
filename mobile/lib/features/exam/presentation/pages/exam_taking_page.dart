@@ -117,6 +117,14 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   int _currentIndex = 0;
   bool _loading = true;
 
+  /// In-flight guard for the bootstrap (see [_bootstrap]).
+  ///
+  /// A blocking screen's "Try again" button is only rebuilt on the next turn of
+  /// the event loop, so a double tap used to start a second session setup on top
+  /// of the first: two capture pipelines competing for one lens, and a first
+  /// kiosk pin, watcher set and integrity probe that nothing released.
+  bool _bootstrapping = false;
+
   /// Set when the session cannot be proctored at all (permission refused, no
   /// camera) or when the question feed fails to load. Both are blocking states
   /// with a retry, because silently running an unproctored exam is worse than
@@ -215,7 +223,24 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     if (sync != null) unawaited(sync.retryNow());
   }
 
+  /// Runs the session setup for this attempt, at most once at a time.
+  ///
+  /// The blocking states all retry through here, and a retry that arrives while
+  /// one is already running is dropped rather than queued: the pass in flight is
+  /// about to decide what this page shows anyway (see [_bootstrapping]).
   Future<void> _bootstrap() async {
+    if (_bootstrapping) return;
+    _bootstrapping = true;
+    try {
+      await _runBootstrap();
+    } finally {
+      _bootstrapping = false;
+    }
+  }
+
+  /// The bootstrap itself: the durable cache, the microphone, the browser/kiosk
+  /// guards and the integrity probe, then the capture pipeline proctoring runs on.
+  Future<void> _runBootstrap() async {
     final notifier = ref.read(proctoringProvider(widget.submissionId).notifier);
 
     // Local-first: load the durable cache before anything can be painted, so a
@@ -518,14 +543,42 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
 
   /// Ends the bootstrap in the blocking-error state (see [_blockingError]).
   void _failStart(String message) {
-    _cameraController?.removeListener(_onCameraValueChanged);
-    _cameraController?.dispose();
+    // Released through the same path as the session teardown: a device asked to
+    // stop a stream that never started (or that has already ended) answers with
+    // an async error, and it must not escape a screen the student is looking at.
+    final camera = _cameraController;
     _cameraController = null;
+    if (camera != null) {
+      camera.removeListener(_onCameraValueChanged);
+      unawaited(_releaseCamera(camera));
+    }
     if (!mounted) return;
     setState(() {
       _loading = false;
       _blockingError = message;
     });
+  }
+
+  /// Releases one capture session: stop the frames, then dispose the controller.
+  ///
+  /// Every step is contained, because this only ever runs on the way *out* - of a
+  /// failed start or of the whole attempt. The order is what Android needs: the
+  /// lens is only handed back once the image stream is closed, and `dispose()`
+  /// does not wait for that itself, so a session that skipped the stop could
+  /// leave the next exam (or another app) with a camera that reports "in use".
+  static Future<void> _releaseCamera(CameraController camera) async {
+    try {
+      // Guarded as well as caught: `stopImageStream()` throws when no stream is
+      // running, which is the normal state of a controller that just failed.
+      if (camera.value.isStreamingImages) await camera.stopImageStream();
+    } catch (error) {
+      debugPrint('ProctorGuard: stopping the camera stream failed: $error');
+    }
+    try {
+      await camera.dispose();
+    } catch (error) {
+      debugPrint('ProctorGuard: releasing the camera failed: $error');
+    }
   }
 
   /// Camera controller listener: pausing on error, resuming once frames flow
@@ -693,21 +746,28 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     final minutes = widget.durationMinutes;
     if (minutes == null || minutes <= 0) return;
 
+    // Anchored and read through the page clock (see [ExamTakingPage.clock]) - the
+    // same clock the fullscreen window counts on, so the two timings on this
+    // screen cannot disagree about how much of the hour is gone.
     final deadline =
-        (widget.startedAt ?? DateTime.now()).add(Duration(minutes: minutes));
+        (widget.startedAt ?? _now()).add(Duration(minutes: minutes));
 
     _countdown?.cancel();
-    _tickCountdown(deadline);
+    // The ticker is installed *before* the first tick: that tick is what submits
+    // an attempt which resumes past its deadline, and it cancels the ticker it
+    // finds. Creating the ticker afterwards used to re-arm the submission once a
+    // second for as long as the page stayed on screen.
     _countdown = Timer.periodic(
       const Duration(seconds: 1),
       (_) => _tickCountdown(deadline),
     );
+    _tickCountdown(deadline);
   }
 
   void _tickCountdown(DateTime deadline) {
     if (!mounted) return;
 
-    final remaining = deadline.difference(DateTime.now());
+    final remaining = deadline.difference(_now());
     setState(() => _remaining = remaining.isNegative ? Duration.zero : remaining);
 
     if (!remaining.isNegative && remaining != Duration.zero) return;
@@ -760,9 +820,16 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     _fullscreenTicker = null;
     _appLifecycle?.dispose();
     _appLifecycle = null;
-    _cameraController?.removeListener(_onCameraValueChanged);
-    _cameraController?.stopImageStream();
-    _cameraController?.dispose();
+    // Detached before it is released: a teardown in flight must not find a
+    // controller this page still calls "the camera" (see [_releaseCamera]).
+    final camera = _cameraController;
+    _cameraController = null;
+    if (camera != null) {
+      camera.removeListener(_onCameraValueChanged);
+      // Not awaited - `dispose()` cannot be - and fully contained, so no error
+      // out of a dying capture session can reach the zone as unhandled.
+      unawaited(_releaseCamera(camera));
+    }
 
     // Unpin before releasing the bridge: `stopLock` tells the platform the exit
     // is intentional, so finishing the exam is not logged as an escape.
@@ -1109,7 +1176,12 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     if (sync == null) return true; // no queue: nothing to drain
 
     await sync.flush();
-    if (!sync.state.hasPending) return true;
+    // Only *answers* hold the attempt open: grading reads the server's copy of
+    // them. A queued violation is delivered - and still counted - after the
+    // attempt closes, so blocking an otherwise finished student on evidence
+    // delivery would let one log row the server refuses strand them for good
+    // (see [SyncState.hasPendingAnswers]).
+    if (!sync.state.hasPendingAnswers) return true;
     if (!mounted) return false;
 
     setState(() {
@@ -1133,7 +1205,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     if (sync != null) await sync.flush();
     if (!mounted) return;
 
-    if (sync != null && sync.state.hasPending) {
+    if (sync != null && sync.state.hasPendingAnswers) {
       setState(() => _offlineSubmitPending = true);
       _showMessage(
         'Still offline - your answers are safe on this device. Reconnect and '

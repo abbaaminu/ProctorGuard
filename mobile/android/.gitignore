@@ -6,6 +6,9 @@ gradle-wrapper.jar
 /local.properties
 GeneratedPluginRegistrant.java
 .cxx/
+# Gradle 9 drops its build-problems report here even though the Flutter template
+# redirects the project build dir to ../build, so it shows up as untracked noise.
+/build/
 
 # Remember to never publicly share your keystore.
 # See https://flutter.dev/to/reference-keystore

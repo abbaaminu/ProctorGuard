@@ -84,6 +84,72 @@ void main() {
 
       expect(config.sessionKey, 'sb-abcdefgh-auth-token');
     });
+
+    test('refuses a plain http origin that is not this machine', () {
+      // The publishable key and the student's access token travel on every request,
+      // so a remote http:// origin is a credential leak over a network the school
+      // does not control.
+      final resolution = SupabaseConfig.resolveWithReason(
+        url: 'http://abcdefgh.supabase.co',
+        publishableKey: 'sb_publishable_abc',
+      );
+
+      expect(resolution.isReady, isFalse);
+      expect(resolution.config, isNull);
+      expect(resolution.reason, contains('https://'));
+      // The reason has to name what is wrong, not just refuse: "not configured"
+      // used to be the answer for a build that *did* set both values.
+      expect(resolution.reason, isNot(contains('empty')));
+    });
+
+    test('accepts http only on loopback, for a local supabase stack', () {
+      // `supabase start` serves http on localhost, and the Android emulator reaches
+      // the host through 10.0.2.2: both are this machine, so nothing leaves it.
+      for (final url in <String>[
+        'http://localhost:54321',
+        'http://127.0.0.1:54321',
+        'http://[::1]:54321',
+        'http://10.0.2.2:54321',
+      ]) {
+        final resolution = SupabaseConfig.resolveWithReason(
+          url: url,
+          publishableKey: 'sb_publishable_abc',
+        );
+        expect(resolution.isReady, isTrue, reason: url);
+      }
+
+      // ...and a host that merely *looks* local (a DNS name, another device on the
+      // LAN) is still refused.
+      for (final url in <String>[
+        'http://localhost.evil.test',
+        'http://192.168.1.50:54321',
+        'http://notlocalhost',
+      ]) {
+        expect(
+          SupabaseConfig.resolveWithReason(
+            url: url,
+            publishableKey: 'sb_publishable_abc',
+          ).isReady,
+          isFalse,
+          reason: url,
+        );
+      }
+    });
+
+    test('names the missing value when the URL or key is the problem', () {
+      expect(
+        SupabaseConfig.resolveWithReason(url: '', publishableKey: 'k' * 24)
+            .reason,
+        contains('SUPABASE_URL'),
+      );
+      expect(
+        SupabaseConfig.resolveWithReason(
+          url: 'https://abcdefgh.supabase.co',
+          publishableKey: '',
+        ).reason,
+        contains('SUPABASE_PUBLISHABLE_KEY'),
+      );
+    });
   });
 
   group('unconfigured service', () {

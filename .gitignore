@@ -14,6 +14,14 @@ mobile/ios/.symlinks/
 mobile/ios/Flutter/Flutter.framework
 mobile/*.iml
 
+# ---- Release signing material (mobile/android/) ----
+# The keystore *and* the file that unlocks it. Leaking either lets anyone publish an
+# "upgrade" of this app - camera permission, kiosk pin and all - that the school's
+# students would install. `key.properties.example` is the committed template.
+mobile/android/key.properties
+*.jks
+*.keystore
+
 # ---- Node / Vite (dashboard/) ----
 dashboard/node_modules/
 dashboard/dist/

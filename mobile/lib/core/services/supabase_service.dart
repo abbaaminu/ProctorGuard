@@ -33,7 +33,11 @@ class SupabaseConfig {
   /// `Supabase.initialize` asserts on a missing key, and an assertion failure
   /// before `runApp` is precisely the blank-page startup failure this guards
   /// against.
-  static SupabaseConfig? fromEnvironment() => fromValues(
+  static SupabaseConfig? fromEnvironment() => resolveFromEnvironment().config;
+
+  /// [fromEnvironment] with the rejection reason kept, which is what
+  /// `SupabaseService.init` reports to the setup screen.
+  static SupabaseConfigResolution resolveFromEnvironment() => resolveFromValues(
         url: const String.fromEnvironment('SUPABASE_URL'),
         publishableKey: const String.fromEnvironment('SUPABASE_PUBLISHABLE_KEY'),
         anonKey: const String.fromEnvironment('SUPABASE_ANON_KEY'),
@@ -46,7 +50,20 @@ class SupabaseConfig {
     required String publishableKey,
     required String anonKey,
   }) =>
-      resolve(
+      resolveFromValues(
+        url: url,
+        publishableKey: publishableKey,
+        anonKey: anonKey,
+      ).config;
+
+  /// [fromValues] with the rejection reason kept. One implementation, so the
+  /// key-precedence rule cannot drift between the two.
+  static SupabaseConfigResolution resolveFromValues({
+    required String url,
+    required String publishableKey,
+    required String anonKey,
+  }) =>
+      resolveWithReason(
         url: url,
         publishableKey:
             publishableKey.trim().isEmpty ? anonKey : publishableKey,
@@ -54,18 +71,84 @@ class SupabaseConfig {
 
   /// Validation rules, kept separate from [fromEnvironment] so they can be
   /// unit-tested without compile-time defines.
+  ///
+  /// Returns null for every rejection; [resolveWithReason] is the same call with
+  /// the *reason* attached.
   static SupabaseConfig? resolve({
+    required String url,
+    required String publishableKey,
+  }) =>
+      resolveWithReason(url: url, publishableKey: publishableKey).config;
+
+  /// [resolve], with the rejection reason kept.
+  ///
+  /// The reason exists because every rejection used to produce the same
+  /// sentence — "no URL/key, or they are still placeholders" — which is wrong
+  /// (and unactionable) for a build that *did* set both, but over `http://`. That
+  /// is the case this whole validator is here for: a plain-http URL sends the
+  /// publishable key and the student's access token in clear text on every
+  /// request, so it is refused rather than quietly used.
+  static SupabaseConfigResolution resolveWithReason({
     required String url,
     required String publishableKey,
   }) {
     final cleanUrl = url.trim().replaceAll(RegExp(r'/+$'), '');
     final cleanKey = publishableKey.trim();
 
-    if (!_isUsable(cleanUrl) || !_isUsable(cleanKey)) return null;
-    if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
-      return null;
+    if (!_isUsable(cleanUrl)) {
+      return const SupabaseConfigResolution.rejected(
+        'SUPABASE_URL is empty or still the placeholder from the docs.',
+      );
     }
-    return SupabaseConfig(url: cleanUrl, publishableKey: cleanKey);
+    if (!_isUsable(cleanKey)) {
+      return const SupabaseConfigResolution.rejected(
+        'SUPABASE_PUBLISHABLE_KEY is empty or still the placeholder from the '
+        'docs.',
+      );
+    }
+
+    final uri = Uri.tryParse(cleanUrl);
+    if (uri == null || !uri.hasAuthority || uri.host.isEmpty) {
+      return const SupabaseConfigResolution.rejected(
+        'SUPABASE_URL must be an absolute origin such as '
+        'https://<project-ref>.supabase.co.',
+      );
+    }
+    if (!_isSecureOrigin(uri)) {
+      return const SupabaseConfigResolution.rejected(
+        'SUPABASE_URL must be https:// - a plain http:// origin sends the '
+        'publishable key and the exam session token in clear text over a network '
+        'the school does not control. A loopback development server (localhost, '
+        '127.0.0.1, or the Android emulator host 10.0.2.2) is the only exception.',
+      );
+    }
+
+    return SupabaseConfigResolution.ready(
+      SupabaseConfig(url: cleanUrl, publishableKey: cleanKey),
+    );
+  }
+
+  /// Whether [uri] is an origin the app may send credentials to (see
+  /// [resolveWithReason]): https anywhere, http only on this machine.
+  static bool _isSecureOrigin(Uri uri) {
+    if (uri.scheme == 'https') return true;
+    if (uri.scheme != 'http') return false;
+    return _isLoopbackHost(uri.host);
+  }
+
+  /// True for the hosts that *are* this machine: a local `supabase start` stack,
+  /// or the Android emulator's alias for the host's loopback (`10.0.2.2`).
+  ///
+  /// Spelled out rather than resolved through `dart:io`'s `InternetAddress`,
+  /// because this file is compiled for the web as well and `dart:io` does not
+  /// exist there.
+  static bool _isLoopbackHost(String host) {
+    // `Uri.host` keeps IPv6 in brackets on some platforms and not others.
+    final lower = host.toLowerCase().replaceAll(RegExp(r'^\[|\]$'), '');
+    return lower == 'localhost' ||
+        lower == '::1' ||
+        lower == '10.0.2.2' ||
+        lower.startsWith('127.');
   }
 
   /// Rejects empty values and the placeholders copied out of docs/examples, so
@@ -99,6 +182,24 @@ class SupabaseConfig {
   /// Unknown leftovers for the startup screen: never log the key itself.
   @override
   String toString() => 'SupabaseConfig($url, key: ${publishableKey.length} chars)';
+}
+
+/// The outcome of validating a build's Supabase settings: either a usable
+/// [config], or the [reason] the build was refused.
+///
+/// Both halves matter at boot. `status` alone cannot explain itself (a missing
+/// URL, a placeholder key and an `http://` origin all end up "not configured"),
+/// and the setup screen has to tell a deployer which of the three they are
+/// looking at.
+class SupabaseConfigResolution {
+  const SupabaseConfigResolution.ready(SupabaseConfig this.config) : reason = null;
+
+  const SupabaseConfigResolution.rejected(String this.reason) : config = null;
+
+  final SupabaseConfig? config;
+  final String? reason;
+
+  bool get isReady => config != null;
 }
 
 /// How far initialisation got, so the UI can explain itself instead of showing
@@ -139,6 +240,11 @@ class SupabaseService {
   SupabaseInitStatus _status = SupabaseInitStatus.notConfigured;
   String? _initError;
   bool _canPersistSession = true;
+
+  /// The origin [_client] was built for, so [init] can tell a repeat call (fine)
+  /// from a second backend (refused). Null while there is no client.
+  String? _initialisedUrl;
+
   StreamSubscription<AuthState>? _authSubscription;
   final StreamController<AuthState> _authStates =
       StreamController<AuthState>.broadcast();
@@ -196,13 +302,36 @@ class SupabaseService {
   /// Initialises the client. **Never throws**: failures surface through
   /// [status] and [initError] so `main()` keeps booting and the UI can explain
   /// them.
+  ///
+  /// Idempotent. A second call reports the status already reached instead of
+  /// re-running the boot: `Supabase.initialize` returns the instance it built the
+  /// first time, so re-initialising cannot produce a *new* backend, and a call
+  /// naming a different URL is refused loudly rather than silently re-pointing a
+  /// running app whose repositories are already bound to the first client.
   Future<SupabaseInitStatus> init({SupabaseConfig? config}) async {
-    final settings = config ?? SupabaseConfig.fromEnvironment();
+    final resolution = config != null
+        ? SupabaseConfigResolution.ready(config)
+        : SupabaseConfig.resolveFromEnvironment();
+    final settings = resolution.config;
+
     if (settings == null) {
       _status = SupabaseInitStatus.notConfigured;
-      _initError = 'No SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY in this build '
-          '(or they are still the documentation placeholders).';
+      // The validator's own words: "not configured" covers a missing URL, a
+      // placeholder key *and* a plain-http origin, and only the reason tells a
+      // deployer which one to fix.
+      _initError = resolution.reason ??
+          'No SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY in this build.';
       debugPrint('SupabaseService: $_initError');
+      return _status;
+    }
+
+    if (_client != null) {
+      if (_initialisedUrl != null && _initialisedUrl != settings.url) {
+        debugPrint(
+          'SupabaseService: already initialised against $_initialisedUrl; '
+          'ignoring a second init for ${settings.url}.',
+        );
+      }
       return _status;
     }
 
@@ -226,6 +355,7 @@ class SupabaseService {
       );
 
       _client = app.client;
+      _initialisedUrl = settings.url;
       _status = SupabaseInitStatus.ready;
       _initError = null;
       _listenToAuthState();
@@ -331,11 +461,20 @@ class SupabaseService {
     }
   }
 
+  /// Wires the singleton's public auth stream to the SDK's.
+  ///
+  /// Called on every successful [init] and replaces any previous subscription
+  /// instead of stacking a second one on the same controller (which would make
+  /// every event appear twice). After [dispose] the stream is closed, so there is
+  /// nothing left to wire.
   void _listenToAuthState() {
     final auth = _client?.auth;
     if (auth == null) return;
+    if (_authStates.isClosed) return; // disposed: the stream is gone
 
-    _authSubscription?.cancel();
+    // Not awaited: this is a synchronous teardown of the previous listener, and
+    // `init` must not be able to hang on a client that is going away.
+    unawaited(_authSubscription?.cancel());
     _authSubscription = listenToAuthState(
       auth.onAuthStateChange,
       onState: (state) {
@@ -370,6 +509,9 @@ class SupabaseService {
   @visibleForTesting
   void debugSetClient(SupabaseClient? client) {
     _client = client;
+    // A double has no genesis origin, so a later `init` must not read it as
+    // "already initialised against <url>" (see [init]).
+    _initialisedUrl = null;
     _status = client == null
         ? SupabaseInitStatus.notConfigured
         : SupabaseInitStatus.ready;
@@ -377,6 +519,9 @@ class SupabaseService {
 
   /// Releases the auth listener; the singleton normally lives for the whole run,
   /// tests call this to avoid leaking subscriptions.
+  ///
+  /// The client itself is kept: disposing the SDK's client is the SDK's business,
+  /// and [init] is documented to be a no-op once a client exists.
   Future<void> dispose() async {
     await _authSubscription?.cancel();
     _authSubscription = null;
