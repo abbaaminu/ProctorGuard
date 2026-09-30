@@ -1,0 +1,46 @@
+{
+  /*
+   * Types for the Edge Functions, which run on Deno — not Node, not a browser
+   * tab. `Deno.serve` / `Deno.env` come with the runtime, so no tsconfig used to
+   * claim these files and the editor's TypeScript server checked
+   * `admin-create-user/index.ts` as a plain script: every `Deno` reference
+   * reported TS2304 ("Cannot find name 'Deno'"), while `npm run build` in
+   * `dashboard/` stayed silent because its tsconfig only includes `src`. Same
+   * story as `dashboard/tsconfig.node.json`, and fixed the same way.
+   *
+   * `"types": ["deno"]` is what resolves those globals, exactly as
+   * `"types": ["node"]` resolves `path` / `__dirname` over there: `@types/deno`
+   * is the Deno authors' own `lib.deno*.d.ts`, republished on npm for an editor
+   * with no Deno toolchain (and no Deno extension) installed. `lib` stays
+   * DOM-shaped because the `Request`/`Response` a handler receives are the web
+   * ones Deno implements.
+   *
+   * The other half is `npm-imports.d.ts`: Deno resolves the `npm:` specifier in
+   * `index.ts` by itself, but a TypeScript server cannot, so that file names the
+   * npm package it stands for. Both are dev-only — `supabase functions deploy`
+   * bundles what a function imports, so nothing in this folder ships. Runs with
+   * whatever TypeScript is on the machine; `npm install` here only pulls the
+   * types.
+   *
+   * Check it with `npm install && npm run typecheck` from this folder.
+   */
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["deno"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true
+  },
+  /*
+   * Every function in this folder, plus the type declarations above them, so a
+   * new `supabase/functions/<name>/index.ts` is covered the moment it is created.
+   * `node_modules` is excluded by TypeScript's own default.
+   */
+  "include": ["**/*.ts"]
+}

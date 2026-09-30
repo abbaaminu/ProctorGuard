@@ -14,7 +14,9 @@ proctor/
                 policies, and RPCs. Run this once per environment.
     functions/  admin-create-user — the Edge Function that creates staff
                 logins. It is the only place a service_role key is used,
-                and it never leaves Supabase's servers.
+                and it never leaves Supabase's servers. The
+                `tsconfig.json` / `package.json` beside it are dev-only:
+                types for the editor, not part of a deployment.
 ```
 
 Roles live in the `public.user_role` enum: `student`, `lecturer`, `supervisor`
@@ -91,15 +93,24 @@ Both apps read/write the same tables, so a submission a student makes in
 ## Verifying a change
 
 A fresh clone has never had its dependencies installed, so run `flutter pub get`
-once (and `npm install` in `dashboard/`) **before** the checks below — with an
-empty pub cache `flutter analyze` reports hundreds of phantom errors
-(`Target of URI doesn't exist: 'package:flutter_riverpod/...'`) that are all just
-missing packages, not broken code.
+once (and `npm install` in `dashboard/` and `supabase/functions/`) **before** the
+checks below — with an empty pub cache `flutter analyze` reports hundreds of
+phantom errors (`Target of URI doesn't exist: 'package:flutter_riverpod/...'`)
+that are all just missing packages, not broken code.
 
 ```
 cd mobile   && flutter pub get && flutter analyze && flutter test   # 256 tests, no device needed
 cd dashboard && npm install && npm run build                       # tsc -b && vite build
+cd supabase/functions && npm install && npm run typecheck          # the Deno Edge Function
 ```
+
+The last line is the only check the Edge Function has: this repo carries no Deno
+toolchain, so `supabase/functions/tsconfig.json` (`"types": ["deno"]` +
+`npm-imports.d.ts`) is what lets an editor, or `tsc`, see `Deno.serve` /
+`Deno.env` and the `npm:` import inside `admin-create-user/index.ts` at all — the
+same trick `dashboard/tsconfig.node.json` plays for `path` / `__dirname`. It
+type-checks only; `supabase functions deploy` still bundles the function with
+Deno.
 
 The Flutter suite pins the client↔database contract (`mobile/test/schema_contract_test.dart`:
 RPC names, argument names — including the `register_violation` idempotency key and

@@ -32,6 +32,12 @@ dashboard/*.log
 # `tsc -b` bookkeeping: machine-specific, regenerated on every build.
 dashboard/*.tsbuildinfo
 
+# ---- Deno type-checking (supabase/functions/) ----
+# Dev-only: `@types/deno`, `typescript`, and the npm packages the `npm:`
+# specifiers name — what the editor and `npm run typecheck` read. `supabase
+# functions deploy` bundles only what a function imports, so none of it ships.
+supabase/functions/node_modules/
+
 # ---- Kotlin/Gradle build state (mobile/android/) ----
 mobile/android/.kotlin/
 

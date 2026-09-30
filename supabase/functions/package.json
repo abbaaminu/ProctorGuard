@@ -1,0 +1,15 @@
+{
+  "name": "proctor-functions",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Dev-only type-checking for the Deno Edge Functions in this folder. Nothing here is deployed: `supabase functions deploy` bundles only what a function imports, and these are its types.",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "@types/deno": "^2.7.0",
+    "typescript": "^6.0.3"
+  }
+}
