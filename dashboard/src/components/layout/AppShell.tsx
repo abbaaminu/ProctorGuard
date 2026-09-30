@@ -21,7 +21,7 @@ export function AppShell({
   return (
     <div className="min-h-screen bg-surface">
       <Sidebar
-        userName={profile?.name ?? "Supervisor"}
+        userName={profile?.full_name || "Staff console"}
         userEmail={profile?.email ?? ""}
         pending={profilePending}
       />

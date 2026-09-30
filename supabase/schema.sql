@@ -4,13 +4,15 @@
 -- Run in Supabase SQL editor. Assumes auth.users is Supabase Auth.
 --
 -- SECURITY MODEL (what the policies below deliberately enforce)
---   * `users.role` is the boundary every policy trusts, so it is write-once for
---     non-supervisors: self-service signup may only create role='student'
---     (users_insert_self_student) and a trigger blocks later role rewrites.
+--   * `profiles.role` is the boundary every policy trusts, so it is write-once
+--     for non-admins: self-service signup may only create role='student'
+--     (profiles_insert_self_student) and a trigger blocks later role rewrites
+--     unless the caller is an admin (guard_user_role_change). The four roles
+--     live in the `user_role` enum: admin, lecturer, supervisor, student.
 --   * Students never see answer keys: there is no student SELECT policy on
 --     `questions`; they read the definer view `questions_public` (published
 --     exams only, neither `correct_option` nor `correct_text_answer`) while
---     supervisors read the raw table.
+--     staff (`is_staff()`) read the raw table.
 --   * Two question shapes share `questions`: `question_type = 'multiple_choice'`
 --     (options + index) and `'fill_in_the_blank'` (`correct_text_answer`, graded
 --     case-insensitively after trimming). Answers are merged by
@@ -30,20 +32,116 @@
 create extension if not exists "uuid-ossp";
 
 -- ---------------------------------------------------------------------
--- 1. USERS (profile table, 1:1 with auth.users)
+-- 1. PROFILES (profile table, 1:1 with auth.users)
 -- ---------------------------------------------------------------------
-create table if not exists public.users (
+-- The table is called `profiles` because that is what a row is: the account
+-- itself lives in `auth.users`, and this row adds the role, the display name
+-- and the e-mail that both apps render. (It used to be `public.users`, which
+-- made `public.users` and `auth.users` easy to mix up in a query.)
+--
+-- FOUR ROLES, one enum:
+--   admin       manages accounts: the mobile admin dashboard, and the only role
+--               that may create a profile row for somebody else or rewrite a
+--               `role` after the fact.
+--   lecturer    staff: writes exams and reviews the attempt roster (dashboard).
+--   supervisor  staff: invigilates a live exam (mobile console + dashboard).
+--   student     sits exams.
+-- `lecturer` and `supervisor` are the same tier for *reads* -- is_staff() --
+-- while writes to other people's rows are admin-only, so a lecturer cannot
+-- quietly promote an account to admin.
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_type t
+    join pg_namespace n on n.oid = t.typnamespace
+    where n.nspname = 'public' and t.typname = 'user_role'
+  ) then
+    create type public.user_role as enum ('admin','lecturer','supervisor','student');
+  end if;
+end $$;
+
+-- Upgrade path for a database created by an earlier revision of this file.
+-- schema.sql stays re-runnable, so the `users` -> `profiles` and
+-- `name` -> `full_name` renames have to live here too, not only in
+-- supabase/migrations/add_user_roles_and_profiles.sql (which is the copy to run
+-- against an already-deployed project, where it is the only file that runs).
+do $$
+begin
+  if to_regclass('public.users') is not null
+     and to_regclass('public.profiles') is null then
+    alter table public.users rename to profiles;
+  end if;
+
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'profiles'
+      and column_name = 'name'
+  ) and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'profiles'
+      and column_name = 'full_name'
+  ) then
+    alter table public.profiles rename column name to full_name;
+  end if;
+end $$;
+
+-- The previous revision stored `role` as text behind a two-value CHECK.
+-- Convert the column to the enum in place: 'student' and 'supervisor' are valid
+-- labels, so no row is lost, and the type carries the constraint from now on.
+do $$
+declare
+  v_udt        text;
+  v_constraint text;
+begin
+  if to_regclass('public.profiles') is null then
+    return; -- fresh install: the CREATE TABLE below has not run yet
+  end if;
+
+  select c.udt_name into v_udt
+  from information_schema.columns c
+  where c.table_schema = 'public'
+    and c.table_name = 'profiles'
+    and c.column_name = 'role';
+
+  if v_udt is null or v_udt = 'user_role' then
+    return; -- no role column at all, or already the enum
+  end if;
+
+  for v_constraint in
+    select con.conname
+    from pg_constraint con
+    join pg_class rel on rel.oid = con.conrelid
+    join pg_namespace nsp on nsp.oid = rel.relnamespace
+    where nsp.nspname = 'public'
+      and rel.relname = 'profiles'
+      and con.contype = 'c'
+      and pg_get_constraintdef(con.oid) like '%role%'
+  loop
+    execute format('alter table public.profiles drop constraint %I', v_constraint);
+  end loop;
+
+  alter table public.profiles alter column role drop default;
+  alter table public.profiles
+    alter column role type public.user_role using role::text::public.user_role;
+  alter table public.profiles alter column role set default 'student';
+end $$;
+
+create table if not exists public.profiles (
   id          uuid primary key references auth.users(id) on delete cascade,
-  role        text not null check (role in ('student','supervisor')),
-  name        text not null,
+  role        public.user_role not null default 'student',
+  full_name   text not null,
   email       text not null unique,
   created_at  timestamptz not null default now()
 );
 
-alter table public.users enable row level security;
+alter table public.profiles enable row level security;
 
--- Security Definer helper function prevents RLS infinite recursion loops
-create or replace function public.is_supervisor()
+-- Security Definer helpers: a policy on `profiles` can ask about the caller's
+-- role without re-entering the policies on `profiles`, which would recurse
+-- (policy -> select profiles -> policy -> ...). `set search_path` pins the
+-- lookup so a hijacked search_path cannot swap the table underneath.
+create or replace function public.is_staff()
 returns boolean
 language sql
 security definer
@@ -51,67 +149,134 @@ stable
 set search_path = public
 as $$
   select exists (
-    select 1 from public.users
-    where id = auth.uid() and role = 'supervisor'
+    select 1 from public.profiles
+    where id = auth.uid() and role in ('admin','lecturer','supervisor')
   );
 $$;
 
--- Drop legacy policies to ensure a clean state
-drop policy if exists "users_select_own_or_supervisor" on public.users;
-drop policy if exists "Users can view own profile" on public.users;
-drop policy if exists "Authenticated users can read profiles" on public.users;
-drop policy if exists "users_insert_self" on public.users;
-drop policy if exists "users_insert_self_student" on public.users;
-drop policy if exists "users_update_self" on public.users;
+-- Admin-only. Used by the profiles policies and by guard_user_role_change();
+-- this is the tier the mobile admin dashboard signs in as.
+create or replace function public.is_admin()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role = 'admin'
+  );
+$$;
 
--- Read: your own row, or every row when you are a supervisor (the dashboard
--- roster and the mobile live monitor render student names). Deliberately NOT
--- "any authenticated user": a student must not be able to enumerate the roster
--- of the whole institution.
-create policy "users_select_own_or_supervisor"
-  on public.users for select
+-- Historical name, kept deliberately: a policy or RPC created by an *earlier*
+-- revision of this file still calls it on a database that has not re-run this
+-- file yet. It resolves to the staff tier, exactly as it did back when
+-- 'supervisor' was the only staff role, so re-running this file can never
+-- narrow anybody's access. New code calls is_staff() / is_admin().
+create or replace function public.is_supervisor()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select public.is_staff();
+$$;
+
+-- Drop legacy policies to ensure a clean state. The `users_*` names are what a
+-- pre-rename database still carries on this table, so they are dropped too.
+drop policy if exists "users_select_own_or_supervisor" on public.profiles;
+drop policy if exists "Users can view own profile" on public.profiles;
+drop policy if exists "Authenticated users can read profiles" on public.profiles;
+drop policy if exists "users_insert_self" on public.profiles;
+drop policy if exists "users_insert_self_student" on public.profiles;
+drop policy if exists "users_update_self" on public.profiles;
+drop policy if exists "profiles_select_own_or_staff" on public.profiles;
+drop policy if exists "profiles_insert_self_student" on public.profiles;
+drop policy if exists "profiles_update_self" on public.profiles;
+drop policy if exists "profiles_admin_all" on public.profiles;
+
+-- Read: your own row, or every row when you are staff — the dashboard roster,
+-- the admin dashboard's account list and the mobile live monitor all render
+-- other people's names and roles. Deliberately NOT "any authenticated user": a
+-- student must not be able to enumerate the roster of the whole institution.
+create policy "profiles_select_own_or_staff"
+  on public.profiles for select
   to authenticated
-  using (id = auth.uid() or public.is_supervisor());
+  using (id = auth.uid() or public.is_staff());
 
 -- Self-service provisioning may only ever create a STUDENT row. Without the
 -- role check, anyone who can sign up (public anon key) could insert
 -- role='supervisor' for themselves — and every policy in this file trusts
--- `users.role`. Supervisor rows are created out of band: the SQL editor and
--- the service_role key both bypass RLS.
-create policy "users_insert_self_student"
-  on public.users for insert
+-- `profiles.role`. Staff and admin rows are created out of band: by an admin
+-- through the `admin-create-user` Edge Function, or by the SQL editor and the
+-- service_role key, both of which bypass RLS.
+create policy "profiles_insert_self_student"
+  on public.profiles for insert
   to authenticated
   with check (id = auth.uid() and role = 'student');
 
 -- Profile owners may correct their own name. `role` is protected by the trigger
 -- below, because RLS cannot restrict *columns*.
-create policy "users_update_self"
-  on public.users for update
+create policy "profiles_update_self"
+  on public.profiles for update
   to authenticated
   using (id = auth.uid())
   with check (id = auth.uid());
 
+-- The admin tier: full row access for account management (provision a lecturer,
+-- fix a misspelt name, promote a supervisor, clean up a duplicate). This is the
+-- policy the mobile admin dashboard relies on, and the one that lets it list
+-- every account.
+--
+-- One caveat worth knowing before using the DELETE half: deleting a profile row
+-- does not delete the auth account, because `auth.users` is owned by Supabase
+-- Auth. Removing an account for good means calling Auth's admin API (or, from
+-- the dashboard, the Authentication tab); the row here is only the profile.
+create policy "profiles_admin_all"
+  on public.profiles for all
+  to authenticated
+  using (public.is_admin())
+  with check (public.is_admin());
+
 -- `role` is the security boundary the whole schema is built on, so it cannot be
--- rewritten through a self-update. Supervisors may still promote/demote (there
--- is no admin UI today; this keeps that door open for one).
+-- rewritten through a self-update. Admins are the one role that may do it -- that
+-- is what the admin dashboard exists for -- and `profiles_admin_all` above is
+-- the matching RLS half of the same rule.
+--
+-- Two sessions have to stay able to change a role or a project could never be
+-- bootstrapped: the SQL editor / migrations, which carry no JWT at all, and the
+-- service_role key, which is what an Edge Function holds. Neither bypasses a
+-- trigger, so both are recognised explicitly below: `request.jwt.claims` is set
+-- by PostgREST for real API traffic only, and its `role` claim reads
+-- 'service_role' when the request was signed with the service key. A request
+-- from a signed-in user always lands in the is_admin() branch, so this escape
+-- hatch is not reachable with an anon or a user token.
 create or replace function public.guard_user_role_change()
 returns trigger
 language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  v_claims text := nullif(current_setting('request.jwt.claims', true), '');
 begin
-  if new.role is distinct from old.role and not public.is_supervisor() then
-    raise exception 'users.role is immutable'
+  if new.role is distinct from old.role
+     and v_claims is not null
+     and coalesce(v_claims::jsonb ->> 'role', '') <> 'service_role'
+     and not public.is_admin() then
+    raise exception 'profiles.role is immutable for non-admins'
       using errcode = '42501';
   end if;
   return new;
 end;
 $$;
 
-drop trigger if exists users_guard_role_change on public.users;
-create trigger users_guard_role_change
-  before update on public.users
+drop trigger if exists users_guard_role_change on public.profiles;
+drop trigger if exists profiles_guard_role_change on public.profiles;
+create trigger profiles_guard_role_change
+  before update on public.profiles
   for each row execute function public.guard_user_role_change();
 
 -- ---------------------------------------------------------------------
@@ -120,7 +285,7 @@ create trigger users_guard_role_change
 create table if not exists public.exams (
   id               uuid primary key default uuid_generate_v4(),
   title            text not null,
-  created_by       uuid not null references public.users(id) on delete cascade,
+  created_by       uuid not null references public.profiles(id) on delete cascade,
   duration_minutes int not null check (duration_minutes > 0),
   is_published     boolean not null default false,
   created_at       timestamptz not null default now()
@@ -139,7 +304,7 @@ create policy "exams_select"
   using (
     is_published = true
     or created_by = auth.uid()
-    or public.is_supervisor()
+    or public.is_staff()
   );
 
 create policy "exams_insert_supervisor_only"
@@ -147,7 +312,7 @@ create policy "exams_insert_supervisor_only"
   to authenticated
   with check (
     created_by = auth.uid()
-    and public.is_supervisor()
+    and public.is_staff()
   );
 
 create policy "exams_update_owner"
@@ -238,7 +403,7 @@ create policy "questions_select_owner"
 create policy "questions_select_supervisor"
   on public.questions for select
   to authenticated
-  using (public.is_supervisor());
+  using (public.is_staff());
 
 -- NOTE: there is deliberately NO student SELECT policy on this table, and that
 -- is the whole point of the view further down. A policy that lets students read
@@ -307,7 +472,7 @@ grant select on public.questions_public to authenticated;
 -- ---------------------------------------------------------------------
 create table if not exists public.exam_submissions (
   id            uuid primary key default uuid_generate_v4(),
-  student_id    uuid not null references public.users(id) on delete cascade,
+  student_id    uuid not null references public.profiles(id) on delete cascade,
   exam_id       uuid not null references public.exams(id) on delete cascade,
   answers       jsonb not null default '{}'::jsonb,
   status        text not null default 'ongoing'
@@ -333,7 +498,7 @@ drop policy if exists "submissions_delete_supervisor" on public.exam_submissions
 create policy "submissions_select_own_or_supervisor"
   on public.exam_submissions for select
   to authenticated
-  using (student_id = auth.uid() or public.is_supervisor());
+  using (student_id = auth.uid() or public.is_staff());
 
 -- A start row can only ever be a *fresh* attempt: own student id, status
 -- 'ongoing', no score, and a published exam. Without the last three checks a
@@ -361,11 +526,11 @@ create policy "submissions_update_supervisor"
   to authenticated
   using (
     exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
-    or public.is_supervisor()
+    or public.is_staff()
   )
   with check (
     exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
-    or public.is_supervisor()
+    or public.is_staff()
   );
 
 -- Resetting one attempt (the console's "Reset attempt" on the submission audit)
@@ -384,7 +549,7 @@ create policy "submissions_delete_supervisor"
   to authenticated
   using (
     exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
-    or public.is_supervisor()
+    or public.is_staff()
   );
 
 -- ---------------------------------------------------------------------
@@ -485,7 +650,7 @@ create policy "logs_select_own_or_supervisor"
       select 1 from public.exam_submissions s
       where s.id = submission_id and s.student_id = auth.uid()
     )
-    or public.is_supervisor()
+    or public.is_staff()
   );
 
 -- There is deliberately NO insert policy. `register_violation()` is the single
@@ -531,7 +696,7 @@ create policy "Proctor snapshots read access"
         where s.id::text = (storage.foldername(name))[1]
           and s.student_id = auth.uid()
       )
-      or public.is_supervisor()
+      or public.is_staff()
     )
   );
 
@@ -571,7 +736,7 @@ create policy "Proctor snapshots supervisor purge"
   to authenticated
   using (
     bucket_id = 'proctor-snapshots'
-    and public.is_supervisor()
+    and public.is_staff()
   );
 
 -- ---------------------------------------------------------------------
@@ -600,8 +765,8 @@ begin
   -- Profile rows so the console's id -> name map can refresh itself (the
   -- supervisor roster/incident feed renders names, see dashboard/
   -- src/hooks/useAccountNames.ts). RLS still applies to the stream.
-  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'users') then
-    alter publication supabase_realtime add table public.users;
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'profiles') then
+    alter publication supabase_realtime add table public.profiles;
   end if;
 end $$;
 
@@ -646,7 +811,7 @@ begin
     into v_status
   from public.exam_submissions s
   where s.id = p_submission_id
-    and (s.student_id = auth.uid() or public.is_supervisor())
+    and (s.student_id = auth.uid() or public.is_staff())
   for update;
 
   if v_status is null then
@@ -765,7 +930,7 @@ begin
       using errcode = 'P0002';
   end if;
 
-  if v_student <> auth.uid() and not public.is_supervisor() then
+  if v_student <> auth.uid() and not public.is_staff() then
     raise exception 'submission % does not belong to the caller', p_submission_id
       using errcode = '42501';
   end if;

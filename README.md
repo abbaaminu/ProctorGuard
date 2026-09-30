@@ -1,7 +1,7 @@
 # Proctor
 
-AI exam proctoring system: a Flutter mobile app for students and a React
-supervisor dashboard, sharing one Supabase backend.
+AI exam proctoring system: a Flutter mobile app for students (it also carries the
+admin dashboard) and a React staff dashboard, sharing one Supabase backend.
 
 ```
 proctor/
@@ -12,15 +12,29 @@ proctor/
   supabase/
     schema.sql  Single source of truth for both apps: tables, RLS
                 policies, and RPCs. Run this once per environment.
+    functions/  admin-create-user — the Edge Function that creates staff
+                logins. It is the only place a service_role key is used,
+                and it never leaves Supabase's servers.
 ```
+
+Roles live in the `public.user_role` enum: `student`, `lecturer`, `supervisor`
+and `admin`. Students take exams in the mobile app, `lecturer` and `supervisor`
+sign into this console (`is_staff()`), and `admin` additionally gets a roster and
+role-management screen in the mobile app.
 
 ## Getting started
 1. Create a Supabase project, run `supabase/schema.sql` in its SQL editor,
    then optionally `supabase/seed.sql` to load demo users, exams and
    questions (see the header of that file for the demo logins).
-2. Mobile: see `mobile/README.md` (`flutter pub get`, then `flutter run
+2. Deploy the account-creation function — `supabase functions deploy
+   admin-create-user` (needs the Supabase CLI linked to the project, or paste
+   `supabase/functions/admin-create-user/index.ts` into the dashboard's Edge
+   Functions editor). `SUPABASE_URL`, `SUPABASE_ANON_KEY` and
+   `SUPABASE_SERVICE_ROLE_KEY` are injected automatically, so there is nothing
+   to configure; without it only the seeded logins exist.
+3. Mobile: see `mobile/README.md` (`flutter pub get`, then `flutter run
    --dart-define=SUPABASE_URL=... --dart-define=SUPABASE_ANON_KEY=...`).
-3. Dashboard: see `dashboard/README.md` (`npm install`, copy
+4. Dashboard: see `dashboard/README.md` (`npm install`, copy
    `.env.example` to `.env.local`, `npm run dev`).
 
 Both apps read/write the same tables, so a submission a student makes in
@@ -32,11 +46,22 @@ Both apps read/write the same tables, so a submission a student makes in
 
 - [ ] **Turn off public sign-ups** (Supabase → Authentication → Sign In /
       Providers). The schema lets a self-provisioned account create *only* a
-      `student` profile row and makes `users.role` immutable for non-supervisors,
-      so it cannot self-promote — but an open sign-up form still lets strangers
-      into the exam portal. Create students/supervisors yourself (or invite them);
-      supervisor rows must be inserted by an admin, since RLS rejects
-      `role='supervisor'` from a client.
+      `student` profile row (`profiles_insert_self_student` forces the role
+      server-side), and the `profiles_guard_role_change` trigger makes
+      `profiles.role` immutable for every caller below `admin` — so it cannot
+      self-promote. But an open sign-up form still lets strangers into the exam
+      portal. Create the first staff accounts yourself (or invite them, then set
+      their `role` in the SQL editor as `postgres`); after that, use the app's
+      Admin Dashboard. RLS rejects `role in ('admin','lecturer','supervisor')`
+      written from a client, so a staff row written by hand has to come from the
+      SQL editor or the Edge Function — not from the Flutter/React apps.
+- [ ] **Deploy `admin-create-user`** (`supabase functions deploy admin-create-user`).
+      It is the only path that mints a staff login: it re-reads the caller's JWT
+      against `profiles` with the anon key, refuses anything that is not an
+      `admin`, and only then switches to the `service_role` key — which never
+      reaches a client. Skip it and the Admin Dashboard says so — the repository
+      turns the 404 into "The admin-create-user function is not deployed on this
+      project" instead of pretending the create failed.
 - [ ] **Client keys only.** Dashboard: `VITE_SUPABASE_URL` +
       `VITE_SUPABASE_ANON_KEY`. Mobile: `SUPABASE_URL` +
       `SUPABASE_PUBLISHABLE_KEY` (via `mobile/run_app.ps1` / `build_apk.ps1`).
@@ -72,7 +97,7 @@ empty pub cache `flutter analyze` reports hundreds of phantom errors
 missing packages, not broken code.
 
 ```
-cd mobile   && flutter pub get && flutter analyze && flutter test   # 176 tests, no device needed
+cd mobile   && flutter pub get && flutter analyze && flutter test   # 256 tests, no device needed
 cd dashboard && npm install && npm run build                       # tsc -b && vite build
 ```
 
@@ -80,7 +105,11 @@ The Flutter suite pins the client↔database contract (`mobile/test/schema_contr
 RPC names, argument names — including the `register_violation` idempotency key and
 client timestamp — and the `action_type` values), so a schema change that breaks the
 app fails there rather than at runtime. It reads `supabase/schema.sql` directly for
-that half of the check, so re-run `flutter test` after editing the schema.
+that half of the check, so re-run `flutter test` after editing the schema. The same
+file carries the role contract: the `student`/`lecturer`/`supervisor`/`admin` values
+of `public.user_role`, the `profiles` roster read (oldest first), the role-change
+PATCH, and the `admin-create-user` request/response shapes, so a renamed column or
+a moved endpoint fails in CI instead of on someone's phone.
 
 ## Pushing to GitHub
 From this folder:

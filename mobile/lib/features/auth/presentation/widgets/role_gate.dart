@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart';
+import '../../../admin/presentation/pages/admin_dashboard_page.dart';
 import '../../../dashboard/presentation/pages/supervisor_exam_picker_page.dart';
 import '../../../exam/presentation/pages/student_exam_portal_page.dart';
 import '../../domain/entities/user_profile.dart';
@@ -9,11 +10,19 @@ import '../../domain/repositories/profile_repository.dart';
 import '../pages/login_page.dart';
 import '../providers/profile_provider.dart';
 
-/// Post-login router: reads `users.role` for the authenticated account and hands
-/// the session to the matching home.
+/// Post-login router: reads `profiles.role` for the authenticated account and
+/// hands the session to the matching home.
 ///
-///   `student`    -> [StudentExamPortalPage]   (published exams -> exam session)
-///   `supervisor` -> [SupervisorExamPickerPage] (pick an exam -> live monitor)
+///   `student`               -> [StudentExamPortalPage]    (published exams ->
+///                              exam session)
+///   `supervisor`, `lecturer`-> [SupervisorExamPickerPage] (pick an exam ->
+///                              live monitor)
+///   `admin`                 -> [AdminDashboardPage]        (create accounts,
+///                              manage roles)
+///
+/// Lecturers share the supervisor console: `is_staff()` treats them alike for
+/// reading profiles and monitoring a session, and the two roles differ only in
+/// what the institution calls them.
 ///
 /// Auth events are what drive the rebuild, so the session the SDK restores from
 /// storage after a browser refresh lands here too.
@@ -60,8 +69,16 @@ class RoleGate extends ConsumerWidget {
                     studentName: profile.displayName,
                     onSignOut: () => _signOut(context, ref, userId),
                   ),
-                UserRole.supervisor => SupervisorExamPickerPage(
+                UserRole.supervisor || UserRole.lecturer =>
+                  SupervisorExamPickerPage(
                     supervisorName: profile.displayName,
+                    onSignOut: () => _signOut(context, ref, userId),
+                  ),
+                UserRole.admin => AdminDashboardPage(
+                    adminName: profile.displayName,
+                    // The signed-in id, so the page can recognise this admin's
+                    // own roster row without a second trip to the SDK.
+                    adminId: userId,
                     onSignOut: () => _signOut(context, ref, userId),
                   ),
               },

@@ -3,6 +3,11 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:exam_proctor/core/services/supabase_service.dart';
+import 'package:exam_proctor/features/admin/data/repositories/admin_user_repository_impl.dart';
+import 'package:exam_proctor/features/admin/domain/entities/managed_account.dart';
+import 'package:exam_proctor/features/admin/domain/repositories/admin_user_repository.dart';
+import 'package:exam_proctor/features/admin/presentation/providers/admin_providers.dart';
+import 'package:exam_proctor/features/auth/domain/entities/user_profile.dart';
 import 'package:exam_proctor/features/exam/data/repositories/exam_repository_impl.dart';
 import 'package:exam_proctor/features/exam/domain/entities/question.dart';
 import 'package:exam_proctor/features/exam/domain/entities/submission.dart';
@@ -18,11 +23,17 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 ///    `warning_count` / `disqualified` fields;
 ///  * every `action_type` string the check constraint allows (the five camera
 ///    and lifecycle ones plus the six enterprise lockdown/device ones);
-///  * the `proctor-snapshots` upload path convention and JPEG content type.
+///  * the `proctor-snapshots` upload path convention and JPEG content type;
+///  * the admin roster's `profiles` reads/writes and the `admin-create-user`
+///    Edge Function payload, against the `user_role` enum and `full_name`.
 class _RecordingTransport extends http.BaseClient {
   final List<http.BaseRequest> requests = <http.BaseRequest>[];
   final List<String> bodies = <String>[];
   String responseBody = '[]';
+
+  /// Status the recorded response answers with — 200 unless a test needs an
+  /// error (a PostgREST 403, or a function's 40x) to be seen by the client.
+  int statusCode = 200;
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
@@ -30,7 +41,7 @@ class _RecordingTransport extends http.BaseClient {
     bodies.add(request is http.Request ? utf8.decode(request.bodyBytes) : '');
     return http.StreamedResponse(
       Stream<List<int>>.value(utf8.encode(responseBody)),
-      200,
+      statusCode,
       headers: const <String, String>{'content-type': 'application/json'},
       request: request,
     );
@@ -206,6 +217,292 @@ void main() {
         transport.requests.where((request) => request.method == 'PATCH'),
         isEmpty,
       );
+    });
+  });
+
+  group('admin profiles contract', () {
+    const String adminId = '44444444-4444-4444-8444-444444444444';
+    const String aishaId = '22222222-2222-4222-8222-222222222222';
+
+    test('listAccounts reads profiles oldest-first and maps every row',
+        () async {
+      transport.responseBody = jsonEncode(<Map<String, dynamic>>[
+        <String, dynamic>{
+          'id': adminId,
+          'email': 'root@proctor.test',
+          'full_name': 'Root Admin',
+          'role': 'admin',
+          'created_at': '2026-01-01T08:00:00.000Z',
+        },
+        <String, dynamic>{
+          'id': aishaId,
+          'email': 'aisha.bello@proctor.test',
+          // Blank, not null: `profiles.full_name` is `not null`.
+          'full_name': '   ',
+          'role': 'student',
+        },
+      ]);
+      final repo = AdminUserRepositoryImpl(client);
+
+      final List<ManagedAccount> accounts = await repo.listAccounts();
+
+      final request = transport.requests.single;
+      expect(request.method, 'GET');
+      expect(request.url.path, '/rest/v1/profiles');
+      expect(
+        request.url.queryParameters['order'],
+        // postgrest-dart appends `nullslast`, so a row with no `created_at`
+        // sorts after the seeded accounts instead of jumping to the top.
+        'created_at.asc.nullslast',
+      );
+      expect(
+        accounts.map((account) => account.role).toList(),
+        <UserRole>[UserRole.admin, UserRole.student],
+      );
+      expect(accounts.first.createdAt, DateTime.utc(2026, 1, 1, 8));
+      // An unnamed row keeps its address, the same fallback the gate uses.
+      expect(accounts.last.displayName, 'aisha.bello@proctor.test');
+    });
+
+    test('a roster row whose role this build does not know is refused',
+        () async {
+      // Not rendered as a familiar role: `UserRole.fromDb` throws, and the
+      // repository turns that into the "update the app" message.
+      transport.responseBody = jsonEncode(<Map<String, dynamic>>[
+        <String, dynamic>{
+          'id': adminId,
+          'email': 'root@proctor.test',
+          'role': 'principal',
+        },
+      ]);
+
+      await expectLater(
+        AdminUserRepositoryImpl(client).listAccounts(),
+        throwsA(
+          isA<AdminAccountException>().having(
+            (error) => error.message,
+            'message',
+            contains('does not know about'),
+          ),
+        ),
+      );
+    });
+
+    test('updateRole PATCHes profiles and demands the updated row back',
+        () async {
+      transport.responseBody = jsonEncode(<Map<String, dynamic>>[
+        <String, dynamic>{'id': aishaId, 'role': 'supervisor'},
+      ]);
+      final repo = AdminUserRepositoryImpl(client);
+
+      await repo.updateRole(userId: aishaId, role: UserRole.supervisor);
+
+      final request = transport.requests.single;
+      expect(request.method, 'PATCH');
+      expect(request.url.path, '/rest/v1/profiles');
+      expect(request.url.queryParameters['id'], 'eq.$aishaId');
+      // `.select()` is what makes "no row matched" visible instead of silent.
+      expect(request.url.queryParameters['select'], '*');
+      expect(jsonDecode(transport.bodies.single), <String, dynamic>{
+        'role': 'supervisor',
+      });
+    });
+
+    test('an update that matched no row is an error, not a silent success',
+        () async {
+      transport.responseBody = '[]'; // e.g. deleted between list and tap
+
+      expect(
+        AdminUserRepositoryImpl(client)
+            .updateRole(userId: aishaId, role: UserRole.student),
+        throwsA(isA<AdminAccountException>()),
+      );
+    });
+
+    test('an RLS refusal becomes prose for the administrator', () async {
+      // A caller who is not an admin passes the client-side form and is stopped
+      // by `profiles_admin_all` / `guard_user_role_change` — a 42501.
+      transport.statusCode = 403;
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'code': '42501',
+        'message':
+            'new row violates row-level security policy for table "profiles"',
+        'details': null,
+        'hint': null,
+      });
+
+      expect(
+        AdminUserRepositoryImpl(client)
+            .updateRole(userId: aishaId, role: UserRole.admin),
+        throwsA(
+          isA<AdminAccountException>().having(
+            (error) => error.message,
+            'message',
+            'Only an administrator may change accounts.',
+          ),
+        ),
+      );
+    });
+  });
+
+  group('admin-create-user contract', () {
+    Future<ManagedAccount> createLecturer() =>
+        AdminUserRepositoryImpl(client).createAccount(
+          email: 'ada.nwosu@proctor.test',
+          password: 'Proctor123!',
+          fullName: 'Dr. Ada Nwosu',
+          role: UserRole.lecturer,
+        );
+
+    test('createAccount posts the trimmed payload to the Edge Function',
+        () async {
+      // The function answers 200 with the created row; `functions.invoke` treats
+      // any 2xx as success, so the status itself is not load-bearing.
+      transport.statusCode = 200;
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'id': 'new-1',
+        'email': 'ada.nwosu@proctor.test',
+        'full_name': 'Dr. Ada Nwosu',
+        'role': 'lecturer',
+      });
+      final repo = AdminUserRepositoryImpl(client);
+
+      final account = await repo.createAccount(
+        email: '  ada.nwosu@proctor.test ',
+        password: 'Proctor123!',
+        fullName: '  Dr. Ada Nwosu ',
+        role: UserRole.lecturer,
+      );
+
+      final request = transport.requests.single;
+      expect(request.method, 'POST');
+      expect(request.url.path, '/functions/v1/admin-create-user');
+      // The function validates these names itself, so the body is the contract.
+      expect(jsonDecode(transport.bodies.single), <String, dynamic>{
+        'email': 'ada.nwosu@proctor.test',
+        'password': 'Proctor123!',
+        'full_name': 'Dr. Ada Nwosu',
+        'role': 'lecturer',
+      });
+      expect(account.role, UserRole.lecturer);
+      expect(account.displayName, 'Dr. Ada Nwosu');
+    });
+
+    test('a refused creation keeps the function\'s own wording', () async {
+      transport.statusCode = 403;
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'error': 'Only an administrator can create accounts.',
+      });
+
+      await expectLater(
+        createLecturer(),
+        throwsA(
+          isA<AdminAccountException>().having(
+            (error) => error.message,
+            'message',
+            'Only an administrator can create accounts.',
+          ),
+        ),
+      );
+    });
+
+    test('an un-deployed function is explained, not reported as a 404',
+        () async {
+      // What the platform answers for a function that was never deployed: no
+      // `error` field, so the status is all the client has to go on.
+      transport.statusCode = 404;
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'code': 404,
+        'message': 'Requested function was not found',
+      });
+
+      await expectLater(
+        createLecturer(),
+        throwsA(
+          isA<AdminAccountException>().having(
+            (error) => error.message,
+            'message',
+            contains('not deployed on this project'),
+          ),
+        ),
+      );
+    });
+
+    test('a 200 that carries `{ error }` is not mistaken for a new account',
+        () async {
+      transport.statusCode = 200;
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'error': 'ada.nwosu@proctor.test already has an account.',
+      });
+
+      await expectLater(
+        createLecturer(),
+        throwsA(
+          isA<AdminAccountException>().having(
+            (error) => error.message,
+            'message',
+            'ada.nwosu@proctor.test already has an account.',
+          ),
+        ),
+      );
+    });
+  });
+
+  group('role contract', () {
+    test('the client and the Edge Function agree on the roles and the floor',
+        () {
+      // Supabase Auth's default minimum: a shorter password would be accepted
+      // by the form and refused after the administrator had already typed it.
+      expect(adminMinPasswordLength, AdminUserRepositoryImpl.minPasswordLength);
+      expect(adminMinPasswordLength, greaterThanOrEqualTo(6));
+
+      final file = File('../supabase/functions/admin-create-user/index.ts');
+      if (!file.existsSync()) return; // a checkout without ../supabase
+
+      final source = file.readAsStringSync();
+      // Same four roles, same order, on both sides of the wire.
+      final expected =
+          UserRole.values.map((role) => '"${role.dbValue}"').join(', ');
+      expect(source, contains('const ROLES = [$expected]'));
+      // `{ error }` is what `_messageFromFunctionError` reads out of a 4xx.
+      expect(source, contains('return json({ error: message }, status);'));
+      expect(
+        source,
+        contains('const MIN_PASSWORD_LENGTH = $adminMinPasswordLength;'),
+      );
+      // Who may create accounts, and the four keys the 200 answers with — the
+      // body `ManagedAccount.fromMap` reads back.
+      expect(
+        source,
+        contains('const CREATOR_ROLES: readonly Role[] = ["admin"];'),
+      );
+      expect(
+        source,
+        contains(
+          'return json({ id: created.user.id, email, full_name: fullName, role });',
+        ),
+      );
+    });
+
+    test('schema.sql declares the enum, the column and the policies used', () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      expect(sql, contains('create type public.user_role as enum'));
+      // Every role the app can render has to exist in the database's enum.
+      for (final role in UserRole.values) {
+        expect(
+          sql,
+          contains("'${role.dbValue}'"),
+          reason: '${role.dbValue} is missing from the schema',
+        );
+      }
+      // The column behind a roster tile's title (it used to be `name`).
+      expect(sql, contains('full_name   text not null'));
+      // The policy the roster's read and update ride on, and the trigger that
+      // stops an admin from re-roling themselves out of their own account.
+      expect(sql, contains('profiles_admin_all'));
+      expect(sql, contains('guard_user_role_change'));
     });
   });
 

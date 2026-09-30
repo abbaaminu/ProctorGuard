@@ -8,18 +8,19 @@ class ProfileRepositoryImpl implements ProfileRepository {
 
   final SupabaseClient _client;
 
-  /// `public.users` is 1:1 with `auth.users`, and the "Authenticated users can
-  /// read profiles" policy lets any signed-in account read it — so the role the
-  /// app routes on is exactly the role the RLS policies use.
+  /// `public.profiles` is 1:1 with `auth.users`, and the
+  /// `profiles_select_own_or_staff` policy lets an account read its own row (and
+  /// staff read every row) — so the role the app routes on is exactly the role
+  /// the RLS policies use.
   ///
-  /// Every failure is turned into a [ProfileLookupException] with a sentence a
-  /// student can act on, so the gate never has to interpret a PostgREST error.
+  /// Every failure is turned into a [ProfileLookupException] with a sentence the
+  /// user can act on, so the gate never has to interpret a PostgREST error.
   @override
   Future<UserProfile> getProfile(String userId) async {
     final Map<String, dynamic>? row;
     try {
       row = await _client
-          .from('users')
+          .from('profiles')
           .select()
           .eq('id', userId)
           .maybeSingle();
@@ -35,7 +36,7 @@ class ProfileRepositoryImpl implements ProfileRepository {
 
     if (row == null) {
       throw const ProfileLookupException(
-        'This account has no profile row yet — ask your supervisor to create one.',
+        'This account has no profile row yet — ask your administrator to create one.',
       );
     }
 
@@ -44,11 +45,11 @@ class ProfileRepositoryImpl implements ProfileRepository {
     } on ArgumentError {
       throw ProfileLookupException(
         'Your account has an unrecognised role ("${row['role']}"). '
-        'Ask your supervisor to fix it.',
+        'Ask your administrator to fix it.',
       );
     } catch (_) {
       throw const ProfileLookupException(
-        'Your profile row is incomplete — ask your supervisor to fix it.',
+        'Your profile row is incomplete — ask your administrator to fix it.',
       );
     }
   }

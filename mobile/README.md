@@ -8,14 +8,17 @@ lib/
                             # browser guards (tab switch/blur/fullscreen),
                             # microphone level monitor + audio-noise rules
   features/
-    auth/                   # sign-in form, `users.role` profile lookup,
+    auth/                   # sign-in form, `profiles.role` profile lookup,
                             # post-login RoleGate router
+    admin/                  # admin-only roster: list every account, change a
+                            # role, create a staff login via the Edge Function
     exam/                   # domain entities, repo, student portal,
                             # exam-taking UI
     proctoring/             # violation domain model, repo, Riverpod
                             # escalation notifier, full-screen overlay
     dashboard/              # supervisor exam picker + live monitoring page
 supabase/schema.sql         # tables, RLS policies, RPCs
+supabase/functions/         # admin-create-user: the only staff-login writer
 android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLock
 ```
 
@@ -45,11 +48,17 @@ android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLoc
    mode (`.\run_app.ps1 -Mock`, or `--dart-define=MOCK_CAMERA=true`) or with a
    webcam and no face signals; the audio hook (`reportAudioLevel`) and the
    browser guards below are platform-independent and work either way.
-4. Routing is wired: `RoleGate` reads `users.role` after sign-in and sends
-   students to `StudentExamPortalPage` (published exams → `ExamTakingPage`) and
-   supervisors to `SupervisorExamPickerPage` → `SupervisorDashboardPage`. Drop in
-   `go_router` (`go_router` is *not* a dependency yet) when deep links matter —
-   every page takes plain constructor args.
+4. Routing is wired: `RoleGate` reads `profiles.role` after sign-in and routes on
+   the four values of the `public.user_role` enum — students to
+   `StudentExamPortalPage` (published exams → `ExamTakingPage`), `lecturer` and
+   `supervisor` (both staff, `is_staff()` in the schema) to
+   `SupervisorExamPickerPage` → `SupervisorDashboardPage`, and `admin` to
+   `AdminDashboardPage`. The admin page is the only writer of other people's
+   roles, and it creates staff logins through the `admin-create-user` Edge
+   Function (`supabase functions deploy admin-create-user`) because RLS refuses
+   a non-`student` insert from a client. Drop in `go_router` (`go_router` is
+   *not* a dependency yet) when deep links matter — every page takes plain
+   constructor args.
 5. Nothing else to download — ML Kit bundles its face model inside the app, so
    no `assets/models/face_landmarker.task` file is needed any more.
 6. `flutter test` runs the unit/widget tests in `test/` (head-pose geometry,
@@ -334,20 +343,52 @@ Role routing after sign-in is covered in "Role routing (post-login)" below.
 `RoleGate` (`lib/features/auth/presentation/widgets/role_gate.dart`) is the whole
 router today. Once `SupabaseService.signedInChanges` reports a session it:
 
-1. takes the auth user id and reads **`public.users`** for it
+1. takes the auth user id and reads **`public.profiles`** for it
    (`ProfileRepositoryImpl` → `select().eq('id', userId).maybeSingle()`, allowed by
-   the "Authenticated users can read profiles" policy);
+   the `profiles_select_own_or_staff` policy, whose `id = auth.uid()` half covers
+   your own row even as a student);
 2. shows "Loading your profile…" with a spinner while that read is in flight;
-3. routes on the role:
+3. routes on the four values of the `public.user_role` enum:
    * `student` → `StudentExamPortalPage`
-   * `supervisor` → `SupervisorExamPickerPage`
+   * `lecturer` / `supervisor` → `SupervisorExamPickerPage` — one console, because
+     `is_staff()` in the schema gives both roles the same data; the app does not
+     invent a second one just to have a label
+   * `admin` → `AdminDashboardPage`
 
 A failed lookup (offline, no row, unrecognised role) renders a retryable error
 with a **Sign out** escape hatch instead of guessing a role — an unknown
-`users.role` throws in `UserRole.fromDb` rather than defaulting to `student`.
+`profiles.role` throws in `UserRole.fromDb` rather than defaulting to `student`.
 `profileRepositoryProvider` is bound in `main()` next to the exam/proctoring
 repositories, and `userProfileProvider` is keyed by the auth user id, so signing
 in as a different account resolves a different profile.
+
+### Admin dashboard
+
+`AdminDashboardPage`
+(`lib/features/admin/presentation/pages/admin_dashboard_page.dart`) is what
+`RoleGate` renders for `admin` and nobody else: the account roster (every
+`profiles` row with its role) plus a create-account form, backed by
+`AdminUserRepository` → `AdminUserRepositoryImpl`:
+
+| Action | What happens |
+| --- | --- |
+| List | `select().from('profiles')` ordered oldest-first (`created_at.asc.nullslast`), so a freshly created account appears at the end |
+| Change a role | `update({role}).eq('id', …)` with `.select('*')`; a row count of zero is treated as a failure, not a silent success. Your own row is not editable — it renders a plain `role (you)` chip |
+| Create an account | POSTs email, full name, a temporary password and a role to `/functions/v1/admin-create-user`, which answers `200` with the created row (`full_name`, also accepted as `fullName`) |
+
+Every failure surfaces as one `AdminAccountException` whose message is already a
+sentence: PostgREST `42501` (a policy, or the `profiles_guard_role_change` trigger
+refusing "profiles.role is immutable for non-admins") becomes "Only an
+administrator may change accounts.", and the function's own status codes are
+mapped too — no connection, 401/403, and a 404 that names
+`supabase/functions/admin-create-user` when the function is not deployed.
+
+Creating a login needs the Edge Function because `profiles_insert_self_student`
+only lets a client insert its *own* row with `role = 'student'`; the function
+re-reads the caller's JWT against `profiles` with the anon key, refuses anyone
+who is not an admin, and only then uses the `service_role` key to create the auth
+user (which is why it must be deployed with `supabase functions deploy
+admin-create-user` and why the key never reaches the app).
 
 ### Student Exam Portal
 
@@ -472,10 +513,16 @@ Details worth knowing:
   exists to avoid); the exam screen re-checks the critical statuses before opening
   the camera.
 
-`mobile/test/role_routing_test.dart` covers the portal path with injected
-repositories: role parsing, both routes, the loading state, the retry after a
+`mobile/test/role_routing_test.dart` covers the routing with injected
+repositories: role parsing, one group per role (`student` portal, `lecturer` and
+`supervisor` console, `admin` dashboard), the loading state, the retry after a
 failure, the disqualified guard, and the exam/submission ids handed to the session
-screen. `mobile/test/exam_taking_page_test.dart` covers the blocking state and its
+screen. Its admin group also pins the parts of account management a widget test
+can see: the self row is not re-roleable, another row re-roles through the
+repository, and a refused roster renders the repository's prose with a retry —
+pumped on a 1400x1200 surface (`useDesktopSurface`) so the side-by-side layout is
+the one under test.
+`mobile/test/exam_taking_page_test.dart` covers the blocking state and its
 retry/leave actions.
 
 ## Responsive layout (Android phone + desktop browser)
@@ -509,10 +556,19 @@ Per screen:
   question header, which is what used to overflow a 360 dp app bar. The preview
   uses `BoxFit.cover`, so it fills its box whatever aspect ratio the platform
   reports instead of distorting.
+* **Admin dashboard** — driven by `ResponsiveSizing.isExpanded(context)` (>= 900
+  dp): below it the header stays pinned and the create form and the roster scroll
+  together in one `ListView` (form first — provisioning is the primary action); at
+  or above it a `Row` puts the form in a `SingleChildScrollView` on the left and
+  the roster in one on the right, so a wide window shows the roster beside the
+  form instead of pushing it below the fold. Both halves scroll independently, so
+  a long roster on a short laptop window is still reachable.
 
 `mobile/test/hardware_gate_test.dart` and the two viewport tests in
 `mobile/test/exam_taking_page_test.dart` pump these screens at 320x568, 360x640
-and 1440x900 and fail on any `RenderFlex` overflow.
+and 1440x900 and fail on any `RenderFlex` overflow. The admin dashboard's
+side-by-side branch gets the same treatment at 1400x1200 from
+`mobile/test/role_routing_test.dart`.
 
 ## Web authentication (and startup safety)
 
@@ -803,3 +859,15 @@ written-down opt-out for a throwaway demo build and never for one a student runs
   camera stream from backing up on slower devices instead of processing
   stale frames late. Unusable buffers (wrong format/orientation) are skipped
   rather than counted as "no face", so they can't burn a strike.
+- **`profiles.role` is the security boundary, so only an admin may move it.** The
+  four values (`student`, `lecturer`, `supervisor`, `admin`) come from the
+  `public.user_role` enum, and every policy in `schema.sql` asks `is_staff()` /
+  `is_admin()` about it. RLS cannot restrict a *column*, so the
+  `profiles_guard_role_change` trigger raises `42501`
+  ("profiles.role is immutable for non-admins") when a non-admin edits it —
+  `profiles_admin_all` is the matching policy half, which is what the admin
+  dashboard relies on. A client can only ever self-provision a `student` row
+  (`profiles_insert_self_student`), and staff logins are minted by the
+  `admin-create-user` Edge Function, which holds the only `service_role` key in
+  the system and re-checks the caller's JWT before using it.
+

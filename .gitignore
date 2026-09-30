@@ -40,3 +40,5 @@ mobile/android/.kotlin/
 .idea/
 .DS_Store
 *.swp
+.vercel
+.env*

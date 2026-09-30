@@ -34,9 +34,9 @@ export function LoginPage() {
         </div>
 
         <div className="rounded-lg border border-border bg-surface-raised p-6">
-          <h1 className="text-lg font-semibold text-slate-100">Supervisor sign in</h1>
+          <h1 className="text-lg font-semibold text-slate-100">Staff sign in</h1>
           <p className="mt-1 text-sm text-slate-500">
-            Access is restricted to supervisor accounts.
+            Access is restricted to staff accounts — supervisor, lecturer or admin.
           </p>
 
           {displayError && (

@@ -4,9 +4,9 @@
 -- Run this AFTER schema.sql. Shared by both apps in the monorepo:
 -- ../mobile (Flutter) and ../dashboard (React console).
 --
--- Creates: 1 supervisor + 2 student profiles (public.users), 2 published
--- exams (public.exams), 5 questions per exam (public.questions), and 1
--- sample submission with 3 realistic violation logs
+-- Creates: 1 admin + 1 supervisor + 1 lecturer + 2 student profiles
+-- (public.profiles), 2 published exams (public.exams), 5 questions per exam
+-- (public.questions), and 1 sample submission with 3 realistic violation logs
 -- (public.exam_submissions + public.proctoring_logs).
 --
 -- HOW TO RUN (Supabase SQL editor)
@@ -14,21 +14,26 @@
 --   2. Paste this whole file.
 --   3. Click Run (Ctrl/Cmd + Enter) and wait for "Success".
 --      The editor runs as the `postgres` role, which bypasses RLS, so no
---      policies need relaxing for these inserts.
+--      policies need relaxing for these inserts - including the
+--      profiles_guard_role_change trigger, which allows a role change when
+--      there is no JWT (see schema.sql).
 --   4. The LAST statement prints a roster - check it shows one submission
 --      with 3 flags, then reload the dashboard / mobile app.
 --
 -- SAFE TO RE-RUN: every insert ends with `on conflict ... do nothing`.
 -- IDs are hard-coded and repeated inline so the FK graph stays readable:
---   1111... supervisor   2222... Aisha   3333... Chidi
+--   1111... supervisor   2222... Aisha      3333... Chidi
+--   4444... admin        5555... lecturer
 --   aaaa..a1 CS101       aaaa..a2 MAT201
 --   bbbb..b1-5 CS101 Qs  cccc..c1-5 MAT201 Qs
 --   dddd..d1 submission  eeee..e1-3 its logs
 --
--- DEMO LOGINS (created in step 0; same password for all three):
---   supervisor@proctor.test    / Proctor123!  -> supervisor - dashboard
---   aisha.bello@proctor.test   / Proctor123!  -> student - mobile app
---   chidi.okonkwo@proctor.test / Proctor123!  -> student - mobile app
+-- DEMO LOGINS (created in step 0; the same password for all five):
+--   admin@proctor.test         / Proctor123!  -> admin      - mobile admin dashboard
+--   supervisor@proctor.test    / Proctor123!  -> supervisor - dashboard console + mobile
+--   lecturer@proctor.test      / Proctor123!  -> lecturer   - dashboard console
+--   aisha.bello@proctor.test   / Proctor123!  -> student    - mobile app
+--   chidi.okonkwo@proctor.test / Proctor123!  -> student    - mobile app
 -- The emails use the reserved .test TLD so a demo seed can never mail a
 -- real person. Change them before reusing this script anywhere real.
 -- =====================================================================
@@ -37,7 +42,7 @@ begin;
 
 -- ---------------------------------------------------------------------
 -- 0. AUTH USERS
--- public.users.id references auth.users(id) on delete cascade, so these
+-- public.profiles.id references auth.users(id) on delete cascade, so these
 -- rows must exist before the profiles in step 1. Prefer creating them by
 -- hand? Do that first (Dashboard -> Authentication -> Users -> Add user,
 -- password Proctor123!) and re-run this script: the block below then
@@ -78,7 +83,9 @@ begin
     jsonb_build_object('name', u.name, 'email_verified', true),
     now(), now()
   from (values
+    ('44444444-4444-4444-8444-444444444444'::uuid, 'admin@proctor.test'::text,         'Prof. Grace Adeyemi'::text),
     ('11111111-1111-4111-8111-111111111111'::uuid, 'supervisor@proctor.test'::text,    'Dr. Ada Nwosu'::text),
+    ('55555555-5555-4555-8555-555555555555'::uuid, 'lecturer@proctor.test'::text,      'Dr. Tunde Balogun'::text),
     ('22222222-2222-4222-8222-222222222222'::uuid, 'aisha.bello@proctor.test'::text,   'Aisha Bello'::text),
     ('33333333-3333-4333-8333-333333333333'::uuid, 'chidi.okonkwo@proctor.test'::text, 'Chidi Okonkwo'::text)
   ) as u(id, email, name)
@@ -89,7 +96,9 @@ begin
   -- silently skip unknown shapes - password sign-in works from auth.users.
   for r in
     select id, email from (values
+      ('44444444-4444-4444-8444-444444444444'::uuid, 'admin@proctor.test'::text),
       ('11111111-1111-4111-8111-111111111111'::uuid, 'supervisor@proctor.test'::text),
+      ('55555555-5555-4555-8555-555555555555'::uuid, 'lecturer@proctor.test'::text),
       ('22222222-2222-4222-8222-222222222222'::uuid, 'aisha.bello@proctor.test'::text),
       ('33333333-3333-4333-8333-333333333333'::uuid, 'chidi.okonkwo@proctor.test'::text)
     ) as t(id, email)
@@ -125,13 +134,17 @@ begin
 end $$;
 
 -- ---------------------------------------------------------------------
--- 1. PROFILES  (public.users) - 1 supervisor + 2 students, 1:1 with the
---    auth users created in step 0.
+-- 1. PROFILES  (public.profiles) - 1 admin + 1 supervisor + 1 lecturer +
+--    2 students, 1:1 with the auth users created in step 0.
+--    `role` is the public.user_role enum; the admin is the account that may
+--    create further accounts from the mobile admin dashboard.
 -- ---------------------------------------------------------------------
-insert into public.users (id, role, name, email) values
-  ('11111111-1111-4111-8111-111111111111', 'supervisor', 'Dr. Ada Nwosu',  'supervisor@proctor.test'),
-  ('22222222-2222-4222-8222-222222222222', 'student',    'Aisha Bello',   'aisha.bello@proctor.test'),
-  ('33333333-3333-4333-8333-333333333333', 'student',    'Chidi Okonkwo', 'chidi.okonkwo@proctor.test')
+insert into public.profiles (id, role, full_name, email) values
+  ('44444444-4444-4444-8444-444444444444', 'admin',      'Prof. Grace Adeyemi', 'admin@proctor.test'),
+  ('11111111-1111-4111-8111-111111111111', 'supervisor', 'Dr. Ada Nwosu',       'supervisor@proctor.test'),
+  ('55555555-5555-4555-8555-555555555555', 'lecturer',   'Dr. Tunde Balogun',   'lecturer@proctor.test'),
+  ('22222222-2222-4222-8222-222222222222', 'student',    'Aisha Bello',         'aisha.bello@proctor.test'),
+  ('33333333-3333-4333-8333-333333333333', 'student',    'Chidi Okonkwo',       'chidi.okonkwo@proctor.test')
 on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------
@@ -286,20 +299,20 @@ commit;
 -- Other useful spot-checks:
 --   select * from public.questions_public order by exam_id, question_text;
 --   select * from public.proctoring_logs  order by timestamp;
---   select id, role, name, email from public.users order by role, name;
+--   select id, role, full_name, email from public.profiles order by role, full_name;
 -- ---------------------------------------------------------------------
 select
   e.title       as exam,
-  u.name        as student,
+  u.full_name   as student,
   s.status,
   count(l.id)   as flags,
   s.started_at,
   s.submitted_at
 from public.exam_submissions s
 join public.exams e on e.id = s.exam_id
-join public.users u on u.id = s.student_id
+join public.profiles u on u.id = s.student_id
 left join public.proctoring_logs l on l.submission_id = s.id
-group by e.title, u.name, s.status, s.started_at, s.submitted_at
+group by e.title, u.full_name, s.status, s.started_at, s.submitted_at
 order by s.started_at;
 
 

@@ -1,6 +1,9 @@
 import 'dart:async';
 
 import 'package:exam_proctor/core/services/supabase_service.dart';
+import 'package:exam_proctor/features/admin/domain/entities/managed_account.dart';
+import 'package:exam_proctor/features/admin/domain/repositories/admin_user_repository.dart';
+import 'package:exam_proctor/features/admin/presentation/providers/admin_providers.dart';
 import 'package:exam_proctor/features/auth/domain/entities/user_profile.dart';
 import 'package:exam_proctor/features/auth/domain/repositories/profile_repository.dart';
 import 'package:exam_proctor/features/auth/presentation/providers/profile_provider.dart';
@@ -15,8 +18,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// Post-login routing: `users.role` decides between the student portal and the
-/// supervisor console, with the loading and failure states around it.
+/// Post-login routing: `profiles.role` decides between the student portal, the
+/// staff console and the admin dashboard, with the loading and failure states
+/// around it.
 ///
 /// Everything is injected (auth stream, user id, repositories, sign-out), so no
 /// Supabase project, no camera and no platform channel is involved.
@@ -26,14 +30,27 @@ void main() {
   const aisha = UserProfile(
     id: aishaId,
     role: UserRole.student,
-    name: 'Aisha Bello',
+    fullName: 'Aisha Bello',
     email: 'aisha.bello@proctor.test',
   );
   const ada = UserProfile(
-    id: '11111111-1111-4111-8111-111111111111',
+    id: adaUserId,
     role: UserRole.supervisor,
-    name: 'Dr. Ada Nwosu',
+    fullName: 'Dr. Ada Nwosu',
     email: 'supervisor@proctor.test',
+  );
+  // The seed's lecturer and the bootstrap admin.
+  const musa = UserProfile(
+    id: '55555555-5555-4555-8555-555555555555',
+    role: UserRole.lecturer,
+    fullName: 'Musa Ibrahim',
+    email: 'lecturer@proctor.test',
+  );
+  const rootAdmin = UserProfile(
+    id: '44444444-4444-4444-8444-444444444444',
+    role: UserRole.admin,
+    fullName: 'Root Admin',
+    email: 'admin@proctor.test',
   );
   const cs101Id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1';
   const mat201Id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2';
@@ -54,6 +71,7 @@ void main() {
 
   late _FakeProfileRepository profiles;
   late _FakeExamRepository exams;
+  late _FakeAdminUserRepository admin;
 
   Widget gateUnderTest({
     String userId = aishaId,
@@ -63,6 +81,7 @@ void main() {
         overrides: [
           profileRepositoryProvider.overrideWithValue(profiles),
           examRepositoryProvider.overrideWithValue(exams),
+          adminUserRepositoryProvider.overrideWithValue(admin),
         ],
         child: MaterialApp(
           home: RoleGate(
@@ -76,28 +95,44 @@ void main() {
   setUp(() {
     profiles = _FakeProfileRepository(profile: aisha);
     exams = _FakeExamRepository(exams: <Exam>[cs101, mat201]);
+    admin = _FakeAdminUserRepository();
   });
 
-  group('users.role parsing', () {
-    test('maps the two allowed values', () {
+  group('profiles.role parsing', () {
+    test('maps every value of the user_role enum', () {
       expect(UserRole.fromDb('student'), UserRole.student);
       expect(UserRole.fromDb('supervisor'), UserRole.supervisor);
-      expect(UserRole.student.dbValue, 'student');
+      expect(UserRole.fromDb('lecturer'), UserRole.lecturer);
+      expect(UserRole.fromDb('admin'), UserRole.admin);
+      expect(
+        UserRole.values.map((role) => role.dbValue).toList(),
+        <String>['admin', 'lecturer', 'supervisor', 'student'],
+      );
     });
 
     test('rejects an unknown role instead of guessing', () {
-      expect(() => UserRole.fromDb('admin'), throwsArgumentError);
+      expect(() => UserRole.fromDb('principal'), throwsArgumentError);
     });
 
     test('falls back to the email when the row has no name', () {
       final profile = UserProfile.fromMap(<String, dynamic>{
         'id': aishaId,
         'role': 'student',
-        'name': '   ',
+        'full_name': '   ',
         'email': 'aisha.bello@proctor.test',
       });
       expect(profile.displayName, 'aisha.bello@proctor.test');
       expect(profile.isStudent, isTrue);
+      expect(profile.isStaff, isFalse);
+      expect(profile.isAdmin, isFalse);
+    });
+
+    test('the staff tier is every non-student role', () {
+      expect(ada.isStaff, isTrue);
+      expect(musa.isStaff, isTrue);
+      expect(rootAdmin.isStaff, isTrue);
+      expect(rootAdmin.isAdmin, isTrue);
+      expect(ada.isAdmin, isFalse);
     });
   });
 
@@ -143,7 +178,7 @@ void main() {
       expect(find.text('60 minutes'), findsOneWidget);
       expect(find.text('45 minutes'), findsOneWidget);
       expect(profiles.lastUserId, aishaId,
-          reason: 'the role came from users.id = auth uid');
+          reason: 'the role came from profiles.id = auth uid');
     });
 
     testWidgets('an ongoing attempt opens the session with both ids',
@@ -284,7 +319,7 @@ void main() {
       expect(find.text('We could not load your profile'), findsOneWidget);
       expect(find.textContaining('Check your connection'), findsOneWidget);
 
-      // Backend recovers -> retry re-reads users instead of showing the old error.
+      // Backend recovers -> retry re-reads the profile row, not the old error.
       profiles.behaviour = () => Future<UserProfile>.value(aisha);
       await tester.tap(find.byKey(const Key('profile-retry')));
       await tester.pumpAndSettle();
@@ -328,6 +363,176 @@ void main() {
     });
   });
 
+  group('lecturer role', () {
+    testWidgets('shares the staff console with the supervisor', (tester) async {
+      profiles.behaviour = () => Future<UserProfile>.value(musa);
+
+      await tester.pumpWidget(gateUnderTest());
+      await tester.pumpAndSettle();
+
+      // `is_staff()` treats the two alike in the database, so the app does not
+      // invent a second console for a lecturer.
+      expect(find.text('Supervisor Console'), findsOneWidget);
+      expect(find.textContaining('Welcome, Musa Ibrahim'), findsOneWidget);
+      expect(find.text('Student Exam Portal'), findsNothing);
+    });
+  });
+
+  group('admin role', () {
+    /// Desktop-width surface: at 900+ logical px the page lays the roster out in
+    /// its own column (Breakpoints.expanded), where every tile is built — a
+    /// phone-width `ListView` would only build the tiles that fit the viewport.
+    void useDesktopSurface(WidgetTester tester) {
+      tester.view.physicalSize = const Size(1400, 1200);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+    }
+
+    testWidgets('lands on the admin dashboard, not the staff console',
+        (tester) async {
+      useDesktopSurface(tester);
+      profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
+
+      await tester.pumpWidget(gateUnderTest(userId: rootAdmin.id));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Admin Dashboard'), findsOneWidget);
+      expect(find.textContaining('Welcome, Root Admin'), findsOneWidget);
+      expect(find.text('Supervisor Console'), findsNothing);
+      expect(find.text('Student Exam Portal'), findsNothing);
+
+      // The roster came from the injected repository, not from a backend.
+      expect(find.text('Aisha Bello'), findsOneWidget);
+      expect(find.text('manager@proctor.test'), findsOneWidget);
+      expect(admin.listCalls, 1);
+    });
+
+    testWidgets('the signed-in admin is listed but cannot re-role themselves',
+        (tester) async {
+      useDesktopSurface(tester);
+      profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
+
+      await tester.pumpWidget(gateUnderTest(userId: rootAdmin.id));
+      await tester.pumpAndSettle();
+
+      // Their own row: labelled "(you)" and with no picker at all.
+      expect(find.text('Admin (you)'), findsOneWidget);
+      expect(find.byKey(Key('admin-role-${rootAdmin.id}')), findsNothing);
+      // Everybody else keeps theirs.
+      expect(find.byKey(const Key('admin-role-$aishaId')), findsOneWidget);
+    });
+
+    testWidgets('re-roling a row goes through the repository', (tester) async {
+      useDesktopSurface(tester);
+      profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
+
+      await tester.pumpWidget(gateUnderTest(userId: rootAdmin.id));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('admin-role-$aishaId')));
+      await tester.pumpAndSettle();
+
+      // The menu item, not the "Supervisor" chip on the other row.
+      await tester.tap(
+        find.descendant(
+          of: find.byType(PopupMenuItem<UserRole>),
+          matching: find.text('Supervisor'),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        admin.roleUpdates,
+        <(String, UserRole)>[(aishaId, UserRole.supervisor)],
+      );
+      expect(find.textContaining('is now a supervisor'), findsOneWidget);
+      await letSnackBarExpire(tester);
+    });
+
+    testWidgets('a refused roster is reported with a retry', (tester) async {
+      useDesktopSurface(tester);
+      profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
+      admin.listError = const AdminAccountException('Only an administrator.');
+
+      await tester.pumpWidget(gateUnderTest(userId: rootAdmin.id));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Only an administrator.'), findsOneWidget);
+
+      // Recovering and reloading replaces the error with the roster.
+      admin.listError = null;
+      await tester.tap(find.byKey(const Key('admin-reload-accounts')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Only an administrator.'), findsNothing);
+      expect(find.text('Aisha Bello'), findsOneWidget);
+    });
+  });
+}
+
+/// Stands in for `AdminUserRepositoryImpl`, so the admin dashboard can be driven
+/// without an Edge Function, an auth server or a `profiles` table.
+class _FakeAdminUserRepository implements AdminUserRepository {
+  _FakeAdminUserRepository({List<ManagedAccount>? accounts})
+      : accounts = accounts ??
+            <ManagedAccount>[
+              const ManagedAccount(
+                id: '44444444-4444-4444-8444-444444444444',
+                email: 'admin@proctor.test',
+                fullName: 'Root Admin',
+                role: UserRole.admin,
+              ),
+              const ManagedAccount(
+                id: '22222222-2222-4222-8222-222222222222',
+                email: 'aisha.bello@proctor.test',
+                fullName: 'Aisha Bello',
+                role: UserRole.student,
+              ),
+              const ManagedAccount(
+                id: '33333333-3333-4333-8333-333333333333',
+                email: 'manager@proctor.test',
+                fullName: '',
+                role: UserRole.supervisor,
+              ),
+            ];
+
+  List<ManagedAccount> accounts;
+  final List<(String, UserRole)> roleUpdates = <(String, UserRole)>[];
+  int listCalls = 0;
+  Object? listError;
+
+  @override
+  Future<ManagedAccount> createAccount({
+    required String email,
+    required String password,
+    required String fullName,
+    required UserRole role,
+  }) async =>
+      ManagedAccount(
+        id: 'new-${accounts.length}',
+        email: email,
+        fullName: fullName,
+        role: role,
+      );
+
+  @override
+  Future<List<ManagedAccount>> listAccounts() async {
+    listCalls++;
+    final failure = listError;
+    if (failure != null) throw failure;
+    return List<ManagedAccount>.of(accounts);
+  }
+
+  @override
+  Future<void> updateRole({
+    required String userId,
+    required UserRole role,
+  }) async {
+    roleUpdates.add((userId, role));
+  }
 }
 
 /// Stands in for `ProfileRepositoryImpl`: a swappable [behaviour] so a test can
@@ -338,7 +543,7 @@ class _FakeProfileRepository implements ProfileRepository {
 
   Future<UserProfile> Function() behaviour;
 
-  /// Last id passed in, so a test can prove the gate queried `users.id`.
+  /// Last id passed in, so a test can prove the gate queried `profiles.id`.
   String? lastUserId;
 
   @override

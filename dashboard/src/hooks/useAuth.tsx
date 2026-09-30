@@ -1,10 +1,16 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { supabase } from "@/lib/supabase";
-import type { UserRow } from "@/types/database";
+import type { ProfileRow, UserRole } from "@/types/database";
+
+/**
+ * The roles this console serves — `is_staff()` in `supabase/schema.sql`. A
+ * student can sign in, but is blocked below rather than shown staff-scoped data.
+ */
+const STAFF_ROLES: readonly UserRole[] = ["admin", "lecturer", "supervisor"];
 
 interface AuthState {
   loading: boolean;
-  profile: UserRow | null;
+  profile: ProfileRow | null;
   error: string | null;
   signIn: (email: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
@@ -14,7 +20,7 @@ const AuthContext = createContext<AuthState | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
-  const [profile, setProfile] = useState<UserRow | null>(null);
+  const [profile, setProfile] = useState<ProfileRow | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function loadProfile() {
@@ -27,7 +33,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
 
     const { data, error: profileError } = await supabase
-      .from("users")
+      .from("profiles")
       .select("*")
       .eq("id", userId)
       .single();
@@ -35,13 +41,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (profileError || !data) {
       setError("Could not load your profile.");
       setProfile(null);
-    } else if (data.role !== "supervisor") {
-      // Role guard: authenticated but not a supervisor -> block access
-      // rather than silently showing student-scoped data.
-      setError("This console is restricted to supervisor accounts.");
+    } else if (!STAFF_ROLES.includes(data.role)) {
+      // Role guard: authenticated but a student -> block access rather than
+      // silently showing staff-scoped data. RLS would already withhold the rows;
+      // this is what turns that into a sentence instead of empty panels.
+      setError("This console is restricted to staff accounts.");
       setProfile(null);
     } else {
-      setProfile(data as UserRow);
+      setProfile(data as ProfileRow);
       setError(null);
     }
     setLoading(false);

@@ -13,10 +13,13 @@ Uses the shared schema at `../supabase/schema.sql` — run that once in the
 Supabase SQL editor before starting either app in this monorepo. It already
 includes `questions.points` and `exam_submissions.submitted_at`.
 
-`../supabase/seed.sql` then loads mock testing data: 1 supervisor + 2 student
-profiles, 2 published exams with 5 questions each, and one disqualified
-submission with 3 proctoring logs. Log in with
-`supervisor@proctor.test` / `Proctor123!` to see it in this console.
+`../supabase/seed.sql` then loads mock testing data: 5 profiles (admin, lecturer,
+supervisor and 2 students), 2 published exams with 5 questions each, and one
+disqualified submission with 3 proctoring logs. Log in with
+`supervisor@proctor.test` / `Proctor123!` to see it in this console — the admin
+(`admin@proctor.test`) and lecturer (`lecturer@proctor.test`) logins use the same
+demo password and reach the same console, since `is_staff()` in the schema treats
+all three staff roles alike.
 
 ## Structure
 ```

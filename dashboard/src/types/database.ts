@@ -1,10 +1,16 @@
 export type SubmissionStatus = "ongoing" | "submitted" | "disqualified";
-export type UserRole = "student" | "supervisor";
 
-export type UserRow = {
+/** Mirrors the `public.user_role` enum in `supabase/schema.sql`. */
+export type UserRole = "admin" | "lecturer" | "supervisor" | "student";
+
+/**
+ * Row of `public.profiles` — the table used to be `users`, and its display-name
+ * column used to be `name`.
+ */
+export type ProfileRow = {
   id: string;
   role: UserRole;
-  name: string;
+  full_name: string;
   email: string;
 };
 
@@ -89,10 +95,10 @@ export type ProctoringLogRow = {
 export type Database = {
   public: {
     Tables: {
-      users: {
-        Row: UserRow;
-        Insert: Partial<UserRow>;
-        Update: Partial<UserRow>;
+      profiles: {
+        Row: ProfileRow;
+        Insert: Partial<ProfileRow>;
+        Update: Partial<ProfileRow>;
         Relationships: [];
       };
       exams: {
