@@ -48,3 +48,5 @@ mobile/android/.kotlin/
 *.swp
 .vercel
 .env*
+supabase/.temp/
+supabase\.temp/
