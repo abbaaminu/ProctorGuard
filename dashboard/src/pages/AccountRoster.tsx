@@ -1,5 +1,5 @@
 import { useRef, useState, type ComponentProps, type FormEvent } from "react";
-import { Loader2, ShieldCheck, UserPlus } from "lucide-react";
+import { Loader2, ShieldCheck, Trash2, UserPlus } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -14,6 +14,9 @@ import {
   type NewAccountInput,
 } from "@/hooks/useAccounts";
 import {
+  deleteAccountVerdict,
+  deleteAccountWarning,
+  deletionSummary,
   roleChangeVerdict,
   roleChangeWarning,
   roleLabel,
@@ -245,7 +248,10 @@ function CreateAccountCard({
  *   * list every profile row (`profiles_admin_all`, admin-only) and move its
  *     `role` — the column `is_admin()` / `is_staff()` read, which
  *     `profiles_guard_role_change` refuses to let anyone below admin touch;
- *   * mint a login through `admin-create-user`.
+ *   * mint a login through `admin-create-user`;
+ *   * and remove an account for good through `admin-delete-user` — the only way
+ *     to delete an `auth.users` row, so a `DELETE` issued from this page would
+ *     be the wrong write even though `profiles_admin_all` allows it.
  *
  * ROUTING AND AUTHORISATION ARE DIFFERENT THINGS. `RequireAdmin` (and the
  * sidebar item) decide *where a signed-in user lands*; the database decides
@@ -256,7 +262,15 @@ function CreateAccountCard({
  */
 export function AccountRoster() {
   const { profile } = useAuth();
-  const { accounts, loading, error, reload, changeRole, createAccount } = useAccounts();
+  const {
+    accounts,
+    loading,
+    error,
+    reload,
+    changeRole,
+    createAccount,
+    deleteAccount,
+  } = useAccounts();
 
   /** Selected-but-unsaved role per account id; cleared once a write lands. */
   const [draftRoles, setDraftRoles] = useState<Record<string, UserRole>>({});
@@ -266,6 +280,9 @@ export function AccountRoster() {
     role: UserRole;
   } | null>(null);
   const [saving, setSaving] = useState(false);
+  /** The account the delete confirm dialog is asking about. */
+  const [pendingDelete, setPendingDelete] = useState<ProfileRow | null>(null);
+  const [deleting, setDeleting] = useState(false);
   /**
    * A *refused* write, held apart from the hook's read error so a refusal is
    * not erased by the next successful refetch — and shown in the banner, which
@@ -319,6 +336,43 @@ export function AccountRoster() {
     showToast("ok", `${accountName(account)} now has the ${roleLabel(role)} role.`);
   }
 
+  /**
+   * Delete the account the dialog is asking about.
+   *
+   * The dialog is not decoration: this is the one irreversible action on the page,
+   * so the click that performs it is a second, deliberate one. The hook does the
+   * work — including asking the refetched roster to confirm it — while what this
+   * handler owns is where the outcome is *said*: a refusal joins the same banner a
+   * refused role change uses (it has to stay readable, not vanish in a toast),
+   * and a success is a toast like every other completed write here, reporting the
+   * counts `admin-delete-user` took before it deleted.
+   */
+  async function applyDelete() {
+    if (!pendingDelete) return;
+
+    const account = pendingDelete;
+    setDeleting(true);
+    const result = await deleteAccount(account.id);
+    setDeleting(false);
+    setPendingDelete(null);
+
+    if (!result.ok) {
+      setWriteError(result.message);
+      return;
+    }
+
+    setWriteError(null);
+    // The row has left the hook's roster (it was filtered out and the refetch
+    // agreed), but a draft role keyed by that id would outlive it — uuids are
+    // never reused, so the entry is dropped with the account.
+    setDraftRoles((previous) => {
+      const next = { ...previous };
+      delete next[account.id];
+      return next;
+    });
+    showToast("ok", deletionSummary(account, result.scope));
+  }
+
   return (
     <div className="p-6">
       <div className="mb-6">
@@ -353,13 +407,14 @@ export function AccountRoster() {
               <th className="px-4 py-2.5 font-medium">Role</th>
               <th className="px-4 py-2.5 font-medium">Joined</th>
               <th className="px-4 py-2.5 text-right font-medium">Change role</th>
+              <th className="px-4 py-2.5 text-right font-medium">Delete</th>
             </tr>
           </thead>
           <tbody>
-            {loading && <TableSkeleton rows={4} columns={4} />}
+            {loading && <TableSkeleton rows={4} columns={5} />}
             {!loading && accounts.length === 0 && (
               <tr>
-                <td colSpan={4} className="px-4 py-6 text-center text-slate-500">
+                <td colSpan={5} className="px-4 py-6 text-center text-slate-500">
                   No accounts yet — create the first one below.
                 </td>
               </tr>
@@ -368,6 +423,7 @@ export function AccountRoster() {
               const selected = selectedRole(account);
               const verdict = roleChangeVerdict(profile?.id, account, selected);
               const isSelf = account.id === profile?.id;
+              const deleteVerdict = deleteAccountVerdict(profile?.id, account);
               return (
                 <tr
                   key={account.id}
@@ -430,6 +486,35 @@ export function AccountRoster() {
                       </div>
                     )}
                   </td>
+                  <td className="px-4 py-2.5">
+                    {/* The self-delete lock, rendered the same way the
+                        self-demotion lock above is: the explanation instead of a
+                        control, because this administrator *is* the page that
+                        would create the account back. `deleteAccountVerdict` is
+                        the one place that rule lives, and `admin-delete-user`
+                        enforces its own copy of it server-side. */}
+                    {deleteVerdict.kind === "blocked" ? (
+                      <div
+                        className="flex items-center justify-end gap-1.5 text-xs text-slate-500"
+                        title={deleteVerdict.reason}
+                      >
+                        <ShieldCheck size={14} className="shrink-0" />
+                        Your own account — ask another administrator
+                      </div>
+                    ) : (
+                      <div className="flex justify-end">
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          title={`Delete ${accountName(account)}`}
+                          onClick={() => setPendingDelete(account)}
+                        >
+                          <Trash2 size={14} />
+                          Delete
+                        </Button>
+                      </div>
+                    )}
+                  </td>
                 </tr>
               );
             })}
@@ -458,6 +543,27 @@ export function AccountRoster() {
               {roleLabel(pendingChange.account.role)} → {roleLabel(pendingChange.role)}. The
               change applies the next time they sign in, and only an administrator can
               move it back.
+            </p>
+          </>
+        )}
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        title="Delete this account?"
+        confirmLabel="Delete account"
+        busyLabel="Deleting…"
+        busy={deleting}
+        onConfirm={() => void applyDelete()}
+        onCancel={() => setPendingDelete(null)}
+      >
+        {pendingDelete && (
+          <>
+            <p>{deleteAccountWarning(pendingDelete)}</p>
+            <p className="text-xs text-slate-500">
+              {accountName(pendingDelete)} · {pendingDelete.email}. The login goes with the
+              profile, so this cannot be undone from here — the account would have to be
+              created again, and the person told about it.
             </p>
           </>
         )}

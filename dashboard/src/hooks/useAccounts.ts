@@ -2,9 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import {
   createAccountMessage,
+  deleteAccountMessage,
   roleChangeErrorMessage,
   rosterErrorMessage,
 } from "@/lib/api-errors";
+import type { RemovalScope } from "@/lib/roles";
 import type { ProfileRow, UserRole } from "@/types/database";
 
 /**
@@ -16,6 +18,20 @@ import type { ProfileRow, UserRole } from "@/types/database";
 export const CREATE_ACCOUNT_FUNCTION = "admin-create-user";
 
 /**
+ * The Edge Function that is the only supported way to remove an account for good
+ * (`supabase/functions/admin-delete-user`).
+ *
+ * Deleting the *row* is not deleting the account: `auth.users` belongs to
+ * Supabase Auth, so a PostgREST `DELETE` on `profiles` — which is what
+ * `profiles_admin_all` would happily allow — leaves a login that still signs in
+ * but has no profile row. `schema.sql` says so over that very policy. So the
+ * browser never deletes a row itself: it asks this function, which removes the
+ * login with the service key and lets `on delete cascade` take the row (and the
+ * exams, submissions and incident logs hanging off it) with it.
+ */
+export const DELETE_ACCOUNT_FUNCTION = "admin-delete-user";
+
+/**
  * Supabase Auth's default minimum, mirrored by the Edge Function so the form's
  * message and the API's agree.
  */
@@ -23,6 +39,16 @@ export const MIN_PASSWORD_LENGTH = 6;
 
 /** Outcome of a roster write. A refusal always carries its sentence. */
 export type AccountWriteResult = { ok: true } | { ok: false; message: string };
+
+/**
+ * Outcome of a deletion. Separate from `AccountWriteResult` because a success
+ * carries more than "ok": the counts `admin-delete-user` took immediately before
+ * the write, which are what the confirmation sentence reports
+ * (`deletionSummary`).
+ */
+export type DeleteAccountResult =
+  | { ok: true; scope: RemovalScope }
+  | { ok: false; message: string };
 
 export interface NewAccountInput {
   email: string;
@@ -64,26 +90,37 @@ export function useAccounts() {
    * skeleton rows on every write would make the roster flicker while an
    * administrator is reading it.
    */
-  const load = useCallback(async ({ quiet = false }: { quiet?: boolean } = {}) => {
-    if (!quiet) setLoading(true);
+  const load = useCallback(
+    async ({
+      quiet = false,
+    }: { quiet?: boolean } = {}): Promise<ProfileRow[] | null> => {
+      if (!quiet) setLoading(true);
 
-    const { data, error: loadError } = await supabase
-      .from("profiles")
-      .select("*")
-      // Oldest first, like the Flutter roster: the seeded/bootstrap admin — the
-      // account an administrator looks for — stays at the top.
-      .order("created_at", { ascending: true });
+      const { data, error: loadError } = await supabase
+        .from("profiles")
+        .select("*")
+        // Oldest first, like the Flutter roster: the seeded/bootstrap admin — the
+        // account an administrator looks for — stays at the top.
+        .order("created_at", { ascending: true });
 
-    if (loadError) {
-      setError(rosterErrorMessage(loadError));
+      if (loadError) {
+        setError(rosterErrorMessage(loadError));
+        setLoading(false);
+        return null;
+      }
+
+      const rows = (data as ProfileRow[] | null) ?? [];
+      setError(null);
+      setAccounts(rows);
       setLoading(false);
-      return;
-    }
 
-    setError(null);
-    setAccounts((data as ProfileRow[] | null) ?? []);
-    setLoading(false);
-  }, []);
+      // The rows, not just the state: `deleteAccount` takes the *refetched* roster
+      // as its verdict on a 200 — the same reason `changeRole` asks for the written
+      // row back instead of trusting a status code.
+      return rows;
+    },
+    []
+  );
 
   useEffect(() => {
     let active = true;
@@ -157,7 +194,10 @@ export function useAccounts() {
       const { data, error: invokeError } = await invokeCreateAccount(input);
 
       if (invokeError) {
-        return { ok: false, message: await describeFunctionFailure(invokeError) };
+        return {
+          ok: false,
+          message: await describeFunctionFailure(invokeError, createAccountMessage),
+        };
       }
 
       // A 200 carrying `{ error }` (a proxy in front of the function, or an
@@ -178,7 +218,71 @@ export function useAccounts() {
     [load]
   );
 
-  return { accounts, loading, error, reload, changeRole, createAccount };
+  /**
+   * Remove one account for good — the login *and* the row.
+   *
+   * The browser deliberately issues no `DELETE` of its own: `profiles_admin_all`
+   * allows one, and it would remove only the profile, leaving a login that still
+   * signs in to nothing. So the write goes to the `admin-delete-user` Edge
+   * Function, which holds the service key and removes the `auth.users` row, with
+   * the profile (and the exams, submissions and incident logs hanging off it)
+   * following through `on delete cascade`.
+   *
+   * Nothing about the answer is taken on trust. A 200 carrying `{ error }` is a
+   * refusal, not a deletion — a proxy in front of the function, or an older
+   * deployment, can produce one. And as in `changeRole`, the *rows* are the
+   * verdict: the roster is refetched quietly and a row that is still listed is
+   * reported as a failure, because an administrator told an account was deleted
+   * must not find it in the table on the next paint.
+   */
+  const deleteAccount = useCallback(
+    async (accountId: string): Promise<DeleteAccountResult> => {
+      const { data, error: invokeError } = await invokeDeleteAccount(accountId);
+
+      if (invokeError) {
+        return {
+          ok: false,
+          message: await describeFunctionFailure(invokeError, deleteAccountMessage),
+        };
+      }
+      if (
+        data &&
+        typeof data === "object" &&
+        typeof (data as { error?: unknown }).error === "string"
+      ) {
+        return { ok: false, message: deleteAccountMessage(200, data) };
+      }
+
+      // Drop the row on the strength of that 200 — the server has just said the
+      // login is gone — and then let the quiet refetch settle it, which also puts
+      // the row back if the confirmation disagrees with the optimistic removal.
+      setAccounts((previous) =>
+        previous.filter((account) => account.id !== accountId)
+      );
+
+      const rows = await load({ quiet: true });
+      if (rows?.some((account) => account.id === accountId)) {
+        return {
+          ok: false,
+          message:
+            "The server said the account was deleted, but it is still listed. Reload the list and try again.",
+        };
+      }
+
+      return { ok: true, scope: removedCounts(data) };
+    },
+    [load]
+  );
+
+  return {
+    accounts,
+    loading,
+    error,
+    reload,
+    changeRole,
+    createAccount,
+    deleteAccount,
+  };
 }
 
 /** Split out so the two call sites in `createAccount` stay readable. */
@@ -194,17 +298,65 @@ function invokeCreateAccount(input: NewAccountInput) {
 }
 
 /**
+ * The delete call, in one place: the function name and the request body.
+ *
+ * `{ id }` is the shape `admin-delete-user` documents; it also accepts
+ * `account_id` / `accountId`, but a caller with no reason to vary should not.
+ */
+function invokeDeleteAccount(accountId: string) {
+  return supabase.functions.invoke(DELETE_ACCOUNT_FUNCTION, {
+    body: { id: accountId },
+  });
+}
+
+/**
+ * The `removed` counts of a delete response, and zeros for a body that carries
+ * none.
+ *
+ * Zeros are the honest fallback rather than a guess: a deployment that did not
+ * report counts did not *say* how much went with the account, so the confirmation
+ * sentence reports nothing extra instead of inventing a number about data that is
+ * already gone.
+ */
+function removedCounts(data: unknown): RemovalScope {
+  const removed = (
+    data as { removed?: { exams?: unknown; submissions?: unknown } } | null
+  )?.removed;
+
+  return {
+    exams: typeof removed?.exams === "number" ? removed.exams : 0,
+    submissions:
+      typeof removed?.submissions === "number" ? removed.submissions : 0,
+  };
+}
+
+/**
  * Turns a failed `functions.invoke` into the sentence the function wrote.
  *
  * supabase-js answers a non-2xx with an error object carrying the `Response` in
- * `context`, and throws (`FunctionsFetchError`, or a plain network error) only
- * when no response arrived at all — both shapes are read here, so the page
- * never has to know which one happened. The body is read from a `clone()`
- * because a response body can only be consumed once.
+ * `context`, and answers a request that never arrived with `FunctionsFetchError`
+ * — whose `context` is the failed *fetch* (`TypeError: Failed to fetch`), not a
+ * response. Both shapes are read here, so the page never has to know which one
+ * happened. The body is read from a `clone()` because a response body can only
+ * be consumed once.
+ *
+ * `describe` is the function-specific reader (`createAccountMessage` /
+ * `deleteAccountMessage`), which is where the deployment-specific sentence lives:
+ * this helper knows the transport, not which function was called.
  */
-async function describeFunctionFailure(error: unknown): Promise<string> {
-  const context = (error as { context?: Response } | null)?.context;
-  if (context) {
+async function describeFunctionFailure(
+  error: unknown,
+  describe: (status: number, body: unknown) => string
+): Promise<string> {
+  const context = (error as { context?: unknown } | null)?.context;
+
+  // Only a `Response` has a status and a body to read. Both other shapes mean
+  // the request never arrived — `FunctionsFetchError` puts the *transport* error
+  // in `context` (a `TypeError`, so it has neither `clone()` nor `status`) and a
+  // bare throw carries nothing but a message. Reading a status off those would
+  // print "refused the request (undefined)" at someone who is simply offline,
+  // so they are the status-0 case that sentence is written for.
+  if (isResponseLike(context)) {
     let body: unknown = null;
     try {
       body = await context.clone().json();
@@ -215,9 +367,17 @@ async function describeFunctionFailure(error: unknown): Promise<string> {
         body = null;
       }
     }
-    return createAccountMessage(context.status, body);
+    return describe(context.status, body);
   }
 
   const message = (error as { message?: string } | null)?.message;
-  return createAccountMessage(0, message);
+  return describe(0, message);
+}
+
+/** A real `Response`, not the failed fetch `FunctionsFetchError` stores. */
+function isResponseLike(value: unknown): value is Response {
+  const candidate = value as Response | null | undefined;
+  return (
+    typeof candidate?.clone === "function" && typeof candidate.status === "number"
+  );
 }

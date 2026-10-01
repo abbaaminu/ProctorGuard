@@ -122,18 +122,23 @@ export function roleChangeErrorMessage(error: ApiError): string {
 }
 
 /**
- * Why `admin-create-user` did not create the account.
+ * Why an Edge Function did not do what it was asked.
  *
- * The Edge Function answers `{ error: "<sentence for the administrator>" }` and
- * the page shows that body verbatim — it is written for this reader. The status
- * fallbacks exist for the cases where there is no body to read: a relay/fetch
- * failure (`status 0`, the request never arrived), an un-deployed function
- * (404, which is a deployment step rather than a refusal), and a refused caller.
+ * Both functions in `supabase/functions/` answer the same shape —
+ * `{ error: "<sentence written for the administrator>" }` — and the page shows
+ * that body verbatim: it is written for this reader. Only the fallbacks differ
+ * between them, because those are the cases where there is no body to read at
+ * all: a relay/fetch failure (`status 0` — the request never arrived), an
+ * un-deployed function (404, which is a deployment step rather than a refusal),
+ * and a refused caller. That last one has to name the action, hence
+ * `refusedSentence`; the 404 sentence names the function, which is the operator's
+ * instruction either way.
  */
-export function createAccountMessage(
+function edgeFunctionMessage(
   status: number,
   body: unknown,
-  functionName = "admin-create-user"
+  functionName: string,
+  refusedSentence: string
 ): string {
   if (status === 0) {
     return "Could not reach the server. Check your connection and try again.";
@@ -148,9 +153,47 @@ export function createAccountMessage(
     return `The ${functionName} function is not deployed on this project (see supabase/functions/${functionName}).`;
   }
   if (status === 401 || status === 403) {
-    return "Only an administrator can create accounts.";
+    return refusedSentence;
   }
   return `The server refused the request (${status}). Try again.`;
+}
+
+/** Why `admin-create-user` did not create the account. */
+export function createAccountMessage(
+  status: number,
+  body: unknown,
+  functionName = "admin-create-user"
+): string {
+  return edgeFunctionMessage(
+    status,
+    body,
+    functionName,
+    "Only an administrator can create accounts."
+  );
+}
+
+/**
+ * Why `admin-delete-user` did not delete the account.
+ *
+ * The function's own sentences carry the interesting refusals — "You cannot
+ * delete the account you are signed in with" (403, the same lock
+ * `deleteAccountVerdict` applies in the roster), "That account no longer exists"
+ * (404, whose fix is a reload of the list) — and they arrive in the body, so they
+ * are shown as written. The fallbacks matter for the two cases where nothing was
+ * refused: an undeployed function (which is the *operator's* step, hence the
+ * sentence names it) and a request that never arrived.
+ */
+export function deleteAccountMessage(
+  status: number,
+  body: unknown,
+  functionName = "admin-delete-user"
+): string {
+  return edgeFunctionMessage(
+    status,
+    body,
+    functionName,
+    "Only an administrator can delete accounts."
+  );
 }
 
 /**

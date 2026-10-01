@@ -43,10 +43,13 @@ src/
                         useLiveIncidentFeed, useExamSubmissions,
                         useResetSubmission (clear one attempt),
                         useAccountNames (id -> "Aisha Bello"),
-                        useAccounts (roster + role writes)
+                        useAccounts (roster + role writes, and the account
+                        create/delete calls that go through the Edge
+                        Functions)
   lib/incidents.ts     action_type -> label, shared by every incident panel
   lib/roles.ts         the `public.user_role` vocabulary: labels, the admin
-                        test, the role-change verdict and warning
+                        test, and the role-change / account-delete verdicts
+                        and warnings
   lib/api-errors.ts    a server refusal -> a sentence (deployment fault vs
                         account fault), shared by useAuth and useAccounts
   pages/               Login, DashboardOverview, ExamManager,
@@ -125,6 +128,23 @@ control does not know or care which page it was pressed from.
   account** goes through `admin-create-user`, the only way to mint a non-student
   login. See *Role-based rendering* under Design decisions for why nothing else in
   the console is branched on role.
+
+  The roster's last column is **Delete**, one control per row, with the signed-in
+  administrator's own row carrying the explanation instead of the button — the
+  other half of the self-demotion lock, and for the same reason: deleting that row
+  would revoke the page that mints its replacement. The control opens a confirm
+  dialog that names what leaves with the account — by role, a student's attempts
+  and the incident log behind each one, or a member of staff's exams with their
+  questions and every attempt made on them — because this is a delete, not a
+  deactivation. Confirming it goes through `admin-delete-user`, never a `DELETE`
+  from the browser: `profiles_admin_all` would happily delete the *row*, and that
+  leaves a login which still signs in but has no profile. The function removes the
+  `auth.users` row with the service key and everything else follows through
+  `on delete cascade`. On success the row leaves the table immediately and the
+  toast reports what the function counted just before the write ("Chidi Okonkwo
+  was deleted, along with 3 exams and 41 attempts."); a 200 that still lists the
+  account in the refetched roster, or that carries an `error`, is reported as a
+  failure instead of a deletion that did not happen.
 
 ## Loading behaviour (no blocking loaders)
 
@@ -226,6 +246,22 @@ question instead, or create a new exam.
   `profiles_guard_role_change` raises `42501` for anyone below admin, so a fence
   bypassed in devtools still gets a refusal from PostgREST instead of a granted
   write.
+- **Deleting an account is a server-side act, and the console checks its work.**
+  `auth.users` belongs to Supabase Auth, so a `DELETE` on `profiles` — which
+  `profiles_admin_all` allows — would leave the login behind: an account that still
+  signs in and has no profile row, which is the stranded half-account
+  `admin-create-user` rolls back rather than leave. So the browser asks
+  `admin-delete-user` for the whole thing (`supabase functions deploy
+  admin-delete-user`, JWT verification on), and the function re-reads the caller's
+  role with the caller's *own* JWT before it touches the service key — the same
+  two-client pattern as the create function, and the reason a request typed
+  straight at the API cannot delete anything. It refuses a self-delete with a 403
+  (the server-side half of `deleteAccountVerdict`) and removes the login first,
+  because that is what makes the row — and the exams, submissions and incident
+  logs hanging off it — follow through `on delete cascade`. The console then
+  believes none of it on trust: `useAccounts.deleteAccount` treats a 200 carrying
+  `{ error }` as a refusal and refetches the roster as the verdict, so a row that
+  is still listed is reported as a failure.
 - **Empty is not an error.** Every panel distinguishes "nothing has happened yet"
   from "the read failed": the roster, the incident feed and the dashboard all
   surface the underlying message with a retry instead of an empty list.

@@ -12,11 +12,11 @@ proctor/
   supabase/
     schema.sql  Single source of truth for both apps: tables, RLS
                 policies, and RPCs. Run this once per environment.
-    functions/  admin-create-user — the Edge Function that creates staff
-                logins. It is the only place a service_role key is used,
-                and it never leaves Supabase's servers. The
-                `tsconfig.json` / `package.json` beside it are dev-only:
-                types for the editor, not part of a deployment.
+    functions/  admin-create-user and admin-delete-user — the Edge Functions
+                that mint and remove staff logins. They are the only place a
+                service_role key is used, and it never leaves Supabase's
+                servers. The `tsconfig.json` / `package.json` beside them are
+                dev-only: types for the editor, not part of a deployment.
 ```
 
 Roles live in the `public.user_role` enum: `student`, `lecturer`, `supervisor`
@@ -30,12 +30,13 @@ footer's **Sign out**, which ends the session and puts the login form back.
 1. Create a Supabase project, run `supabase/schema.sql` in its SQL editor,
    then optionally `supabase/seed.sql` to load demo users, exams and
    questions (see the header of that file for the demo logins).
-2. Deploy the account-creation function — `supabase functions deploy
-   admin-create-user` (needs the Supabase CLI linked to the project, or paste
-   `supabase/functions/admin-create-user/index.ts` into the dashboard's Edge
-   Functions editor). `SUPABASE_URL`, `SUPABASE_ANON_KEY` and
-   `SUPABASE_SERVICE_ROLE_KEY` are injected automatically, so there is nothing
-   to configure; without it only the seeded logins exist.
+2. Deploy the account functions — `supabase functions deploy admin-create-user`
+   and `supabase functions deploy admin-delete-user` (needs the Supabase CLI
+   linked to the project, or paste each `supabase/functions/<name>/index.ts`
+   into the dashboard's Edge Functions editor). `SUPABASE_URL`,
+   `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` are injected
+   automatically, so there is nothing to configure; without them only the seeded
+   logins exist, and neither app can add or remove an account.
 3. Mobile: see `mobile/README.md` (`flutter pub get`, then `flutter run
    --dart-define=SUPABASE_URL=... --dart-define=SUPABASE_ANON_KEY=...`).
 4. Dashboard: see `dashboard/README.md` (`npm install`, copy
@@ -77,6 +78,16 @@ it. Beyond that:
       reaches a client. Skip it and the Admin Dashboard says so — the repository
       turns the 404 into "The admin-create-user function is not deployed on this
       project" instead of pretending the create failed.
+- [ ] **Deploy `admin-delete-user`** (`supabase functions deploy admin-delete-user`).
+      It is the only way to remove an account *and* its login: a `DELETE` sent
+      from a client is allowed by `profiles_admin_all` on the row, which leaves
+      the `auth.users` row behind — a login that still signs in and has no
+      profile. Like the create function it re-reads the caller's role with the
+      caller's own JWT, refuses a self-delete with a `403`, and only then uses the
+      `service_role` key; the profile, exams, questions, submissions and incident
+      logs all follow the login through `on delete cascade`. Skip it and the
+      console answers "The admin-delete-user function is not deployed on this
+      project" instead of pretending the account was deleted.
 - [ ] **Client keys only.** Dashboard: `VITE_SUPABASE_URL` +
       `VITE_SUPABASE_ANON_KEY`. Mobile: `SUPABASE_URL` +
       `SUPABASE_PUBLISHABLE_KEY` (via `mobile/run_app.ps1` / `build_apk.ps1`).
