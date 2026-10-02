@@ -1,0 +1,351 @@
+﻿00:00 +0: loading C:/Users/ABBA AMINU/ProctorGuard/mobile/test/afk_watcher_test.dart
+00:00 +0: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: AndroidManifest.xml does not back the session up off the device
+00:00 +1: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: AndroidManifest.xml declares no system-overlay permission
+00:00 +2: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: AndroidManifest.xml keeps the permissions the exam actually needs
+00:00 +3: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: AndroidManifest.xml pins the exam activity and points it at the network policy
+00:00 +4: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: network security config denies cleartext everywhere except loopback
+00:00 +5: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: release build shrinks and keeps the face detector alive
+00:00 +6: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: release build ships the detector models uncompressed
+00:00 +7: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: release build cannot be signed with the debug key by accident
+00:00 +8: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: release build the keystore and the file that unlocks it are git-ignored
+00:00 +9: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: MainActivity.kt blocks screenshots for the duration of a pinned exam
+00:00 +10: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: MainActivity.kt re-pins the exam when the platform dropped the pin
+00:00 +11: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/android_manifest_contract_test.dart: MainActivity.kt answers the channel names and methods the Dart side calls
+00:02 +12: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/afk_watcher_test.dart: nothing is reported while the device is still being touched
+00:02 +13: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/afk_watcher_test.dart: one idle episode is reported exactly once
+00:02 +14: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/afk_watcher_test.dart: coming back re-arms the watcher for a second episode
+00:02 +15: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/afk_watcher_test.dart: a keystroke counts as activity even outside a text field
+00:02 +16: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/afk_watcher_test.dart: stop() releases the timer, and start() re-arms it
+00:02 +17: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/afk_watcher_test.dart: start() is idempotent, so a retried bootstrap cannot double-report
+00:02 +18: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioNoiseDetector the room is measured with a median, so a cough cannot skew it
+00:04 +19: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioNoiseDetector the threshold follows the room, clamped so neither end is silly
+00:04 +20: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioNoiseDetector a level held above the threshold is one strike
+00:04 +21: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioNoiseDetector one dip below the threshold restarts the window
+00:04 +22: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioNoiseDetector the cooldown keeps one long outburst to one strike
+00:04 +23: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioNoiseDetector a misbehaving source cannot corrupt the calibration
+00:04 +24: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioNoiseDetector reset() forgets the room, the episode and the cooldown
+00:04 +25: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a refused microphone is a state, not an exception
+00:04 +26: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a device that will not open is reported as unavailable
+ProctorGuard audio: could not open the microphone: Bad state: device busy
+00:04 +27: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a platform with no capture path says so instead of pretending
+00:04 +28: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a build with AUDIO_MONITORING=false never opens the device
+00:04 +29: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor levels are the proof of life: monitoring only once one arrives
+00:04 +30: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a restart clears the peak of the session that just ended
+00:04 +31: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a device that never reports a level is not called monitoring
+00:04 +32: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a capture stream that fails mid-session is interrupted
+ProctorGuard audio: level stream failed: Bad state: device gone
+00:04 +33: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor the stream ending is the headset-unplugged case
+00:04 +34: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a source that never releases cannot strand the reconnect
+ProctorGuard audio: the session did not release within 0:00:00.040000
+00:04 +35: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a restart does not leave a second listener behind
+ProctorGuard audio: level stream failed: Bad state: device gone
+00:04 +36: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a teardown during the permission prompt never opens the device
+00:04 +37: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a teardown while the device is opening leaves no session behind
+00:04 +38: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitor a stop after teardown does not reach into the released source
+00:04 +39: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitoringNotifier a sustained loud room reports one violation; a blip reports none
+00:04 +40: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitoringNotifier the rendered state tracks the device, and a retry reopens it
+00:04 +41: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/audio_monitoring_test.dart: AudioMonitoringNotifier a blocked microphone reaches the UI as a state, not a crash
+00:05 +42: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_lifecycle_observer_test.dart: one violation per background episode, none for returning
+00:05 +43: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_lifecycle_observer_test.dart: a detached engine is not the student leaving the app
+00:05 +44: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_lifecycle_observer_test.dart: attach and detach pair around a session
+00:07 +45: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+00:14 +46: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+00:15 +47: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+00:15 +48: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+00:15 +49: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+00:16 +50: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+00:16 +51: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+00:16 +52: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+00:16 +53: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+00:17 +54: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+00:17 +55: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+ProctorGuard: answer still queued (SocketException: network is unreachable)
+00:17 +56: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) an offline save is kept, announced, and synced on recovery
+00:17 +57: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/hardware_gate_test.dart: the platform note is a copy: the probe results are untouched
+00:17 +58: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) a typed answer survives the trip and the queue
+00:17 +59: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) a typed answer survives the trip and the queue
+00:17 +59: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/hardware_gate_test.dart: the real verifier blocks instead of throwing when the platform has no camera plugin
+PermissionService: camera status failed: MissingPluginException(No implementation found for method checkPermissionStatus on channel flutter.baseflow.com/permissions/methods)
+PermissionService: microphone status failed: MissingPluginException(No implementation found for method checkPermissionStatus on channel flutter.baseflow.com/permissions/methods)
+ProctorGuard hardware: camera enumeration failed: MissingPluginException(No implementation found for method availableCameras on channel plugins.flutter.io/camera)
+00:17 +60: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) a typed answer survives the trip and the queue
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+ProctorGuard: answer still queued (SocketException: network is unreachable)
+00:18 +61: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: offline resilience (requirement 1) a resumed attempt paints what the device already holds
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:18 +62: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: fullscreen enforcement (requirement 3) leaving fullscreen counts down instead of logging at once
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:19 +63: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: fullscreen enforcement (requirement 3) staying out of fullscreen costs exactly one strike
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:19 +64: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: browser lockdown (requirement 4) the attempt runs with the DOM lockdown armed
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:19 +65: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: browser lockdown (requirement 4) a blocked copy is logged as copy_paste_attempt
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:19 +66: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: browser lockdown (requirement 4) a suppressed menu and a devtools panel are separate strikes
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:19 +67: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: browser lockdown (requirement 4) a log the server refuses cannot hold the attempt open
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+ProctorGuard: violation queued for retry (copy_paste_attempt): SocketException: network is unreachable
+ProctorGuard: violation still queued (SocketException: network is unreachable)
+ProctorGuard: violation still queued (SocketException: network is unreachable)
+ProctorGuard: violation still queued (SocketException: network is unreachable)
+ProctorGuard: 1 of 1 proctoring log(s) still queued as the attempt closes - they will be delivered on the next connection.
+00:21 +68: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: blocking states a session that cannot be proctored offers retry and leave
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+PermissionService: camera status did not answer within 0:00:02.000000
+ProctorGuard integrity: no answer within 3s ΓÇö reporting nothing rather than holding the exam
+PermissionService: microphone status did not answer within 0:00:02.000000
+ProctorGuard: could not confirm camera and microphone access ΓÇö continuing with the camera plugin.
+00:22 +69: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: blocking states retry re-runs the bootstrap and stays escapable
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+PermissionService: camera status did not answer within 0:00:02.000000
+ProctorGuard integrity: no answer within 3s ΓÇö reporting nothing rather than holding the exam
+PermissionService: microphone status did not answer within 0:00:02.000000
+ProctorGuard: could not confirm camera and microphone access ΓÇö continuing with the camera plugin.
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+PermissionService: camera status did not answer within 0:00:02.000000
+ProctorGuard integrity: no answer within 3s ΓÇö reporting nothing rather than holding the exam
+PermissionService: microphone status did not answer within 0:00:02.000000
+ProctorGuard: could not confirm camera and microphone access ΓÇö continuing with the camera plugin.
+00:22 +70: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: questions numbers every question and saves a tapped option
+00:22 +71: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: questions numbers every question and saves a tapped option
+00:22 +72: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: questions numbers every question and saves a tapped option
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:22 +73: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/hardware_integrity_service_test.dart: check() a missing handler is "cannot see", not "clean"
+00:22 +74: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/hardware_integrity_service_test.dart: check() a partial reply from an older host reads as not found
+00:22 +75: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: questions Next and Previous move between questions without scrolling
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:23 +76: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/hardware_integrity_service_test.dart: startMonitoring() reports a display when it appears, once per episode
+00:23 +77: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: questions renders a text field for fill-in-the-blank and saves it
+00:23 +78: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: questions renders a text field for fill-in-the-blank and saves it
+00:23 +79: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: questions renders a text field for fill-in-the-blank and saves it
+00:23 +80: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: questions renders a text field for fill-in-the-blank and saves it
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:23 +81: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: questions submitting flushes an unsaved text answer first
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:23 +82: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: questions fits a small phone viewport without overflowing
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:24 +83: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: questions fits a desktop browser viewport
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:24 +84: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: audio proctoring the microphone state is always on screen
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:24 +85: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: audio proctoring a lost microphone prompts to reconnect instead of going quiet
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+ProctorGuard audio: level stream failed: Bad state: device gone
+00:25 +86: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: audio proctoring tapping a lost microphone reopens it
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+ProctorGuard audio: level stream failed: Bad state: device gone
+00:25 +87: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/exam_taking_page_test.dart: audio proctoring a refused microphone offers the OS settings page
+ProctorGuard kiosk: not pinned ΓÇö Kiosk mode is Android-only, or the activity could not be pinned.
+00:25 +88: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/kiosk_service_test.dart: startLock / stopLock pins the app and reports device-owner strictness
+00:25 +89: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/kiosk_service_test.dart: startLock / stopLock flags best-effort screen pinning when the app is not whitelisted
+00:25 +90: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/kiosk_service_test.dart: startLock / stopLock refused pinning comes back as granted: false with a reason
+00:25 +91: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/kiosk_service_test.dart: startLock / stopLock degrades instead of throwing when no platform handler exists
+00:25 +92: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/kiosk_service_test.dart: startLock / stopLock stopLock unpins without being reported as an escape
+00:26 +93: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/kiosk_service_test.dart: startLock / stopLock a bridge that never answers cannot hang the exam bootstrap
+00:30 +94: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation empty fields block the call and say what is missing
+00:30 +95: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation empty fields block the call and say what is missing
+00:30 +96: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation empty fields block the call and say what is missing
+00:30 +97: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation empty fields block the call and say what is missing
+00:30 +98: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation empty fields block the call and say what is missing
+00:30 +99: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation empty fields block the call and say what is missing
+00:30 +100: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation empty fields block the call and say what is missing
+00:30 +101: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation empty fields block the call and say what is missing
+00:30 +102: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation empty fields block the call and say what is missing
+00:30 +103: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/kiosk_service_test.dart: escape detection dispose stops polling and closes the stream
+00:30 +104: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation whitespace-only fields count as empty
+00:30 +105: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation whitespace-only fields count as empty
+00:31 +106: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation whitespace-only fields count as empty
+00:31 +107: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: validation whitespace-only fields count as empty
+00:31 +108: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: sign-in trims the credentials and shows progress while waiting
+00:32 +109: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors a wrong password is reported in a SnackBar
+00:32 +110: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfirmed email gets its own message
+00:32 +111: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors a failure with no message still explains itself
+00:33 +112: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/mediapipe_proctoring_service_test.dart: estimateHeadPose returns ~0/0 when the nose sits centred between the eyes
+00:33 +113: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +114: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +115: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +116: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +117: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +118: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +119: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +120: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +121: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +122: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +123: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +124: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +125: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +126: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +127: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +128: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +129: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +130: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +131: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +132: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: errors an unconfigured build reports the setup problem
+00:33 +133: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/login_page_test.dart: role gate a ready build with no session shows the sign-in form
+00:34 +134: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/mock_camera_test.dart: mock camera feed alternates no_face / looking_away on its interval
+00:35 +135: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/mock_camera_test.dart: mock camera feed is off by default (no dart-define, no timer)
+00:35 +136: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/mock_camera_test.dart: violation snapshots uploads a frame and attaches its URL to the logged violation
+00:35 +137: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/mock_camera_test.dart: violation snapshots logs the violation (without a URL) when capture yields nothing
+00:36 +138: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: answer cache a tapped answer is durable before the network is asked
+ProctorGuard: answer still queued (offline)
+00:36 +139: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: answer cache the queue drains when the connection comes back
+ProctorGuard: answer still queued (offline)
+00:36 +140: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: answer cache a failed delivery is retried by the backoff, with no help
+ProctorGuard: answer still queued (offline)
+00:36 +141: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: answer cache a row the server keeps refusing does not block the rows behind it
+ProctorGuard: answer still queued (offline)
+ProctorGuard: answer still queued (offline)
+ProctorGuard: answer still queued (offline)
+00:36 +142: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: answer cache re-answering replaces the pending row instead of queueing twice
+ProctorGuard: answer still queued (offline)
+ProctorGuard: answer still queued (offline)
+00:36 +143: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: answer cache a keystroke is cached without queueing a network write
+00:36 +144: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: answer cache a fresh service on the same device restores drafts and queue
+ProctorGuard: answer still queued (offline)
+ProctorGuard: answer still queued (offline)
+ProctorGuard: answer still queued (offline)
+00:36 +145: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: answer cache clearSession drops the attempt, clearSession keeps violations
+ProctorGuard: violation queued for retry (app_minimized): offline
+00:36 +146: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: answer cache corrupt storage is dropped, not fatal
+ProctorGuard: dropping an unreadable offline queue (FormatException: Unexpected character (at character 2)
+{not json
+ ^
+)
+00:36 +147: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: violation outbox (requirement 4) a violation that cannot be delivered is queued, not lost
+ProctorGuard: violation queued for retry (looking_away): offline
+00:36 +148: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: violation outbox (requirement 4) the retry replays the same event id and reports the ruling
+ProctorGuard: violation queued for retry (no_face): offline
+00:36 +149: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: violation outbox (requirement 4) a third strike delivered late still ends the attempt
+ProctorGuard: violation queued for retry (multiple_faces): offline
+00:36 +150: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: violation outbox (requirement 4) the queue is bounded, newest evidence kept
+ProctorGuard: violation queued for retry (audio_noise): offline
+ProctorGuard: violation queued for retry (audio_noise): offline
+ProctorGuard: violation queued for retry (audio_noise): offline
+ProctorGuard: violation queue full - dropped audio_noise from sub-1
+ProctorGuard: violation queued for retry (audio_noise): offline
+ProctorGuard: violation queue full - dropped audio_noise from sub-1
+00:36 +151: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: network probe an "online" event drains a queue that was waiting
+ProctorGuard: answer still queued (offline)
+00:36 +152: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: network probe an "offline" event flips the banner before anything fails
+00:36 +153: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: client event ids uuidV4 has the v4 shape
+00:36 +154: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/offline_sync_service_test.dart: client event ids uuidV4 does not repeat itself
+00:37 +155: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/permission_service_test.dart: platform support rules Android-only overlay permission is skipped on web
+00:37 +156: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/permission_service_test.dart: platform support rules camera and microphone are supported on web
+00:37 +157: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/permission_service_test.dart: requestAll never throws returns one safe fallback result per permission
+PermissionService: camera request failed (not supported on this platform): MissingPluginException(No implementation found for method requestPermissions on channel flutter.baseflow.com/permissions/methods)
+PermissionService: microphone request failed (not supported on this platform): MissingPluginException(No implementation found for method requestPermissions on channel flutter.baseflow.com/permissions/methods)
+PermissionService: systemAlertWindow request failed (not supported on this platform): MissingPluginException(No implementation found for method requestPermissions on channel flutter.baseflow.com/permissions/methods)
+00:37 +158: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/permission_service_test.dart: requestAll never throws critical-permission helpers degrade instead of throwing
+PermissionService: camera status failed: MissingPluginException(No implementation found for method checkPermissionStatus on channel flutter.baseflow.com/permissions/methods)
+PermissionService: camera status failed: MissingPluginException(No implementation found for method checkPermissionStatus on channel flutter.baseflow.com/permissions/methods)
+PermissionService: microphone status failed: MissingPluginException(No implementation found for method checkPermissionStatus on channel flutter.baseflow.com/permissions/methods)
+00:37 +159: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/permission_service_test.dart: PermissionResult is granted only for a granted status
+00:37 +160: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/permission_service_test.dart: PermissionResult flags skipped, platform-only permissions as not applicable
+00:39 +161: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: kiosk escape a lock task escape is logged as app_minimized
+00:39 +162: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: audio noise hook a classified strike is logged as audio_noise
+00:39 +163: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: audio noise hook the notifier declares no second noise rule
+00:39 +164: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: audio noise hook repeats inside the debounce window are one violation
+00:39 +165: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: 3-strike escalation a server-side disqualification ends the session and forces exit
+00:39 +166: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: 3-strike escalation the third strike auto-disqualifies
+00:41 +167: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: 3-strike escalation the third strike auto-disqualifies
+00:41 +168: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: 3-strike escalation the third strike auto-disqualifies
+00:41 +169: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: 3-strike escalation the third strike auto-disqualifies
+00:41 +170: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: 3-strike escalation the third strike auto-disqualifies
+00:43 +171: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: 3-strike escalation the third strike auto-disqualifies
+00:43 +172: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: student role an ongoing attempt opens the session with both ids
+00:44 +173: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: student role an ongoing attempt opens the session with both ids
+00:44 +174: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: student role an ongoing attempt opens the session with both ids
+00:44 +175: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: student role an ongoing attempt opens the session with both ids
+00:44 +176: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: student role an ongoing attempt opens the session with both ids
+00:44 +177: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: student role an ongoing attempt opens the session with both ids
+00:44 +178: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: student role an ongoing attempt opens the session with both ids
+00:44 +179: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: browser lockdown + device signals the debounce is per type, not per session
+00:44 +180: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: browser lockdown + device signals the debounce is per type, not per session
+00:44 +181: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: browser lockdown + device signals the debounce is per type, not per session
+00:44 +182: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: browser lockdown + device signals the debounce is per type, not per session
+00:44 +183: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: browser lockdown + device signals the debounce is per type, not per session
+00:44 +184: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: browser lockdown + device signals the debounce is per type, not per session
+00:45 +185: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: browser lockdown + device signals the debounce is per type, not per session
+00:45 +186: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: browser lockdown + device signals the debounce is per type, not per session
+00:45 +187: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: browser lockdown + device signals the debounce is per type, not per session
+00:46 +188: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role lands on the admin dashboard, not the staff console
+00:46 +189: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role lands on the admin dashboard, not the staff console
+00:46 +190: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role lands on the admin dashboard, not the staff console
+00:46 +191: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role lands on the admin dashboard, not the staff console
+00:46 +192: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role lands on the admin dashboard, not the staff console
+00:46 +192: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/proctoring_notifier_test.dart: disqualification without a backend a third strike locks the student out even when the write fails
+ProctoringNotifier: could not persist the disqualification of sub-1 (Bad state: network is unreachable) ΓÇö exiting anyway.
+00:46 +193: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role lands on the admin dashboard, not the staff console
+00:46 +194: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role lands on the admin dashboard, not the staff console
+00:46 +195: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role lands on the admin dashboard, not the staff console
+00:46 +196: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role lands on the admin dashboard, not the staff console
+00:46 +197: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role the signed-in admin is listed but cannot re-role themselves
+00:46 +198: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role re-roling a row goes through the repository
+00:47 +199: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/role_routing_test.dart: admin role a refused roster is reported with a retry
+00:48 +200: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: register_violation RPC payload sends exactly the schema argument names and maps the result
+00:50 +201: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: register_violation RPC payload reports the third strike as disqualified
+00:50 +202: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: register_violation RPC payload every ViolationType maps to an allowed action_type
+00:50 +203: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: register_violation RPC payload fromDb is the exact inverse, so a queued row is never dropped
+00:50 +204: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: register_violation RPC payload schema.sql allows every action_type the client can send
+00:50 +205: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: submit_exam RPC payload submitExam asks the server to grade and close the attempt
+00:50 +206: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: submit_exam RPC payload markDisqualified flags the close so the server never grades
+00:50 +207: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: submit_exam RPC payload closing an attempt never PATCHes exam_submissions directly
+00:50 +208: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: admin profiles contract listAccounts reads profiles oldest-first and maps every row
+00:50 +209: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: admin profiles contract a roster row whose role this build does not know is refused
+00:50 +210: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: admin profiles contract updateRole PATCHes profiles and demands the updated row back
+00:50 +211: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: admin profiles contract an update that matched no row is an error, not a silent success
+00:50 +212: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: admin profiles contract an RLS refusal becomes prose for the administrator
+00:50 +213: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: admin-create-user contract createAccount posts the trimmed payload to the Edge Function
+00:50 +214: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: admin-create-user contract a refused creation keeps the function's own wording
+00:50 +215: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: admin-create-user contract an un-deployed function is explained, not reported as a 404
+00:50 +216: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: admin-create-user contract a 200 that carries `{ error }` is not mistaken for a new account
+00:50 +217: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: role contract the client and the Edge Function agree on the roles and the floor
+00:50 +218: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: role contract schema.sql declares the enum, the column and the policies used
+00:50 +219: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: attempt clock Submission parses started_at so the countdown can be anchored
+00:50 +220: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: attempt clock an unusable started_at is null rather than an exception
+00:50 +221: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: proctor-snapshots upload POSTs JPEG bytes to <submission_id>/<action_type>_<epoch-ms>.jpg
+00:50 +222: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: proctor-snapshots upload snapshotPath is the single source of the path convention
+00:50 +223: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: merge_submission_text_answer RPC payload saveTextAnswer uses the documented argument names
+00:50 +224: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: question shapes QuestionType round-trips the values the check constraint allows
+00:50 +225: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: question shapes an unknown or missing type falls back instead of throwing
+00:50 +226: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: question shapes Question.fromMap reads a fill-in-the-blank row from the safe view
+00:50 +227: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: question shapes a row without question_type (pre-types database) still parses
+00:50 +228: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/schema_contract_test.dart: schema.sql carries the offline-retry contract the log table, the RPC and the dedupe index agree with the client
+00:52 +229: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +230: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +231: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +232: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +233: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +234: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +235: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +236: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +237: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +237: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/supabase_service_test.dart: unconfigured service init reports notConfigured instead of throwing
+SupabaseService: SUPABASE_URL is empty or still the placeholder from the docs.
+00:53 +238: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +239: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +240: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:53 +241: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens unconfigured build shows setup steps instead of a blank page
+00:54 +242: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens failed initialisation is reported
+00:54 +243: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/startup_screens_test.dart: startup screens warns when the runtime refuses local storage
+00:55 +244: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +245: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +246: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +247: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +248: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +249: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +250: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +251: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +252: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +253: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +254: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +255: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +256: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +257: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +258: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +259: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:56 +260: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: shows the current strike count and the violation message
+00:57 +261: C:/Users/ABBA AMINU/ProctorGuard/mobile/test/violation_overlay_test.dart: locks down after the third strike with no continue button
+00:57 +262: All tests passed!

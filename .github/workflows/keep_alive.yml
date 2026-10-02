@@ -13,8 +13,15 @@ jobs:
       - name: Send keep-alive query to Supabase REST API
         run: |
           echo "Sending live query to Supabase..."
-          
-          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X GET "${{ secrets.SUPABASE_URL }}/rest/v1/questions_public?select=id&limit=1" \
+
+          # The probe asks `profiles`, not the student question feed:
+          # `questions_public` is granted to `authenticated` only (schema.sql §3
+          # revokes the blanket grant from `anon`), so the anonymous keep-alive
+          # key gets a 401 there by design. `profiles` answers 200 with an empty
+          # array instead - `anon` has no policy on it, and an empty array is RLS
+          # doing its job rather than a refused query - which is all this needs:
+          # one statement actually executed against the database.
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X GET "${{ secrets.SUPABASE_URL }}/rest/v1/profiles?select=id&limit=1" \
             -H "apikey: ${{ secrets.SUPABASE_KEY }}" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_KEY }}")
 
@@ -29,6 +36,6 @@ jobs:
           if [ "$STATUS" -eq 200 ]; then
             echo "✅ Success: Database activity recorded."
           else
-            echo "❌ Error: API request failed with status $STATUS. Check your RLS or Table Name."
+            echo "❌ Error: API request failed with status $STATUS. Check the project's schema grants (§0/§3 of supabase/schema.sql) and the table name."
             exit 1
           fi

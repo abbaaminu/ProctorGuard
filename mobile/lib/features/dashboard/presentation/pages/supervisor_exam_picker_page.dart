@@ -19,7 +19,7 @@ class SupervisorExamPickerPage extends ConsumerStatefulWidget {
     this.onSignOut,
   });
 
-  /// Greeting name; the gate passes `users.name` ("Dr. Ada Nwosu").
+  /// Greeting name; the gate passes `profiles.full_name` ("Dr. Ada Nwosu").
   final String? supervisorName;
 
   /// Sign-out shown in the app bar (the gate owns the Supabase call).

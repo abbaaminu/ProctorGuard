@@ -113,7 +113,7 @@ class RoleGate extends ConsumerWidget {
   }
 }
 
-/// Shown while `public.users` is being read — deliberately a full screen with a
+/// Shown while `public.profiles` is being read — deliberately a full screen with a
 /// label, since this is the moment between "signed in" and "knows where to go".
 class _ProfileLoading extends StatelessWidget {
   const _ProfileLoading();
@@ -135,7 +135,7 @@ class _ProfileLoading extends StatelessWidget {
   }
 }
 
-/// Role lookup failed (offline, no `users` row, unknown role value). Retryable,
+/// Role lookup failed (offline, no `profiles` row, unknown role value). Retryable,
 /// and always offers a way out.
 class _ProfileError extends StatelessWidget {
   const _ProfileError({

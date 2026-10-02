@@ -329,6 +329,48 @@ void main() {
 
       expect(sync.state.pendingViolations, 2);
     });
+
+    test('a queue restored from disk is bounded to the cap in force', () async {
+      final store = InMemoryKeyValueStore();
+      proctoring.online = false;
+      sync = _service(exams: exams, proctoring: proctoring, store: store);
+
+      // Four rows are written while the bound is the default 200...
+      for (var i = 0; i < 4; i++) {
+        await sync.log(
+          submissionId: 'sub-1',
+          violation: Violation(
+            type: ViolationType.audioNoise,
+            timestamp: DateTime.utc(2026, 3, 4, 9, 15, i),
+            clientEventId: uuidV4(),
+          ),
+        );
+      }
+      await sync.dispose();
+
+      // ...and the app comes back on a build with a tighter bound, the way it would
+      // after a release that lowers the cap.
+      final relaunched = _service(
+        exams: exams,
+        proctoring: proctoring,
+        store: store,
+        maxQueuedViolations: 2,
+      );
+      addTearDown(relaunched.dispose);
+      await relaunched.ensureHydrated();
+
+      expect(relaunched.state.pendingViolations, 2,
+          reason: 'the cap bounds what arrives from disk, not only what is added');
+
+      // The newest evidence is what the cap keeps, and it is what still gets
+      // delivered - the shed rows are the oldest ones.
+      proctoring.online = true;
+      await relaunched.retryNow();
+      expect(
+        proctoring.violations.map((violation) => violation.timestamp.second),
+        <int>[2, 3],
+      );
+    });
   });
 
   group('network probe', () {

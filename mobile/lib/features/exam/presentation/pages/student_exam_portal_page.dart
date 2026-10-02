@@ -46,7 +46,7 @@ class StudentExamPortalPage extends ConsumerStatefulWidget {
     this.onSignOut,
   });
 
-  /// Greeting name; the gate passes `users.name` ("Aisha Bello").
+  /// Greeting name; the gate passes `profiles.full_name` ("Aisha Bello").
   final String? studentName;
 
   /// Defaults to [ExamTakingPage].
@@ -155,7 +155,7 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
 
   @override
   Widget build(BuildContext context) {
-    // Only used to keep the greeting honest if `users.name` is empty.
+    // Only used to keep the greeting honest if `profiles.full_name` is empty.
     final fallback = SupabaseService.instance.currentUser?.email;
 
     return Scaffold(

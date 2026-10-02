@@ -1,12 +1,15 @@
 # iOS: not a target yet, and what has to be true when it becomes one
 
-**There is no iOS project in this repository.** `mobile/ios/` does not exist, and
-`mobile/pubspec.yaml` ships Android + web only (`flutter create --platforms=ios .`
-has never been run here). So there is no `Runner/Info.plist` to harden, and this
-directory holds the checklist instead. Nothing else in the app blocks an iOS target:
-`KioskService` degrades to `KioskResult.unsupported` off Android, `AudioMonitor` and
-the web guards have their own platform seams, and the Supabase/data layer is
-platform-neutral.
+**There is no iOS project in this repository.** `mobile/ios/` exists, but it holds
+only what a Flutter build writes: `Flutter/Generated.xcconfig`,
+`Flutter/flutter_export_environment.sh`, `Flutter/ephemeral/*` and
+`Runner/GeneratedPluginRegistrant.{h,m}`. There is no `Runner.xcodeproj`, no
+`Runner/Info.plist` and no `AppDelegate.swift`, and `mobile/pubspec.yaml` ships
+Android + web only (`flutter create --platforms=ios .` has never been run here).
+This directory holds the checklist instead. Nothing else in the app blocks an iOS
+target: `KioskService` degrades to `KioskResult.unsupported` off Android,
+`AudioMonitor` and the web guards have their own platform seams, and the
+Supabase/data layer is platform-neutral.
 
 Two of the Android guarantees in this repository **cannot be reproduced on iOS**, and
 the decision to ship iOS has to account for them:
@@ -22,6 +25,26 @@ the decision to ship iOS has to account for them:
    into `ios/Runner/Info.plist`.
 
 ```xml
+<!-- The app's identity metadata. `CFBundleDisplayName` is the name under the icon
+     and `CFBundleName` the short one the system uses internally; both are the
+     name the student is told to look for when the app sends them to Settings
+     ("Allow it for ProctorGuard in ...", `lib/core/services/audio_monitor.dart`),
+     so they are the same string as `android:label`, `MaterialApp.title` and the
+     web metadata (`AndroidManifest.xml`, `lib/main.dart`, `web/index.html`,
+     `web/manifest.json`) - `test/android_manifest_contract_test.dart` pins all of
+     them together.
+     `CFBundleIdentifier` is the iOS half of the package rename: it has to be the
+     same id as the Android `applicationId` in `android/app/build.gradle.kts`,
+     because that id is the app's data directory, its granted permissions and its
+     upgrade path. `flutter create`'s placeholder (`com.example.exam_proctor`) is
+     refused by the store and collides with any other `flutter create` build. -->
+<key>CFBundleDisplayName</key>
+<string>ProctorGuard</string>
+<key>CFBundleName</key>
+<string>ProctorGuard</string>
+<key>CFBundleIdentifier</key>
+<string>com.stackbuildco.proctorguard</string>
+
 <!-- The camera and microphone are the proctoring session itself; without these
      strings iOS terminates the app the moment it asks for access. -->
 <key>NSCameraUsageDescription</key>
@@ -54,8 +77,15 @@ sustained noise. No audio is recorded or stored.</string>
 
 ## Verified from this repository
 
-- `mobile/pubspec.yaml` declares no iOS-specific dependency, and no `ios/` directory is
-  tracked (`git ls-files mobile/ios` is empty).
+- `mobile/pubspec.yaml` declares no iOS-specific dependency, and
+  `git ls-files mobile/ios` returns only Flutter-generated files
+  (`Flutter/Generated.xcconfig`, `Flutter/flutter_export_environment.sh`,
+  `Flutter/ephemeral/*`, `Runner/GeneratedPluginRegistrant.{h,m}`) plus this README:
+  no Xcode project, so no `Info.plist` holding the identity keys above yet - and
+  nothing in the repository silently relying on the `flutter create` placeholder
+  bundle id either (the Android half was renamed to `com.stackbuildco.proctorguard`
+  in `android/app/build.gradle.kts`, and it is the id `CFBundleIdentifier` has to
+  match on the day the target is created).
 - The Supabase session policy (`allowBackup="false"` on Android) has an iOS analogue to
   configure when the target lands: `isExcludedFromBackup` on the keychain item, so the
   refresh token does not travel to a new device through iCloud Keychain.

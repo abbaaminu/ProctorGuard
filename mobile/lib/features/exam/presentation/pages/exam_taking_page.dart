@@ -1181,7 +1181,10 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     // attempt closes, so blocking an otherwise finished student on evidence
     // delivery would let one log row the server refuses strand them for good
     // (see [SyncState.hasPendingAnswers]).
-    if (!sync.state.hasPendingAnswers) return true;
+    if (!sync.state.hasPendingAnswers) {
+      await _drainViolationsBeforeClose(sync);
+      return true;
+    }
     if (!mounted) return false;
 
     setState(() {
@@ -1190,6 +1193,40 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       _offlineSubmitPending = !timeUp;
     });
     return false;
+  }
+
+  /// One last, backoff-free push of the violation queue, while the session screen
+  /// is still alive to make it.
+  ///
+  /// `register_violation` counts a log that arrives after the attempt closed, so
+  /// this is not about the window about to end - it is about the queue's own
+  /// durability. The retry backoff and the queue's timers only run while the app
+  /// runs, and the student's next move is to close the exam (possibly the app):
+  /// whatever `flush()` above could not place - the pass before it may have given
+  /// up after [OfflineSyncService.maxPassFailures] rows - would then wait for the
+  /// next launch to be delivered, i.e. possibly never. `retryNow()` drops the
+  /// backoff for this one attempt at the network.
+  ///
+  /// It is deliberately best-effort: evidence that cannot be delivered is a
+  /// weaker console signal, but it is not the student's to fix and no retry the
+  /// student can perform would change it, which is why the hold above is on
+  /// answers only.
+  Future<void> _drainViolationsBeforeClose(OfflineSyncService sync) async {
+    final queued = sync.state.pendingViolations;
+    if (queued == 0) return;
+
+    await sync.retryNow();
+
+    final left = sync.state.pendingViolations;
+    if (left > 0) {
+      // Never silently: this is the one proctoring signal that can be missing
+      // from a closed attempt's audit, and a support engineer has to be able to
+      // see that it was the connection and not the session.
+      debugPrint(
+        'ProctorGuard: $left of $queued proctoring log(s) still queued as the '
+        'attempt closes - they will be delivered on the next connection.',
+      );
+    }
   }
 
   /// The "waiting for a connection" screen's retry: drain the queue and, when it

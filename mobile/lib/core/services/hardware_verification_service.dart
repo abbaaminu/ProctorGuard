@@ -59,6 +59,7 @@ class HardwareReport {
     required this.microphone,
     this.mock = false,
     this.settingsHint = false,
+    this.faceDetectionInactive = false,
   });
 
   /// Both devices mid-flight (the gate's first frame).
@@ -79,6 +80,32 @@ class HardwareReport {
   /// True when a refused **permission** caused this report, so the gate also
   /// offers "Open settings" (Android/iOS stop prompting after a denial).
   final bool settingsHint;
+
+  /// True when this report comes from a platform whose on-device face detector
+  /// does not exist — the web, because Google ML Kit has no browser
+  /// implementation (the same limitation `PermissionService`'s platform notes
+  /// describe).
+  ///
+  /// The camera and microphone probes are one code path on every platform, so
+  /// this is the only thing that tells the gate apart: on the web [isVerified]
+  /// can be true — a browser camera is a real camera — while no attempt started
+  /// here will flag faces automatically. A student is entitled to know that
+  /// before the exam rather than from a proctoring report afterwards: the exam
+  /// screen keeps recording what the camera sees, it just cannot pick a face out
+  /// of it, so the review is a person's, in full.
+  final bool faceDetectionInactive;
+
+  /// The same report, marked [faceDetectionInactive]. How the platform
+  /// independent probe's result reaches the gate — kept as a copy rather than a
+  /// constructor argument so [DeviceHardwareVerifier.verify] can apply it once,
+  /// on the way out, instead of at each of the probe's exits.
+  HardwareReport withFaceDetectionInactive() => HardwareReport(
+        camera: camera,
+        microphone: microphone,
+        mock: mock,
+        settingsHint: settingsHint,
+        faceDetectionInactive: true,
+      );
 
   /// The only state that unlocks "Start Exam".
   bool get isVerified => camera.isVerified && microphone.isVerified;
@@ -193,6 +220,20 @@ class DeviceHardwareVerifier implements HardwareVerifier {
       );
   @override
   Future<HardwareReport> verify() async {
+    final report = await _probe();
+
+    // The one platform note, applied here rather than inside the probe: it is a
+    // property of the platform and not of how the probe ended, so every exit
+    // below (a denied permission, a refused getUserMedia, a camera that never
+    // answered) reaches the gate with it already on. A mock build is skipped —
+    // MOCK_CAMERA already says nothing here is proctored, and it is the
+    // documented way to run on the web.
+    if (!kIsWeb || report.mock) return report;
+    return report.withFaceDetectionInactive();
+  }
+
+  /// The probe itself: permissions, then a live capture session.
+  Future<HardwareReport> _probe() async {
     // Explicit opt-in only (`--dart-define=MOCK_CAMERA=true`). Not a fallback:
     // without the define this branch is dead code, so a real build can never end
     // up "verifying" simulated hardware.

@@ -146,7 +146,10 @@ class _LoginPageState extends State<LoginPage> {
                 ),
                 const SizedBox(height: 12),
                 Text(
-                  'Exam Proctor',
+                  // The wordmark is the app name, so it is the same string as the
+                  // launcher label, `MaterialApp.title` and the web / iOS metadata
+                  // (`android_manifest_contract_test.dart` pins them together).
+                  'ProctorGuard',
                   textAlign: TextAlign.center,
                   style: theme.textTheme.headlineSmall,
                 ),

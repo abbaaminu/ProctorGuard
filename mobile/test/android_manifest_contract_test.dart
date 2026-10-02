@@ -4,6 +4,12 @@ import 'package:exam_proctor/core/services/hardware_integrity_service.dart';
 import 'package:exam_proctor/core/services/kiosk_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+/// The Kotlin half of the app lives in the app's own package: the rename out of
+/// the `flutter create` placeholder is pinned by the `package identity` group
+/// below, which is where the four halves have to agree.
+const String mainActivityPath =
+    'android/app/src/main/kotlin/com/stackbuildco/proctorguard/MainActivity.kt';
+
 /// Pins the Android half of the app's security contract, the same way
 /// `schema_contract_test.dart` pins the Supabase one.
 ///
@@ -19,7 +25,12 @@ import 'package:flutter_test/flutter_test.dart';
 ///  * cleartext denied at the platform layer, with loopback as the only exception;
 ///  * `FLAG_SECURE` for the duration of an exam, and re-pinning on resume;
 ///  * R8 on for release, with the keep rules the face detector needs;
-///  * a release build that can no longer be signed with the public debug key.
+///  * a release build that can no longer be signed with the public debug key;
+///  * the package id the app is installed, upgraded and kept alive under, spelled
+///    the same in Gradle, the manifest, `MainActivity.kt` and the R8 keep rules;
+///  * one app name across the launcher label, the `MaterialApp` title, the web
+///    metadata and the iOS Info.plist checklist, because the app sends the student
+///    to Settings by that name.
 void main() {
   /// Reads a file relative to the package root (`mobile/`, which is the working
   /// directory `flutter test` uses). Null when a checkout does not have it, so the
@@ -114,7 +125,7 @@ void main() {
       // `no_face`, i.e. students disqualified by a shrinker.
       expect(rules, contains('com.google.mlkit'));
       expect(rules, contains('com.google.mediapipe'));
-      expect(rules, contains('com.example.exam_proctor'));
+      expect(rules, contains('com.stackbuildco.proctorguard'));
       expect(rules, contains('io.flutter'));
       expect(rules, contains('SourceFile,LineNumberTable'));
       // The bundled detector's own rules only keep the *fields* of its generated proto
@@ -172,7 +183,7 @@ void main() {
   group('MainActivity.kt', () {
     test('blocks screenshots for the duration of a pinned exam', () {
       final activity =
-          read('android/app/src/main/kotlin/com/example/exam_proctor/MainActivity.kt');
+          read(mainActivityPath);
       if (activity == null) return;
 
       expect(activity, contains('WindowManager.LayoutParams.FLAG_SECURE'));
@@ -188,7 +199,7 @@ void main() {
 
     test('re-pins the exam when the platform dropped the pin', () {
       final activity =
-          read('android/app/src/main/kotlin/com/example/exam_proctor/MainActivity.kt');
+          read(mainActivityPath);
       if (activity == null) return;
 
       // Android drops lock task mode whenever the activity is stopped and never restores
@@ -210,7 +221,7 @@ void main() {
 
     test('answers the channel names and methods the Dart side calls', () {
       final activity =
-          read('android/app/src/main/kotlin/com/example/exam_proctor/MainActivity.kt');
+          read(mainActivityPath);
       if (activity == null) return;
 
       // A rename on either side of a string-keyed bridge fails at runtime, on a student's
@@ -226,6 +237,88 @@ void main() {
       ]) {
         expect(activity, contains('"$method"'), reason: method);
       }
+    });
+  });
+
+  group('package identity', () {
+    test('is the app\'s own id, not the flutter create placeholder', () {
+      final gradle = read('android/app/build.gradle.kts');
+      final rules = read('android/app/proguard-rules.pro');
+      final manifest = read('android/app/src/main/AndroidManifest.xml');
+      if (gradle == null || rules == null || manifest == null) return;
+
+      // `com.example.*` is the template placeholder: Play refuses it outright and it
+      // collides with any other `flutter create` build already on a student's device.
+      // The id is the app's data directory, its granted permissions and its upgrade
+      // path, so it is picked once, before the first deployment - and the four places
+      // that spell it out have to agree, because a half-finished rename fails on a
+      // student's device: a `MainActivity` in the wrong package is an activity the
+      // manifest cannot start, and a stale keep rule is a renamed class R8 strips
+      // (which takes both method channels with it, mid-exam).
+      const id = 'com.stackbuildco.proctorguard';
+
+      expect(gradle, contains('namespace = "$id"'));
+      expect(gradle, contains('applicationId = "$id"'));
+      expect(rules, contains('-keep class $id.**'));
+      expect(manifest, contains('android:name=".MainActivity"'));
+      expect(read(mainActivityPath), isNotNull, reason: mainActivityPath);
+      expect(read(mainActivityPath), contains('package $id'));
+
+      // ...and no file still *declares* the placeholder id, Kotlin half included. What is
+      // matched is the id itself rather than the bare `com.example.` prefix, because the
+      // comment above is allowed to name what it used to be.
+      for (final source in <String?>[
+        gradle,
+        rules,
+        manifest,
+        read(mainActivityPath),
+      ]) {
+        expect(source, isNot(contains('com.example.exam_proctor')));
+      }
+    });
+  });
+
+  group('app name metadata', () {
+    test('every platform the student sees is named the same thing', () {
+      const name = 'ProctorGuard';
+
+      final manifest = read('android/app/src/main/AndroidManifest.xml');
+      final main = read('lib/main.dart');
+      final web = read('web/index.html');
+      final webManifest = read('web/manifest.json');
+      final ios = read('ios/README.md');
+      if (manifest == null ||
+          main == null ||
+          web == null ||
+          webManifest == null ||
+          ios == null) {
+        return;
+      }
+
+      // `android:label` is what the launcher, Settings and the OS permission
+      // dialogs show; `MaterialApp.title` is the task-switcher / browser-tab name.
+      // The app's own refusal copy already tells the student to go and allow
+      // "ProctorGuard" (`audio_monitor.dart`), so a label that disagrees sends
+      // them hunting Settings for an app that is not there under that name.
+      expect(manifest, contains('android:label="$name"'));
+      expect(main, contains("title: '$name'"));
+
+      // The web build is installed as a home-screen app under the same name, and
+      // the iOS checklist has to carry it into `Info.plist` - including the bundle
+      // id, which is the iOS half of the package rename in the group above.
+      expect(web, contains('apple-mobile-web-app-title" content="$name"'));
+      expect(web, contains('<title>$name'));
+      expect(webManifest, contains('"short_name": "$name"'));
+      expect(ios, contains('<key>CFBundleDisplayName</key>'));
+      expect(ios, contains('<string>$name</string>'));
+      expect(ios, contains('<key>CFBundleIdentifier</key>'));
+      expect(ios, contains('com.stackbuildco.proctorguard'));
+
+      // And the *declarations* no longer carry the old name: matched as the
+      // quoted value, so the comments explaining the rename may still name it.
+      expect(manifest, isNot(contains('android:label="Exam Proctor"')));
+      expect(main, isNot(contains("title: 'Exam Proctor'")));
+      expect(ios, isNot(contains('<string>Exam Proctor</string>')));
     });
   });
 }

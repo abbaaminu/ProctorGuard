@@ -39,6 +39,7 @@ class MediaPipeProctoringService {
     this.pitchThresholdDegrees = 30.0,
     this.lookAwayGraceDuration = const Duration(seconds: 3),
     this.noFaceGraceDuration = const Duration(seconds: 3),
+    this.multipleFacesCooldown = const Duration(seconds: 30),
     this.sensorOrientation = 90,
     this.lensDirection = CameraLensDirection.front,
     this.mockCamera = mockCameraFromEnvironment,
@@ -75,6 +76,15 @@ class MediaPipeProctoringService {
   /// emitted (once per episode). This is the time grace period: a blink, a
   /// dropped frame or a hand sweeping past the lens no longer burns a strike.
   final Duration noFaceGraceDuration;
+
+  /// How long the student has to be *alone* in frame before a second person can
+  /// be reported again.
+  ///
+  /// The other end of a multi-face episode: the signal itself is immediate (two
+  /// faces is not something to wait on), and this is what decides that the
+  /// episode is over. See [_multipleFacesFlagged] for why the latch needs a
+  /// boundary at all.
+  final Duration multipleFacesCooldown;
 
   /// Injectable time source, so the grace windows can be exercised in tests
   /// without waiting wall-clock seconds.
@@ -120,6 +130,22 @@ class MediaPipeProctoringService {
   DateTime? _faceMissingSince;
   bool _lookAwayFlagged = false;
   bool _noFaceFlagged = false;
+
+  /// When the most recent two-face frame was seen, and whether the multi-face
+  /// signal has already been reported for the current episode.
+  ///
+  /// [GazeSignal.multipleFaces] has no grace window - two people in frame is
+  /// unambiguous the moment it is seen, and making the student wait three
+  /// seconds to be told would be worse. The episode boundary is the opposite
+  /// condition instead: the latch re-arms only after [multipleFacesCooldown]
+  /// with a single face in frame, measured from the *last* two-face frame, so a
+  /// detector flickering between one and two faces at the edge of the frame
+  /// keeps pushing that boundary out. Without the latch the signal was emitted
+  /// once per inference (~7 a second at [inferenceInterval]) and the server's
+  /// three-strike rule closed the attempt within a second of a guest leaning
+  /// into shot.
+  DateTime? _multipleFacesAt;
+  bool _multipleFacesFlagged = false;
 
   /// Whether the camera stream is actually delivering frames. Flipped by the
   /// exam page through [setStreamActive], so frames that arrive before the
@@ -177,11 +203,17 @@ class MediaPipeProctoringService {
   /// Clears every sustained-window timer and latch. Called when the camera goes
   /// offline (see [setStreamActive]) and whenever the notifier pauses tracking,
   /// so resuming never inherits a half-elapsed grace window.
+  ///
+  /// The multi-face latch goes with them: a feed that comes back with two people
+  /// in front of it is a fresh episode, and carrying the cooldown across the gap
+  /// would hide the guest who arrived while the camera was down.
   void resetSustained() {
     _offCenterSince = null;
     _faceMissingSince = null;
+    _multipleFacesAt = null;
     _lookAwayFlagged = false;
     _noFaceFlagged = false;
+    _multipleFacesFlagged = false;
   }
 
   /// Feed every camera frame here; internal throttling decides whether it
@@ -390,6 +422,11 @@ class MediaPipeProctoringService {
   /// or a visible face) before the same condition can be reported again, so a
   /// blink, a dropped frame, or one glance at the keyboard cannot accumulate
   /// multiple disqualification flags.
+  ///
+  /// [GazeSignal.multipleFaces] is the one condition with no grace window (two
+  /// people in frame needs no measuring), so it is latched instead: one episode,
+  /// and the episode ends only once the student has been alone in frame for
+  /// [multipleFacesCooldown].
   void _handleResult(FaceFrameResult result) {
     // An inference that was already on the wire when the session ended still
     // lands here: `onCameraFrame` fire-and-forgets it (`.then(_handleResult)`), so
@@ -421,11 +458,31 @@ class MediaPipeProctoringService {
     _noFaceFlagged = false;
 
     if (result.faceCount > 1) {
-      // Two people in frame is unambiguous, so it is reported immediately.
+      // Two people in frame is unambiguous, so it is reported immediately
+      // rather than on a grace window - but once per episode, like the
+      // sustained conditions above. One guest leaning into shot is one
+      // violation; the latch is what stops it being one *per inference*, which
+      // is how a single second of it used to reach the server's three-strike
+      // limit and disqualify the attempt.
       _offCenterSince = null;
       _lookAwayFlagged = false;
+      _multipleFacesAt = now;
+      if (_multipleFacesFlagged) return;
+      _multipleFacesFlagged = true;
       _signalController.add(GazeSignal.multipleFaces);
       return;
+    }
+
+    // Exactly one face: the state that *ends* a multi-face episode, once
+    // [multipleFacesCooldown] has passed since the last two-face frame. A
+    // detector flickering between one and two faces at the frame edge keeps
+    // resetting that clock, so it cannot re-arm the latch and re-open the burst.
+    final lastMultipleFaces = _multipleFacesAt;
+    if (_multipleFacesFlagged &&
+        (lastMultipleFaces == null ||
+            now.difference(lastMultipleFaces) >= multipleFacesCooldown)) {
+      _multipleFacesFlagged = false;
+      _multipleFacesAt = null;
     }
 
     final yaw = result.yawDegrees ?? 0;

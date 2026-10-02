@@ -48,6 +48,13 @@
 --      from the SQL editor), which is who creates them here; an object created
 --      by a different role needs its own `alter default privileges ... for
 --      role <that role>`.
+--   4. ... except for the two objects the anonymous key must never reach: step
+--      2 hands `anon` SELECT on `public.questions` and its safe view
+--      `public.questions_public`, because "all privileges on all tables" does
+--      not distinguish between a table a student reads after signing in and the
+--      answer key behind it. Step 4 revokes both. Neither client needs them
+--      anonymously (the view is read with the student's own session) and the
+--      keep-alive ping now asks `profiles` instead.
 --
 -- AFTER RUNNING THIS, CHECK THE STAFF ROW ITSELF. The grants only unblock the
 -- read; a staff login still needs a `profiles` row carrying a staff role:
@@ -83,6 +90,23 @@ alter default privileges in schema public
   grant all privileges on sequences to postgres, anon, authenticated, service_role;
 alter default privileges in schema public
   grant all privileges on functions to postgres, anon, authenticated, service_role;
+
+-- ---------------------------------------------------------------------
+-- 4. ... but not the answer key, with any key but a session
+-- ---------------------------------------------------------------------
+-- Steps 1-3 are exactly what the Data API needs to answer at all, and they are
+-- deliberately blunt: a role needs `select` on the *object* before row security
+-- is consulted, so they cannot be narrowed per table. Two tables in this schema
+-- are not "an object": `questions` holds `correct_option` /
+-- `correct_text_answer`, and `questions_public` is the view that exists to strip
+-- them. Both are read with a signed-in student's session (`select` for
+-- `authenticated` below, i.e. the view's own grant in `schema.sql` §3), so the
+-- anonymous key has no reason to reach either, and holding this privilege is
+-- what would let a future policy mistake in §0's blanket grant turn into a real
+-- leak. Idempotent, like everything else here: revoking an absent privilege is a
+-- no-op.
+revoke all on public.questions_public from anon;
+revoke all on public.questions        from anon;
 
 -- ---------------------------------------------------------------------
 -- VERIFY

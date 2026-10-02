@@ -14,7 +14,7 @@ class ProfileLookupException implements Exception {
 }
 
 abstract class ProfileRepository {
-  /// Reads `public.users` for [userId] (the **auth** user id).
+  /// Reads `public.profiles` for [userId] (the **auth** user id).
   ///
   /// Throws [ProfileLookupException] when there is no row, the role is
   /// unrecognised, or the backend refuses — the gate renders that as a

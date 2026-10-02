@@ -241,6 +241,41 @@ void main() {
     expect(startEnabled(tester), isTrue);
   });
 
+  testWidgets('a web attempt is told face detection is inactive, and still '
+      'starts', (tester) async {
+    await pushGate(
+      tester,
+      _FakeVerifier(<HardwareReport>[verified.withFaceDetectionInactive()]),
+    );
+
+    expect(find.byKey(const Key('gate-face-detection-note')), findsOneWidget);
+    // The note is information, not a gate: a browser camera is a real camera,
+    // so a verified report still unlocks entry.
+    expect(startEnabled(tester), isTrue);
+  });
+
+  testWidgets('a platform with an on-device detector shows no such note',
+      (tester) async {
+    await pushGate(tester, _FakeVerifier(<HardwareReport>[verified]));
+
+    expect(find.byKey(const Key('gate-face-detection-note')), findsNothing);
+    expect(startEnabled(tester), isTrue);
+  });
+
+  test('the platform note is a copy: the probe results are untouched', () {
+    final web = verified.withFaceDetectionInactive();
+
+    expect(web.faceDetectionInactive, isTrue);
+    expect(web.isVerified, isTrue);
+    expect(web.hasFailed, isFalse);
+    expect(web.camera.message, verified.camera.message);
+    expect(web.microphone.message, verified.microphone.message);
+    // Nothing else is implied by the platform: this is not a mock build, and it
+    // is not a refusal that would offer "Open settings".
+    expect(web.mock, isFalse);
+    expect(web.settingsHint, isFalse);
+  });
+
   testWidgets('fits a small phone and a desktop viewport without overflowing',
       (tester) async {
     for (final size in const <Size>[Size(320, 568), Size(1440, 900)]) {

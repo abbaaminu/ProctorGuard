@@ -1,4 +1,4 @@
-package com.example.exam_proctor
+package com.stackbuildco.proctorguard
 
 import android.app.ActivityManager
 import android.app.admin.DevicePolicyManager

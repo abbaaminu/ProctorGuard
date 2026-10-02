@@ -501,6 +501,28 @@ comment on view public.questions_public is
 
 grant select on public.questions_public to authenticated;
 
+-- ... and now take the reader the view was never meant for out of it.
+--
+-- That grant is not what keeps the public key away: §0's blanket
+-- `grant all privileges on all tables` runs on *every* install of this file -
+-- including a re-run over a database where this view already exists - and the
+-- `alter default privileges` beside it re-applies the same privileges to
+-- anything created later, so `anon` holds SELECT on this view (and on
+-- `questions`, the table holding the answer keys) unless it is revoked here,
+-- after both objects exist. A revoke, not a missing grant, is what makes the
+-- reach deterministic no matter which order this file is applied in.
+--
+-- Nothing in either client needs the feed with the anonymous key: every read of
+-- it happens after sign-in (the student's own `questions_public` query runs with
+-- their session, the console reads `questions` as staff), and the only anonymous
+-- consumer was `.github/workflows/keep_alive.yml`, which pinged this view to
+-- prove the schema was reachable - i.e. exactly the reach being removed here. It
+-- pings `profiles` now, which answers 200 `[]` for `anon` because no policy
+-- grants it a row: the schema proves itself without the answer key's table being
+-- reachable at all.
+revoke all on public.questions_public from anon;
+revoke all on public.questions        from anon;
+
 -- ---------------------------------------------------------------------
 -- 4. EXAM SUBMISSIONS
 -- ---------------------------------------------------------------------
@@ -585,6 +607,66 @@ create policy "submissions_delete_supervisor"
     exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
     or public.is_staff()
   );
+
+-- A closed attempt stops being editable.
+--
+-- The policies above stop every *client* path (students have no UPDATE policy,
+-- a supervisor writes through RLS), but nothing stopped the two SECURITY DEFINER
+-- merge RPCs from writing to a row that had already been graded: a queued answer
+-- replayed after `submit_exam()` - which is exactly what the app's offline queue
+-- does on the next connection - landed a key in the `answers` jsonb of a closed
+-- attempt, silently changing what a re-grade would read. The guard is keyed on
+-- the status the row *already* has, so it holds for every caller that can reach
+-- the row: the RPCs (definer, so RLS never sees them), the console's supervisor
+-- update, and anything added later.
+--
+-- What stays writable on a closed row is deliberate: `score` and `submitted_at`
+-- are how a supervisor re-grades, and `status` may still move between the two
+-- closed states ('submitted' <-> 'disqualified') so an after-the-fact
+-- disqualification counts and a mistaken one can be undone. Reopening one
+-- ('ongoing' again) is not a repair - it would hand a student a live session over
+-- an attempt whose answers were already recorded; the supported way to let
+-- somebody retake an exam is "Reset attempt", which deletes the row.
+create or replace function public.guard_submission_immutability()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  -- Null for anything that did not arrive through PostgREST (a migration, the
+  -- SQL editor, a trigger from a background job).
+  v_claims text := nullif(current_setting('request.jwt.claims', true), '');
+begin
+  -- The escape hatch the rest of this file gives the Edge Functions: their
+  -- client signs with the service key, which is what `admin-delete-user` and the
+  -- cleanup scripts use. Same rule as guard_user_role_change above - a request
+  -- signed by a user or the anon key never carries this claim.
+  if v_claims is not null
+     and coalesce(v_claims::jsonb ->> 'role', '') = 'service_role' then
+    return new;
+  end if;
+
+  if old.status <> 'ongoing' then
+    if new.answers is distinct from old.answers then
+      raise exception 'the answers of a closed attempt are immutable'
+        using errcode = '42501';
+    end if;
+
+    if new.status = 'ongoing' then
+      raise exception 'a closed attempt cannot be reopened'
+        using errcode = '42501';
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists submissions_guard_immutability on public.exam_submissions;
+create trigger submissions_guard_immutability
+  before update on public.exam_submissions
+  for each row execute function public.guard_submission_immutability();
 
 -- ---------------------------------------------------------------------
 -- 5. PROCTORING LOGS

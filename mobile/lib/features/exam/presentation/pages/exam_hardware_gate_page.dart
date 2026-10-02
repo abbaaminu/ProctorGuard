@@ -95,6 +95,15 @@ class _ExamHardwareGatePageState extends State<ExamHardwareGatePage> {
               const SizedBox(height: 20),
               if (report.mock) const _MockHardwareBanner(),
               if (report.mock) const SizedBox(height: 12),
+              // Web only, and never together with the mock banner (the verifier
+              // suppresses it on that path): a browser camera is a real camera,
+              // so the checks above are unchanged — but the on-device face
+              // detector they are usually followed by does not exist here, and
+              // the student is told before the attempt instead of after it.
+              if (report.faceDetectionInactive) ...[
+                const _FaceDetectionInactiveBanner(),
+                const SizedBox(height: 12),
+              ],
               _ProbeRow(probe: report.camera),
               const SizedBox(height: 8),
               _ProbeRow(probe: report.microphone),
@@ -219,6 +228,53 @@ class _MockHardwareBanner extends StatelessWidget {
                 'MOCK_CAMERA=true, so no real camera or microphone is opened '
                 'and nothing here is proctored.',
                 style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Shown when the platform has no on-device face detector (the web: Google ML
+/// Kit has no browser build).
+///
+/// Not a refusal and not a mock — the attempt is a real one, with a real camera
+/// and a real microphone, and it starts either way. What changes is how the
+/// evidence can be used afterwards: every frame is still captured and reviewed,
+/// but nothing flags a missing or second face automatically, so the student
+/// should not expect the strike rules they were told about to fire in a browser.
+class _FaceDetectionInactiveBanner extends StatelessWidget {
+  const _FaceDetectionInactiveBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+
+    return Card(
+      key: const Key('gate-face-detection-note'),
+      margin: EdgeInsets.zero,
+      color: Colors.amber.withValues(alpha: 0.12),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(Icons.face_retouching_off_outlined, color: Colors.amber),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'This exam is running in a browser, where on-device face '
+                'detection is not available. Your camera and microphone are '
+                'still checked and the attempt is still recorded for review — '
+                'but faces are not flagged automatically, so a second person on '
+                'screen or a covered camera will be caught by the recording, '
+                'not as it happens.',
+                style: Theme.of(context)
+                    .textTheme
+                    .bodySmall
+                    ?.copyWith(color: scheme.onSurface),
               ),
             ),
           ],

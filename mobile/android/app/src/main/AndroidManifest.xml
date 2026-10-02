@@ -22,8 +22,16 @@
     <uses-feature android:name="android.hardware.camera" android:required="true"/>
     <uses-feature android:name="android.hardware.camera.front" android:required="true"/>
 
+    <!-- `android:label` is the name the student actually sees: on the launcher, in
+         Settings, and inside the OS permission dialogs. It has to be the same name
+         the app's own refusal copy sends them looking for ("Allow it for
+         ProctorGuard in ...", `audio_monitor.dart`) and the one the web and iOS
+         metadata already use (`web/index.html`, `web/manifest.json`,
+         `ios/README.md`); `android_manifest_contract_test.dart` pins all of them
+         together, because a name only some of them agree on makes the student
+         hunt Settings for an app that is not there under that name. -->
     <application
-        android:label="Exam Proctor"
+        android:label="ProctorGuard"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
         android:networkSecurityConfig="@xml/network_security_config">

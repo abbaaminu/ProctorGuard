@@ -128,6 +128,60 @@ interface RemovalScope {
 type ServiceClient = SupabaseClient;
 
 /**
+ * How many rows one page of a paged read asks for.
+ *
+ * A *request*, not a guarantee: PostgREST answers with at most its `max rows`
+ * setting however much is asked for. The read below therefore advances by what
+ * actually arrived, which is what makes it converge whatever that setting is on
+ * this project.
+ */
+const PAGE_SIZE = 1000;
+
+/**
+ * How many exam ids travel in one `in (...)` filter.
+ *
+ * A uuid is 36 characters, so this is about 3.7 kB of request line - comfortably
+ * inside what the API's proxy accepts, and large enough that even a lecturer with
+ * hundreds of exams needs a handful of requests rather than hundreds of them.
+ */
+const ID_CHUNK = 100;
+
+/**
+ * Every exam id this account created, read page by page.
+ *
+ * `expected` is the API's own count of them (`removalScope` reads it first with
+ * `head: true`, so no rows are fetched to get it) and is what the loop runs to:
+ * asking for one page is not the same as being done. Pages are ordered so a range
+ * can neither repeat nor skip a row between requests, and a page that comes back
+ * empty while the count says there is more means the set moved under the read.
+ * That is answered as an error rather than as a short list, because a short list
+ * becomes a short *submission* count below, and this function refuses to describe
+ * a deletion it cannot count.
+ */
+async function ownedExamIds(
+  client: ServiceClient,
+  id: string,
+  expected: number,
+): Promise<string[] | { error: string }> {
+  const ids: string[] = [];
+  while (ids.length < expected) {
+    const { data, error } = await client
+      .from("exams")
+      .select("id")
+      .eq("created_by", id)
+      .order("id")
+      .range(ids.length, ids.length + PAGE_SIZE - 1);
+    if (error) return { error: error.message };
+    const page = (data as { id: string }[] | null) ?? [];
+    if (page.length === 0) {
+      return { error: "the list of exams changed while it was being read" };
+    }
+    ids.push(...page.map((exam) => exam.id));
+  }
+  return ids;
+}
+
+/**
  * What deleting this account will take with it, counted before it happens.
  *
  * The console cannot work this out for itself: its roster reads `profiles`, and
@@ -147,18 +201,27 @@ type ServiceClient = SupabaseClient;
  * the whole deletion on it: reporting "0 exams" for a lecturer whose exams were
  * never read would be a lie told by the one screen whose job is to say what
  * happened.
+ *
+ * Every figure here is taken by the API itself (`count: "exact"` with
+ * `head: true`), never by fetching rows and counting them: PostgREST answers a
+ * read with at most its `max rows` setting however much is asked for, so a
+ * lecturer owning more exams than that limit would have the surplus missing from
+ * *both* figures below. The exam ids are read only for the second figure, a page
+ * at a time (`ownedExamIds`), and only ever sent back in chunks.
  */
 async function removalScope(
   client: ServiceClient,
   id: string,
 ): Promise<RemovalScope | { error: string }> {
-  const { data: ownedExams, error: examError } = await client
+  // The count is taken by the API, not by counting rows: `head: true` asks for no
+  // rows at all, and `count: "exact"` is PostgREST's own count for the whole
+  // filtered set - so a lecturer with more exams than the API's `max rows` setting
+  // still gets the true figure.
+  const { count: ownedExams, error: examError } = await client
     .from("exams")
-    .select("id")
+    .select("id", { count: "exact", head: true })
     .eq("created_by", id);
   if (examError) return { error: examError.message };
-
-  const examIds = (ownedExams ?? []).map((exam: { id: string }) => exam.id);
 
   const { count: ownAttempts, error: ownError } = await client
     .from("exam_submissions")
@@ -166,18 +229,26 @@ async function removalScope(
     .eq("student_id", id);
   if (ownError) return { error: ownError.message };
 
+  // The other half: the attempts of exams this account created, whatever
+  // candidate sat them. They are reached through the exam ids, read a page at a
+  // time by `ownedExamIds` and sent back in chunks, because those ids are the one
+  // thing here that has no upper bound: `in (...)` travels in the request line,
+  // and a list that overran it could only fail - or, worse, be served truncated.
+  const examIds = await ownedExamIds(client, id, ownedExams ?? 0);
+  if (!Array.isArray(examIds)) return examIds;
+
   let examAttempts = 0;
-  if (examIds.length > 0) {
+  for (let start = 0; start < examIds.length; start += ID_CHUNK) {
     const { count, error } = await client
       .from("exam_submissions")
       .select("id", { count: "exact", head: true })
-      .in("exam_id", examIds);
+      .in("exam_id", examIds.slice(start, start + ID_CHUNK));
     if (error) return { error: error.message };
-    examAttempts = count ?? 0;
+    examAttempts += count ?? 0;
   }
 
   return {
-    exams: examIds.length,
+    exams: ownedExams ?? 0,
     submissions: (ownAttempts ?? 0) + examAttempts,
   };
 }

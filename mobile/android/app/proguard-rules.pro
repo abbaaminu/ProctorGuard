@@ -30,7 +30,7 @@
 # Instantiated from the manifest and answered over `lock_task_channel` /
 # `hardware_integrity_channel`; the channel names themselves are string literals that
 # R8 would otherwise be free to consider unused.
--keep class com.example.exam_proctor.** { *; }
+-keep class com.stackbuildco.proctorguard.** { *; }
 
 # --- On-device vision (the engine named "MediaPipe") -------------------------
 # `lib/core/services/mediapipe_proctoring_service.dart` -> `MediaPipeProctoringService`

@@ -221,7 +221,9 @@ void main() {
       await tester.pump();
 
       expect(find.byKey(submitKey), findsOneWidget);
-      expect(find.text('Exam Proctor'), findsOneWidget);
+      // The wordmark is the app's name, so it is the launcher label and the web /
+      // iOS metadata spelled the same way.
+      expect(find.text('ProctorGuard'), findsOneWidget);
       expect(find.text('Login page goes here'), findsNothing);
     });
   });

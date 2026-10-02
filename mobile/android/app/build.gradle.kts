@@ -41,7 +41,7 @@ val requestedReleaseTask = gradle.startParameter.taskNames.any {
 }
 
 android {
-    namespace = "com.example.exam_proctor"
+    namespace = "com.stackbuildco.proctorguard"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -67,12 +67,20 @@ android {
     }
 
     defaultConfig {
-        // TODO(PG-1): still the `flutter create` placeholder, and it is the app's
-        // permanent identity on Android (data directory, granted permissions, upgrade
-        // path). Changing it makes every installed build a *different* app, so it has
-        // to land before the first deployment rather than after one - see the
-        // hardening report.
-        applicationId = "com.example.exam_proctor"
+        // The app's permanent identity on Android (data directory, granted
+        // permissions, upgrade path) - and no longer the `flutter create`
+        // placeholder: `com.example.*` is refused by Play and would collide with
+        // any other template build already on a student's device. Changing it
+        // again after the first deployment makes every installed build a
+        // *different* app, so this is the last rename of its kind before release.
+        //
+        // Four halves have to agree, and `android_manifest_contract_test.dart`
+        // checks all of them: this `applicationId` (and the `namespace` above),
+        // the `package` of `MainActivity.kt`, the R8 keep rule in
+        // `proguard-rules.pro`, and the relative `android:name=".MainActivity"` in
+        // the manifest. The iOS bundle id carries the same value
+        // (`mobile/ios/README.md`).
+        applicationId = "com.stackbuildco.proctorguard"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion

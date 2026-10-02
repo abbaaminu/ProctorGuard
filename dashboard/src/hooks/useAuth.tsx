@@ -94,6 +94,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   /**
+   * The account this console is currently serving, as the last *stated* session
+   * had it: written by `loadProfile` (and by `signIn` / `signOut`, which know the
+   * answer before the SDK's event does) and read by `loadProfileForUser` before
+   * it commits anything.
+   *
+   * `mountedRef` alone was not enough. A profile read is a round trip and the
+   * session can move on underneath it: sign out while one is in flight and it
+   * lands *after* `loadProfile` has answered "signed out", painting a console for
+   * an account nobody is signed into - and with two sign-ins in quick succession
+   * the slower read of the two wins, which can hand one account's console to
+   * another. Keying the commit on the identity the read was made *for* is what
+   * makes a late answer lose: the state a sign-out (or a new sign-in) wrote is
+   * the state that is true, and a stale read is dropped whole - profile and
+   * sentence together, since a sentence about an account nobody is signed into is
+   * worse than the silence it replaces.
+   */
+  const sessionUserIdRef = useRef<string | null>(null);
+
+  /**
    * Read `public.profiles` for one authenticated user and decide whether this
    * console can serve them.
    *
@@ -194,6 +213,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const promise = (async () => {
         const result = await readProfile(userId);
 
+        // Committing before ending the session, not after it: the sign-out below
+        // raises an event that re-reads the session and (finding nobody) states
+        // the very same thing, so a commit placed after it would be judged stale
+        // by the transition it caused and this account's sentence would be
+        // dropped by its own sign-out.
+        //
+        // The guard is the identity this read was made *for*
+        // (`sessionUserIdRef`): an answer for an account this console has since
+        // stopped serving leaves the newer state alone, profile and sentence
+        // together.
+        if (mountedRef.current && sessionUserIdRef.current === userId) {
+          setProfile(result.profile);
+          setError(result.message);
+          setLoading(false);
+        }
+
         // An account this console cannot serve (no row, a refused read, a
         // student) would otherwise keep its session, and a login form drawn over
         // a live session is one that can never succeed: every retry re-fails and
@@ -202,16 +237,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // (mobile/lib/features/auth/.../role_gate.dart), done here because this
         // console shows a login screen rather than a dedicated error page.
         if (result.fatal) {
+          // Claimed before it is done, so the event this raises cannot make some
+          // other in-flight read look current either.
+          sessionUserIdRef.current = null;
           await supabase.auth.signOut().catch(() => {
             // A failed sign-out is not fatal in itself — the next read retries
             // it — and the message below is shown either way.
           });
         }
-
-        if (!mountedRef.current) return;
-        setProfile(result.profile);
-        setError(result.message);
-        setLoading(false);
       })();
 
       pendingRef.current = { userId, promise };
@@ -241,6 +274,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch {
       sessionError = { message: "session lookup failed" };
     }
+
+    // State who this console is serving, and do it before anything is read: this
+    // is the one place that knows both answers, so every read that follows can ask
+    // whether its own answer still belongs to the current account
+    // (`sessionUserIdRef`) instead of committing over a newer one. "Nobody" is a
+    // legitimate value and covers both cases below: a signed-out session, and a
+    // session that could not be read at all - where the console is about to say so
+    // and must not be contradicted by a profile that arrives late.
+    sessionUserIdRef.current = sessionError ? null : userId;
 
     if (sessionError) {
       if (!mountedRef.current) return;
@@ -297,6 +339,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       throw new Error(message);
     }
     if (data.user) {
+      // Claimed before it is read: `loadProfileForUser` commits only for the
+      // account this console is serving, and a fresh sign-in is what makes it so.
+      sessionUserIdRef.current = data.user.id;
       await loadProfileForUser(data.user.id);
     }
   }
@@ -314,6 +359,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       failure = thrown && typeof thrown === "object" ? (thrown as ApiError) : { message: String(thrown) };
     }
     if (failure) throw new Error(signOutErrorMessage(failure));
+
+    // Released with the session, and before the state below: a read still in
+    // flight for the account that just left resolves against nobody from here on,
+    // so it cannot commit a profile over the login screen.
+    sessionUserIdRef.current = null;
 
     if (!mountedRef.current) return;
     setProfile(null);

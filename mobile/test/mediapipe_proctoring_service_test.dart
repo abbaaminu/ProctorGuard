@@ -199,6 +199,66 @@ void main() {
       expect(seen, <GazeSignal>[GazeSignal.multipleFaces]);
     });
 
+    test('a sustained second person is one violation, not one per inference',
+        () async {
+      // The regression this pins: two faces had no latch, so the signal was
+      // emitted on every inference - ~7 a second at `inferenceInterval` - and
+      // `register_violation` disqualifies on the third strike. One second of a
+      // guest leaning into shot closed the attempt.
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      engine.handleResult(const FaceFrameResult(faceCount: 2)); // t0, reported
+      for (var i = 0; i < 40; i++) {
+        now = now.add(engine.inferenceInterval); // 6s of two faces
+        engine.handleResult(const FaceFrameResult(faceCount: 2));
+      }
+
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.multipleFaces),
+        hasLength(1),
+      );
+    });
+
+    test('the guest leaving re-arms one fresh episode, a flicker does not',
+        () async {
+      // Trace, with a 30s cooldown: two faces at t0 is the only signal; a
+      // flicker back to two faces at t25 is suppressed *and* restarts the
+      // alone-window, so the student must then be alone for a full 30s after
+      // it before a second episode can be reported. Nothing here is
+      // time-based luck - each step is the state machine's documented rule.
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      engine.handleResult(const FaceFrameResult(faceCount: 2)); // t0 -> #1
+      engine.handleResult(const FaceFrameResult(faceCount: 1)); // t0 alone
+
+      now = now.add(const Duration(seconds: 25)); // t25
+      engine.handleResult(const FaceFrameResult(faceCount: 1)); // 25s alone
+      engine.handleResult(const FaceFrameResult(faceCount: 2)); // suppressed
+
+      now = now.add(const Duration(seconds: 15)); // t40
+      engine.handleResult(const FaceFrameResult(faceCount: 1)); // 15s alone
+      engine.handleResult(const FaceFrameResult(faceCount: 2)); // suppressed
+
+      now = now.add(const Duration(seconds: 35)); // t75
+      engine.handleResult(const FaceFrameResult(faceCount: 1)); // 35s alone
+
+      now = now.add(const Duration(seconds: 1)); // t76
+      engine.handleResult(const FaceFrameResult(faceCount: 2)); // #2
+
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.multipleFaces),
+        hasLength(2),
+      );
+    });
+
     test('resetSustained clears a half-elapsed window', () async {
       final engine = clocked();
       final seen = <GazeSignal>[];
@@ -214,6 +274,27 @@ void main() {
       await pumpEventQueue();
       expect(seen, isEmpty);
     });
+
+    test('resetSustained re-arms the multi-face latch', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      engine.handleResult(const FaceFrameResult(faceCount: 2)); // #1
+
+      // A camera that drops and comes back with the guest still in frame is a
+      // fresh episode: carrying the latch across the gap would hide them for
+      // the whole cooldown, and the gap is exactly the moment they arrive.
+      engine.resetSustained();
+      engine.handleResult(const FaceFrameResult(faceCount: 2)); // #2
+
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.multipleFaces),
+        hasLength(2),
+      );
+    });
   });
 
   group('engine defaults', () {
@@ -225,6 +306,9 @@ void main() {
       expect(engine.pitchThresholdDegrees, 30.0);
       expect(engine.lookAwayGraceDuration, const Duration(seconds: 3));
       expect(engine.noFaceGraceDuration, const Duration(seconds: 3));
+      // A multi-face episode is latched rather than grace-windowed, so this is
+      // how long the student has to be *alone* before a second one counts.
+      expect(engine.multipleFacesCooldown, const Duration(seconds: 30));
     });
 
     test('expose a broadcast signal stream and leak nothing on dispose', () {

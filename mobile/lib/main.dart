@@ -100,7 +100,14 @@ class ExamProctorApp extends StatelessWidget {
     final service = SupabaseService.instance;
 
     return MaterialApp(
-      title: 'Exam Proctor',
+      // The app's own name metadata: Android uses it for the task-switcher entry,
+      // the web build for the browser tab. The launcher label is `android:label`
+      // and the web/iOS names are `web/index.html` (`<title>`,
+      // `apple-mobile-web-app-title`), `web/manifest.json` and the Info.plist
+      // checklist in `ios/README.md` - `android_manifest_contract_test.dart` pins
+      // all of them to one name, because the app tells a student whose microphone
+      // was refused to go and allow "ProctorGuard" (`audio_monitor.dart`).
+      title: 'ProctorGuard',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
       // `RoleGate` is the whole router today: signed out -> login, then

@@ -690,12 +690,20 @@ class OfflineSyncService implements ViolationOutbox {
   Stream<ViolationRuling> get deferredRulings => _deferredRulings.stream;
 
   /// Keeps the oldest rows out of an unbounded queue (see [maxQueuedViolations]).
-  void _trimViolations() {
+  ///
+  /// Returns how many rows it dropped, so [_readFromDisk] can write a trimmed queue
+  /// back: rows queued by a build with a larger bound (or by one that predates the
+  /// bound) are already on disk, and the cap has to hold on the way in as well as on
+  /// the way out.
+  int _trimViolations() {
+    var dropped = 0;
     while (_violations.length > maxQueuedViolations) {
-      final dropped = _violations.removeAt(0);
+      final oldest = _violations.removeAt(0);
+      dropped++;
       debugPrint('ProctorGuard: violation queue full - dropped '
-          '${dropped.violation.type.dbValue} from ${dropped.submissionId}');
+          '${oldest.violation.type.dbValue} from ${oldest.submissionId}');
     }
+    return dropped;
   }
 
   // --- Persistence -------------------------------------------------------
@@ -716,6 +724,10 @@ class OfflineSyncService implements ViolationOutbox {
     _violations
       ..clear()
       ..addAll(violations);
+    // The bound is applied on the way in: a device can be carrying a queue written
+    // by a build with a bigger bound, and that oversized file is the thing the cap
+    // exists to prevent. Rewriting it here means the next launch starts bounded too.
+    if (_trimViolations() > 0) await _persistViolations();
 
     _choiceDrafts
       ..clear()

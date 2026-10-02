@@ -302,7 +302,7 @@ $flutter = Get-ChildItem "$env:USERPROFILE\.gradle\caches\modules-2\files-2.1\io
 $androidx = Get-ChildItem "$env:USERPROFILE\.gradle\caches\transforms-*" -Recurse -Filter classes.jar |
     Where-Object { $_.FullName -match 'lifecycle|annotation|activity|core' } | ForEach-Object FullName
 & $kotlinc -classpath ((@($android, $flutter) + $androidx) -join ';') -jvm-target 17 `
-    -d "$env:TEMP\kiosk-out" mobile\android\app\src\main\kotlin\com\example\exam_proctor\MainActivity.kt
+    -d "$env:TEMP\kiosk-out" mobile\android\app\src\main\kotlin\com\stackbuildco\proctorguard\MainActivity.kt
 ```
 
 That is how the invalid `override fun onLockTaskModeExiting()` was caught:

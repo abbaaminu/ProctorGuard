@@ -40,6 +40,13 @@ function SnapshotModal({ url, onClose }: { url: string; onClose: () => void }) {
 export function LiveMonitor() {
   const { id: examId } = useParams<{ id: string }>();
   const [exam, setExam] = useState<ExamRow | null>(null);
+  /**
+   * Why the header cannot name this exam. The read below used to be `.then(({ data
+   * }) => setExam(data))`, so a refusal left the title as a pulsing skeleton for as
+   * long as the page stayed open: "still loading", forever, on the one line here
+   * that has nothing to fall back to.
+   */
+  const [examError, setExamError] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<string | null>(null);
   const [flash, setFlash] = useState(false);
   /** Action-level failure: a disqualify that the server refused, say. */
@@ -85,12 +92,33 @@ export function LiveMonitor() {
 
   useEffect(() => {
     if (!examId) return;
-    supabase
-      .from("exams")
-      .select("*")
-      .eq("id", examId)
-      .single()
-      .then(({ data }) => setExam(data));
+    let active = true;
+
+    (async () => {
+      // `single()` rather than `maybeSingle()` on purpose: an id that no longer
+      // exists is an error to report here, not a zero-row answer to render as a
+      // skeleton.
+      const { data, error: examError } = await supabase
+        .from("exams")
+        .select("*")
+        .eq("id", examId)
+        .single();
+      if (!active) return;
+      if (examError) {
+        setExamError(
+          examError.code === "PGRST116"
+            ? "This exam no longer exists - it may have been deleted."
+            : `Could not load this exam: ${examError.message}`
+        );
+        return;
+      }
+      setExamError(null);
+      setExam(data as ExamRow);
+    })();
+
+    return () => {
+      active = false;
+    };
   }, [examId]);
 
   // Visual ping when a new violation lands — flash the feed header briefly
@@ -190,6 +218,10 @@ export function LiveMonitor() {
                 <Clock size={12} /> {exam.duration_minutes} min
               </span>
             </>
+          ) : examError ? (
+            <span className="max-w-md truncate text-xs text-warn" title={examError}>
+              {examError}
+            </span>
           ) : (
             // The header never says "Loading exam…": it shows the shape of the
             // title and swaps in the real one when the row arrives.

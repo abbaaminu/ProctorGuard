@@ -30,10 +30,22 @@ export function SubmissionAudit() {
   const [questions, setQuestions] = useState<QuestionRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * The two panel reads below, one error each. They used to discard what the API
+   * said, so a refused incident read rendered as "No incidents recorded during
+   * this session." and a refused question read as "No questions are stored for
+   * this exam." - each a clean bill of health for something nobody could read.
+   * The submission itself has loaded by the point these run, so a failure belongs
+   * inside its own card rather than replacing the page. The reset confirmation is
+   * the third reader of this state: it prints the incident count when the read
+   * answered, and names the incidents without a number when it did not.
+   */
+  const [logsError, setLogsError] = useState<string | null>(null);
+  const [questionsError, setQuestionsError] = useState<string | null>(null);
   /** True once the attempt is gone: there is nothing left on this page to audit. */
   const [cleared, setCleared] = useState(false);
   const [confirmingReset, setConfirmingReset] = useState(false);
-  const { names } = useAccountNames();
+  const { names, error: namesError } = useAccountNames();
   const { resetSubmission, resetting } = useResetSubmission();
   /** One toast slot, the way the rest of the console does it (`ui/toast.tsx`). */
   const [toast, setToast] = useState<{ id: number; tone: ToastTone; message: string } | null>(null);
@@ -70,12 +82,18 @@ export function SubmissionAudit() {
 
       setSubmission(sub as SubmissionRow);
 
+      // The two panels are read in parallel and either read can fail on its own,
+      // so each keeps what the API answered: what is rendered below is then
+      // either the rows or the reason there are none, never an empty list
+      // standing in for both.
       const [logRows, questionRows] = await Promise.all([
         supabase.from("proctoring_logs").select("*").eq("submission_id", submissionId).order("timestamp"),
         supabase.from("questions").select("*").eq("exam_id", sub.exam_id),
       ]);
       if (!active) return;
 
+      setLogsError(logRows.error?.message ?? null);
+      setQuestionsError(questionRows.error?.message ?? null);
       setLogs((logRows.data as ProctoringLogRow[]) ?? []);
       setQuestions((questionRows.data as QuestionRow[]) ?? []);
       setLoading(false);
@@ -199,8 +217,15 @@ export function SubmissionAudit() {
         <div>
           <h1 className="text-lg font-semibold text-slate-100">Submission audit</h1>
           <p className="text-xs text-slate-400">
-            {names[submission.student_id] ?? "Unknown student"}
+            {names[submission.student_id] ??
+              (namesError ? "Student name unavailable" : "Unknown student")}
           </p>
+          {/* The monitor's note, for the same reason: this line shows a name where
+              a short id would do, so a failed profiles read has to say so rather
+              than let "Unknown student" pass for an answer about a real person. */}
+          {namesError && (
+            <p className="text-xs text-warn">Student names could not be loaded.</p>
+          )}
           <p className="font-mono text-xs text-slate-500">{submission.id}</p>
         </div>
         <div className="flex items-center gap-3">
@@ -224,7 +249,14 @@ export function SubmissionAudit() {
         <Card>
           <CardHeader><CardTitle>Incident timeline</CardTitle></CardHeader>
           <CardContent className="p-0">
-            {logs.length === 0 ? (
+            {logsError ? (
+              // LiveMonitor's incident feed reports its own read failure the same
+              // way: the panel says what it could not do instead of drawing an
+              // empty timeline, which reads as "nothing happened".
+              <p className="p-4 text-sm text-alert">
+                Could not load incidents: {logsError}
+              </p>
+            ) : logs.length === 0 ? (
               <p className="p-4 text-sm text-slate-500">No incidents recorded during this session.</p>
             ) : (
               <ol className="relative border-l border-border ml-4 py-2">
@@ -248,7 +280,12 @@ export function SubmissionAudit() {
         <Card>
           <CardHeader><CardTitle>Question breakdown</CardTitle></CardHeader>
           <CardContent className="space-y-3 p-4">
-            {questions.length === 0 && (
+            {questionsError && (
+              <p className="text-sm text-alert">
+                Could not load this exam's questions: {questionsError}
+              </p>
+            )}
+            {!questionsError && questions.length === 0 && (
               <p className="text-sm text-slate-500">
                 No questions are stored for this exam.
               </p>
@@ -316,9 +353,18 @@ export function SubmissionAudit() {
         onCancel={() => setConfirmingReset(false)}
       >
         <p>
-          The submission, its stored answers and its {logs.length} proctoring incident
-          {logs.length === 1 ? "" : "s"} are deleted for good, and the student can start the
-          exam again from a fresh attempt.
+          {logsError ? (
+            // A count from the read that failed above would be a number this page
+            // does not have. What is deleted is the same either way - the server
+            // removes every incident with the attempt - so only the figure goes.
+            "The submission, its stored answers and its proctoring incidents are deleted for good, and the student can start the exam again from a fresh attempt."
+          ) : (
+            <>
+              The submission, its stored answers and its {logs.length} proctoring incident
+              {logs.length === 1 ? "" : "s"} are deleted for good, and the student can start the
+              exam again from a fresh attempt.
+            </>
+          )}
         </p>
         <p>
           A student who is mid-exam is logged out of it, and any snapshot images of this attempt

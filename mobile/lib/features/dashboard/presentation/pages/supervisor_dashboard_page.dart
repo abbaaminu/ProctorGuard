@@ -6,8 +6,9 @@ import '../../../../core/services/supabase_service.dart';
 /// Streams `proctoring_logs` and `exam_submissions` for a given exam via
 /// Supabase Realtime, so supervisors see violations and status changes as
 /// they happen — no polling. RLS is what scopes the rows: a supervisor may read
-/// every attempt and every log (see `users_select_own_or_supervisor` and
-/// friends in `supabase/schema.sql`), a student only their own.
+/// every attempt and every log (see `submissions_select_own_or_supervisor` and
+/// `profiles_select_own_or_staff` in `supabase/schema.sql`), a student only their
+/// own.
 final examSubmissionsStreamProvider =
     StreamProvider.family<List<Map<String, dynamic>>, String>((ref, examId) {
   return SupabaseService.instance.client
@@ -19,8 +20,17 @@ final examSubmissionsStreamProvider =
 
 /// `id -> display name` for every account the caller may read, so the monitor
 /// shows "Aisha Bello" instead of a raw uuid.
+///
+/// The table is `profiles`, not `users`: the schema has no `public.users` at all
+/// (only `auth.users`, which PostgREST does not expose, plus `public.profiles`,
+/// 1:1 with it - see `profile_repository_impl.dart`). Pointing this stream at
+/// `users` made every roster read fail with `42P01 relation "public.users" does
+/// not exist`, so the monitor showed a raw uuid for a whole exam and said
+/// nothing about why - the fallback label is built from the id, e.g.
+/// `Student <uuid>`. `profiles_select_own_or_staff` is what a supervisor's
+/// session reads through, so the names are all there.
 final accountNamesProvider = StreamProvider<Map<String, String>>((ref) {
-  return SupabaseService.instance.client.from('users').stream(
+  return SupabaseService.instance.client.from('profiles').stream(
         primaryKey: ['id'],
       ).map((rows) => {
             for (final row in rows)
@@ -56,9 +66,9 @@ final liveViolationFeedProvider =
           .toList());
 });
 
-/// `users.name`, falling back to the address (never an empty tile).
+/// `profiles.full_name`, falling back to the address (never an empty tile).
 String _displayName(Map<String, dynamic> row) {
-  final name = (row['name'] as String? ?? '').trim();
+  final name = (row['full_name'] as String? ?? '').trim();
   if (name.isNotEmpty) return name;
   final email = (row['email'] as String? ?? '').trim();
   return email.isEmpty ? 'Unknown account' : email;
