@@ -9,21 +9,22 @@
 // calling Auth's admin API". A client-side DELETE of the row would be worse than
 // useless — it would leave a login that still signs in but has no profile, which
 // is the stranded half-account `admin-create-user` rolls back rather than leave
-// behind — so both halves happen here, in the one order that cannot strand
-// anything:
+// behind — so all account cleanup happens here in a deliberate order:
 //
-//   1. `auth.admin.deleteUser(id)` — the root of the graph, and the only step
-//      that can fail on its own;
-//   2. the `profiles` row follows by itself, through
-//      `profiles.id references auth.users(id) on delete cascade`;
-//   3. and so does everything the schema hangs off that row: `exams`
-//      (`created_by`), their `questions`, every `exam_submissions` row — the
-//      account's own attempts, and the attempts *of* an exam it created — and
-//      the `proctoring_logs` under them. Referential actions run outside row
-//      security, so this unwinds in one statement and no policy can half-do it.
+//   1. preflight the submission ids whose image folders live in Storage;
+//   2. `auth.admin.deleteUser(id)` — the root of the database graph, after which
+//      the `profiles` row and everything the schema hangs off it cascades:
+//      `exams` (`created_by`), their `questions`, every `exam_submissions` row
+//      and the `proctoring_logs` under those attempts;
+//   3. remove the image folders through the Storage API (Storage is not part of
+//      the database cascade). A failure here is returned with the affected
+//      submission folder so the remaining public object can be removed.
 //
-// Deleting the login FIRST is the whole safety argument: if Auth refuses, not one
-// other row has been touched.
+// Referential actions run outside row security, so the database graph unwinds
+// in one statement and no policy can half-do it.
+//
+// Auth is deleted before the database cascade. If Storage cleanup fails after
+// that point, the function reports the failed submission folder for remediation.
 //
 // Request  (POST, `Authorization: Bearer <the caller's access token>`):
 //   { "id": "<uuid of the account to remove>" }   (`account_id` / `accountId` too)
@@ -124,6 +125,11 @@ interface RemovalScope {
   submissions: number;
 }
 
+interface RemovalPlan {
+  removed: RemovalScope;
+  snapshotSubmissionIds: string[];
+}
+
 /** Both clients `createClient` builds share this type; named once for the helper. */
 type ServiceClient = SupabaseClient;
 
@@ -181,6 +187,99 @@ async function ownedExamIds(
   return ids;
 }
 
+/** Submission folders whose independently stored snapshots must be removed. */
+async function snapshotSubmissionIds(
+  client: ServiceClient,
+  id: string,
+  examIds: string[],
+  expectedOwnAttempts: number,
+): Promise<string[] | { error: string }> {
+  const submissionIds = new Set<string>();
+
+  let ownOffset = 0;
+  for (let offset = 0;; offset += PAGE_SIZE) {
+    const { data, error } = await client
+      .from("exam_submissions")
+      .select("id")
+      .eq("student_id", id)
+      .order("id")
+      .range(offset, offset + PAGE_SIZE - 1);
+    if (error) return { error: error.message };
+    const page = (data as { id: string }[] | null) ?? [];
+    page.forEach(({ id }) => submissionIds.add(id));
+    ownOffset += page.length;
+    if (page.length < PAGE_SIZE) break;
+  }
+  if (ownOffset !== expectedOwnAttempts) {
+    return { error: "the list of student attempts changed while it was being read" };
+  }
+
+  for (let start = 0; start < examIds.length; start += ID_CHUNK) {
+    const examChunk = examIds.slice(start, start + ID_CHUNK);
+    const { count: expectedAttempts, error: countError } = await client
+      .from("exam_submissions")
+      .select("id", { count: "exact", head: true })
+      .in("exam_id", examChunk);
+    if (countError) return { error: countError.message };
+
+    let examOffset = 0;
+    for (let offset = 0;; offset += PAGE_SIZE) {
+      const { data, error } = await client
+        .from("exam_submissions")
+        .select("id")
+        .in("exam_id", examChunk)
+        .order("id")
+        .range(offset, offset + PAGE_SIZE - 1);
+      if (error) return { error: error.message };
+      const page = (data as { id: string }[] | null) ?? [];
+      page.forEach(({ id }) => submissionIds.add(id));
+      examOffset += page.length;
+      if (page.length < PAGE_SIZE) break;
+    }
+    if (examOffset !== (expectedAttempts ?? 0)) {
+      return { error: "the list of exam attempts changed while it was being read" };
+    }
+  }
+
+  return [...submissionIds];
+}
+
+/**
+ * Remove the image files stored outside the database cascade. Collect each
+ * folder's full listing before deleting so offset pagination cannot skip files.
+ */
+async function removeSnapshots(
+  client: ServiceClient,
+  submissionIds: string[],
+): Promise<string | null> {
+  const bucket = client.storage.from("proctor-snapshots");
+
+  for (const submissionId of submissionIds) {
+    const names: string[] = [];
+    for (let offset = 0;; offset += PAGE_SIZE) {
+      const { data, error } = await bucket.list(submissionId, {
+        limit: PAGE_SIZE,
+        offset,
+      });
+      if (error) return `${submissionId}: ${error.message}`;
+      const page = data ?? [];
+      names.push(
+        ...page
+          .filter((file) => file.id !== null)
+          .map((file) => `${submissionId}/${file.name}`),
+      );
+      if (page.length < PAGE_SIZE) break;
+    }
+
+    for (let start = 0; start < names.length; start += ID_CHUNK) {
+      const { error } = await bucket.remove(names.slice(start, start + ID_CHUNK));
+      if (error) return `${submissionId}: ${error.message}`;
+    }
+  }
+
+  return null;
+}
+
 /**
  * What deleting this account will take with it, counted before it happens.
  *
@@ -193,9 +292,8 @@ async function ownedExamIds(
  *   * `exam_submissions.student_id` cascades too, which is the student case: an
  *     account that submitted attempts of its own.
  *
- * The two submission sets cannot overlap — a row carries exactly one `role`, so
- * an account is either the candidate who submitted an attempt or the author of
- * the exam, never both — which is why they add up rather than needing a union.
+ * A staff account may also have taken one of its own exams, so submission ids
+ * are deduplicated before reporting the number of rows removed.
  *
  * A read that fails answers `{ error }` instead of a guess, and the caller refuses
  * the whole deletion on it: reporting "0 exams" for a lecturer whose exams were
@@ -212,7 +310,7 @@ async function ownedExamIds(
 async function removalScope(
   client: ServiceClient,
   id: string,
-): Promise<RemovalScope | { error: string }> {
+): Promise<RemovalPlan | { error: string }> {
   // The count is taken by the API, not by counting rows: `head: true` asks for no
   // rows at all, and `count: "exact"` is PostgREST's own count for the whole
   // filtered set - so a lecturer with more exams than the API's `max rows` setting
@@ -237,19 +335,20 @@ async function removalScope(
   const examIds = await ownedExamIds(client, id, ownedExams ?? 0);
   if (!Array.isArray(examIds)) return examIds;
 
-  let examAttempts = 0;
-  for (let start = 0; start < examIds.length; start += ID_CHUNK) {
-    const { count, error } = await client
-      .from("exam_submissions")
-      .select("id", { count: "exact", head: true })
-      .in("exam_id", examIds.slice(start, start + ID_CHUNK));
-    if (error) return { error: error.message };
-    examAttempts += count ?? 0;
-  }
+  const snapshotIds = await snapshotSubmissionIds(
+    client,
+    id,
+    examIds,
+    ownAttempts ?? 0,
+  );
+  if (!Array.isArray(snapshotIds)) return snapshotIds;
 
   return {
-    exams: ownedExams ?? 0,
-    submissions: (ownAttempts ?? 0) + examAttempts,
+    removed: {
+      exams: ownedExams ?? 0,
+      submissions: snapshotIds.length,
+    },
+    snapshotSubmissionIds: snapshotIds,
   };
 }
 
@@ -380,10 +479,10 @@ Deno.serve(async (request: Request): Promise<Response> => {
     };
   }
 
-  const scope = await removalScope(admin, id);
-  if ("error" in scope) {
+  const plan = await removalScope(admin, id);
+  if ("error" in plan) {
     return fail(
-      `Could not count what deleting this account would remove: ${scope.error}. Nothing was deleted.`,
+      `Could not count what deleting this account would remove: ${plan.error}. Nothing was deleted.`,
       500,
     );
   }
@@ -398,6 +497,17 @@ Deno.serve(async (request: Request): Promise<Response> => {
         ? "That account no longer exists — reload the list and try again."
         : `Could not delete the account: ${deleteError.message}`,
       alreadyGone ? 404 : 500,
+    );
+  }
+
+  const snapshotError = await removeSnapshots(
+    admin,
+    plan.snapshotSubmissionIds,
+  );
+  if (snapshotError) {
+    return fail(
+      `The login was deleted, but its proctoring snapshots could not be removed: ${snapshotError}. Remove the reported submission folder from the proctor-snapshots bucket.`,
+      500,
     );
   }
 
@@ -424,5 +534,5 @@ Deno.serve(async (request: Request): Promise<Response> => {
   }
 
   // 200 with what went with it: the sentence the console confirms with.
-  return json({ id, ...identity, removed: scope });
+  return json({ id, ...identity, removed: plan.removed });
 });

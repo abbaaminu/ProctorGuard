@@ -113,7 +113,7 @@ export function useResetSubmission() {
           incidents: 0,
           snapshots: 0,
           error:
-            "the server deleted nothing - the attempt may already be cleared, and you may not be a supervisor for this exam",
+            "the server deleted nothing - the attempt may already be cleared, and you may not be an admin or supervisor",
         };
       }
 

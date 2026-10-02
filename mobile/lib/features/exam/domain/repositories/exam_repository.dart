@@ -2,6 +2,13 @@ import '../entities/exam.dart';
 import '../entities/question.dart';
 import '../entities/submission.dart';
 
+class AnswerWriteRejected implements Exception {
+  const AnswerWriteRejected();
+
+  @override
+  String toString() => 'The server no longer accepts answers for this attempt.';
+}
+
 abstract class ExamRepository {
   Future<List<Exam>> getPublishedExams();
   Future<List<Question>> getQuestions(String examId);

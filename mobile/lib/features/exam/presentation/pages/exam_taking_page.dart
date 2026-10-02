@@ -410,9 +410,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       _failStart(
         kIsWeb
             ? 'No camera is available. Allow camera access for this site in your '
-              'browser (and check the device has one), then tap Try again.'
+                  'browser (and check the device has one), then tap Try again.'
             : 'No camera is available on this device. Proctoring needs a working '
-              'front camera.',
+                  'front camera.',
       );
       return;
     }
@@ -663,8 +663,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       ..hideCurrentSnackBar()
       ..showSnackBar(
         SnackBar(
-          content:
-              Text(state.message ?? 'Audio proctoring needs your attention.'),
+          content: Text(
+            state.message ?? 'Audio proctoring needs your attention.',
+          ),
           duration: const Duration(seconds: 8),
           action: SnackBarAction(
             // A refusal cannot be fixed by asking again (Android and iOS stop
@@ -715,8 +716,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
 
   Future<void> _loadQuestions() async {
     try {
-      final questions =
-          await ref.read(examRepositoryProvider).getQuestions(widget.examId);
+      final questions = await ref
+          .read(examRepositoryProvider)
+          .getQuestions(widget.examId);
       if (!mounted) return;
       setState(() {
         _questions = questions;
@@ -730,7 +732,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _blockingError = 'Could not load the questions for this exam. Check '
+        _blockingError =
+            'Could not load the questions for this exam. Check '
             'your connection and tap Try again.';
       });
     }
@@ -749,8 +752,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     // Anchored and read through the page clock (see [ExamTakingPage.clock]) - the
     // same clock the fullscreen window counts on, so the two timings on this
     // screen cannot disagree about how much of the hour is gone.
-    final deadline =
-        (widget.startedAt ?? _now()).add(Duration(minutes: minutes));
+    final deadline = (widget.startedAt ?? _now()).add(
+      Duration(minutes: minutes),
+    );
 
     _countdown?.cancel();
     // The ticker is installed *before* the first tick: that tick is what submits
@@ -768,7 +772,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     if (!mounted) return;
 
     final remaining = deadline.difference(_now());
-    setState(() => _remaining = remaining.isNegative ? Duration.zero : remaining);
+    setState(
+      () => _remaining = remaining.isNegative ? Duration.zero : remaining,
+    );
 
     if (!remaining.isNegative && remaining != Duration.zero) return;
 
@@ -882,8 +888,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     // know (see [_pointerRouteAttached]).
     if (_pointerRouteAttached) {
       _pointerRouteAttached = false;
-      GestureBinding.instance.pointerRouter
-          .removeGlobalRoute(_onPointerActivity);
+      GestureBinding.instance.pointerRouter.removeGlobalRoute(
+        _onPointerActivity,
+      );
     }
     _integrity?.stopMonitoring();
     _integrity = null;
@@ -1012,7 +1019,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   Future<void> _persistChoice(String questionId, int optionIndex) {
     final sync = _sync;
     if (sync == null) {
-      return ref.read(examRepositoryProvider).saveAnswer(
+      return ref
+          .read(examRepositoryProvider)
+          .saveAnswer(
             submissionId: widget.submissionId,
             questionId: questionId,
             selectedOption: optionIndex,
@@ -1030,7 +1039,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   Future<void> _persistText(String questionId, String text) {
     final sync = _sync;
     if (sync == null) {
-      return ref.read(examRepositoryProvider).saveTextAnswer(
+      return ref
+          .read(examRepositoryProvider)
+          .saveTextAnswer(
             submissionId: widget.submissionId,
             questionId: questionId,
             answer: text,
@@ -1060,7 +1071,10 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// Returns whether the answer is now durable. [advance] moves to the next
   /// question *after* the local write, so a failure (no queue and no network) still
   /// keeps the student on the question with their text intact.
-  Future<bool> _saveTextAnswer(Question question, {bool advance = false}) async {
+  Future<bool> _saveTextAnswer(
+    Question question, {
+    bool advance = false,
+  }) async {
     if (_savingText || !mounted) return false;
 
     final text = _textAnswers[question.id] ?? '';
@@ -1176,6 +1190,37 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     if (sync == null) return true; // no queue: nothing to drain
 
     await sync.flush();
+    if (!mounted) return false;
+    final rejectedAnswers = sync.rejectedAnswerCountFor(widget.submissionId);
+    if (rejectedAnswers > 0) {
+      final accepted = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          title: const Text('Some answers were not saved'),
+          content: Text(
+            '$rejectedAnswers ${rejectedAnswers == 1 ? 'answer could' : 'answers could'} '
+            'not be saved because the attempt was closed or its deadline passed. '
+            'The server will grade only answers it accepted.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Submit saved answers'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted) return false;
+      if (accepted != true) {
+        setState(() {
+          _submitting = false;
+          _timeUpPending = timeUp;
+        });
+        return false;
+      }
+    }
+
     // Only *answers* hold the attempt open: grading reads the server's copy of
     // them. A queued violation is delivered - and still counted - after the
     // attempt closes, so blocking an otherwise finished student on evidence
@@ -1255,27 +1300,27 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   }
 
   Future<bool?> _confirmSubmit() => showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Submit your exam?'),
-          content: Text(
-            'You have answered ${_savedQuestions.length} of '
-            '${_questions.length} questions. Submitting closes the attempt for '
-            'good.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Keep working'),
-            ),
-            FilledButton(
-              key: const Key('exam-submit-confirm'),
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Submit'),
-            ),
-          ],
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Submit your exam?'),
+      content: Text(
+        'You have answered ${_savedQuestions.length} of '
+        '${_questions.length} questions. Submitting closes the attempt for '
+        'good.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Keep working'),
         ),
-      );
+        FilledButton(
+          key: const Key('exam-submit-confirm'),
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('Submit'),
+        ),
+      ],
+    ),
+  );
 
   void _showMessage(String message) {
     if (!mounted) return;
@@ -1344,7 +1389,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         key: const Key('exam-time-up'),
         icon: Icons.timer_off_outlined,
         title: 'Time is up',
-        message: 'Your answers are saved, but the submission has not reached '
+        message:
+            'Your answers are saved, but the submission has not reached '
             'the server yet.',
         onRetry: () => _finalSubmit(timeUp: true),
         retryLabel: 'Send again',
@@ -1357,7 +1403,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         key: const Key('exam-offline-submit'),
         icon: Icons.cloud_off,
         title: 'Waiting for a connection',
-        message: 'Every answer is saved on this device, so nothing is lost. '
+        message:
+            'Every answer is saved on this device, so nothing is lost. '
             'Reconnect to hand the attempt in - it will go through as soon as '
             'the answers reach the server.',
         onRetry: _retryOfflineSubmit,
@@ -1378,7 +1425,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         key: const Key('exam-no-questions'),
         icon: Icons.help_outline,
         title: 'No questions yet',
-        message: 'This exam has no questions published yet. Tell your '
+        message:
+            'This exam has no questions published yet. Tell your '
             'supervisor — you can come back once they are added.',
         allowExit: true,
       );
@@ -1424,8 +1472,12 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                               children: [
                                 Expanded(child: questionPane),
                                 Padding(
-                                  padding:
-                                      EdgeInsets.fromLTRB(0, 16, gutter, 16),
+                                  padding: EdgeInsets.fromLTRB(
+                                    0,
+                                    16,
+                                    gutter,
+                                    16,
+                                  ),
                                   child: SizedBox(
                                     width: 300,
                                     height: 220,
@@ -1439,8 +1491,12 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                           : Column(
                               children: [
                                 Padding(
-                                  padding:
-                                      EdgeInsets.fromLTRB(gutter, 12, gutter, 0),
+                                  padding: EdgeInsets.fromLTRB(
+                                    gutter,
+                                    12,
+                                    gutter,
+                                    0,
+                                  ),
                                   child: Align(
                                     alignment: Alignment.centerRight,
                                     child: SizedBox(
@@ -1469,7 +1525,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                 if (proctoringState.disqualified) {
                   Navigator.of(context).popUntil((r) => r.isFirst);
                 } else {
-                  ref.read(proctoringProvider(widget.submissionId).notifier).dismissOverlay();
+                  ref
+                      .read(proctoringProvider(widget.submissionId).notifier)
+                      .dismissOverlay();
                 }
               },
             ),
@@ -1493,7 +1551,10 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// a non-scrollable body, so a five-option question on a phone in landscape (or
   /// any large accessibility text scale) overflowed — and the overflow banner
   /// covered the last option.
-  Widget _buildQuestionPane(Question question, AudioMonitoringState audioState) {
+  Widget _buildQuestionPane(
+    Question question,
+    AudioMonitoringState audioState,
+  ) {
     final theme = Theme.of(context);
     final gutter = ResponsiveSizing.horizontalPadding(context);
     final selectedOption = _answers[question.id];
@@ -1529,8 +1590,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                 onRetry: () => unawaited(_retryAudioMonitoring()),
                 onOpenSettings:
                     audioState.monitor == AudioMonitorState.permissionDenied
-                        ? () => unawaited(PermissionService().openSettings())
-                        : null,
+                    ? () => unawaited(PermissionService().openSettings())
+                    : null,
               ),
             ],
           ),
@@ -1543,7 +1604,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
             _FillInTheBlankField(
               key: ValueKey(question.id),
               initialValue: _textAnswers[question.id] ?? '',
-              saved: _savedQuestions.contains(question.id) &&
+              saved:
+                  _savedQuestions.contains(question.id) &&
                   _savedText[question.id] == (_textAnswers[question.id] ?? ''),
               enabled: !_submitting,
               // Keystrokes go to the durable cache (no network write): losing the
@@ -1600,17 +1662,17 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         child: widget.mockMode
             ? const _MockCameraTile()
             : controller != null &&
-                    controller.value.isInitialized &&
-                    !controller.value.hasError
-                ? FittedBox(
-                    fit: BoxFit.cover,
-                    child: SizedBox(
-                      width: controller.value.previewSize?.height ?? 480,
-                      height: controller.value.previewSize?.width ?? 640,
-                      child: CameraPreview(controller),
-                    ),
-                  )
-                : const _CameraOfflineNotice(),
+                  controller.value.isInitialized &&
+                  !controller.value.hasError
+            ? FittedBox(
+                fit: BoxFit.cover,
+                child: SizedBox(
+                  width: controller.value.previewSize?.height ?? 480,
+                  height: controller.value.previewSize?.width ?? 640,
+                  child: CameraPreview(controller),
+                ),
+              )
+            : const _CameraOfflineNotice(),
       ),
     );
   }
@@ -1635,8 +1697,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
               if (_currentIndex > 0)
                 TextButton.icon(
                   key: const Key('exam-previous'),
-                  onPressed:
-                      _submitting ? null : () => _goTo(_currentIndex - 1),
+                  onPressed: _submitting
+                      ? null
+                      : () => _goTo(_currentIndex - 1),
                   icon: const Icon(Icons.chevron_left),
                   label: const Text('Previous'),
                 ),
@@ -1650,8 +1713,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                   _currentIndex < _questions.length - 1)
                 FilledButton.icon(
                   key: const Key('exam-next'),
-                  onPressed:
-                      _submitting ? null : () => _goTo(_currentIndex + 1),
+                  onPressed: _submitting
+                      ? null
+                      : () => _goTo(_currentIndex + 1),
                   icon: const Icon(Icons.chevron_right),
                   iconAlignment: IconAlignment.end,
                   label: const Text('Next'),
@@ -1692,7 +1756,10 @@ class _KioskBadge extends StatelessWidget {
   Widget build(BuildContext context) {
     final locked = status.granted;
     final strict = status.strict;
-    final (IconData icon, Color color, String label) = switch ((locked, strict)) {
+    final (IconData icon, Color color, String label) = switch ((
+      locked,
+      strict,
+    )) {
       (true, true) => (Icons.lock, Colors.green, 'Kiosk'),
       (true, false) => (Icons.lock_outline, Colors.amber, 'Pinned'),
       _ => (Icons.lock_open_outlined, Colors.redAccent, 'Unpinned'),
@@ -1732,10 +1799,10 @@ class _CameraOfflineNotice extends StatelessWidget {
         Text(
           'CAMERA\nOFFLINE',
           textAlign: TextAlign.center,
-          style: Theme.of(context)
-              .textTheme
-              .labelSmall
-              ?.copyWith(color: Colors.redAccent, height: 1.2),
+          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+            color: Colors.redAccent,
+            height: 1.2,
+          ),
         ),
       ],
     );
@@ -1757,15 +1824,18 @@ class _MockCameraTile extends StatelessWidget {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          const Icon(Icons.videocam_off_outlined, color: Colors.amber, size: 26),
+          const Icon(
+            Icons.videocam_off_outlined,
+            color: Colors.amber,
+            size: 26,
+          ),
           const SizedBox(height: 6),
           Text(
             'MOCK\nCAMERA',
             textAlign: TextAlign.center,
-            style: Theme.of(context)
-                .textTheme
-                .labelSmall
-                ?.copyWith(color: Colors.amber, height: 1.2),
+            style: Theme.of(
+              context,
+            ).textTheme.labelSmall?.copyWith(color: Colors.amber, height: 1.2),
           ),
         ],
       ),
@@ -1812,10 +1882,7 @@ class _BlockingState extends StatelessWidget {
     final openSettings = onOpenSettings;
 
     return Scaffold(
-      appBar: AppBar(
-        automaticallyImplyLeading: false,
-        title: Text(title),
-      ),
+      appBar: AppBar(automaticallyImplyLeading: false, title: Text(title)),
       // Scrollable and width-capped: a phone in landscape, a resized desktop
       // window or a large accessibility text scale can still reach every button.
       // This screen is the only way out of a blocked session, so it must never
@@ -1879,8 +1946,8 @@ class _RemainingChip extends StatelessWidget {
     final color = seconds <= 60
         ? Colors.redAccent
         : seconds <= 300
-            ? Colors.amber
-            : scheme.onSurface;
+        ? Colors.amber
+        : scheme.onSurface;
 
     return Tooltip(
       message: 'Time remaining',
@@ -1935,8 +2002,9 @@ class _FillInTheBlankField extends StatefulWidget {
 }
 
 class _FillInTheBlankFieldState extends State<_FillInTheBlankField> {
-  late final TextEditingController _controller =
-      TextEditingController(text: widget.initialValue);
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.initialValue,
+  );
 
   @override
   void dispose() {
@@ -1972,7 +2040,9 @@ class _FillInTheBlankFieldState extends State<_FillInTheBlankField> {
         Row(
           children: [
             Icon(
-              widget.saved ? Icons.check_circle_outline : Icons.cloud_off_outlined,
+              widget.saved
+                  ? Icons.check_circle_outline
+                  : Icons.cloud_off_outlined,
               size: 14,
               color: widget.saved
                   ? Colors.green
@@ -1984,7 +2054,7 @@ class _FillInTheBlankFieldState extends State<_FillInTheBlankField> {
                 widget.saved
                     ? 'Answer saved'
                     : 'Not saved yet — tap "Save & next", or Submit on the last '
-                        'question, to send it.',
+                          'question, to send it.',
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: widget.saved
                       ? Colors.green

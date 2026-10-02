@@ -108,6 +108,28 @@ alter default privileges in schema public
 revoke all on public.questions_public from anon;
 revoke all on public.questions        from anon;
 
+-- This migration may be run against an older project before every RPC has been
+-- installed. Repair grants only for the signatures that exist at migration time.
+do $$
+begin
+  if to_regprocedure('public.merge_submission_answer(uuid,uuid,integer)') is not null then
+    execute 'revoke execute on function public.merge_submission_answer(uuid, uuid, int) from public, anon';
+    execute 'grant execute on function public.merge_submission_answer(uuid, uuid, int) to authenticated, service_role';
+  end if;
+  if to_regprocedure('public.merge_submission_text_answer(uuid,uuid,text)') is not null then
+    execute 'revoke execute on function public.merge_submission_text_answer(uuid, uuid, text) from public, anon';
+    execute 'grant execute on function public.merge_submission_text_answer(uuid, uuid, text) to authenticated, service_role';
+  end if;
+  if to_regprocedure('public.register_violation(uuid,text,text,timestamp with time zone,uuid)') is not null then
+    execute 'revoke execute on function public.register_violation(uuid, text, text, timestamptz, uuid) from public, anon';
+    execute 'grant execute on function public.register_violation(uuid, text, text, timestamptz, uuid) to authenticated, service_role';
+  end if;
+  if to_regprocedure('public.submit_exam(uuid,boolean)') is not null then
+    execute 'revoke execute on function public.submit_exam(uuid, boolean) from public, anon';
+    execute 'grant execute on function public.submit_exam(uuid, boolean) to authenticated, service_role';
+  end if;
+end $$;
+
 -- ---------------------------------------------------------------------
 -- VERIFY
 -- ---------------------------------------------------------------------
@@ -124,4 +146,3 @@ revoke all on public.questions        from anon;
 -- An empty array is the *correct* answer there: `anon` has no policy on
 -- `profiles`, so zero rows is RLS doing its job, not a query being refused. A
 -- staff session then reads its own row and the console signs in normally.
-

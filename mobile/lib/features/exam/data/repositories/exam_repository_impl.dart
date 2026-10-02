@@ -58,11 +58,16 @@ class ExamRepositoryImpl implements ExamRepository {
   }) async {
     // jsonb_set merges the single answer without clobbering others written
     // concurrently (e.g. answer autosave firing while user moves on).
-    await _client.rpc('merge_submission_answer', params: {
-      'p_submission_id': submissionId,
-      'p_question_id': questionId,
-      'p_selected_option': selectedOption,
-    });
+    try {
+      await _client.rpc('merge_submission_answer', params: {
+        'p_submission_id': submissionId,
+        'p_question_id': questionId,
+        'p_selected_option': selectedOption,
+      });
+    } on PostgrestException catch (error) {
+      if (error.code == '55000') throw const AnswerWriteRejected();
+      rethrow;
+    }
   }
 
   @override
@@ -74,11 +79,16 @@ class ExamRepositoryImpl implements ExamRepository {
     // Same merge semantics for free text: the server stores it as a JSON string
     // under the question id and `submit_exam` compares it case-insensitively
     // after trimming, so "  http " scores for "HTTP".
-    await _client.rpc('merge_submission_text_answer', params: {
-      'p_submission_id': submissionId,
-      'p_question_id': questionId,
-      'p_answer': answer,
-    });
+    try {
+      await _client.rpc('merge_submission_text_answer', params: {
+        'p_submission_id': submissionId,
+        'p_question_id': questionId,
+        'p_answer': answer,
+      });
+    } on PostgrestException catch (error) {
+      if (error.code == '55000') throw const AnswerWriteRejected();
+      rethrow;
+    }
   }
 
   @override

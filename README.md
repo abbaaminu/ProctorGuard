@@ -23,13 +23,16 @@ Roles live in the `public.user_role` enum: `student`, `lecturer`, `supervisor`
 and `admin`. Students take exams in the mobile app, `lecturer` and `supervisor`
 sign into this console (`is_staff()`), and `admin` additionally gets the roster and
 role-management screen — in the mobile app, and as the dashboard's one admin-only
-page (`/accounts`). Every signed-in account leaves the console from the sidebar
+page (`/accounts`). Lecturers can review attempts; only admins and supervisors can
+disqualify or reset them. Every signed-in account leaves the console from the sidebar
 footer's **Sign out**, which ends the session and puts the login form back.
 
 ## Getting started
 1. Create a Supabase project, run `supabase/schema.sql` in its SQL editor,
-   then optionally `supabase/seed.sql` to load demo users, exams and
-   questions (see the header of that file for the demo logins).
+   then run `supabase/migrations/secure_exam_access_and_deadlines.sql` on an
+   existing project to apply the staff-role, RPC-grant and server-side exam
+   deadline hardening. Optionally run `supabase/seed.sql` to load demo users,
+   exams and questions (see the header of that file for the demo logins).
 2. Deploy the account functions — `supabase functions deploy admin-create-user`
    and `supabase functions deploy admin-delete-user` (needs the Supabase CLI
    linked to the project, or paste each `supabase/functions/<name>/index.ts`
@@ -85,7 +88,8 @@ it. Beyond that:
       profile. Like the create function it re-reads the caller's role with the
       caller's own JWT, refuses a self-delete with a `403`, and only then uses the
       `service_role` key; the profile, exams, questions, submissions and incident
-      logs all follow the login through `on delete cascade`. Skip it and the
+      logs follow the login through `on delete cascade`, and the function removes
+      the matching proctoring snapshot folders through the Storage API. Skip it and the
       console answers "The admin-delete-user function is not deployed on this
       project" instead of pretending the account was deleted.
 - [ ] **Client keys only.** Dashboard: `VITE_SUPABASE_URL` +

@@ -203,6 +203,19 @@ as $$
   );
 $$;
 
+create or replace function public.is_exam_supervisor()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role in ('admin', 'supervisor')
+  );
+$$;
+
 -- Historical name, kept deliberately: a policy or RPC created by an *earlier*
 -- revision of this file still calls it on a database that has not re-run this
 -- file yet. It resolves to the staff tier, exactly as it did back when
@@ -352,12 +365,12 @@ create policy "exams_insert_supervisor_only"
 create policy "exams_update_owner"
   on public.exams for update
   to authenticated
-  using (created_by = auth.uid());
+  using (created_by = auth.uid() and public.is_staff());
 
 create policy "exams_delete_owner"
   on public.exams for delete
   to authenticated
-  using (created_by = auth.uid());
+  using (created_by = auth.uid() and public.is_staff());
 
 -- ---------------------------------------------------------------------
 -- 3. QUESTIONS
@@ -431,7 +444,11 @@ create policy "questions_select_owner"
   on public.questions for select
   to authenticated
   using (
-    exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
+    exists (
+      select 1 from public.exams e
+      where e.id = exam_id and e.created_by = auth.uid()
+    )
+    and public.is_staff()
   );
 
 create policy "questions_select_supervisor"
@@ -448,21 +465,33 @@ create policy "questions_write_owner"
   on public.questions for insert
   to authenticated
   with check (
-    exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
+    exists (
+      select 1 from public.exams e
+      where e.id = exam_id and e.created_by = auth.uid()
+    )
+    and public.is_staff()
   );
 
 create policy "questions_update_owner"
   on public.questions for update
   to authenticated
   using (
-    exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
+    exists (
+      select 1 from public.exams e
+      where e.id = exam_id and e.created_by = auth.uid()
+    )
+    and public.is_staff()
   );
 
 create policy "questions_delete_owner"
   on public.questions for delete
   to authenticated
   using (
-    exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
+    exists (
+      select 1 from public.exams e
+      where e.id = exam_id and e.created_by = auth.uid()
+    )
+    and public.is_staff()
   );
 
 -- Student-safe view: strips both answer keys (`correct_option` and
@@ -556,10 +585,10 @@ create policy "submissions_select_own_or_supervisor"
   to authenticated
   using (student_id = auth.uid() or public.is_staff());
 
--- A start row can only ever be a *fresh* attempt: own student id, status
--- 'ongoing', no score, and a published exam. Without the last three checks a
--- student could insert {"status":"submitted","score":100} and forge a graded
--- attempt, or open a session on somebody's unpublished draft.
+-- A start row can only ever be a fresh attempt: the student's own id, ongoing
+-- status, empty answers, no score or submit time, and the database's start
+-- timestamp on a published exam. Otherwise a client could preseed answers or
+-- choose a future start time to bypass the server-enforced deadline.
 create policy "submissions_insert_own_ongoing"
   on public.exam_submissions for insert
   to authenticated
@@ -567,6 +596,9 @@ create policy "submissions_insert_own_ongoing"
     student_id = auth.uid()
     and status = 'ongoing'
     and score is null
+    and answers = '{}'::jsonb
+    and submitted_at is null
+    and started_at = now()
     and exists (
       select 1 from public.exams e
       where e.id = exam_id and e.is_published = true
@@ -575,19 +607,13 @@ create policy "submissions_insert_own_ongoing"
 
 -- There is deliberately NO student UPDATE policy: status, score and
 -- submitted_at are written by submit_exam() and register_violation(), both
--- SECURITY DEFINER, so a patched client cannot grade itself. Supervisors keep a
--- direct update path for manual intervention (disqualify, re-grade).
+-- SECURITY DEFINER, so a patched client cannot grade itself. Only admins and
+-- supervisors can directly intervene; lecturers review attempts.
 create policy "submissions_update_supervisor"
   on public.exam_submissions for update
   to authenticated
-  using (
-    exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
-    or public.is_staff()
-  )
-  with check (
-    exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
-    or public.is_staff()
-  );
+  using (public.is_exam_supervisor())
+  with check (public.is_exam_supervisor());
 
 -- Resetting one attempt (the console's "Reset attempt" on the submission audit)
 -- is a DELETE of this row: the score, the stored answers, the roster card and -
@@ -596,17 +622,14 @@ create policy "submissions_update_supervisor"
 -- referential actions run outside row security, so this one policy is what lets
 -- the evidence go with the attempt.
 --
--- Same audience as the update policy above: the exam's author, or a supervisor.
+-- Same audience as the update policy above: admins and supervisors.
 -- Students are deliberately left out. A student who could delete their own row
 -- would be able to erase a graded attempt - and the evidence behind a
 -- disqualification - and then simply start the exam again.
 create policy "submissions_delete_supervisor"
   on public.exam_submissions for delete
   to authenticated
-  using (
-    exists (select 1 from public.exams e where e.id = exam_id and e.created_by = auth.uid())
-    or public.is_staff()
-  );
+  using (public.is_exam_supervisor());
 
 -- A closed attempt stops being editable.
 --
@@ -766,7 +789,7 @@ create policy "logs_select_own_or_supervisor"
       select 1 from public.exam_submissions s
       where s.id = submission_id and s.student_id = auth.uid()
     )
-    or public.is_staff()
+    or public.is_exam_supervisor()
   );
 
 -- There is deliberately NO insert policy. `register_violation()` is the single
@@ -852,7 +875,7 @@ create policy "Proctor snapshots supervisor purge"
   to authenticated
   using (
     bucket_id = 'proctor-snapshots'
-    and public.is_staff()
+    and public.is_exam_supervisor()
   );
 
 -- ---------------------------------------------------------------------
@@ -918,6 +941,11 @@ declare
   v_count  int;
   v_status text;
 begin
+  if auth.uid() is null then
+    raise exception 'authentication is required to register a violation'
+      using errcode = '42501';
+  end if;
+
   -- SECURITY DEFINER is required here (a student may neither insert into
   -- proctoring_logs nor update exam_submissions), which is exactly why the
   -- function has to re-check who is asking: without this guard any signed-in
@@ -927,7 +955,7 @@ begin
     into v_status
   from public.exam_submissions s
   where s.id = p_submission_id
-    and (s.student_id = auth.uid() or public.is_staff())
+    and s.student_id = auth.uid()
   for update;
 
   if v_status is null then
@@ -978,6 +1006,8 @@ begin
   end if;
 end;
 $$;
+revoke execute on function public.register_violation(uuid, text, text, timestamptz, uuid) from public, anon;
+grant execute on function public.register_violation(uuid, text, text, timestamptz, uuid) to authenticated, service_role;
 
 -- ---------------------------------------------------------------------
 -- Race-safe partial-answer merge (RPC)
@@ -993,18 +1023,37 @@ security definer
 set search_path = public
 as $$
 begin
-  update public.exam_submissions
+  if auth.uid() is null then
+    raise exception 'authentication is required to save an exam answer'
+      using errcode = '42501';
+  end if;
+
+  update public.exam_submissions as s
   set answers = jsonb_set(
-        coalesce(answers, '{}'::jsonb),
+        coalesce(s.answers, '{}'::jsonb),
         array[p_question_id::text],
         to_jsonb(p_selected_option),
         true
       )
-  where id = p_submission_id
-    and student_id = auth.uid()
-    and status = 'ongoing';
+  where s.id = p_submission_id
+    and s.student_id = auth.uid()
+    and s.status = 'ongoing'
+    and exists (
+      select 1
+      from public.exams e
+      where e.id = s.exam_id
+        and clock_timestamp() < s.started_at
+          + make_interval(mins => e.duration_minutes)
+    );
+
+  if not found then
+    raise exception 'submission is not active or its exam deadline has passed'
+      using errcode = '55000';
+  end if;
 end;
 $$;
+revoke execute on function public.merge_submission_answer(uuid, uuid, int) from public, anon;
+grant execute on function public.merge_submission_answer(uuid, uuid, int) to authenticated, service_role;
 
 -- ---------------------------------------------------------------------
 -- Server-side grading + close (RPC)
@@ -1033,20 +1082,29 @@ declare
   v_student uuid;
   v_exam    uuid;
   v_status  text;
+  v_started_at timestamptz;
+  v_duration_minutes int;
+  v_submitted_at timestamptz;
   v_score   numeric;
 begin
-  select s.student_id, s.exam_id, s.status
-    into v_student, v_exam, v_status
+  if auth.uid() is null then
+    raise exception 'authentication is required to submit an exam'
+      using errcode = '42501';
+  end if;
+
+  select s.student_id, s.exam_id, s.status, s.started_at, e.duration_minutes
+    into v_student, v_exam, v_status, v_started_at, v_duration_minutes
   from public.exam_submissions s
+  join public.exams e on e.id = s.exam_id
   where s.id = p_submission_id
-  for update;
+  for update of s;
 
   if v_student is null then
     raise exception 'submission % does not exist', p_submission_id
       using errcode = 'P0002';
   end if;
 
-  if v_student <> auth.uid() and not public.is_staff() then
+  if v_student <> auth.uid() and not public.is_exam_supervisor() then
     raise exception 'submission % does not belong to the caller', p_submission_id
       using errcode = '42501';
   end if;
@@ -1059,6 +1117,13 @@ begin
       where s.id = p_submission_id;
     return;
   end if;
+
+  -- Expired attempts are closed and graded from answers saved before the
+  -- deadline. Record the deadline as the effective submit time for late closes.
+  v_submitted_at := least(
+    clock_timestamp(),
+    v_started_at + make_interval(mins => v_duration_minutes)
+  );
 
   -- A disqualified attempt is never graded: a score would imply it counts.
   if p_disqualified then
@@ -1097,7 +1162,7 @@ begin
     );
 
   update public.exam_submissions
-  set status = 'submitted', submitted_at = now(), score = v_score
+  set status = 'submitted', submitted_at = v_submitted_at, score = v_score
   where id = p_submission_id;
 
   return query select 'submitted'::text, v_score;
@@ -1105,7 +1170,10 @@ end;
 $$;
 
 comment on function public.submit_exam(uuid, boolean) is
-  'Closes (and grades, unless disqualified) a student''s own attempt; idempotent.';
+  'Closes and grades a student''s own attempt; late answer writes are rejected and an expired attempt is graded from saved answers. Idempotent.';
+
+revoke execute on function public.submit_exam(uuid, boolean) from public, anon;
+grant execute on function public.submit_exam(uuid, boolean) to authenticated, service_role;
 
 -- ---------------------------------------------------------------------
 -- Race-safe free-text answer merge (RPC)
@@ -1130,15 +1198,34 @@ security definer
 set search_path = public
 as $$
 begin
-  update public.exam_submissions
+  if auth.uid() is null then
+    raise exception 'authentication is required to save an exam answer'
+      using errcode = '42501';
+  end if;
+
+  update public.exam_submissions as s
   set answers = jsonb_set(
-        coalesce(answers, '{}'::jsonb),
+        coalesce(s.answers, '{}'::jsonb),
         array[p_question_id::text],
         to_jsonb(left(coalesce(p_answer, ''), 2000)),
         true
       )
-  where id = p_submission_id
-    and student_id = auth.uid()
-    and status = 'ongoing';
+  where s.id = p_submission_id
+    and s.student_id = auth.uid()
+    and s.status = 'ongoing'
+    and exists (
+      select 1
+      from public.exams e
+      where e.id = s.exam_id
+        and clock_timestamp() < s.started_at
+          + make_interval(mins => e.duration_minutes)
+    );
+
+  if not found then
+    raise exception 'submission is not active or its exam deadline has passed'
+      using errcode = '55000';
+  end if;
 end;
 $$;
+revoke execute on function public.merge_submission_text_answer(uuid, uuid, text) from public, anon;
+grant execute on function public.merge_submission_text_answer(uuid, uuid, text) to authenticated, service_role;

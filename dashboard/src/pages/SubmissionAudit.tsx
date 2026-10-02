@@ -4,6 +4,7 @@ import { CheckCircle2, XCircle, AlertOctagon, RotateCcw } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { useAccountNames } from "@/hooks/useAccountNames";
 import { useResetSubmission } from "@/hooks/useResetSubmission";
+import { useAuth } from "@/hooks/useAuth";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge, statusTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -25,6 +26,9 @@ function normalise(value: string | null | undefined) {
 
 export function SubmissionAudit() {
   const { id: submissionId } = useParams<{ id: string }>();
+  const { profile } = useAuth();
+  const canIntervene =
+    profile?.role === "admin" || profile?.role === "supervisor";
   const [submission, setSubmission] = useState<SubmissionRow | null>(null);
   const [logs, setLogs] = useState<ProctoringLogRow[]>([]);
   const [questions, setQuestions] = useState<QuestionRow[]>([]);
@@ -114,7 +118,7 @@ export function SubmissionAudit() {
    * the page would simply look unchanged, with no reason given.
    */
   async function handleReset() {
-    if (!submission || resetting) return;
+    if (!canIntervene || !submission || resetting) return;
     const label = names[submission.student_id] ?? "this student";
 
     // The dialog stays open while the write is in flight (buttons disable, the
@@ -233,15 +237,17 @@ export function SubmissionAudit() {
           <span className="text-lg font-semibold text-slate-100">
             {submission.score != null ? `${submission.score} pts` : "—"}
           </span>
-          <Button
-            variant="destructive"
-            size="sm"
-            disabled={resetting}
-            onClick={() => setConfirmingReset(true)}
-          >
-            <RotateCcw size={13} />
-            Reset attempt
-          </Button>
+          {canIntervene && (
+            <Button
+              variant="destructive"
+              size="sm"
+              disabled={resetting}
+              onClick={() => setConfirmingReset(true)}
+            >
+              <RotateCcw size={13} />
+              Reset attempt
+            </Button>
+          )}
         </div>
       </div>
 

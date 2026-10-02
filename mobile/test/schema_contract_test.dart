@@ -11,6 +11,7 @@ import 'package:exam_proctor/features/auth/domain/entities/user_profile.dart';
 import 'package:exam_proctor/features/exam/data/repositories/exam_repository_impl.dart';
 import 'package:exam_proctor/features/exam/domain/entities/question.dart';
 import 'package:exam_proctor/features/exam/domain/entities/submission.dart';
+import 'package:exam_proctor/features/exam/domain/repositories/exam_repository.dart';
 import 'package:exam_proctor/features/proctoring/data/repositories/proctoring_repository_impl.dart';
 import 'package:exam_proctor/features/proctoring/domain/entities/violation.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -62,8 +63,7 @@ void main() {
   });
 
   group('register_violation RPC payload', () {
-    test('sends exactly the schema argument names and maps the result',
-        () async {
+    test('sends exactly the schema argument names and maps the result', () async {
       transport.responseBody = '[{"warning_count": 2, "disqualified": false}]';
       final repo = ProctoringRepositoryImpl(client);
 
@@ -72,7 +72,8 @@ void main() {
         violation: Violation(
           type: ViolationType.lookingAway,
           timestamp: DateTime.utc(2026, 1, 1, 10, 30),
-          snapshotUrl: 'https://mock.supabase.co/storage/v1/object/public/'
+          snapshotUrl:
+              'https://mock.supabase.co/storage/v1/object/public/'
               'proctor-snapshots/sub-1/looking_away_1.jpg',
           clientEventId: '9f1a4d0e-0f6b-4a1e-9a2b-6c2d2b7a3f11',
         ),
@@ -168,11 +169,71 @@ void main() {
         );
       }
     });
+
+    test('server enforces answer deadlines and scopes staff intervention', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      expect(sql, contains('clock_timestamp() < s.started_at'));
+      expect(sql, contains('v_submitted_at := least('));
+      expect(sql, contains('authentication is required to submit an exam'));
+      expect(sql, contains("and answers = '{}'::jsonb"));
+      expect(sql, contains('and submitted_at is null'));
+      expect(sql, contains('and started_at = now()'));
+      final violationStart = sql.indexOf(
+        'create or replace function public.register_violation(',
+      );
+      final answerMergeStart = sql.indexOf(
+        '-- Race-safe partial-answer merge (RPC)',
+        violationStart,
+      );
+      final violationRpc = sql.substring(violationStart, answerMergeStart);
+      expect(violationRpc, contains('and s.student_id = auth.uid()'));
+      expect(violationRpc, isNot(contains('or public.is_staff()')));
+      expect(
+        sql,
+        contains(
+          'revoke execute on function public.submit_exam(uuid, boolean) from public, anon',
+        ),
+      );
+      expect(sql, contains("role in ('admin', 'supervisor')"));
+      expect(
+        File(
+          '../supabase/migrations/secure_exam_access_and_deadlines.sql',
+        ).existsSync(),
+        isTrue,
+        reason: 'existing projects need an explicit hardening migration',
+      );
+    });
   });
 
   group('submit_exam RPC payload', () {
-    test('submitExam asks the server to grade and close the attempt',
-        () async {
+    test(
+      'a closed/deadline-expired answer becomes a terminal local warning',
+      () async {
+        transport
+          ..statusCode = 400
+          ..responseBody = jsonEncode(<String, dynamic>{
+            'code': '55000',
+            'message':
+                'submission is not active or its exam deadline has passed',
+            'details': null,
+            'hint': null,
+          });
+        final repo = ExamRepositoryImpl(client);
+
+        await expectLater(
+          repo.saveAnswer(
+            submissionId: 'sub-1',
+            questionId: 'q-1',
+            selectedOption: 2,
+          ),
+          throwsA(isA<AnswerWriteRejected>()),
+        );
+      },
+    );
+
+    test('submitExam asks the server to grade and close the attempt', () async {
       transport.responseBody =
           '[{"result_status":"submitted","final_score":4}]';
       final repo = ExamRepositoryImpl(client);
@@ -188,136 +249,153 @@ void main() {
       expect(body['p_submission_id'], 'sub-1');
     });
 
-    test('markDisqualified flags the close so the server never grades',
-        () async {
-      transport.responseBody =
-          '[{"result_status":"disqualified","final_score":null}]';
-      final repo = ExamRepositoryImpl(client);
+    test(
+      'markDisqualified flags the close so the server never grades',
+      () async {
+        transport.responseBody =
+            '[{"result_status":"disqualified","final_score":null}]';
+        final repo = ExamRepositoryImpl(client);
 
-      await repo.markDisqualified('sub-1');
+        await repo.markDisqualified('sub-1');
 
-      expect(transport.requests.single.url.path, '/rest/v1/rpc/submit_exam');
+        expect(transport.requests.single.url.path, '/rest/v1/rpc/submit_exam');
 
-      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
-      expect(body.keys.toSet(), <String>{'p_submission_id', 'p_disqualified'});
-      expect(body['p_disqualified'], isTrue);
-    });
+        final body =
+            jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+        expect(body.keys.toSet(), <String>{
+          'p_submission_id',
+          'p_disqualified',
+        });
+        expect(body['p_disqualified'], isTrue);
+      },
+    );
 
-    test('closing an attempt never PATCHes exam_submissions directly',
-        () async {
-      // schema.sql §4 has no student UPDATE policy on the table, so a direct
-      // write would be rejected by RLS — submit_exam is the only writer.
-      transport.responseBody =
-          '[{"result_status":"submitted","final_score":0}]';
-      final repo = ExamRepositoryImpl(client);
+    test(
+      'closing an attempt never PATCHes exam_submissions directly',
+      () async {
+        // schema.sql §4 has no student UPDATE policy on the table, so a direct
+        // write would be rejected by RLS — submit_exam is the only writer.
+        transport.responseBody =
+            '[{"result_status":"submitted","final_score":0}]';
+        final repo = ExamRepositoryImpl(client);
 
-      await repo.submitExam('sub-1');
+        await repo.submitExam('sub-1');
 
-      expect(
-        transport.requests.where((request) => request.method == 'PATCH'),
-        isEmpty,
-      );
-    });
+        expect(
+          transport.requests.where((request) => request.method == 'PATCH'),
+          isEmpty,
+        );
+      },
+    );
   });
 
   group('admin profiles contract', () {
     const String adminId = '44444444-4444-4444-8444-444444444444';
     const String aishaId = '22222222-2222-4222-8222-222222222222';
 
-    test('listAccounts reads profiles oldest-first and maps every row',
-        () async {
-      transport.responseBody = jsonEncode(<Map<String, dynamic>>[
-        <String, dynamic>{
-          'id': adminId,
-          'email': 'root@proctor.test',
-          'full_name': 'Root Admin',
-          'role': 'admin',
-          'created_at': '2026-01-01T08:00:00.000Z',
-        },
-        <String, dynamic>{
-          'id': aishaId,
-          'email': 'aisha.bello@proctor.test',
-          // Blank, not null: `profiles.full_name` is `not null`.
-          'full_name': '   ',
-          'role': 'student',
-        },
-      ]);
-      final repo = AdminUserRepositoryImpl(client);
+    test(
+      'listAccounts reads profiles oldest-first and maps every row',
+      () async {
+        transport.responseBody = jsonEncode(<Map<String, dynamic>>[
+          <String, dynamic>{
+            'id': adminId,
+            'email': 'root@proctor.test',
+            'full_name': 'Root Admin',
+            'role': 'admin',
+            'created_at': '2026-01-01T08:00:00.000Z',
+          },
+          <String, dynamic>{
+            'id': aishaId,
+            'email': 'aisha.bello@proctor.test',
+            // Blank, not null: `profiles.full_name` is `not null`.
+            'full_name': '   ',
+            'role': 'student',
+          },
+        ]);
+        final repo = AdminUserRepositoryImpl(client);
 
-      final List<ManagedAccount> accounts = await repo.listAccounts();
+        final List<ManagedAccount> accounts = await repo.listAccounts();
 
-      final request = transport.requests.single;
-      expect(request.method, 'GET');
-      expect(request.url.path, '/rest/v1/profiles');
-      expect(
-        request.url.queryParameters['order'],
-        // postgrest-dart appends `nullslast`, so a row with no `created_at`
-        // sorts after the seeded accounts instead of jumping to the top.
-        'created_at.asc.nullslast',
-      );
-      expect(
-        accounts.map((account) => account.role).toList(),
-        <UserRole>[UserRole.admin, UserRole.student],
-      );
-      expect(accounts.first.createdAt, DateTime.utc(2026, 1, 1, 8));
-      // An unnamed row keeps its address, the same fallback the gate uses.
-      expect(accounts.last.displayName, 'aisha.bello@proctor.test');
-    });
+        final request = transport.requests.single;
+        expect(request.method, 'GET');
+        expect(request.url.path, '/rest/v1/profiles');
+        expect(
+          request.url.queryParameters['order'],
+          // postgrest-dart appends `nullslast`, so a row with no `created_at`
+          // sorts after the seeded accounts instead of jumping to the top.
+          'created_at.asc.nullslast',
+        );
+        expect(accounts.map((account) => account.role).toList(), <UserRole>[
+          UserRole.admin,
+          UserRole.student,
+        ]);
+        expect(accounts.first.createdAt, DateTime.utc(2026, 1, 1, 8));
+        // An unnamed row keeps its address, the same fallback the gate uses.
+        expect(accounts.last.displayName, 'aisha.bello@proctor.test');
+      },
+    );
 
-    test('a roster row whose role this build does not know is refused',
-        () async {
-      // Not rendered as a familiar role: `UserRole.fromDb` throws, and the
-      // repository turns that into the "update the app" message.
-      transport.responseBody = jsonEncode(<Map<String, dynamic>>[
-        <String, dynamic>{
-          'id': adminId,
-          'email': 'root@proctor.test',
-          'role': 'principal',
-        },
-      ]);
+    test(
+      'a roster row whose role this build does not know is refused',
+      () async {
+        // Not rendered as a familiar role: `UserRole.fromDb` throws, and the
+        // repository turns that into the "update the app" message.
+        transport.responseBody = jsonEncode(<Map<String, dynamic>>[
+          <String, dynamic>{
+            'id': adminId,
+            'email': 'root@proctor.test',
+            'role': 'principal',
+          },
+        ]);
 
-      await expectLater(
-        AdminUserRepositoryImpl(client).listAccounts(),
-        throwsA(
-          isA<AdminAccountException>().having(
-            (error) => error.message,
-            'message',
-            contains('does not know about'),
+        await expectLater(
+          AdminUserRepositoryImpl(client).listAccounts(),
+          throwsA(
+            isA<AdminAccountException>().having(
+              (error) => error.message,
+              'message',
+              contains('does not know about'),
+            ),
           ),
-        ),
-      );
-    });
+        );
+      },
+    );
 
-    test('updateRole PATCHes profiles and demands the updated row back',
-        () async {
-      transport.responseBody = jsonEncode(<Map<String, dynamic>>[
-        <String, dynamic>{'id': aishaId, 'role': 'supervisor'},
-      ]);
-      final repo = AdminUserRepositoryImpl(client);
+    test(
+      'updateRole PATCHes profiles and demands the updated row back',
+      () async {
+        transport.responseBody = jsonEncode(<Map<String, dynamic>>[
+          <String, dynamic>{'id': aishaId, 'role': 'supervisor'},
+        ]);
+        final repo = AdminUserRepositoryImpl(client);
 
-      await repo.updateRole(userId: aishaId, role: UserRole.supervisor);
+        await repo.updateRole(userId: aishaId, role: UserRole.supervisor);
 
-      final request = transport.requests.single;
-      expect(request.method, 'PATCH');
-      expect(request.url.path, '/rest/v1/profiles');
-      expect(request.url.queryParameters['id'], 'eq.$aishaId');
-      // `.select()` is what makes "no row matched" visible instead of silent.
-      expect(request.url.queryParameters['select'], '*');
-      expect(jsonDecode(transport.bodies.single), <String, dynamic>{
-        'role': 'supervisor',
-      });
-    });
+        final request = transport.requests.single;
+        expect(request.method, 'PATCH');
+        expect(request.url.path, '/rest/v1/profiles');
+        expect(request.url.queryParameters['id'], 'eq.$aishaId');
+        // `.select()` is what makes "no row matched" visible instead of silent.
+        expect(request.url.queryParameters['select'], '*');
+        expect(jsonDecode(transport.bodies.single), <String, dynamic>{
+          'role': 'supervisor',
+        });
+      },
+    );
 
-    test('an update that matched no row is an error, not a silent success',
-        () async {
-      transport.responseBody = '[]'; // e.g. deleted between list and tap
+    test(
+      'an update that matched no row is an error, not a silent success',
+      () async {
+        transport.responseBody = '[]'; // e.g. deleted between list and tap
 
-      expect(
-        AdminUserRepositoryImpl(client)
-            .updateRole(userId: aishaId, role: UserRole.student),
-        throwsA(isA<AdminAccountException>()),
-      );
-    });
+        expect(
+          AdminUserRepositoryImpl(
+            client,
+          ).updateRole(userId: aishaId, role: UserRole.student),
+          throwsA(isA<AdminAccountException>()),
+        );
+      },
+    );
 
     test('an RLS refusal becomes prose for the administrator', () async {
       // A caller who is not an admin passes the client-side form and is stopped
@@ -332,8 +410,9 @@ void main() {
       });
 
       expect(
-        AdminUserRepositoryImpl(client)
-            .updateRole(userId: aishaId, role: UserRole.admin),
+        AdminUserRepositoryImpl(
+          client,
+        ).updateRole(userId: aishaId, role: UserRole.admin),
         throwsA(
           isA<AdminAccountException>().having(
             (error) => error.message,
@@ -354,8 +433,7 @@ void main() {
           role: UserRole.lecturer,
         );
 
-    test('createAccount posts the trimmed payload to the Edge Function',
-        () async {
+    test('createAccount posts the trimmed payload to the Edge Function', () async {
       // The function answers 200 with the created row; `functions.invoke` treats
       // any 2xx as success, so the status itself is not load-bearing.
       transport.statusCode = 200;
@@ -406,51 +484,54 @@ void main() {
       );
     });
 
-    test('an un-deployed function is explained, not reported as a 404',
-        () async {
-      // What the platform answers for a function that was never deployed: no
-      // `error` field, so the status is all the client has to go on.
-      transport.statusCode = 404;
-      transport.responseBody = jsonEncode(<String, dynamic>{
-        'code': 404,
-        'message': 'Requested function was not found',
-      });
+    test(
+      'an un-deployed function is explained, not reported as a 404',
+      () async {
+        // What the platform answers for a function that was never deployed: no
+        // `error` field, so the status is all the client has to go on.
+        transport.statusCode = 404;
+        transport.responseBody = jsonEncode(<String, dynamic>{
+          'code': 404,
+          'message': 'Requested function was not found',
+        });
 
-      await expectLater(
-        createLecturer(),
-        throwsA(
-          isA<AdminAccountException>().having(
-            (error) => error.message,
-            'message',
-            contains('not deployed on this project'),
+        await expectLater(
+          createLecturer(),
+          throwsA(
+            isA<AdminAccountException>().having(
+              (error) => error.message,
+              'message',
+              contains('not deployed on this project'),
+            ),
           ),
-        ),
-      );
-    });
+        );
+      },
+    );
 
-    test('a 200 that carries `{ error }` is not mistaken for a new account',
-        () async {
-      transport.statusCode = 200;
-      transport.responseBody = jsonEncode(<String, dynamic>{
-        'error': 'ada.nwosu@proctor.test already has an account.',
-      });
+    test(
+      'a 200 that carries `{ error }` is not mistaken for a new account',
+      () async {
+        transport.statusCode = 200;
+        transport.responseBody = jsonEncode(<String, dynamic>{
+          'error': 'ada.nwosu@proctor.test already has an account.',
+        });
 
-      await expectLater(
-        createLecturer(),
-        throwsA(
-          isA<AdminAccountException>().having(
-            (error) => error.message,
-            'message',
-            'ada.nwosu@proctor.test already has an account.',
+        await expectLater(
+          createLecturer(),
+          throwsA(
+            isA<AdminAccountException>().having(
+              (error) => error.message,
+              'message',
+              'ada.nwosu@proctor.test already has an account.',
+            ),
           ),
-        ),
-      );
-    });
+        );
+      },
+    );
   });
 
   group('role contract', () {
-    test('the client and the Edge Function agree on the roles and the floor',
-        () {
+    test('the client and the Edge Function agree on the roles and the floor', () {
       // Supabase Auth's default minimum: a shorter password would be accepted
       // by the form and refused after the administrator had already typed it.
       expect(adminMinPasswordLength, AdminUserRepositoryImpl.minPasswordLength);
@@ -461,8 +542,9 @@ void main() {
 
       final source = file.readAsStringSync();
       // Same four roles, same order, on both sides of the wire.
-      final expected =
-          UserRole.values.map((role) => '"${role.dbValue}"').join(', ');
+      final expected = UserRole.values
+          .map((role) => '"${role.dbValue}"')
+          .join(', ');
       expect(source, contains('const ROLES = [$expected]'));
       // `{ error }` is what `_messageFromFunctionError` reads out of a 4xx.
       expect(source, contains('return json({ error: message }, status);'));
@@ -530,53 +612,57 @@ void main() {
   });
 
   group('proctor-snapshots upload', () {
-    test('POSTs JPEG bytes to <submission_id>/<action_type>_<epoch-ms>.jpg',
-        () async {
-      // storage_client expects the object key back from the upload response.
-      transport.responseBody =
-          '{"Key": "proctor-snapshots/sub-1/no_face_1.jpg"}';
-      SupabaseService.instance.debugSetClient(client);
-      addTearDown(() => SupabaseService.instance.debugSetClient(null));
+    test(
+      'POSTs JPEG bytes to <submission_id>/<action_type>_<epoch-ms>.jpg',
+      () async {
+        // storage_client expects the object key back from the upload response.
+        transport.responseBody =
+            '{"Key": "proctor-snapshots/sub-1/no_face_1.jpg"}';
+        SupabaseService.instance.debugSetClient(client);
+        addTearDown(() => SupabaseService.instance.debugSetClient(null));
 
-      final before = DateTime.now().millisecondsSinceEpoch;
-      final url = await SupabaseService.instance.uploadViolationSnapshot(
-        submissionId: 'sub-1',
-        actionType: 'no_face',
-        bytes: Uint8List.fromList(<int>[1, 2, 3, 4]),
-      );
-      final after = DateTime.now().millisecondsSinceEpoch;
+        final before = DateTime.now().millisecondsSinceEpoch;
+        final url = await SupabaseService.instance.uploadViolationSnapshot(
+          submissionId: 'sub-1',
+          actionType: 'no_face',
+          bytes: Uint8List.fromList(<int>[1, 2, 3, 4]),
+        );
+        final after = DateTime.now().millisecondsSinceEpoch;
 
-      final request = transport.requests.single;
-      expect(request.method, 'POST');
-      expect(
-        request.url.path,
-        startsWith('/storage/v1/object/proctor-snapshots/sub-1/no_face_'),
-      );
-      expect(request.url.path, endsWith('.jpg'));
+        final request = transport.requests.single;
+        expect(request.method, 'POST');
+        expect(
+          request.url.path,
+          startsWith('/storage/v1/object/proctor-snapshots/sub-1/no_face_'),
+        );
+        expect(request.url.path, endsWith('.jpg'));
 
-      // supabase-storage takes the object's MIME type from the multipart part —
-      // that is what the bucket's allowed_mime_types (jpeg/png) validates — and
-      // `x-upsert: false` keeps snapshot names append-only.
-      expect(request, isA<http.MultipartRequest>());
-      final multipart = request as http.MultipartRequest;
-      expect(multipart.files, hasLength(1));
-      expect(multipart.files.single.contentType.mimeType, 'image/jpeg');
-      expect(multipart.fields['cacheControl'], '3600');
-      expect(multipart.headers['x-upsert'], 'false');
+        // supabase-storage takes the object's MIME type from the multipart part —
+        // that is what the bucket's allowed_mime_types (jpeg/png) validates — and
+        // `x-upsert: false` keeps snapshot names append-only.
+        expect(request, isA<http.MultipartRequest>());
+        final multipart = request as http.MultipartRequest;
+        expect(multipart.files, hasLength(1));
+        expect(multipart.files.single.contentType.mimeType, 'image/jpeg');
+        expect(multipart.fields['cacheControl'], '3600');
+        expect(multipart.headers['x-upsert'], 'false');
 
-      // The URL stored on the log row comes from getPublicUrl().
-      expect(url, isNotNull);
-      expect(
-        url,
-        contains('/storage/v1/object/public/proctor-snapshots/sub-1/no_face_'),
-      );
-      expect(url, endsWith('.jpg'));
+        // The URL stored on the log row comes from getPublicUrl().
+        expect(url, isNotNull);
+        expect(
+          url,
+          contains(
+            '/storage/v1/object/public/proctor-snapshots/sub-1/no_face_',
+          ),
+        );
+        expect(url, endsWith('.jpg'));
 
-      final stamp = int.parse(
-        RegExp(r'no_face_(\d+)\.jpg').firstMatch(url!)!.group(1)!,
-      );
-      expect(stamp, inInclusiveRange(before, after));
-    });
+        final stamp = int.parse(
+          RegExp(r'no_face_(\d+)\.jpg').firstMatch(url!)!.group(1)!,
+        );
+        expect(stamp, inInclusiveRange(before, after));
+      },
+    );
 
     test('snapshotPath is the single source of the path convention', () {
       expect(SupabaseService.snapshotBucket, 'proctor-snapshots');
@@ -622,10 +708,10 @@ void main() {
 
   group('question shapes', () {
     test('QuestionType round-trips the values the check constraint allows', () {
-      expect(
-        QuestionType.values.map((type) => type.dbValue).toList(),
-        <String>['multiple_choice', 'fill_in_the_blank'],
-      );
+      expect(QuestionType.values.map((type) => type.dbValue).toList(), <String>[
+        'multiple_choice',
+        'fill_in_the_blank',
+      ]);
       expect(
         QuestionType.fromDb('fill_in_the_blank'),
         QuestionType.fillInTheBlank,
@@ -643,21 +729,23 @@ void main() {
       expect(QuestionType.fromDb(null), QuestionType.multipleChoice);
     });
 
-    test('Question.fromMap reads a fill-in-the-blank row from the safe view',
-        () {
-      final question = Question.fromMap(<String, dynamic>{
-        'id': 'q-1',
-        'exam_id': 'exam-1',
-        'question_text': 'What does the acronym HTTP stand for?',
-        'question_type': 'fill_in_the_blank',
-        'options': <String>[],
-        'points': 2,
-      });
+    test(
+      'Question.fromMap reads a fill-in-the-blank row from the safe view',
+      () {
+        final question = Question.fromMap(<String, dynamic>{
+          'id': 'q-1',
+          'exam_id': 'exam-1',
+          'question_text': 'What does the acronym HTTP stand for?',
+          'question_type': 'fill_in_the_blank',
+          'options': <String>[],
+          'points': 2,
+        });
 
-      expect(question.questionType, QuestionType.fillInTheBlank);
-      expect(question.isFillInTheBlank, isTrue);
-      expect(question.options, isEmpty);
-    });
+        expect(question.questionType, QuestionType.fillInTheBlank);
+        expect(question.isFillInTheBlank, isTrue);
+        expect(question.options, isEmpty);
+      },
+    );
 
     test('a row without question_type (pre-types database) still parses', () {
       final question = Question.fromMap(<String, dynamic>{
@@ -673,13 +761,15 @@ void main() {
   });
 
   group('schema.sql carries the offline-retry contract', () {
-    test('the log table, the RPC and the dedupe index agree with the client',
-        () {
+    test('the log table, the RPC and the dedupe index agree with the client', () {
       final sql = schemaSql();
       if (sql == null) return; // a checkout without ../supabase
 
       // The two columns `ProctoringRepositoryImpl` now sends.
-      expect(sql, contains('add column if not exists client_timestamp timestamptz'));
+      expect(
+        sql,
+        contains('add column if not exists client_timestamp timestamptz'),
+      );
       expect(sql, contains('add column if not exists client_event_id uuid'));
       expect(sql, contains('p_client_timestamp timestamptz default null'));
       expect(sql, contains('p_client_event_id  uuid default null'));
@@ -688,15 +778,19 @@ void main() {
       expect(sql, contains('idx_logs_client_event_id'));
       expect(
         sql,
-        contains('on conflict (client_event_id) where client_event_id is not null '
-            'do nothing'),
+        contains(
+          'on conflict (client_event_id) where client_event_id is not null '
+          'do nothing',
+        ),
       );
 
       // And the old 3-argument overload has to be dropped, or every call becomes
       // ambiguous now that a 5-argument defaulted version exists.
       expect(
         sql,
-        contains('drop function if exists public.register_violation(uuid, text, text);'),
+        contains(
+          'drop function if exists public.register_violation(uuid, text, text);',
+        ),
       );
     });
   });

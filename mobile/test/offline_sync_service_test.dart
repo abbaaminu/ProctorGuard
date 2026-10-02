@@ -127,6 +127,36 @@ void main() {
           reason: 'a pass that delivered and failed is not a connection that is back');
     });
 
+    test('a permanent server rejection is retained as a warning, not retried',
+        () async {
+      exams.rejectPermanentlyQuestionId = 'q-1';
+
+      await sync.cacheChoice(
+        submissionId: 'sub-1',
+        questionId: 'q-1',
+        selectedOption: 2,
+      );
+
+      expect(sync.state.pendingAnswers, 0);
+      expect(sync.state.rejectedAnswers, 1);
+      expect(sync.state.hasPending, isFalse);
+      expect(sync.state.hasRejectedAnswers, isTrue);
+      expect(sync.rejectedAnswerCountFor('sub-1'), 1);
+      expect(sync.state.label, contains('not accepted'));
+      expect(exams.permanentRejections, 1);
+
+      await sync.dispose();
+      final relaunched =
+          _service(exams: exams, proctoring: proctoring, store: store);
+      addTearDown(relaunched.dispose);
+      await relaunched.ensureHydrated();
+
+      expect(relaunched.state.rejectedAnswers, 1);
+      await relaunched.retryNow();
+      expect(exams.permanentRejections, 1,
+          reason: 'a terminal rejection is not retried after restoration');
+    });
+
     test('re-answering replaces the pending row instead of queueing twice',
         () async {
       exams.online = false;
@@ -479,6 +509,8 @@ class _FlakyExamRepository implements ExamRepository {
   /// schema change would: the row stays queued for good while every other row
   /// must still get through.
   String? rejectQuestionId;
+  String? rejectPermanentlyQuestionId;
+  int permanentRejections = 0;
 
   @override
   Future<List<Exam>> getPublishedExams() async => <Exam>[];
@@ -496,6 +528,10 @@ class _FlakyExamRepository implements ExamRepository {
     required String questionId,
     required int selectedOption,
   }) async {
+    if (questionId == rejectPermanentlyQuestionId) {
+      permanentRejections++;
+      throw const AnswerWriteRejected();
+    }
     if (!online || questionId == rejectQuestionId) throw const _Offline();
     optionAnswers.add('$questionId=$selectedOption');
   }
@@ -506,6 +542,10 @@ class _FlakyExamRepository implements ExamRepository {
     required String questionId,
     required String answer,
   }) async {
+    if (questionId == rejectPermanentlyQuestionId) {
+      permanentRejections++;
+      throw const AnswerWriteRejected();
+    }
     if (!online || questionId == rejectQuestionId) throw const _Offline();
     textAnswers.add('$questionId=$answer');
   }

@@ -6,6 +6,7 @@ import { useExamSubmissions } from "@/hooks/useExamSubmissions";
 import { useLiveIncidentFeed } from "@/hooks/useLiveIncidentFeed";
 import { useResetSubmission } from "@/hooks/useResetSubmission";
 import { useAccountNames } from "@/hooks/useAccountNames";
+import { useAuth } from "@/hooks/useAuth";
 import {
   REALTIME_STATUS_COPY,
   useRealtimeStatus,
@@ -39,6 +40,9 @@ function SnapshotModal({ url, onClose }: { url: string; onClose: () => void }) {
 
 export function LiveMonitor() {
   const { id: examId } = useParams<{ id: string }>();
+  const { profile } = useAuth();
+  const canIntervene =
+    profile?.role === "admin" || profile?.role === "supervisor";
   const [exam, setExam] = useState<ExamRow | null>(null);
   /**
    * Why the header cannot name this exam. The read below used to be `.then(({ data
@@ -157,6 +161,7 @@ export function LiveMonitor() {
    * leaving the supervisor wondering why nothing happened.
    */
   async function handleDisqualify(submission: SubmissionRow) {
+    if (!canIntervene) return;
     const label = labelFor(submission.student_id);
     if (!confirm(`Disqualify ${label}? The attempt is closed immediately and cannot be reopened.`)) {
       return;
@@ -166,7 +171,7 @@ export function LiveMonitor() {
     const ok = await disqualify(submission.id);
     if (!ok) {
       setActionError(
-        `Could not disqualify ${label}. The attempt is unchanged — check that you are a supervisor for this exam.`
+        `Could not disqualify ${label}. The attempt is unchanged — only an administrator or supervisor can intervene.`
       );
     }
   }
@@ -181,7 +186,7 @@ export function LiveMonitor() {
    * instead of leaving the card on screen with no explanation.
    */
   async function handleReset() {
-    if (!pendingReset || resetting) return;
+    if (!canIntervene || !pendingReset || resetting) return;
     const target = pendingReset;
     const label = labelFor(target.student_id);
 
@@ -305,16 +310,18 @@ export function LiveMonitor() {
                       >
                         <FileText size={12} /> Audit
                       </Link>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="ml-auto"
-                        disabled={resetting}
-                        onClick={() => setPendingReset(s)}
-                      >
-                        <RotateCcw size={13} /> Reset
-                      </Button>
-                      {s.status === "ongoing" && (
+                      {canIntervene && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="ml-auto"
+                          disabled={resetting}
+                          onClick={() => setPendingReset(s)}
+                        >
+                          <RotateCcw size={13} /> Reset
+                        </Button>
+                      )}
+                      {canIntervene && s.status === "ongoing" && (
                         <Button
                           variant="destructive"
                           size="sm"

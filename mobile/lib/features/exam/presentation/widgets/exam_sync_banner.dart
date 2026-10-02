@@ -51,7 +51,9 @@ class _ExamSyncBannerState extends State<ExamSyncBanner> {
     // pass emits twice (syncing on, then off) and an offline queue retries on a
     // backoff, so repainting on every emission would keep a dead-connection exam
     // scheduling frames for as long as it stayed offline.
-    if (state.online == _state.online && state.pending == _state.pending) {
+    if (state.online == _state.online &&
+        state.pending == _state.pending &&
+        state.rejectedAnswers == _state.rejectedAnswers) {
       _state = state;
       return;
     }
@@ -68,11 +70,16 @@ class _ExamSyncBannerState extends State<ExamSyncBanner> {
   @override
   Widget build(BuildContext context) {
     // Nothing pending: the server has everything, so there is nothing to say.
-    if (!_state.hasPending) return const SizedBox.shrink();
+    if (!_state.hasPending && !_state.hasRejectedAnswers) {
+      return const SizedBox.shrink();
+    }
 
     final theme = Theme.of(context);
     final offline = !_state.online;
-    final color = offline ? Colors.amber.shade800 : theme.colorScheme.primary;
+    final warning = _state.hasRejectedAnswers;
+    final color = offline || warning
+        ? Colors.amber.shade800
+        : theme.colorScheme.primary;
 
     return Container(
       key: const Key('exam-sync-banner'),
@@ -82,7 +89,11 @@ class _ExamSyncBannerState extends State<ExamSyncBanner> {
       child: Row(
         children: [
           Icon(
-            offline ? Icons.cloud_off : Icons.cloud_upload_outlined,
+            warning
+                ? Icons.warning_amber_outlined
+                : offline
+                    ? Icons.cloud_off
+                    : Icons.cloud_upload_outlined,
             size: 18,
             color: color,
           ),
@@ -93,10 +104,16 @@ class _ExamSyncBannerState extends State<ExamSyncBanner> {
               style: theme.textTheme.labelLarge?.copyWith(color: color),
             ),
           ),
-          Text(
-            '${_state.pending} to sync',
-            style: theme.textTheme.labelSmall?.copyWith(color: color),
-          ),
+          if (_state.hasPending)
+            Text(
+              '${_state.pending} to sync',
+              style: theme.textTheme.labelSmall?.copyWith(color: color),
+            )
+          else
+            Text(
+              '${_state.rejectedAnswers} not saved',
+              style: theme.textTheme.labelSmall?.copyWith(color: color),
+            ),
         ],
       ),
     );

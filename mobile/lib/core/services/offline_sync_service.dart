@@ -20,6 +20,7 @@ class PendingAnswer {
     required this.updatedAt,
     this.selectedOption,
     this.text,
+    this.rejected = false,
   });
 
   final String submissionId;
@@ -33,15 +34,29 @@ class PendingAnswer {
 
   final DateTime updatedAt;
 
+  /// A permanent server rejection; retained locally for an explicit warning
+  /// instead of retrying a closed or expired attempt forever.
+  final bool rejected;
+
   bool get isText => text != null;
 
+  PendingAnswer markRejected() => PendingAnswer(
+    submissionId: submissionId,
+    questionId: questionId,
+    updatedAt: updatedAt,
+    selectedOption: selectedOption,
+    text: text,
+    rejected: true,
+  );
+
   Map<String, dynamic> toJson() => <String, dynamic>{
-        'submission_id': submissionId,
-        'question_id': questionId,
-        if (selectedOption != null) 'selected_option': selectedOption,
-        if (text != null) 'text': text,
-        'updated_at': updatedAt.toUtc().toIso8601String(),
-      };
+    'submission_id': submissionId,
+    'question_id': questionId,
+    if (selectedOption != null) 'selected_option': selectedOption,
+    if (text != null) 'text': text,
+    if (rejected) 'rejected': true,
+    'updated_at': updatedAt.toUtc().toIso8601String(),
+  };
 
   /// Returns null for a row that is not a usable answer, so one corrupt entry
   /// can never cost the whole queue.
@@ -58,9 +73,10 @@ class PendingAnswer {
       questionId: questionId,
       selectedOption: option is int ? option : null,
       text: text is String ? text : null,
+      rejected: json['rejected'] == true,
       updatedAt:
           DateTime.tryParse(json['updated_at'] as String? ?? '')?.toLocal() ??
-              DateTime.now(),
+          DateTime.now(),
     );
   }
 }
@@ -81,10 +97,10 @@ class PendingViolation {
   int attempts;
 
   Map<String, dynamic> toJson() => <String, dynamic>{
-        'submission_id': submissionId,
-        'violation': violation.toJson(),
-        'attempts': attempts,
-      };
+    'submission_id': submissionId,
+    'violation': violation.toJson(),
+    'attempts': attempts,
+  };
 
   static PendingViolation? fromJson(Map<String, dynamic> json) {
     final submissionId = json['submission_id'];
@@ -177,7 +193,8 @@ class DirectViolationOutbox implements ViolationOutbox {
       );
     } catch (error) {
       debugPrint(
-          'ProctorGuard: violation delivery failed (no queue attached): $error');
+        'ProctorGuard: violation delivery failed (no queue attached): $error',
+      );
       return null;
     }
   }
@@ -193,6 +210,7 @@ class SyncState {
   const SyncState({
     this.online = true,
     this.pendingAnswers = 0,
+    this.rejectedAnswers = 0,
     this.pendingViolations = 0,
     this.syncing = false,
     this.lastSyncedAt,
@@ -205,6 +223,7 @@ class SyncState {
   final bool online;
 
   final int pendingAnswers;
+  final int rejectedAnswers;
   final int pendingViolations;
 
   /// True while a delivery pass is in flight.
@@ -219,6 +238,7 @@ class SyncState {
   int get pending => pendingAnswers + pendingViolations;
 
   bool get hasPending => pending > 0;
+  bool get hasRejectedAnswers => rejectedAnswers > 0;
 
   /// Whether an answer the *grader* will read is still owed to the server.
   ///
@@ -231,16 +251,23 @@ class SyncState {
   /// to strand a student whose work is otherwise finished.
   bool get hasPendingAnswers => pendingAnswers > 0;
 
-  bool get isSynced => pending == 0;
+  bool get isSynced => pending == 0 && !hasRejectedAnswers;
 
   /// The headline the exam banner shows: the work is safe on this device but has
   /// not reached the server.
-  String get label =>
-      online ? 'Syncing your answers...' : 'Offline - syncing locally';
+  String get label {
+    if (hasRejectedAnswers) {
+      final answerNoun = rejectedAnswers == 1 ? 'answer was' : 'answers were';
+      return '$rejectedAnswers $answerNoun not accepted before the attempt closed.';
+    }
+    return online ? 'Syncing your answers...' : 'Offline - syncing locally';
+  }
 
   @override
-  String toString() => 'SyncState(online: $online, answers: $pendingAnswers, '
-      'violations: $pendingViolations, syncing: $syncing)';
+  String toString() =>
+      'SyncState(online: $online, answers: $pendingAnswers, '
+      'rejectedAnswers: $rejectedAnswers, violations: $pendingViolations, '
+      'syncing: $syncing)';
 }
 
 /// Local-first answer cache, durable retry queues and violation delivery for one
@@ -356,20 +383,26 @@ class OfflineSyncService implements ViolationOutbox {
 
   /// Queue state for the banner and the submit gate.
   SyncState get state => SyncState(
-        online: _online,
-        pendingAnswers: _answers.length,
-        pendingViolations: _violations.length,
-        syncing: _flushing,
-        lastSyncedAt: _lastSyncedAt,
-        lastError: _lastError,
-      );
+    online: _online,
+    pendingAnswers: _answers.where((answer) => !answer.rejected).length,
+    rejectedAnswers: _answers.where((answer) => answer.rejected).length,
+    pendingViolations: _violations.length,
+    syncing: _flushing,
+    lastSyncedAt: _lastSyncedAt,
+    lastError: _lastError,
+  );
 
   /// Emits the current [SyncState] on every change; read [state] first for the
   /// value that happened before a listener attached.
   Stream<SyncState> get changes => _changes.stream;
 
   /// True while anything is waiting for the network.
-  bool get hasPending => _answers.isNotEmpty || _violations.isNotEmpty;
+  bool get hasPending =>
+      _answers.any((answer) => !answer.rejected) || _violations.isNotEmpty;
+
+  int rejectedAnswerCountFor(String submissionId) => _answers
+      .where((answer) => answer.submissionId == submissionId && answer.rejected)
+      .length;
 
   /// Number of violations still waiting to be delivered, for diagnostics.
   int get pendingViolations => _violations.length;
@@ -384,12 +417,14 @@ class OfflineSyncService implements ViolationOutbox {
   /// Answers already given for [submissionId], by question id (choice shape).
   Map<String, int> cachedChoices(String submissionId) =>
       Map<String, int>.unmodifiable(
-          _choiceDrafts[submissionId] ?? const <String, int>{});
+        _choiceDrafts[submissionId] ?? const <String, int>{},
+      );
 
   /// Answers already given for [submissionId], by question id (text shape).
   Map<String, String> cachedText(String submissionId) =>
       Map<String, String>.unmodifiable(
-          _textDrafts[submissionId] ?? const <String, String>{});
+        _textDrafts[submissionId] ?? const <String, String>{},
+      );
 
   // --- Local-first writes (requirement 1) -------------------------------
 
@@ -402,13 +437,14 @@ class OfflineSyncService implements ViolationOutbox {
     required String submissionId,
     required String questionId,
     required int selectedOption,
-  }) =>
-      _cache(PendingAnswer(
-        submissionId: submissionId,
-        questionId: questionId,
-        selectedOption: selectedOption,
-        updatedAt: _now(),
-      ));
+  }) => _cache(
+    PendingAnswer(
+      submissionId: submissionId,
+      questionId: questionId,
+      selectedOption: selectedOption,
+      updatedAt: _now(),
+    ),
+  );
 
   /// Caches a fill-in-the-blank answer ("Save & next", the keyboard's done
   /// action, or the flush before submitting) and queues it for the server.
@@ -416,13 +452,14 @@ class OfflineSyncService implements ViolationOutbox {
     required String submissionId,
     required String questionId,
     required String text,
-  }) =>
-      _cache(PendingAnswer(
-        submissionId: submissionId,
-        questionId: questionId,
-        text: text,
-        updatedAt: _now(),
-      ));
+  }) => _cache(
+    PendingAnswer(
+      submissionId: submissionId,
+      questionId: questionId,
+      text: text,
+      updatedAt: _now(),
+    ),
+  );
 
   /// Mirrors a keystroke into the durable cache **without** queueing a network
   /// write: an unsaved field has to survive the app being killed, but the server
@@ -432,8 +469,10 @@ class OfflineSyncService implements ViolationOutbox {
     required String questionId,
     required String text,
   }) {
-    _textDrafts.putIfAbsent(submissionId, () => <String, String>{})[questionId] =
-        text;
+    _textDrafts.putIfAbsent(
+      submissionId,
+      () => <String, String>{},
+    )[questionId] = text;
     // Deliberately not awaited: a keystroke must never wait on a disk write, and
     // the value is in memory either way.
     unawaited(_persistDrafts());
@@ -441,19 +480,25 @@ class OfflineSyncService implements ViolationOutbox {
 
   Future<void> _cache(PendingAnswer answer) async {
     if (answer.isText) {
-      _textDrafts.putIfAbsent(answer.submissionId, () => <String, String>{})[
-          answer.questionId] = answer.text!;
+      _textDrafts.putIfAbsent(
+        answer.submissionId,
+        () => <String, String>{},
+      )[answer.questionId] = answer.text!;
     } else {
-      _choiceDrafts.putIfAbsent(answer.submissionId, () => <String, int>{})[
-          answer.questionId] = answer.selectedOption!;
+      _choiceDrafts.putIfAbsent(
+        answer.submissionId,
+        () => <String, int>{},
+      )[answer.questionId] = answer.selectedOption!;
     }
     await _persistDrafts();
 
     // One queued row per question: re-answering replaces the pending value
     // instead of sending a stale one first.
-    _answers.removeWhere((existing) =>
-        existing.submissionId == answer.submissionId &&
-        existing.questionId == answer.questionId);
+    _answers.removeWhere(
+      (existing) =>
+          existing.submissionId == answer.submissionId &&
+          existing.questionId == answer.questionId,
+    );
     _answers.add(answer);
 
     await _persistAnswers();
@@ -541,6 +586,7 @@ class OfflineSyncService implements ViolationOutbox {
 
     for (final pending in List<PendingAnswer>.of(_answers)) {
       if (_disposed) return;
+      if (pending.rejected) continue;
       try {
         if (pending.isText) {
           await _exams.saveTextAnswer(
@@ -555,6 +601,15 @@ class OfflineSyncService implements ViolationOutbox {
             selectedOption: pending.selectedOption!,
           );
         }
+      } on AnswerWriteRejected {
+        final index = _answers.indexOf(pending);
+        if (index != -1) _answers[index] = pending.markRejected();
+        await _persistAnswers();
+        _lastError =
+            'Some answers were not accepted because this attempt is no longer writable.';
+        _online = true;
+        _notify();
+        continue;
       } catch (error) {
         debugPrint('ProctorGuard: answer still queued ($error)');
         _offline('Could not sync your answers yet.');
@@ -583,12 +638,14 @@ class OfflineSyncService implements ViolationOutbox {
         // The session may still be on screen: hand it the ruling, so a third
         // strike that landed while the network was down can still end the
         // attempt (see ProctoringNotifier's deferred-ruling handler).
-        _deferredRulings.add(ViolationRuling(
-          submissionId: pending.submissionId,
-          violation: pending.violation,
-          warningCount: result.warningCount,
-          disqualified: result.disqualified,
-        ));
+        _deferredRulings.add(
+          ViolationRuling(
+            submissionId: pending.submissionId,
+            violation: pending.violation,
+            warningCount: result.warningCount,
+            disqualified: result.disqualified,
+          ),
+        );
       } catch (error) {
         debugPrint('ProctorGuard: violation still queued ($error)');
         await _persistViolations();
@@ -672,12 +729,13 @@ class OfflineSyncService implements ViolationOutbox {
         disqualified: result.disqualified,
       );
     } catch (error) {
-      debugPrint('ProctorGuard: violation queued for retry '
-          '(${violation.type.dbValue}): $error');
-      _violations.add(PendingViolation(
-        submissionId: submissionId,
-        violation: violation,
-      ));
+      debugPrint(
+        'ProctorGuard: violation queued for retry '
+        '(${violation.type.dbValue}): $error',
+      );
+      _violations.add(
+        PendingViolation(submissionId: submissionId, violation: violation),
+      );
       _trimViolations();
       await _persistViolations();
       _offline('Could not deliver a proctoring log yet.');
@@ -700,8 +758,10 @@ class OfflineSyncService implements ViolationOutbox {
     while (_violations.length > maxQueuedViolations) {
       final oldest = _violations.removeAt(0);
       dropped++;
-      debugPrint('ProctorGuard: violation queue full - dropped '
-          '${oldest.violation.type.dbValue} from ${oldest.submissionId}');
+      debugPrint(
+        'ProctorGuard: violation queue full - dropped '
+        '${oldest.violation.type.dbValue} from ${oldest.submissionId}',
+      );
     }
     return dropped;
   }
@@ -709,14 +769,12 @@ class OfflineSyncService implements ViolationOutbox {
   // --- Persistence -------------------------------------------------------
 
   Future<void> _readFromDisk() async {
-    final answers = _jsonList(await _store.read(_answerQueueKey))
-        .map(PendingAnswer.fromJson)
-        .whereType<PendingAnswer>()
-        .toList();
-    final violations = _jsonList(await _store.read(_violationQueueKey))
-        .map(PendingViolation.fromJson)
-        .whereType<PendingViolation>()
-        .toList();
+    final answers = _jsonList(
+      await _store.read(_answerQueueKey),
+    ).map(PendingAnswer.fromJson).whereType<PendingAnswer>().toList();
+    final violations = _jsonList(
+      await _store.read(_violationQueueKey),
+    ).map(PendingViolation.fromJson).whereType<PendingViolation>().toList();
 
     _answers
       ..clear()
@@ -742,25 +800,33 @@ class OfflineSyncService implements ViolationOutbox {
   /// `{submissionId: {questionId: optionIndex}}`.
   Future<Map<String, Map<String, int>>> _readChoiceDrafts() async {
     final decoded = _jsonMap(await _store.read(_choiceDraftKey));
-    return decoded.map((submissionId, questions) => MapEntry(
-          submissionId,
-          questions is Map
-              ? questions.map((questionId, option) => MapEntry(
-                  questionId.toString(), option is int ? option : 0))
-              : <String, int>{},
-        ));
+    return decoded.map(
+      (submissionId, questions) => MapEntry(
+        submissionId,
+        questions is Map
+            ? questions.map(
+                (questionId, option) =>
+                    MapEntry(questionId.toString(), option is int ? option : 0),
+              )
+            : <String, int>{},
+      ),
+    );
   }
 
   /// `{submissionId: {questionId: text}}`.
   Future<Map<String, Map<String, String>>> _readTextDrafts() async {
     final decoded = _jsonMap(await _store.read(_textDraftKey));
-    return decoded.map((submissionId, questions) => MapEntry(
-          submissionId,
-          questions is Map
-              ? questions.map((questionId, text) =>
-                  MapEntry(questionId.toString(), text?.toString() ?? ''))
-              : <String, String>{},
-        ));
+    return decoded.map(
+      (submissionId, questions) => MapEntry(
+        submissionId,
+        questions is Map
+            ? questions.map(
+                (questionId, text) =>
+                    MapEntry(questionId.toString(), text?.toString() ?? ''),
+              )
+            : <String, String>{},
+      ),
+    );
   }
 
   Map<String, dynamic> _jsonMap(String? raw) {
@@ -796,14 +862,14 @@ class OfflineSyncService implements ViolationOutbox {
   }
 
   Future<void> _persistAnswers() => _store.write(
-        _answerQueueKey,
-        jsonEncode(_answers.map((answer) => answer.toJson()).toList()),
-      );
+    _answerQueueKey,
+    jsonEncode(_answers.map((answer) => answer.toJson()).toList()),
+  );
 
   Future<void> _persistViolations() => _store.write(
-        _violationQueueKey,
-        jsonEncode(_violations.map((pending) => pending.toJson()).toList()),
-      );
+    _violationQueueKey,
+    jsonEncode(_violations.map((pending) => pending.toJson()).toList()),
+  );
 
   void _notify() {
     if (_changes.isClosed) return;

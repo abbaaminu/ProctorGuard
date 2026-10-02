@@ -104,27 +104,24 @@ export function useExamSubmissions(examId: string) {
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
 
   /**
-   * Supervisor intervention: close an ongoing attempt as disqualified.
-   *
-   * Returns false instead of throwing so the caller can say *why* nothing
-   * happened — the update is rejected by RLS for an exam the caller does not
-   * own, and that failure used to be invisible (the row simply kept its old
-   * status). `status = 'ongoing'` keeps a double click from re-stamping an
-   * attempt that was already closed.
+   * Admin/supervisor intervention: close an ongoing attempt as disqualified.
+   * Selecting the changed row detects a policy-filtered zero-row update, which
+   * PostgREST otherwise reports as success.
    */
   async function disqualify(submissionId: string): Promise<boolean> {
-    const { error: updateError } = await supabase
+    const { data: updated, error: updateError } = await supabase
       .from("exam_submissions")
       .update({ status: "disqualified", submitted_at: new Date().toISOString() })
       .eq("id", submissionId)
-      .eq("status", "ongoing");
+      .eq("status", "ongoing")
+      .select("id");
     if (updateError) {
       console.error("Could not disqualify submission", submissionId, updateError);
       return false;
     }
+    if (!updated?.length) return false;
     return true;
   }
 
   return { submissions, loading, error, disqualify, reload };
 }
-
