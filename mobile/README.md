@@ -1,4 +1,4 @@
-# Exam Proctor — Architecture Notes
+# ProctorGuard — Flutter app notes
 
 ## Layout
 ```
@@ -10,21 +10,20 @@ lib/
   features/
     auth/                   # sign-in form, `profiles.role` profile lookup,
                             # post-login RoleGate router
-    admin/                  # admin-only roster: list every account, change a
-                            # role, create a staff login via the Edge Function
+    admin/                  # admin roster: create/delete accounts and manage roles
     exam/                   # domain entities, repo, student portal,
                             # exam-taking UI
     proctoring/             # violation domain model, repo, Riverpod
                             # escalation notifier, full-screen overlay
-    dashboard/              # supervisor exam picker + live monitoring page
+    dashboard/              # staff analytics, supervisor monitoring and resets
 supabase/schema.sql         # tables, RLS policies, RPCs
-supabase/functions/         # admin-create-user: the only staff-login writer
+supabase/functions/         # server-side account creation and deletion
 android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLock
 ```
 
 ## Wiring order (what to do first)
 1. Run `../supabase/schema.sql` in the Supabase SQL editor (or via CLI
-   migrations) — shared with the `../dashboard` app in this monorepo. It
+   migrations). It
    creates all 5 tables, the RLS policies, the `questions_public` safe view and
    four RPCs: `register_violation` (server-enforced 3-strike rule),
    `submit_exam` (server-side grading + close), `merge_submission_answer`
@@ -53,12 +52,12 @@ android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLoc
    `StudentExamPortalPage` (published exams → `ExamTakingPage`), `lecturer` and
    `supervisor` (both staff, `is_staff()` in the schema) to
    `SupervisorExamPickerPage` → `SupervisorDashboardPage`, and `admin` to
-   `AdminDashboardPage`. The admin page is the only writer of other people's
-   roles, and it creates staff logins through the `admin-create-user` Edge
-   Function (`supabase functions deploy admin-create-user`) because RLS refuses
-   a non-`student` insert from a client. Drop in `go_router` (`go_router` is
-   *not* a dependency yet) when deep links matter — every page takes plain
-   constructor args.
+   `AdminDashboardPage`. Admins manage accounts and can open the exam monitor;
+   supervisors can reset attempts; all staff can open analytics. Account
+   creation/deletion use `admin-create-user` and `admin-delete-user` Edge
+   Functions because auth users cannot be managed through ordinary client
+   table writes. Drop in `go_router` (`go_router` is *not* a dependency yet)
+   when deep links matter — every page takes plain constructor args.
 5. Nothing else to download — ML Kit bundles its face model inside the app, so
    no `assets/models/face_landmarker.task` file is needed any more.
 6. `flutter test` runs the unit/widget tests in `test/` (head-pose geometry,
@@ -383,12 +382,33 @@ administrator may change accounts.", and the function's own status codes are
 mapped too — no connection, 401/403, and a 404 that names
 `supabase/functions/admin-create-user` when the function is not deployed.
 
+The roster also supports permanent account deletion through
+`admin-delete-user`. A confirmation explains that the sign-in and related exams,
+attempts, and incidents are removed. The signed-in administrator cannot delete
+their own account, and the function independently enforces that rule.
+
 Creating a login needs the Edge Function because `profiles_insert_self_student`
 only lets a client insert its *own* row with `role = 'student'`; the function
 re-reads the caller's JWT against `profiles` with the anon key, refuses anyone
 who is not an admin, and only then uses the `service_role` key to create the auth
 user (which is why it must be deployed with `supabase functions deploy
 admin-create-user` and why the key never reaches the app).
+
+### Supervisor console and staff analytics
+
+`SupervisorExamPickerPage` lists published exams and opens
+`SupervisorDashboardPage`, whose roster and incident feed are Supabase Realtime
+streams. Supervisors and admins can reset attempts from the roster; lecturers
+can monitor but do not receive reset controls. Reset deletes the attempt and
+cascaded incident records, then removes its snapshot objects through the Storage
+API. If Storage cleanup fails after the attempt is deleted, the UI reports that
+partial result instead of claiming full cleanup.
+
+`AnalyticsPage` is available from the staff and admin homes and the live monitor.
+It reports attempts, completions, disqualification rate, mean scored result, and
+per-exam status totals. Incident counts are bounded to the last 30 days and the
+repository pages through the full result sets so PostgREST row limits do not
+silently truncate the report. Read failures are surfaced with a retry action.
 
 ### Student Exam Portal
 
@@ -870,4 +890,3 @@ written-down opt-out for a throwaway demo build and never for one a student runs
   (`profiles_insert_self_student`), and staff logins are minted by the
   `admin-create-user` Edge Function, which holds the only `service_role` key in
   the system and re-checks the caller's JWT before using it.
-

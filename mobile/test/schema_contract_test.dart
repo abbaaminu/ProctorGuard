@@ -25,8 +25,8 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 ///  * every `action_type` string the check constraint allows (the five camera
 ///    and lifecycle ones plus the six enterprise lockdown/device ones);
 ///  * the `proctor-snapshots` upload path convention and JPEG content type;
-///  * the admin roster's `profiles` reads/writes and the `admin-create-user`
-///    Edge Function payload, against the `user_role` enum and `full_name`.
+///  * the admin roster's `profiles` reads/writes and account Edge Function
+///    payloads, against the `user_role` enum and `full_name`.
 class _RecordingTransport extends http.BaseClient {
   final List<http.BaseRequest> requests = <http.BaseRequest>[];
   final List<String> bodies = <String>[];
@@ -422,6 +422,23 @@ void main() {
         ),
       );
     });
+
+    test('deleteAccount invokes the server-side account deletion function',
+        () async {
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'id': aishaId,
+        'removed': {'exams': 0, 'submissions': 2},
+      });
+
+      await AdminUserRepositoryImpl(client).deleteAccount(userId: aishaId);
+
+      final request = transport.requests.single;
+      expect(request.method, 'POST');
+      expect(request.url.path, '/functions/v1/admin-delete-user');
+      expect(jsonDecode(transport.bodies.single), <String, dynamic>{
+        'id': aishaId,
+      });
+    });
   });
 
   group('admin-create-user contract', () {
@@ -528,6 +545,7 @@ void main() {
         );
       },
     );
+
   });
 
   group('role contract', () {

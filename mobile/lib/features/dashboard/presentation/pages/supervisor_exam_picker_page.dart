@@ -5,6 +5,7 @@ import '../../../../core/services/supabase_service.dart' show SupabaseService;
 import '../../../exam/domain/entities/exam.dart';
 import '../../../exam/presentation/providers/exam_providers.dart';
 import '../../../exam/presentation/widgets/published_exam_list.dart';
+import 'analytics_page.dart';
 import 'supervisor_dashboard_page.dart';
 
 /// The supervisor home: pick an exam, then watch it live.
@@ -17,6 +18,7 @@ class SupervisorExamPickerPage extends ConsumerStatefulWidget {
     super.key,
     this.supervisorName,
     this.onSignOut,
+    this.canResetAttempts = false,
   });
 
   /// Greeting name; the gate passes `profiles.full_name` ("Dr. Ada Nwosu").
@@ -24,6 +26,7 @@ class SupervisorExamPickerPage extends ConsumerStatefulWidget {
 
   /// Sign-out shown in the app bar (the gate owns the Supabase call).
   final VoidCallback? onSignOut;
+  final bool canResetAttempts;
 
   @override
   ConsumerState<SupervisorExamPickerPage> createState() =>
@@ -38,6 +41,7 @@ class _SupervisorExamPickerPageState
         builder: (_) => SupervisorDashboardPage(
           examId: exam.id,
           examTitle: exam.title,
+          canResetAttempts: widget.canResetAttempts,
         ),
       ),
     );
@@ -53,6 +57,16 @@ class _SupervisorExamPickerPageState
         automaticallyImplyLeading: false,
         title: const Text('Supervisor Console'),
         actions: [
+          IconButton(
+            key: const Key('supervisor-analytics'),
+            tooltip: 'Analytics',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const AnalyticsPage(),
+              ),
+            ),
+            icon: const Icon(Icons.analytics_outlined),
+          ),
           IconButton(
             key: const Key('supervisor-refresh'),
             tooltip: 'Refresh',

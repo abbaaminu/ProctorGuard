@@ -16,6 +16,7 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
   AdminUserRepositoryImpl(this._client);
 
   static const String createAccountFunction = 'admin-create-user';
+  static const String deleteAccountFunction = 'admin-delete-user';
 
   /// Supabase Auth's default minimum, mirrored by the Edge Function.
   static const int minPasswordLength = 6;
@@ -120,6 +121,37 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
     });
   }
 
+  @override
+  Future<void> deleteAccount({required String userId}) async {
+    final FunctionResponse response;
+    try {
+      response = await _client.functions.invoke(
+        deleteAccountFunction,
+        body: {'id': userId},
+      );
+    } on FunctionException catch (error) {
+      throw AdminAccountException(
+        _messageFromDeleteFunctionError(error),
+      );
+    } catch (_) {
+      throw const AdminAccountException(
+        'Could not reach the server. Check your connection and try again.',
+      );
+    }
+
+    final data = response.data;
+    if (data is Map<String, dynamic>) {
+      final error = data['error'];
+      if (error is String && error.isNotEmpty) {
+        throw AdminAccountException(error);
+      }
+      if (data['id'] == userId) return;
+    }
+    throw const AdminAccountException(
+      'The server returned an unexpected response. Refresh the list to check.',
+    );
+  }
+
   /// Runs a PostgREST call and converts every failure into
   /// [AdminAccountException], so the page has one error type to render.
   ///
@@ -159,6 +191,27 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
     }
     if (error.status == 401 || error.status == 403) {
       return 'Only an administrator can create accounts.';
+    }
+    return 'The server refused the request (${error.status}). Try again.';
+  }
+
+  static String _messageFromDeleteFunctionError(FunctionException error) {
+    if (error.status == 0) {
+      return 'Could not reach the server. Check your connection and try again.';
+    }
+    final details = error.details;
+    if (details is Map && details['error'] is String) {
+      return details['error'] as String;
+    }
+    if (details is String && details.trim().isNotEmpty) {
+      return details.trim();
+    }
+    if (error.status == 404) {
+      return 'The $deleteAccountFunction function is not deployed on this '
+          'project (see supabase/functions/admin-delete-user).';
+    }
+    if (error.status == 401 || error.status == 403) {
+      return 'Only an administrator can delete accounts.';
     }
     return 'The server refused the request (${error.status}). Try again.';
   }

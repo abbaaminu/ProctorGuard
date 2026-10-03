@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart';
+import '../../domain/repositories/dashboard_repository.dart';
+import '../providers/dashboard_providers.dart';
+import 'analytics_page.dart';
 
 /// Streams `proctoring_logs` and `exam_submissions` for a given exam via
 /// Supabase Realtime, so supervisors see violations and status changes as
@@ -66,6 +69,9 @@ final liveViolationFeedProvider =
           .toList());
 });
 
+final submissionResetInFlightProvider =
+    StateProvider.family<bool, String>((ref, id) => false);
+
 /// `profiles.full_name`, falling back to the address (never an empty tile).
 String _displayName(Map<String, dynamic> row) {
   final name = (row['full_name'] as String? ?? '').trim();
@@ -86,7 +92,13 @@ String _clock(String? iso) {
 class SupervisorDashboardPage extends ConsumerWidget {
   final String examId;
   final String examTitle;
-  const SupervisorDashboardPage({super.key, required this.examId, required this.examTitle});
+  final bool canResetAttempts;
+  const SupervisorDashboardPage({
+    super.key,
+    required this.examId,
+    required this.examTitle,
+    this.canResetAttempts = false,
+  });
 
   /// Human wording for `proctoring_logs.action_type`, kept identical to the
   /// dashboard's incident labels so both consoles read the same.
@@ -107,6 +119,69 @@ class SupervisorDashboardPage extends ConsumerWidget {
     final roster = submissions.valueOrNull ?? const <Map<String, dynamic>>[];
     final nameById = names.valueOrNull ?? const <String, String>{};
 
+    Future<void> resetAttempt(Map<String, dynamic> row) async {
+      if (!canResetAttempts) return;
+      final submissionId = row['id'] as String;
+      final inFlight =
+          ref.read(submissionResetInFlightProvider(submissionId).notifier);
+      if (inFlight.state) return;
+      inFlight.state = true;
+      final studentId = row['student_id'] as String;
+      final studentName = nameById[studentId] ?? 'Student ${_shortId(studentId)}';
+      try {
+        final approved = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text('Reset $studentName’s attempt?'),
+            content: const Text(
+              'This permanently deletes the attempt, saved answers and its '
+              'proctoring incidents. The student can start this exam again from '
+              'a fresh attempt. This cannot be undone.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: const Text('Reset attempt'),
+              ),
+            ],
+          ),
+        );
+        if (approved != true || !context.mounted) return;
+        final outcome = await ref
+            .read(dashboardRepositoryProvider)
+            .resetSubmission(submissionId);
+        ref.invalidate(examSubmissionsStreamProvider(examId));
+        ref.invalidate(liveViolationFeedProvider(examId));
+        if (!context.mounted) return;
+        final message = outcome.storageWarning == null
+            ? 'Attempt reset. ${outcome.incidents} incident(s) and '
+                '${outcome.snapshots} snapshot(s) removed.'
+            : 'Attempt reset, but ${outcome.storageWarning}';
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(
+            content: Text(message),
+            backgroundColor: outcome.storageWarning == null
+                ? null
+                : Theme.of(context).colorScheme.error,
+          ));
+      } on DashboardException catch (error) {
+        if (!context.mounted) return;
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(
+            content: Text(error.message),
+            backgroundColor: Theme.of(context).colorScheme.error,
+          ));
+      } finally {
+        if (context.mounted) inFlight.state = false;
+      }
+    }
+
     // submission id -> student name: a log row only knows its submission.
     final studentBySubmission = <String, String>{
       for (final row in roster)
@@ -122,7 +197,19 @@ class SupervisorDashboardPage extends ConsumerWidget {
     }
 
     return Scaffold(
-      appBar: AppBar(title: Text('Live Monitor — $examTitle')),
+      appBar: AppBar(
+        title: Text('Live Monitor — $examTitle'),
+        actions: [
+          IconButton(
+            key: const Key('monitor-analytics'),
+            tooltip: 'Analytics',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => const AnalyticsPage()),
+            ),
+            icon: const Icon(Icons.analytics_outlined),
+          ),
+        ],
+      ),
       body: Row(
         children: [
           // ---- Student status grid --------------------------------------
@@ -174,15 +261,52 @@ class SupervisorDashboardPage extends ConsumerWidget {
                                     'Status: $status'
                                     '${score != null ? '  •  Score: $score' : ''}',
                                   ),
-                                  trailing: Text(
-                                    '$flags flags',
-                                    style: TextStyle(
-                                      color: flags > 0
-                                          ? Colors.orange
-                                          : Theme.of(context)
-                                              .colorScheme
-                                              .onSurfaceVariant,
-                                    ),
+                                  trailing: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        '$flags flags',
+                                        style: TextStyle(
+                                          color: flags > 0
+                                              ? Colors.orange
+                                              : Theme.of(context)
+                                                  .colorScheme
+                                                  .onSurfaceVariant,
+                                        ),
+                                      ),
+                                      if (canResetAttempts)
+                                        Consumer(
+                                          builder: (context, watchRef, _) {
+                                            final resetting = watchRef.watch(
+                                              submissionResetInFlightProvider(
+                                                row['id'] as String,
+                                              ),
+                                            );
+                                            return IconButton(
+                                              key: Key(
+                                                'reset-attempt-${row['id']}',
+                                              ),
+                                              tooltip: 'Reset attempt',
+                                              onPressed: resetting
+                                                  ? null
+                                                  : () => resetAttempt(row),
+                                              icon: resetting
+                                                  ? const SizedBox(
+                                                      width: 18,
+                                                      height: 18,
+                                                      child:
+                                                          CircularProgressIndicator(
+                                                        strokeWidth: 2,
+                                                      ),
+                                                    )
+                                                  : const Icon(
+                                                      Icons.restart_alt,
+                                                      color: Colors.redAccent,
+                                                    ),
+                                            );
+                                          },
+                                        ),
+                                    ],
                                   ),
                                 ),
                               );

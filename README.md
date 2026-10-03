@@ -1,162 +1,73 @@
-# Proctor
+# ProctorGuard
 
-AI exam proctoring system: a Flutter mobile app for students (it also carries the
-admin dashboard) and a React staff dashboard, sharing one Supabase backend.
+ProctorGuard is a Flutter exam-proctoring application backed by Supabase. The
+mobile/web Flutter app provides student exam sessions, supervisor monitoring and
+attempt resets, analytics for staff, and an admin account-management console.
 
 ```
-proctor/
-  mobile/       Flutter app (students take exams; on-device ML Kit
-                face-detection proctoring logs violations)
-  dashboard/    React + Vite web app (supervisors build exams, monitor
-                live sessions, audit submissions)
-  supabase/
-    schema.sql  Single source of truth for both apps: tables, RLS
-                policies, and RPCs. Run this once per environment.
-    functions/  admin-create-user and admin-delete-user — the Edge Functions
-                that mint and remove staff logins. They are the only place a
-                service_role key is used, and it never leaves Supabase's
-                servers. The `tsconfig.json` / `package.json` beside them are
-                dev-only: types for the editor, not part of a deployment.
+mobile/       Flutter app and staff/admin interfaces
+supabase/     Schema, migrations, seed data, and Edge Functions
 ```
 
-Roles live in the `public.user_role` enum: `student`, `lecturer`, `supervisor`
-and `admin`. Students take exams in the mobile app, `lecturer` and `supervisor`
-sign into this console (`is_staff()`), and `admin` additionally gets the roster and
-role-management screen — in the mobile app, and as the dashboard's one admin-only
-page (`/accounts`). Lecturers can review attempts; only admins and supervisors can
-disqualify or reset them. Every signed-in account leaves the console from the sidebar
-footer's **Sign out**, which ends the session and puts the login form back.
+## Staff features
+
+- **Administrators** can list accounts, create logins, change roles, and
+  permanently delete accounts from the Admin Dashboard. Creation and deletion
+  use the `admin-create-user` and `admin-delete-user` Edge Functions.
+- **Supervisors** can choose a published exam, monitor attempts and incidents in
+  real time, and reset an attempt. Reset removes the submission and cascaded
+  incident records so the student can start over; associated snapshots are
+  removed through Supabase Storage.
+- **Administrators, supervisors, and lecturers** can review analytics and
+  submission activity. Server-side row-level security remains authoritative for
+  every operation.
+
+Roles are stored in the `public.user_role` enum: `student`, `lecturer`,
+`supervisor`, and `admin`. Lecturers can review attempts and analytics but
+cannot reset them. Only admins can manage accounts.
 
 ## Getting started
-1. Create a Supabase project, run `supabase/schema.sql` in its SQL editor,
-   then run `supabase/migrations/secure_exam_access_and_deadlines.sql` on an
-   existing project to apply the staff-role, RPC-grant and server-side exam
-   deadline hardening. Optionally run `supabase/seed.sql` to load demo users,
-   exams and questions (see the header of that file for the demo logins).
-2. Deploy the account functions — `supabase functions deploy admin-create-user`
-   and `supabase functions deploy admin-delete-user` (needs the Supabase CLI
-   linked to the project, or paste each `supabase/functions/<name>/index.ts`
-   into the dashboard's Edge Functions editor). `SUPABASE_URL`,
-   `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` are injected
-   automatically, so there is nothing to configure; without them only the seeded
-   logins exist, and neither app can add or remove an account.
-3. Mobile: see `mobile/README.md` (`flutter pub get`, then `flutter run
-   --dart-define=SUPABASE_URL=... --dart-define=SUPABASE_ANON_KEY=...`).
-4. Dashboard: see `dashboard/README.md` (`npm install`, copy
-   `.env.example` to `.env.local`, `npm run dev`).
 
-Both apps read/write the same tables, so a submission a student makes in
-`mobile` shows up live in `dashboard`'s monitor view via Supabase Realtime.
+1. Create a Supabase project and run `supabase/schema.sql` in its SQL editor.
+   For an existing project, run any unapplied files in `supabase/migrations/`;
+   each migration documents its purpose and verification steps.
+2. Deploy the account-management functions:
+   ```powershell
+   supabase functions deploy admin-create-user
+   supabase functions deploy admin-delete-user
+   ```
+   The project supplies `SUPABASE_URL`, `SUPABASE_ANON_KEY` (or
+   `SUPABASE_PUBLISHABLE_KEY`), and `SUPABASE_SERVICE_ROLE_KEY` to the
+   functions. The service-role key is used only on Supabase servers.
+3. Optionally run `supabase/seed.sql` to load demo accounts, exams, and
+   questions. Demo credentials and account roles are documented at the top of
+   that file.
+4. See [mobile/README.md](./mobile/README.md) for Flutter setup, configuration,
+   and run/build commands.
 
 ## Production checklist
 
-`supabase/migrations/` holds the same statements packaged for a project that is
-already deployed, where re-running all of `schema.sql` is too blunt. Run the
-migrations you have not run yet — each one says what it does and how to verify
-it. Beyond that:
+- Turn off public sign-ups if the institution provisions student accounts
+  separately. Self-sign-up is limited to the `student` role by database policy.
+- Ensure the `admin-create-user` and `admin-delete-user` functions are deployed.
+- Configure the Flutter app with the Supabase project URL and a publishable
+  client key. Never embed a service-role or secret key in the app.
+- Review the `proctor-snapshots` bucket visibility and retention policy in
+  `supabase/schema.sql`.
+- `.github/workflows/keep_alive.yml` pings the Supabase REST API twice a week;
+  configure its repository secrets or remove the workflow on a paid plan.
 
-- [ ] **Turn off public sign-ups** (Supabase → Authentication → Sign In /
-      Providers). The schema lets a self-provisioned account create *only* a
-      `student` profile row (`profiles_insert_self_student` forces the role
-      server-side), and the `profiles_guard_role_change` trigger makes
-      `profiles.role` immutable for every caller below `admin` — so it cannot
-      self-promote. But an open sign-up form still lets strangers into the exam
-      portal. Create the first staff accounts yourself (or invite them, then set
-      their `role` in the SQL editor as `postgres`); after that, use the app's
-      Admin Dashboard. RLS rejects `role in ('admin','lecturer','supervisor')`
-      written from a client, so a staff row written by hand has to come from the
-      SQL editor or the Edge Function — not from the Flutter/React apps.
-- [ ] **Give the API roles their privileges on `public`** on any project created
-      before §0 of `schema.sql` existed. Without them PostgREST answers every
-      request with `401 {"code":"42501","message":"permission denied for schema
-      public"}` *before* a policy is looked at: sign-in still succeeds (GoTrue
-      never touches `public`), and the console then reports that it cannot read
-      profiles, for every account. Run
-      `supabase/migrations/grant_api_roles_public_schema.sql` once in the SQL
-      editor — a fresh `schema.sql` includes the same statements.
-- [ ] **Deploy `admin-create-user`** (`supabase functions deploy admin-create-user`).
-      It is the only path that mints a staff login: it re-reads the caller's JWT
-      against `profiles` with the anon key, refuses anything that is not an
-      `admin`, and only then switches to the `service_role` key — which never
-      reaches a client. Skip it and the Admin Dashboard says so — the repository
-      turns the 404 into "The admin-create-user function is not deployed on this
-      project" instead of pretending the create failed.
-- [ ] **Deploy `admin-delete-user`** (`supabase functions deploy admin-delete-user`).
-      It is the only way to remove an account *and* its login: a `DELETE` sent
-      from a client is allowed by `profiles_admin_all` on the row, which leaves
-      the `auth.users` row behind — a login that still signs in and has no
-      profile. Like the create function it re-reads the caller's role with the
-      caller's own JWT, refuses a self-delete with a `403`, and only then uses the
-      `service_role` key; the profile, exams, questions, submissions and incident
-      logs follow the login through `on delete cascade`, and the function removes
-      the matching proctoring snapshot folders through the Storage API. Skip it and the
-      console answers "The admin-delete-user function is not deployed on this
-      project" instead of pretending the account was deleted.
-- [ ] **Client keys only.** Dashboard: `VITE_SUPABASE_URL` +
-      `VITE_SUPABASE_ANON_KEY`. Mobile: `SUPABASE_URL` +
-      `SUPABASE_PUBLISHABLE_KEY` (via `mobile/run_app.ps1` / `build_apk.ps1`).
-      Never a `service_role` / `sb_secret_` key — it bypasses every policy.
-- [ ] **Decide the `proctor-snapshots` bucket's visibility.** It ships *public* so
-      the console can render evidence with a plain `<img>` (the object paths are
-      unguessable submission UUIDs). If violation stills are sensitive, flip the
-      bucket to private and sign URLs server-side in the console.
-- [ ] **Keep the free-tier project awake.** `.github/workflows/keep_alive.yml`
-      pings the REST API twice a week; set the `SUPABASE_URL` and `SUPABASE_KEY`
-      repository secrets, or delete the workflow if you are on a paid plan.
-- [ ] **Verify both builds.** `cd mobile && flutter analyze && flutter test`, then
-      `cd dashboard && npm run build`.
-- [ ] **Deploy the dashboard with the right Vercel settings.** The Vercel project's
-      **Root Directory must be `dashboard`**: that is what gives the build a
-      `package.json` to run and what makes `dashboard/vercel.json` apply (it pins
-      Build Command `npm run build` and Output Directory `dist` — the Vite
-      defaults, stated explicitly so a mis-detected framework preset cannot
-      change them). Its SPA rewrite sends unknown paths to `index.html`, so a hard
-      refresh on `/exams/:id/monitor` or `/submissions/:id` loads the console
-      instead of Vercel's 404. Static files still win over that rewrite (Vercel
-      resolves the file system *before* the rewrites phase), so `/assets/*.js` and
-      `/icon.png` are unaffected. Also set `VITE_SUPABASE_URL` and
-      `VITE_SUPABASE_ANON_KEY` as project environment variables —
-      `src/lib/supabase.ts` throws at boot without them.
+## Verification
 
-## Verifying a change
+From `mobile/`:
 
-A fresh clone has never had its dependencies installed, so run `flutter pub get`
-once (and `npm install` in `dashboard/` and `supabase/functions/`) **before** the
-checks below — with an empty pub cache `flutter analyze` reports hundreds of
-phantom errors (`Target of URI doesn't exist: 'package:flutter_riverpod/...'`)
-that are all just missing packages, not broken code.
-
-```
-cd mobile   && flutter pub get && flutter analyze && flutter test   # 256 tests, no device needed
-cd dashboard && npm install && npm run build                       # tsc -b && vite build
-cd supabase/functions && npm install && npm run typecheck          # the Deno Edge Function
+```powershell
+flutter pub get
+flutter analyze
+flutter test
 ```
 
-The last line is the only check the Edge Function has: this repo carries no Deno
-toolchain, so `supabase/functions/tsconfig.json` (`"types": ["deno"]` +
-`npm-imports.d.ts`) is what lets an editor, or `tsc`, see `Deno.serve` /
-`Deno.env` and the `npm:` import inside `admin-create-user/index.ts` at all — the
-same trick `dashboard/tsconfig.node.json` plays for `path` / `__dirname`. It
-type-checks only; `supabase functions deploy` still bundles the function with
-Deno.
-
-The Flutter suite pins the client↔database contract (`mobile/test/schema_contract_test.dart`:
-RPC names, argument names — including the `register_violation` idempotency key and
-client timestamp — and the `action_type` values), so a schema change that breaks the
-app fails there rather than at runtime. It reads `supabase/schema.sql` directly for
-that half of the check, so re-run `flutter test` after editing the schema. The same
-file carries the role contract: the `student`/`lecturer`/`supervisor`/`admin` values
-of `public.user_role`, the `profiles` roster read (oldest first), the role-change
-PATCH, and the `admin-create-user` request/response shapes, so a renamed column or
-a moved endpoint fails in CI instead of on someone's phone.
-
-## Pushing to GitHub
-From this folder:
-```bash
-git init
-git add .
-git commit -m "Initial commit: mobile + dashboard + shared schema"
-git branch -M main
-git remote add origin <your-empty-github-repo-url>
-git push -u origin main
-```
+The Flutter contract tests read `supabase/schema.sql` and the Edge Function
+source to ensure the client payloads and database contracts stay aligned.
+`supabase/functions/` also includes a TypeScript type-check for its Deno
+functions; see its `package.json`.

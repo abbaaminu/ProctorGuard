@@ -1,8 +1,7 @@
 -- =====================================================================
 -- PROCTOR - SEED / MOCK TESTING DATA
 -- ---------------------------------------------------------------------
--- Run this AFTER schema.sql. Shared by both apps in the monorepo:
--- ../mobile (Flutter) and ../dashboard (React console).
+-- Run this AFTER schema.sql. The Flutter app at ../mobile uses this data.
 --
 -- Creates: 1 admin + 1 supervisor + 1 lecturer + 2 student profiles
 -- (public.profiles), 2 published exams (public.exams), 5 questions per exam
@@ -18,7 +17,7 @@
 --      profiles_guard_role_change trigger, which allows a role change when
 --      there is no JWT (see schema.sql).
 --   4. The LAST statement prints a roster - check it shows one submission
---      with 3 flags, then reload the dashboard / mobile app.
+--      with 3 flags, then reload the Flutter app.
 --
 -- SAFE TO RE-RUN: every insert ends with `on conflict ... do nothing`.
 -- IDs are hard-coded and repeated inline so the FK graph stays readable:
@@ -29,9 +28,9 @@
 --   dddd..d1 submission  eeee..e1-3 its logs
 --
 -- DEMO LOGINS (created in step 0; the same password for all five):
---   admin@proctor.test         / Proctor123!  -> admin      - mobile admin dashboard
---   supervisor@proctor.test    / Proctor123!  -> supervisor - dashboard console + mobile
---   lecturer@proctor.test      / Proctor123!  -> lecturer   - dashboard console
+--   admin@proctor.test         / Proctor123!  -> admin      - account management
+--   supervisor@proctor.test    / Proctor123!  -> supervisor - staff console
+--   lecturer@proctor.test      / Proctor123!  -> lecturer   - staff analytics
 --   aisha.bello@proctor.test   / Proctor123!  -> student    - mobile app
 --   chidi.okonkwo@proctor.test / Proctor123!  -> student    - mobile app
 -- The emails use the reserved .test TLD so a demo seed can never mail a
@@ -137,7 +136,7 @@ end $$;
 -- 1. PROFILES  (public.profiles) - 1 admin + 1 supervisor + 1 lecturer +
 --    2 students, 1:1 with the auth users created in step 0.
 --    `role` is the public.user_role enum; the admin is the account that may
---    create further accounts from the mobile admin dashboard.
+--    create further accounts from the admin console.
 -- ---------------------------------------------------------------------
 insert into public.profiles (id, role, full_name, email) values
   ('44444444-4444-4444-8444-444444444444', 'admin',      'Prof. Grace Adeyemi', 'admin@proctor.test'),
@@ -149,7 +148,7 @@ on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------
 -- 2. EXAMS  (public.exams) - both published, so the students' exam list
---    and the dashboard's monitor picker are populated. created_by is the
+--    and the monitor's exam picker are populated. created_by is the
 --    supervisor above (exams are owner-scoped by RLS).
 -- ---------------------------------------------------------------------
 insert into public.exams (id, title, created_by, duration_minutes, is_published, created_at) values
@@ -314,5 +313,3 @@ join public.profiles u on u.id = s.student_id
 left join public.proctoring_logs l on l.submission_id = s.id
 group by e.title, u.full_name, s.status, s.started_at, s.submitted_at
 order by s.started_at;
-
-

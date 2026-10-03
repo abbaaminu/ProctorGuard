@@ -22,16 +22,6 @@ mobile/android/key.properties
 *.jks
 *.keystore
 
-# ---- Node / Vite (dashboard/) ----
-dashboard/node_modules/
-dashboard/dist/
-dashboard/.env
-dashboard/.env.local
-dashboard/.env.*.local
-dashboard/*.log
-# `tsc -b` bookkeeping: machine-specific, regenerated on every build.
-dashboard/*.tsbuildinfo
-
 # ---- Deno type-checking (supabase/functions/) ----
 # Dev-only: `@types/deno`, `typescript`, and the npm packages the `npm:`
 # specifiers name — what the editor and `npm run typecheck` read. `supabase
@@ -46,7 +36,6 @@ mobile/android/.kotlin/
 .idea/
 .DS_Store
 *.swp
-.vercel
 .env*
 supabase/.temp/
 supabase\.temp/

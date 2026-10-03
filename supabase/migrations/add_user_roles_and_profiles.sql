@@ -9,7 +9,7 @@
 -- WHY
 --   The account table knew two roles, 'student' and 'supervisor', as free text
 --   behind a CHECK. There was nowhere to put the two roles the product now
---   needs: an `admin` (manages accounts, from the mobile admin dashboard) and a
+--   needs: an `admin` (manages accounts in the Flutter app) and a
 --   `lecturer` (staff who write exams but are not invigilating). Text also meant
 --   every new role needed the constraint rewritten, and a policy comparing a
 --   string could not be type-checked.
@@ -38,7 +38,7 @@
 --
 -- That works from the SQL editor precisely because guard_user_role_change()
 -- lets a session with no JWT through - otherwise the first admin could never be
--- created. After that, admins change roles through the mobile admin dashboard
+-- created. After that, admins change roles through the Flutter admin console
 -- (or the admin-create-user Edge Function) and the SQL editor is no longer
 -- needed.
 --
@@ -240,7 +240,7 @@ create policy "profiles_update_self"
   using (id = auth.uid())
   with check (id = auth.uid());
 
--- The new one: admins manage every profile (the mobile admin dashboard lists
+-- The new one: admins manage every profile (the Flutter admin console lists
 -- accounts with this, and the admin-create-user Edge Function writes the row
 -- for a new lecturer/supervisor through it). Deleting a row here does not delete
 -- the auth account - use Supabase Auth's admin API for that.
@@ -290,7 +290,7 @@ create trigger profiles_guard_role_change
 -- ---------------------------------------------------------------------
 -- 7. Realtime
 -- ---------------------------------------------------------------------
--- The rename kept the publication membership, but the dashboard subscribes by
+-- The rename kept the publication membership, but the staff console subscribes by
 -- table *name* (`postgres_changes` on `profiles`), so the entry has to exist
 -- under the new one. The `exception` guard covers a project where the
 -- supabase_realtime publication was never created.

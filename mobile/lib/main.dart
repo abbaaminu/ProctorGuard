@@ -12,6 +12,8 @@ import 'features/admin/presentation/providers/admin_providers.dart';
 import 'features/auth/data/repositories/profile_repository_impl.dart';
 import 'features/auth/presentation/providers/profile_provider.dart';
 import 'features/auth/presentation/widgets/role_gate.dart';
+import 'features/dashboard/data/repositories/dashboard_repository_impl.dart';
+import 'features/dashboard/presentation/providers/dashboard_providers.dart';
 import 'features/exam/data/repositories/exam_repository_impl.dart';
 import 'features/proctoring/data/repositories/proctoring_repository_impl.dart';
 import 'features/proctoring/presentation/providers/proctoring_provider.dart';
@@ -70,6 +72,9 @@ Future<void> main() async {
         if (client != null)
           adminUserRepositoryProvider
               .overrideWithValue(AdminUserRepositoryImpl(client)),
+        if (client != null)
+          dashboardRepositoryProvider
+              .overrideWithValue(DashboardRepositoryImpl(client)),
       ],
       child: ExamProctorApp(supabaseStatus: supabaseStatus),
     ),
@@ -112,9 +117,8 @@ class ExamProctorApp extends StatelessWidget {
       theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
       // `RoleGate` is the whole router today: signed out -> login, then
       // `profiles.role` picks the student portal, the staff console or the admin
-      // dashboard. Swap in go_router config (/login, /exams, /exam/:id,
-      // /dashboard/:examId) when deep links matter — every page takes plain
-      // constructor args.
+      // staff console. Swap in go_router config when deep links matter —
+      // every page takes plain constructor args.
       home: supabaseStatus == SupabaseInitStatus.ready
           ? const RoleGate()
           : SetupRequiredPage(
@@ -125,6 +129,4 @@ class ExamProctorApp extends StatelessWidget {
     );
   }
 }
-
-
 

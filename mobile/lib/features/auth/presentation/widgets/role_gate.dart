@@ -72,6 +72,7 @@ class RoleGate extends ConsumerWidget {
                 UserRole.supervisor || UserRole.lecturer =>
                   SupervisorExamPickerPage(
                     supervisorName: profile.displayName,
+                    canResetAttempts: profile.role == UserRole.supervisor,
                     onSignOut: () => _signOut(context, ref, userId),
                   ),
                 UserRole.admin => AdminDashboardPage(

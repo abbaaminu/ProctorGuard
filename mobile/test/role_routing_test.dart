@@ -76,21 +76,20 @@ void main() {
   Widget gateUnderTest({
     String userId = aishaId,
     Future<AuthOutcome> Function()? signOut,
-  }) =>
-      ProviderScope(
-        overrides: [
-          profileRepositoryProvider.overrideWithValue(profiles),
-          examRepositoryProvider.overrideWithValue(exams),
-          adminUserRepositoryProvider.overrideWithValue(admin),
-        ],
-        child: MaterialApp(
-          home: RoleGate(
-            signedInChanges: Stream<bool>.value(true),
-            currentUserId: () => userId,
-            signOut: signOut,
-          ),
-        ),
-      );
+  }) => ProviderScope(
+    overrides: [
+      profileRepositoryProvider.overrideWithValue(profiles),
+      examRepositoryProvider.overrideWithValue(exams),
+      adminUserRepositoryProvider.overrideWithValue(admin),
+    ],
+    child: MaterialApp(
+      home: RoleGate(
+        signedInChanges: Stream<bool>.value(true),
+        currentUserId: () => userId,
+        signOut: signOut,
+      ),
+    ),
+  );
 
   setUp(() {
     profiles = _FakeProfileRepository(profile: aisha);
@@ -104,10 +103,12 @@ void main() {
       expect(UserRole.fromDb('supervisor'), UserRole.supervisor);
       expect(UserRole.fromDb('lecturer'), UserRole.lecturer);
       expect(UserRole.fromDb('admin'), UserRole.admin);
-      expect(
-        UserRole.values.map((role) => role.dbValue).toList(),
-        <String>['admin', 'lecturer', 'supervisor', 'student'],
-      );
+      expect(UserRole.values.map((role) => role.dbValue).toList(), <String>[
+        'admin',
+        'lecturer',
+        'supervisor',
+        'student',
+      ]);
     });
 
     test('rejects an unknown role instead of guessing', () {
@@ -147,27 +148,27 @@ void main() {
     required ExamPageBuilder builder,
     String? name = 'Aisha Bello',
     HardwareGateRequest? gate,
-  }) =>
-      ProviderScope(
-        overrides: [
-          profileRepositoryProvider.overrideWithValue(profiles),
-          examRepositoryProvider.overrideWithValue(exams),
-        ],
-        child: MaterialApp(
-          home: StudentExamPortalPage(
-            studentName: name,
-            examPageBuilder: builder,
-            hardwareGate: gate ?? (_, _) async => true,
-          ),
-        ),
-      );
+  }) => ProviderScope(
+    overrides: [
+      profileRepositoryProvider.overrideWithValue(profiles),
+      examRepositoryProvider.overrideWithValue(exams),
+    ],
+    child: MaterialApp(
+      home: StudentExamPortalPage(
+        studentName: name,
+        examPageBuilder: builder,
+        hardwareGate: gate ?? (_, _) async => true,
+      ),
+    ),
+  );
 
   Future<void> letSnackBarExpire(WidgetTester tester) =>
       tester.pumpAndSettle(const Duration(seconds: 7));
 
   group('student role', () {
-    testWidgets('lands on the Student Exam Portal with the published exams',
-        (tester) async {
+    testWidgets('lands on the Student Exam Portal with the published exams', (
+      tester,
+    ) async {
       await tester.pumpWidget(gateUnderTest());
       await tester.pumpAndSettle();
 
@@ -177,12 +178,16 @@ void main() {
       expect(find.text('MAT201: Calculus Quiz'), findsOneWidget);
       expect(find.text('60 minutes'), findsOneWidget);
       expect(find.text('45 minutes'), findsOneWidget);
-      expect(profiles.lastUserId, aishaId,
-          reason: 'the role came from profiles.id = auth uid');
+      expect(
+        profiles.lastUserId,
+        aishaId,
+        reason: 'the role came from profiles.id = auth uid',
+      );
     });
 
-    testWidgets('an ongoing attempt opens the session with both ids',
-        (tester) async {
+    testWidgets('an ongoing attempt opens the session with both ids', (
+      tester,
+    ) async {
       exams.submissions[mat201Id] = const Submission(
         id: 'sub-mat',
         studentId: aishaId,
@@ -192,12 +197,14 @@ void main() {
       );
       (String, String)? pushed;
 
-      await tester.pumpWidget(portal(
-        builder: (examId, submissionId) {
-          pushed = (examId, submissionId);
-          return const Scaffold(body: Text('session placeholder'));
-        },
-      ));
+      await tester.pumpWidget(
+        portal(
+          builder: (examId, submissionId) {
+            pushed = (examId, submissionId);
+            return const Scaffold(body: Text('session placeholder'));
+          },
+        ),
+      );
       await tester.pumpAndSettle();
 
       await tester.tap(find.byKey(const Key('exam-$mat201Id')));
@@ -208,8 +215,9 @@ void main() {
       expect(exams.startCalls, 1);
     });
 
-    testWidgets('a disqualified attempt is reported, not reopened',
-        (tester) async {
+    testWidgets('a disqualified attempt is reported, not reopened', (
+      tester,
+    ) async {
       exams.submissions[cs101Id] = const Submission(
         id: 'sub-cs',
         studentId: aishaId,
@@ -219,12 +227,14 @@ void main() {
       );
       var opened = 0;
 
-      await tester.pumpWidget(portal(
-        builder: (_, _) {
-          opened++;
-          return const SizedBox.shrink();
-        },
-      ));
+      await tester.pumpWidget(
+        portal(
+          builder: (_, _) {
+            opened++;
+            return const SizedBox.shrink();
+          },
+        ),
+      );
       await tester.pumpAndSettle();
 
       await tester.tap(find.byKey(const Key('exam-$cs101Id')));
@@ -236,17 +246,20 @@ void main() {
       await letSnackBarExpire(tester);
     });
 
-    testWidgets('a failed submission start is surfaced, not swallowed',
-        (tester) async {
+    testWidgets('a failed submission start is surfaced, not swallowed', (
+      tester,
+    ) async {
       exams.startError = Exception('offline');
       var opened = 0;
 
-      await tester.pumpWidget(portal(
-        builder: (_, _) {
-          opened++;
-          return const SizedBox.shrink();
-        },
-      ));
+      await tester.pumpWidget(
+        portal(
+          builder: (_, _) {
+            opened++;
+            return const SizedBox.shrink();
+          },
+        ),
+      );
       await tester.pumpAndSettle();
 
       await tester.tap(find.byKey(const Key('exam-$mat201Id')));
@@ -258,19 +271,22 @@ void main() {
       await letSnackBarExpire(tester);
     });
 
-    testWidgets('a refused hardware gate blocks the exam and writes nothing',
-        (tester) async {
+    testWidgets('a refused hardware gate blocks the exam and writes nothing', (
+      tester,
+    ) async {
       var opened = 0;
 
-      await tester.pumpWidget(portal(
-        builder: (_, _) {
-          opened++;
-          return const SizedBox.shrink();
-        },
-        // What ExamHardwareGatePage reports when the camera or the microphone
-        // could not be verified.
-        gate: (_, _) async => false,
-      ));
+      await tester.pumpWidget(
+        portal(
+          builder: (_, _) {
+            opened++;
+            return const SizedBox.shrink();
+          },
+          // What ExamHardwareGatePage reports when the camera or the microphone
+          // could not be verified.
+          gate: (_, _) async => false,
+        ),
+      );
       await tester.pumpAndSettle();
 
       await tester.tap(find.byKey(const Key('exam-$mat201Id')));
@@ -280,7 +296,8 @@ void main() {
       expect(
         exams.startCalls,
         0,
-        reason: 'no submission is created before the gate passes, so there is '
+        reason:
+            'no submission is created before the gate passes, so there is '
             'no orphaned ongoing attempt to resume',
       );
       // Still on the list, free to try again once the device is fixed.
@@ -289,8 +306,9 @@ void main() {
   });
 
   group('loading and failure', () {
-    testWidgets('a spinner shows while the profile is being read',
-        (tester) async {
+    testWidgets('a spinner shows while the profile is being read', (
+      tester,
+    ) async {
       final pending = Completer<UserProfile>();
       profiles.behaviour = () => pending.future;
 
@@ -308,10 +326,10 @@ void main() {
 
     testWidgets('a failed role lookup is retryable', (tester) async {
       profiles.behaviour = () => Future<UserProfile>.error(
-            const ProfileLookupException(
-              'Could not load your profile. Check your connection and try again.',
-            ),
-          );
+        const ProfileLookupException(
+          'Could not load your profile. Check your connection and try again.',
+        ),
+      );
 
       await tester.pumpWidget(gateUnderTest());
       await tester.pumpAndSettle();
@@ -327,14 +345,17 @@ void main() {
       expect(find.text('Student Exam Portal'), findsOneWidget);
     });
 
-    testWidgets('the error state offers a sign-out that reports failures',
-        (tester) async {
+    testWidgets('the error state offers a sign-out that reports failures', (
+      tester,
+    ) async {
       profiles.behaviour = () =>
           Future<UserProfile>.error(const ProfileLookupException('no row'));
 
-      await tester.pumpWidget(gateUnderTest(
-        signOut: () async => const AuthOutcome.failure('Network down'),
-      ));
+      await tester.pumpWidget(
+        gateUnderTest(
+          signOut: () async => const AuthOutcome.failure('Network down'),
+        ),
+      );
       await tester.pumpAndSettle();
 
       await tester.tap(find.byKey(const Key('profile-sign-out')));
@@ -391,8 +412,9 @@ void main() {
       });
     }
 
-    testWidgets('lands on the admin dashboard, not the staff console',
-        (tester) async {
+    testWidgets('lands on the admin dashboard, not the staff console', (
+      tester,
+    ) async {
       useDesktopSurface(tester);
       profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
 
@@ -410,8 +432,9 @@ void main() {
       expect(admin.listCalls, 1);
     });
 
-    testWidgets('the signed-in admin is listed but cannot re-role themselves',
-        (tester) async {
+    testWidgets('the signed-in admin is listed but cannot re-role themselves', (
+      tester,
+    ) async {
       useDesktopSurface(tester);
       profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
 
@@ -444,10 +467,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(
-        admin.roleUpdates,
-        <(String, UserRole)>[(aishaId, UserRole.supervisor)],
-      );
+      expect(admin.roleUpdates, <(String, UserRole)>[
+        (aishaId, UserRole.supervisor),
+      ]);
       expect(find.textContaining('is now a supervisor'), findsOneWidget);
       await letSnackBarExpire(tester);
     });
@@ -470,6 +492,28 @@ void main() {
       expect(find.text('Only an administrator.'), findsNothing);
       expect(find.text('Aisha Bello'), findsOneWidget);
     });
+
+    testWidgets('deleting an account requires confirmation and refreshes the roster',
+        (tester) async {
+      useDesktopSurface(tester);
+      profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
+
+      await tester.pumpWidget(gateUnderTest(userId: rootAdmin.id));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('admin-delete-$aishaId')));
+      await tester.pumpAndSettle();
+      expect(find.text('Delete Aisha Bello?'), findsOneWidget);
+      expect(admin.deletedIds, isEmpty);
+
+      await tester.tap(find.text('Delete account'));
+      await tester.pumpAndSettle();
+
+      expect(admin.deletedIds, <String>[aishaId]);
+      expect(find.text('Aisha Bello'), findsNothing);
+      expect(find.textContaining('Deleted Aisha Bello'), findsOneWidget);
+      await letSnackBarExpire(tester);
+    });
   });
 }
 
@@ -477,32 +521,34 @@ void main() {
 /// without an Edge Function, an auth server or a `profiles` table.
 class _FakeAdminUserRepository implements AdminUserRepository {
   _FakeAdminUserRepository({List<ManagedAccount>? accounts})
-      : accounts = accounts ??
-            <ManagedAccount>[
-              const ManagedAccount(
-                id: '44444444-4444-4444-8444-444444444444',
-                email: 'admin@proctor.test',
-                fullName: 'Root Admin',
-                role: UserRole.admin,
-              ),
-              const ManagedAccount(
-                id: '22222222-2222-4222-8222-222222222222',
-                email: 'aisha.bello@proctor.test',
-                fullName: 'Aisha Bello',
-                role: UserRole.student,
-              ),
-              const ManagedAccount(
-                id: '33333333-3333-4333-8333-333333333333',
-                email: 'manager@proctor.test',
-                fullName: '',
-                role: UserRole.supervisor,
-              ),
-            ];
+    : accounts =
+          accounts ??
+          <ManagedAccount>[
+            const ManagedAccount(
+              id: '44444444-4444-4444-8444-444444444444',
+              email: 'admin@proctor.test',
+              fullName: 'Root Admin',
+              role: UserRole.admin,
+            ),
+            const ManagedAccount(
+              id: '22222222-2222-4222-8222-222222222222',
+              email: 'aisha.bello@proctor.test',
+              fullName: 'Aisha Bello',
+              role: UserRole.student,
+            ),
+            const ManagedAccount(
+              id: '33333333-3333-4333-8333-333333333333',
+              email: 'manager@proctor.test',
+              fullName: '',
+              role: UserRole.supervisor,
+            ),
+          ];
 
   List<ManagedAccount> accounts;
   final List<(String, UserRole)> roleUpdates = <(String, UserRole)>[];
   int listCalls = 0;
   Object? listError;
+  final List<String> deletedIds = <String>[];
 
   @override
   Future<ManagedAccount> createAccount({
@@ -510,13 +556,12 @@ class _FakeAdminUserRepository implements AdminUserRepository {
     required String password,
     required String fullName,
     required UserRole role,
-  }) async =>
-      ManagedAccount(
-        id: 'new-${accounts.length}',
-        email: email,
-        fullName: fullName,
-        role: role,
-      );
+  }) async => ManagedAccount(
+    id: 'new-${accounts.length}',
+    email: email,
+    fullName: fullName,
+    role: role,
+  );
 
   @override
   Future<List<ManagedAccount>> listAccounts() async {
@@ -533,13 +578,19 @@ class _FakeAdminUserRepository implements AdminUserRepository {
   }) async {
     roleUpdates.add((userId, role));
   }
+
+  @override
+  Future<void> deleteAccount({required String userId}) async {
+    deletedIds.add(userId);
+    accounts.removeWhere((account) => account.id == userId);
+  }
 }
 
 /// Stands in for `ProfileRepositoryImpl`: a swappable [behaviour] so a test can
 /// answer with a value, a pending future, or a [ProfileLookupException].
 class _FakeProfileRepository implements ProfileRepository {
   _FakeProfileRepository({required UserProfile profile})
-      : behaviour = (() => Future<UserProfile>.value(profile));
+    : behaviour = (() => Future<UserProfile>.value(profile));
 
   Future<UserProfile> Function() behaviour;
 

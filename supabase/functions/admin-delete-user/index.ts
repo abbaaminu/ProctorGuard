@@ -53,8 +53,7 @@
 // Deploy with `supabase functions deploy admin-delete-user` — JWT verification
 // stays ON (the default). It is not the authorization check, though: every
 // signed-in user holds a valid JWT, so the role read below is what actually gates
-// the deletion. The Flutter admin dashboard does not call this yet; the console's
-// roster (`dashboard/src/hooks/useAccounts.ts`) is the client.
+// the deletion. The Flutter admin roster calls this function.
 
 import {
   createClient,
@@ -353,8 +352,8 @@ async function removalScope(
 }
 
 Deno.serve(async (request: Request): Promise<Response> => {
-  // The dashboard is a browser, so it preflights any cross-origin POST; answering
-  // costs nothing and keeps this function usable from the Flutter app too.
+  // Browser clients preflight cross-origin POSTs; answering also keeps this
+  // function usable from the Flutter app.
   if (request.method === "OPTIONS") {
     return new Response("ok", { headers: CORS_HEADERS });
   }

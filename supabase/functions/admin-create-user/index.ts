@@ -36,7 +36,7 @@
 //   * Creation: `auth.admin.createUser()`, then the role row, rolled back
 //     together if the second half fails.
 //
-// The Flutter admin dashboard (`mobile/lib/features/admin/...`) is the client;
+// The Flutter admin console (`mobile/lib/features/admin/...`) is the client;
 // `mobile/test/schema_contract_test.dart` pins the two halves of this contract
 // together so a rename on one side fails the suite instead of at runtime.
 //
@@ -53,7 +53,7 @@ type Role = (typeof ROLES)[number];
 
 /**
  * The minimum Supabase Auth will accept by default. Kept in step with the
- * client-side validator so the dashboard's message and the API's agree.
+ * client-side validator so the admin form's message and the API's agree.
  */
 const MIN_PASSWORD_LENGTH = 6;
 
@@ -61,7 +61,7 @@ const MIN_PASSWORD_LENGTH = 6;
  * The roles allowed to call this function.
  *
  * `admin` only, deliberately. `profiles_admin_all` (schema.sql) is admin-only and
- * the admin dashboard is the only screen in either app that manages accounts, so
+ * the Flutter admin console is the account-management screen, so
  * a supervisor calling this function would be the one path by which an invigilator
  * could mint an account — including a second admin — which is exactly the tier
  * the schema separates. If a product decision ever widens it, add the role here
@@ -109,9 +109,8 @@ function stringField(
 }
 
 Deno.serve(async (request: Request): Promise<Response> => {
-  // The dashboard (a browser) preflights any cross-origin POST; the mobile app
-  // does not, but answering costs nothing and keeps one function usable from
-  // both apps.
+  // Browser clients preflight cross-origin POSTs; answering also keeps this
+  // function usable from every supported client.
   if (request.method === "OPTIONS") {
     return new Response("ok", { headers: CORS_HEADERS });
   }

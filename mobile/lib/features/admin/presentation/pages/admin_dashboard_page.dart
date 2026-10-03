@@ -3,6 +3,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart' show SupabaseService;
 import '../../../../core/widgets/responsive_layout.dart';
+import '../../../dashboard/presentation/pages/analytics_page.dart';
+import '../../../dashboard/presentation/pages/supervisor_exam_picker_page.dart';
 import '../../../auth/domain/entities/user_profile.dart';
 import '../../domain/entities/managed_account.dart';
 import '../../domain/repositories/admin_user_repository.dart';
@@ -173,6 +175,47 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
     }
   }
 
+  Future<void> _deleteAccount(ManagedAccount account) async {
+    if (account.id == _selfId || _busyId != null) return;
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('Delete ${account.displayName}?'),
+        content: const Text(
+          'This permanently deletes the account and sign-in. Exams created by '
+          'this account, submissions and proctoring incidents are deleted too. '
+          'This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Delete account'),
+          ),
+        ],
+      ),
+    );
+    if (approved != true || !mounted) return;
+
+    setState(() => _busyId = account.id);
+    try {
+      await ref
+          .read(adminUserRepositoryProvider)
+          .deleteAccount(userId: account.id);
+      if (!mounted) return;
+      ref.invalidate(managedAccountsProvider);
+      _showMessage('Deleted ${account.displayName} and its related records.',
+          isError: false);
+    } on AdminAccountException catch (error) {
+      _showMessage(error.message);
+    } finally {
+      if (mounted) setState(() => _busyId = null);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -205,6 +248,7 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
       busyId: _busyId,
       onRefresh: () => ref.invalidate(managedAccountsProvider),
       onChangeRole: _changeRole,
+      onDelete: _deleteAccount,
     );
 
     return Scaffold(
@@ -212,6 +256,28 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
         automaticallyImplyLeading: false,
         title: const Text('Admin Dashboard'),
         actions: [
+          IconButton(
+            key: const Key('admin-exam-monitor'),
+            tooltip: 'Exam monitor',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const SupervisorExamPickerPage(
+                  canResetAttempts: true,
+                ),
+              ),
+            ),
+            icon: const Icon(Icons.monitor_heart_outlined),
+          ),
+          IconButton(
+            key: const Key('admin-analytics'),
+            tooltip: 'Analytics',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const AnalyticsPage(),
+              ),
+            ),
+            icon: const Icon(Icons.analytics_outlined),
+          ),
           IconButton(
             key: const Key('admin-refresh'),
             tooltip: 'Refresh',
@@ -467,12 +533,14 @@ class _RosterSection extends ConsumerWidget {
     required this.busyId,
     required this.onRefresh,
     required this.onChangeRole,
+    required this.onDelete,
   });
 
   final String? selfId;
   final String? busyId;
   final VoidCallback onRefresh;
   final void Function(ManagedAccount account, UserRole role) onChangeRole;
+  final void Function(ManagedAccount account) onDelete;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -530,6 +598,7 @@ class _RosterSection extends ConsumerWidget {
                         isSelf: selfId != null && account.id == selfId,
                         busy: busyId == account.id,
                         onChangeRole: (role) => onChangeRole(account, role),
+                        onDelete: () => onDelete(account),
                       ),
                   ],
                 ),
@@ -585,6 +654,7 @@ class _AccountTile extends StatelessWidget {
     required this.isSelf,
     required this.busy,
     required this.onChangeRole,
+    required this.onDelete,
   });
 
   final ManagedAccount account;
@@ -594,6 +664,7 @@ class _AccountTile extends StatelessWidget {
 
   final bool busy;
   final ValueChanged<UserRole> onChangeRole;
+  final VoidCallback onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -617,42 +688,54 @@ class _AccountTile extends StatelessWidget {
               width: 20,
               child: CircularProgressIndicator(strokeWidth: 2),
             )
-          : isSelf
-              ? Tooltip(
-                  message:
-                      'You cannot change your own role — another admin has to.',
-                  child: Chip(label: Text('${account.role.label} (you)')),
-                )
-              : PopupMenuButton<UserRole>(
-                  key: Key('admin-role-${account.id}'),
-                  tooltip: 'Change role',
-                  onSelected: onChangeRole,
-                  itemBuilder: (context) => [
-                    for (final role in UserRole.values)
-                      PopupMenuItem<UserRole>(
-                        value: role,
-                        // The current role is listed ticked but not selectable:
-                        // picking it again would be a pointless round trip.
-                        enabled: role != account.role,
-                        child: Row(
-                          children: [
-                            Icon(
-                              role == account.role
-                                  ? Icons.check
-                                  : Icons.circle_outlined,
-                              size: 18,
-                            ),
-                            const SizedBox(width: 8),
-                            Text(role.label),
-                          ],
+          : Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (isSelf)
+                  Tooltip(
+                    message:
+                        'You cannot change your own role — another admin has to.',
+                    child: Chip(label: Text('${account.role.label} (you)')),
+                  )
+                else
+                  PopupMenuButton<UserRole>(
+                    key: Key('admin-role-${account.id}'),
+                    tooltip: 'Change role',
+                    onSelected: onChangeRole,
+                    itemBuilder: (context) => [
+                      for (final role in UserRole.values)
+                        PopupMenuItem<UserRole>(
+                          value: role,
+                          enabled: role != account.role,
+                          child: Row(
+                            children: [
+                              Icon(
+                                role == account.role
+                                    ? Icons.check
+                                    : Icons.circle_outlined,
+                                size: 18,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(role.label),
+                            ],
+                          ),
                         ),
-                      ),
-                  ],
-                  child: Chip(
-                    label: Text(account.role.label),
-                    avatar: const Icon(Icons.expand_more, size: 18),
+                    ],
+                    child: Chip(
+                      label: Text(account.role.label),
+                      avatar: const Icon(Icons.expand_more, size: 18),
+                    ),
                   ),
-                ),
+                if (!isSelf)
+                  IconButton(
+                    key: Key('admin-delete-${account.id}'),
+                    tooltip: 'Delete account',
+                    onPressed: onDelete,
+                    color: theme.colorScheme.error,
+                    icon: const Icon(Icons.delete_outline),
+                  ),
+              ],
+            ),
     );
   }
 }

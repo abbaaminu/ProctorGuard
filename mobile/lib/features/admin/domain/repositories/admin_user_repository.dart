@@ -47,4 +47,9 @@ abstract class AdminUserRepository {
   /// Throws [AdminAccountException] when the caller may not write that row, or
   /// when [userId] no longer exists.
   Future<void> updateRole({required String userId, required UserRole role});
+
+  /// Permanently removes the Auth login and its profile through the
+  /// `admin-delete-user` Edge Function. Related exams, attempts and incidents
+  /// are removed by database cascades.
+  Future<void> deleteAccount({required String userId});
 }

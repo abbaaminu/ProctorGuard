@@ -4,13 +4,10 @@
    * tab. `Deno.serve` / `Deno.env` come with the runtime, so no tsconfig used to
    * claim these files and the editor's TypeScript server checked
    * `admin-create-user/index.ts` as a plain script: every `Deno` reference
-   * reported TS2304 ("Cannot find name 'Deno'"), while `npm run build` in
-   * `dashboard/` stayed silent because its tsconfig only includes `src`. Same
-   * story as `dashboard/tsconfig.node.json`, and fixed the same way.
+   * reported TS2304 ("Cannot find name 'Deno'").
    *
    * `"types": ["deno"]` is what resolves those globals, exactly as
-   * `"types": ["node"]` resolves `path` / `__dirname` over there: `@types/deno`
-   * is the Deno authors' own `lib.deno*.d.ts`, republished on npm for an editor
+   * `@types/deno` is the Deno authors' own `lib.deno*.d.ts`, republished on npm for an editor
    * with no Deno toolchain (and no Deno extension) installed. `lib` stays
    * DOM-shaped because the `Request`/`Response` a handler receives are the web
    * ones Deno implements.

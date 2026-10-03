@@ -1,6 +1,6 @@
 -- =====================================================================
 -- PROCTOR — SUPABASE SCHEMA + ROW LEVEL SECURITY (PRODUCTION READY)
--- Single source of truth for BOTH ../mobile (Flutter) and ../dashboard (React).
+-- Single source of truth for the Flutter app at ../mobile.
 -- Run in Supabase SQL editor. Assumes auth.users is Supabase Auth.
 --
 -- SECURITY MODEL (what the policies below deliberately enforce)
@@ -70,15 +70,15 @@ alter default privileges in schema public
 -- ---------------------------------------------------------------------
 -- The table is called `profiles` because that is what a row is: the account
 -- itself lives in `auth.users`, and this row adds the role, the display name
--- and the e-mail that both apps render. (It used to be `public.users`, which
+-- and the e-mail that the app renders. (It used to be `public.users`, which
 -- made `public.users` and `auth.users` easy to mix up in a query.)
 --
 -- FOUR ROLES, one enum:
---   admin       manages accounts: the mobile admin dashboard, and the only role
+--   admin       manages accounts: the mobile admin console, and the only role
 --               that may create a profile row for somebody else or rewrite a
 --               `role` after the fact.
---   lecturer    staff: writes exams and reviews the attempt roster (dashboard).
---   supervisor  staff: invigilates a live exam (mobile console + dashboard).
+--   lecturer    staff: reviews the attempt roster and analytics.
+--   supervisor  staff: invigilates exams, monitors attempts and resets them.
 --   student     sits exams.
 -- `lecturer` and `supervisor` are the same tier for *reads* -- is_staff() --
 -- while writes to other people's rows are admin-only, so a lecturer cannot
@@ -189,7 +189,7 @@ as $$
 $$;
 
 -- Admin-only. Used by the profiles policies and by guard_user_role_change();
--- this is the tier the mobile admin dashboard signs in as.
+-- this is the tier the mobile admin console signs in as.
 create or replace function public.is_admin()
 returns boolean
 language sql
@@ -244,8 +244,8 @@ drop policy if exists "profiles_insert_self_student" on public.profiles;
 drop policy if exists "profiles_update_self" on public.profiles;
 drop policy if exists "profiles_admin_all" on public.profiles;
 
--- Read: your own row, or every row when you are staff — the dashboard roster,
--- the admin dashboard's account list and the mobile live monitor all render
+-- Read: your own row, or every row when you are staff — the staff roster,
+-- the admin console's account list and live exam monitor both render
 -- other people's names and roles. Deliberately NOT "any authenticated user": a
 -- student must not be able to enumerate the roster of the whole institution.
 create policy "profiles_select_own_or_staff"
@@ -274,13 +274,13 @@ create policy "profiles_update_self"
 
 -- The admin tier: full row access for account management (provision a lecturer,
 -- fix a misspelt name, promote a supervisor, clean up a duplicate). This is the
--- policy the mobile admin dashboard relies on, and the one that lets it list
+-- policy the admin console relies on, and the one that lets it list
 -- every account.
 --
 -- One caveat worth knowing before using the DELETE half: deleting a profile row
 -- does not delete the auth account, because `auth.users` is owned by Supabase
 -- Auth. Removing an account for good means calling Auth's admin API (or, from
--- the dashboard, the Authentication tab); the row here is only the profile.
+-- the Supabase Dashboard Authentication tab); the row here is only the profile.
 create policy "profiles_admin_all"
   on public.profiles for all
   to authenticated
@@ -289,7 +289,7 @@ create policy "profiles_admin_all"
 
 -- `role` is the security boundary the whole schema is built on, so it cannot be
 -- rewritten through a self-update. Admins are the one role that may do it -- that
--- is what the admin dashboard exists for -- and `profiles_admin_all` above is
+-- is what the admin console exists for -- and `profiles_admin_all` above is
 -- the matching RLS half of the same rule.
 --
 -- Two sessions have to stay able to change a role or a project could never be
@@ -437,9 +437,8 @@ drop policy if exists "questions_write_owner" on public.questions;
 drop policy if exists "questions_update_owner" on public.questions;
 drop policy if exists "questions_delete_owner" on public.questions;
 
--- Owner-scoped first, then supervisor-wide (the same shape as exams_select):
--- the console audits attempts on any exam, and it is the only reader of
--- `correct_option`.
+-- Owner-scoped first, then staff-wide (the same shape as exams_select): staff
+-- access to an exam's full question set is separate from the student-safe view.
 create policy "questions_select_owner"
   on public.questions for select
   to authenticated
@@ -541,9 +540,9 @@ grant select on public.questions_public to authenticated;
 -- after both objects exist. A revoke, not a missing grant, is what makes the
 -- reach deterministic no matter which order this file is applied in.
 --
--- Nothing in either client needs the feed with the anonymous key: every read of
+-- Nothing in the app needs the feed with the anonymous key: every read of
 -- it happens after sign-in (the student's own `questions_public` query runs with
--- their session, the console reads `questions` as staff), and the only anonymous
+-- their session, and staff access to `questions` uses their session), and the only anonymous
 -- consumer was `.github/workflows/keep_alive.yml`, which pinged this view to
 -- prove the schema was reachable - i.e. exactly the reach being removed here. It
 -- pings `profiles` now, which answers 200 `[]` for `anon` because no policy
@@ -615,7 +614,7 @@ create policy "submissions_update_supervisor"
   using (public.is_exam_supervisor())
   with check (public.is_exam_supervisor());
 
--- Resetting one attempt (the console's "Reset attempt" on the submission audit)
+-- Resetting one attempt (the staff app's "Reset attempt" control)
 -- is a DELETE of this row: the score, the stored answers, the roster card and -
 -- through the `on delete cascade` on proctoring_logs.submission_id - the
 -- incident log are all cleared together. The child table needs no twin policy:
@@ -804,8 +803,8 @@ create policy "logs_select_own_or_supervisor"
 -- Path convention written by the mobile app (core/services/supabase_service.dart):
 --   <submission_id>/<action_type>_<epoch-ms>.jpg
 -- so the first folder is always the submission the snapshot belongs to.
--- The bucket is public because the supervisor console renders the URL straight
--- in an <img>; anyone holding a URL can fetch that snapshot, so treat it as
+-- The bucket is public so the supervisor app can render the snapshot URL;
+-- anyone holding a URL can fetch that snapshot, so treat it as
 -- unguessable rather than secret. The policies below still scope uploads to
 -- the owning student. Everything here is idempotent - safe to re-run.
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
@@ -858,7 +857,7 @@ create policy "Proctor snapshots upload own ongoing session"
 -- No update policy: a stored snapshot is never rewritten.
 --
 -- Delete is one deliberate exception, and it exists for exactly one action - the
--- console's "Reset attempt". That action deletes the submission row first (the
+-- staff app's "Reset attempt". That action deletes the submission row first (the
 -- DELETE that `submissions_delete_supervisor` authorizes, whose cascade takes
 -- the log rows with it) and then has to drop the stills those rows pointed at: a
 -- reset that left a student's images in a public bucket would not be a reset.
@@ -884,7 +883,7 @@ create policy "Proctor snapshots supervisor purge"
 create index if not exists idx_questions_exam_id on public.questions(exam_id);
 create index if not exists idx_submissions_exam_id on public.exam_submissions(exam_id);
 create index if not exists idx_submissions_student_id on public.exam_submissions(student_id);
--- Roster queries (and the console's "live now" metric) filter an exam by status,
+-- Roster queries and staff analytics filter an exam by status,
 -- so the composite pays for itself as soon as an exam has a few hundred rows.
 create index if not exists idx_submissions_exam_status on public.exam_submissions(exam_id, status);
 create index if not exists idx_logs_submission_id on public.proctoring_logs(submission_id);
@@ -902,7 +901,7 @@ begin
     alter publication supabase_realtime add table public.exam_submissions;
   end if;
   -- Profile rows so the console's id -> name map can refresh itself (the
-  -- supervisor roster/incident feed renders names, see dashboard/
+  -- supervisor roster/incident feed renders names, see mobile/lib/features/dashboard/
   -- src/hooks/useAccountNames.ts). RLS still applies to the stream.
   if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'profiles') then
     alter publication supabase_realtime add table public.profiles;
