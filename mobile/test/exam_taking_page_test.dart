@@ -465,10 +465,18 @@ void main() {
       await tester.tap(find.text('open exam'));
       await tester.pumpAndSettle();
 
-      // First question: Next is available, Previous is not yet.
+      // First question: Next is available, and Previous is on screen but inert -
+      // the way back is visible from the first question, it is just not usable
+      // until there is somewhere to go.
       expect(find.text('Question 1 of 2'), findsOneWidget);
       expect(find.byKey(const Key('exam-next')), findsOneWidget);
-      expect(find.byKey(const Key('exam-previous')), findsNothing);
+      expect(
+        tester
+            .widget<TextButton>(find.byKey(const Key('exam-previous')))
+            .onPressed,
+        isNull,
+        reason: 'no previous question to go to yet',
+      );
 
       await tester.tap(find.byKey(const Key('exam-next')));
       await tester.pumpAndSettle();
@@ -482,6 +490,63 @@ void main() {
       await tester.tap(find.byKey(const Key('exam-previous')));
       await tester.pumpAndSettle();
 
+      expect(find.text('Question 1 of 2'), findsOneWidget);
+    });
+
+    testWidgets('the review grid marks answered and unattempted questions',
+        (tester) async {
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      // Nothing answered yet: one tile per question, both in the neutral state,
+      // and the summary says how much is left.
+      expect(find.byKey(const Key('exam-palette')), findsOneWidget);
+      expect(find.byKey(const Key('exam-palette-0')), findsOneWidget);
+      expect(find.byKey(const Key('exam-palette-1')), findsOneWidget);
+      expect(
+        tester.widget<Text>(find.byKey(const Key('exam-palette-summary'))).data,
+        '0 answered • 2 not answered',
+      );
+      expect(
+        find.descendant(
+          of: find.byKey(const Key('exam-palette-0')),
+          matching: find.byIcon(Icons.check),
+        ),
+        findsNothing,
+        reason: 'an unattempted question carries no completed marker',
+      );
+      // The legend spells the two states out rather than leaving them to colour.
+      expect(find.text('Answered'), findsOneWidget);
+      expect(find.text('Not answered'), findsOneWidget);
+
+      // Answering question 1 (a tap saves *and* advances) flips its tile to the
+      // completed state.
+      await tester.tap(find.byKey(const Key('option-1')));
+      await tester.pumpAndSettle();
+      expect(find.text('Question 2 of 2'), findsOneWidget);
+      expect(
+        tester.widget<Text>(find.byKey(const Key('exam-palette-summary'))).data,
+        '1 answered • 1 not answered',
+      );
+      expect(
+        find.descendant(
+          of: find.byKey(const Key('exam-palette-0')),
+          matching: find.byIcon(Icons.check),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: find.byKey(const Key('exam-palette-1')),
+          matching: find.byIcon(Icons.check),
+        ),
+        findsNothing,
+      );
+
+      // And the grid navigates: tapping question 1 goes back to it.
+      await tester.tap(find.byKey(const Key('exam-palette-0')));
+      await tester.pumpAndSettle();
       expect(find.text('Question 1 of 2'), findsOneWidget);
     });
 

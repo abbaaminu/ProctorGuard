@@ -381,6 +381,9 @@ void main() {
         findsOneWidget,
       );
       expect(find.text('Student Exam Portal'), findsNothing);
+      // The console's own Home control, present on every screen it opens (see
+      // `HomeButton`); on the landing page itself there is nothing to pop.
+      expect(find.byKey(const Key('supervisor-home')), findsOneWidget);
     });
   });
 
@@ -396,6 +399,8 @@ void main() {
       expect(find.text('Supervisor Console'), findsOneWidget);
       expect(find.textContaining('Welcome, Musa Ibrahim'), findsOneWidget);
       expect(find.text('Student Exam Portal'), findsNothing);
+      // Same console, so the same Home control.
+      expect(find.byKey(const Key('supervisor-home')), findsOneWidget);
     });
   });
 
@@ -425,6 +430,9 @@ void main() {
       expect(find.textContaining('Welcome, Root Admin'), findsOneWidget);
       expect(find.text('Supervisor Console'), findsNothing);
       expect(find.text('Student Exam Portal'), findsNothing);
+      // The admin console's Home control, in the same place on every screen it
+      // opens - including the exam monitor, which is pushed on top of this one.
+      expect(find.byKey(const Key('admin-home')), findsOneWidget);
 
       // The roster came from the injected repository, not from a backend.
       expect(find.text('Aisha Bello'), findsOneWidget);

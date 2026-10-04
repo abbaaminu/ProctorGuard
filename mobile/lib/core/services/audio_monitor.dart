@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show debugPrint, kIsWeb;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:record/record.dart';
+
+import '../utils/proctor_log.dart';
 
 /// How far the microphone got in this session.
 ///
@@ -80,8 +82,11 @@ abstract class AudioLevelSource {
   /// unsupported encoder).
   Future<void> begin();
 
-  /// dBFS samples, roughly -90 (silence) to 0 (clipping). An error here means the
-  /// device went away, and the monitor reports [AudioMonitorState.interrupted].
+  /// dBFS samples. The contract is negative, 0 being full scale: -160 is the
+  /// sentinel `record` reports when it has nothing to report (silence, or no
+  /// capture session), and a normal exam room sits around -60…-20. An error here
+  /// means the device went away, and the monitor reports
+  /// [AudioMonitorState.interrupted].
   Stream<double> get levels;
 
   /// Releases the capture session. Never throws.
@@ -213,7 +218,7 @@ class RecordAudioLevelSource implements AudioLevelSource {
       await recorder.stop();
     } catch (error) {
       // Already stopped, or the platform is gone: nothing left to release.
-      debugPrint('ProctorGuard audio: stop failed: $error');
+      proctorLog('ProctorGuard audio: stop failed: $error');
     }
   }
 
@@ -233,7 +238,7 @@ class RecordAudioLevelSource implements AudioLevelSource {
       // Best effort and never awaited: dispose has to be safe during a widget
       // teardown, and the platform releases the input device either way.
       unawaited(recorder.dispose().catchError((Object error) {
-        debugPrint('ProctorGuard audio: dispose failed: $error');
+        proctorLog('ProctorGuard audio: dispose failed: $error');
       }));
     }
     unawaited(_levels.close());
@@ -315,6 +320,21 @@ class AudioMonitor {
   double? _peakLevel;
   bool _disposed = false;
 
+  /// True once a level has been logged for the session that is running.
+  ///
+  /// "The microphone opened but nothing ever came out of it" is the failure this
+  /// whole class exists to make visible; a single debug line saying that levels
+  /// started flowing (and at what level) is what turns "audio proctoring never
+  /// flagged anything" from guesswork into a reading.
+  bool _reportedFirstLevel = false;
+
+  /// Floor of the dBFS band a level is clamped into.
+  ///
+  /// `record` reports -160 dBFS when it has nothing to report (the same sentinel
+  /// on Android, iOS and web - see `DEFAULT_AMPLITUDE_DB`), so anything at or
+  /// below this is silence, and anything above 0 dBFS is out of contract.
+  static const double _minLevelDb = -160;
+
   /// Where the microphone got to (see [AudioMonitorState]).
   AudioMonitorState get state => _state;
 
@@ -377,6 +397,9 @@ class AudioMonitor {
     unawaited(_levelSubscription?.cancel());
     _levelSubscription = null;
     _currentLevel = null;
+    // The proof-of-life line goes with it: a reconnect that never gets a level is
+    // exactly the case the log has to show again.
+    _reportedFirstLevel = false;
     // The peak goes too: it is a claim about *this* capture session, and the
     // indicator shows it next to the live level. Keeping a loud moment from a
     // microphone that has since been replaced would report a room the student is
@@ -393,7 +416,7 @@ class AudioMonitor {
     try {
       granted = await _source.requestAccess().timeout(startTimeout);
     } catch (error) {
-      debugPrint('ProctorGuard audio: access could not be requested: $error');
+      proctorLog('ProctorGuard audio: access could not be requested: $error');
       if (_disposed) return _state;
       return _transition(
         AudioMonitorState.unavailable,
@@ -423,7 +446,7 @@ class AudioMonitor {
     try {
       await _source.begin().timeout(startTimeout);
     } catch (error) {
-      debugPrint('ProctorGuard audio: could not open the microphone: $error');
+      proctorLog('ProctorGuard audio: could not open the microphone: $error');
       if (_disposed) return _state;
       return _transition(
         AudioMonitorState.unavailable,
@@ -458,23 +481,39 @@ class AudioMonitor {
 
   void _onLevel(double decibels) {
     if (_disposed) return;
-    _currentLevel = decibels;
+
+    // The capture contract is dBFS: negative, 0 being full scale (see
+    // [AudioLevelSource.levels]). A platform that hands back something else -
+    // a linear peak, a NaN from a device that has just gone away - must not
+    // reach the detector, where a single sample can shift the calibration median
+    // the whole room is judged against, or the peak the student is shown.
+    if (decibels.isNaN || decibels.isInfinite) return;
+    final level = decibels.clamp(_minLevelDb, 0.0).toDouble();
+
+    _currentLevel = level;
     _peakLevel = _peakLevel == null
-        ? decibels
-        : (decibels > _peakLevel! ? decibels : _peakLevel);
+        ? level
+        : (level > _peakLevel! ? level : _peakLevel);
     _levelTimer?.cancel();
     _levelTimer = null;
+    if (!_reportedFirstLevel) {
+      _reportedFirstLevel = true;
+      proctorLog(
+        'ProctorGuard audio: levels are flowing (first sample '
+        '${level.toStringAsFixed(1)} dBFS).',
+      );
+    }
     if (_state != AudioMonitorState.monitoring) {
       _transition(AudioMonitorState.monitoring);
     }
-    if (!_levels.isClosed) _levels.add(decibels);
+    if (!_levels.isClosed) _levels.add(level);
   }
 
   void _onStreamError(Object error, [StackTrace? stackTrace]) {
     // An error from a stream a teardown already cancelled must not move a disposed
     // monitor's state (the cancel is not awaited, so this can still arrive).
     if (_disposed) return;
-    debugPrint('ProctorGuard audio: level stream failed: $error');
+    proctorLog('ProctorGuard audio: level stream failed: $error');
     if (_state == AudioMonitorState.monitoring ||
         _state == AudioMonitorState.starting) {
       _transition(
@@ -535,11 +574,11 @@ class AudioMonitor {
     try {
       await _source.end().timeout(endTimeout);
     } on TimeoutException {
-      debugPrint(
+      proctorLog(
         'ProctorGuard audio: the session did not release within $endTimeout',
       );
     } catch (error) {
-      debugPrint('ProctorGuard audio: release failed: $error');
+      proctorLog('ProctorGuard audio: release failed: $error');
     }
   }
 

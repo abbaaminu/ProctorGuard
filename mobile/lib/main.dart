@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'core/services/lockdown_bootstrap.dart';
 import 'core/services/permission_service.dart';
 import 'core/services/supabase_service.dart';
+import 'core/utils/proctor_log.dart';
 import 'core/widgets/setup_required_page.dart';
 import 'features/admin/data/repositories/admin_user_repository_impl.dart';
 import 'features/admin/presentation/providers/admin_providers.dart';
@@ -89,7 +90,7 @@ Future<void> requestStartupPermissions() async {
   try {
     await PermissionService().requestAll();
   } catch (error) {
-    debugPrint('Startup permission pass failed, continuing without it: $error');
+    proctorLog('Startup permission pass failed, continuing without it: $error');
   }
 }
 

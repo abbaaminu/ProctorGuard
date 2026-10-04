@@ -3,9 +3,9 @@ import 'dart:js_interop';
 // `hasProperty`/`callMethod` rather than anything package:web declares.
 import 'dart:js_interop_unsafe';
 
-import 'package:flutter/foundation.dart' show debugPrint;
-
 import 'package:web/web.dart' as web;
+
+import '../utils/proctor_log.dart';
 
 import 'lockdown_bootstrap.dart';
 
@@ -45,7 +45,7 @@ class WebLockdownBootstrap implements LockdownBootstrap {
       // half-defined host script is not a reason to lose the app. The cost is
       // that the pre-boot block stands until an exam arms the lockdown, which is
       // stricter than intended, never looser.
-      debugPrint('ProctorGuard lockdown: could not announce the boot: $error');
+      proctorLog('ProctorGuard lockdown: could not announce the boot: $error');
     }
   }
 }

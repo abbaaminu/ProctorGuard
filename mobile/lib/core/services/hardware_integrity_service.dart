@@ -1,9 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart'
-    show TargetPlatform, debugPrint, defaultTargetPlatform, kIsWeb;
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 import 'package:flutter/services.dart'
     show MethodChannel, MissingPluginException, PlatformException;
+
+import '../utils/proctor_log.dart';
 
 /// The device-level integrity signals an exam attempt can be checked against.
 ///
@@ -172,16 +174,16 @@ class HardwareIntegrityService {
       // error, just an answer this build cannot give.
       return const HardwareIntegrityReport.unsupported();
     } on PlatformException catch (error) {
-      debugPrint('ProctorGuard integrity: the platform refused: ${error.message}');
+      proctorLog('ProctorGuard integrity: the platform refused: ${error.message}');
       return const HardwareIntegrityReport.unsupported();
     } on TimeoutException {
-      debugPrint(
+      proctorLog(
         'ProctorGuard integrity: no answer within ${timeout.inSeconds}s — '
         'reporting nothing rather than holding the exam',
       );
       return const HardwareIntegrityReport.unsupported();
     } catch (error) {
-      debugPrint('ProctorGuard integrity: probe failed: $error');
+      proctorLog('ProctorGuard integrity: probe failed: $error');
       return const HardwareIntegrityReport.unsupported();
     }
   }

@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart' show debugPrint;
+import '../../../../core/utils/proctor_log.dart';
 import 'package:flutter/services.dart' show DeviceOrientation;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -162,15 +162,15 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   ///
   /// Called with `false` while the camera feed is offline/initialising and with
   /// `true` once frames are flowing again. While paused, [GazeSignal]s are
-  /// dropped and the engine's grace windows are cleared, so a lost camera shows
+  /// dropped and the engine's frame counters are cleared, so a lost camera shows
   /// the student a prompt rather than quietly logging `no_face`/`looking_away`
   /// strikes for a stream that is not even running.
   void setCameraActive(bool active) {
     if (!mounted) return;
     if (_cameraActive == active) return;
     _cameraActive = active;
-    // A resume must not inherit a stale dedupe stamp or a half-elapsed grace
-    // window from before the camera dropped out.
+    // A resume must not inherit a stale dedupe stamp or a half-counted frame
+    // episode from before the camera dropped out.
     _lastLoggedAt.clear();
     _engine.setStreamActive(active);
     state = state.copyWith(cameraPaused: !active);
@@ -418,7 +418,7 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     } catch (error) {
       // Best effort, and never fatal: the authoritative status is set by the
       // violation RPC (see above), and the offline queue replays what it can.
-      debugPrint(
+      proctorLog(
         'ProctoringNotifier: could not persist the disqualification of '
         '$submissionId ($error) — exiting anyway.',
       );

@@ -2,8 +2,9 @@ import 'dart:async';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart'
-    show TargetPlatform, debugPrint, defaultTargetPlatform, kIsWeb;
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 
+import '../utils/proctor_log.dart';
 import 'mediapipe_proctoring_service.dart';
 import 'permission_service.dart';
 import 'web_camera_permission.dart';
@@ -238,7 +239,7 @@ class DeviceHardwareVerifier implements HardwareVerifier {
     // without the define this branch is dead code, so a real build can never end
     // up "verifying" simulated hardware.
     if (MediaPipeProctoringService.mockCameraFromEnvironment) {
-      debugPrint(
+      proctorLog(
         'ProctorGuard hardware: MOCK_CAMERA is set — skipping the real device '
         'check (development/CI build).',
       );
@@ -269,7 +270,7 @@ class DeviceHardwareVerifier implements HardwareVerifier {
     } on CameraException catch (error) {
       return _cameraFailure(error.code, settingsHint: true);
     } catch (error) {
-      debugPrint('ProctorGuard hardware: camera enumeration failed: $error');
+      proctorLog('ProctorGuard hardware: camera enumeration failed: $error');
       return _cameraFailure(null, message: 'the camera is not available here');
     }
 
@@ -318,14 +319,14 @@ class DeviceHardwareVerifier implements HardwareVerifier {
     } on CameraException catch (error) {
       return _cameraFailure(error.code);
     } catch (error) {
-      debugPrint('ProctorGuard hardware: capture session failed: $error');
+      proctorLog('ProctorGuard hardware: capture session failed: $error');
       return _cameraFailure(null, message: 'the camera could not be opened');
     } finally {
       // Released here: the exam screen opens its own session for the attempt.
       try {
         await controller.dispose();
       } catch (error) {
-        debugPrint('ProctorGuard hardware: releasing the probe failed: $error');
+        proctorLog('ProctorGuard hardware: releasing the probe failed: $error');
       }
     }
   }

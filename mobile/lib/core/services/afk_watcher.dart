@@ -1,7 +1,8 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/services.dart' show HardwareKeyboard, KeyEvent;
+
+import '../utils/proctor_log.dart';
 
 /// Turns "nothing has happened on this device for a while" into a proctoring
 /// signal for one attempt: the `idle_afk` violation.
@@ -110,7 +111,7 @@ class AfkWatcher {
     } catch (error) {
       // No binding (a pure Dart test, a background isolate): pointer activity
       // still counts, so the watch is merely less sensitive.
-      debugPrint('ProctorGuard AFK: keyboard activity is not available: $error');
+      proctorLog('ProctorGuard AFK: keyboard activity is not available: $error');
     }
   }
 
@@ -120,7 +121,7 @@ class AfkWatcher {
     try {
       HardwareKeyboard.instance.removeHandler(_onKeyEvent);
     } catch (error) {
-      debugPrint('ProctorGuard AFK: releasing the key handler failed: $error');
+      proctorLog('ProctorGuard AFK: releasing the key handler failed: $error');
     }
   }
 

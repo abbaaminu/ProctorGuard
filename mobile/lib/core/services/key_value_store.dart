@@ -1,7 +1,8 @@
-import 'package:flutter/foundation.dart'
-    show debugPrint, visibleForTesting;
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import '../utils/proctor_log.dart';
 
 /// The tiny async string store the offline layer persists through.
 ///
@@ -134,7 +135,7 @@ class SharedPreferencesStore implements KeyValueStore {
 
   void _degrade(String operation, Object error) {
     if (!_unavailable) {
-      debugPrint(
+      proctorLog(
         'ProctorGuard: local storage unavailable on $operation ($error) - '
         'cached answers stay in memory for this session.',
       );

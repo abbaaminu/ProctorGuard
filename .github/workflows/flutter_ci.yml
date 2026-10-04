@@ -1,0 +1,52 @@
+name: Flutter CI (ProctorGuard)
+
+# Runs on every push and every pull request, as the required gate for the
+# Flutter app: static analysis plus the database/Android *contract* tests, then
+# the whole suite behind them.
+on:
+  push:
+  pull_request:
+
+# A newer push to the same ref supersedes a run still in flight, so a burst of
+# commits does not queue up stale analysis.
+concurrency:
+  group: flutter-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze_and_test:
+    name: analyze + contract tests + suite
+    runs-on: ubuntu-latest
+    # Everything lives under `mobile/`; the contract tests reach out to
+    # `../supabase` and `android/`, both of which the checkout provides.
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # `flutter analyze` is the lint gate; it must stay at zero issues.
+      - name: Analyze
+        run: flutter analyze
+
+      # The contract tests pin the client↔database and client↔Android wiring
+      # against `supabase/schema.sql`, the migrations and the Android manifests.
+      # They are named explicitly so the gate says which contract broke.
+      - name: Contract tests (schema + Android manifest)
+        run: >
+          flutter test
+          test/schema_contract_test.dart
+          test/android_manifest_contract_test.dart
+
+      - name: Full test suite
+        run: flutter test

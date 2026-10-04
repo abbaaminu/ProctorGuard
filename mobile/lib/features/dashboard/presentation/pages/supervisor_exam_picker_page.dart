@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart' show SupabaseService;
+import '../../../../core/widgets/home_button.dart';
 import '../../../exam/domain/entities/exam.dart';
 import '../../../exam/presentation/providers/exam_providers.dart';
 import '../../../exam/presentation/widgets/published_exam_list.dart';
@@ -57,6 +58,10 @@ class _SupervisorExamPickerPageState
         automaticallyImplyLeading: false,
         title: const Text('Supervisor Console'),
         actions: [
+          // The supervisor/lecturer landing page. Pressing it here is a no-op
+          // (there is nothing above it), and staying put is what keeps the
+          // console's controls in the same place on every one of its screens.
+          const HomeButton(key: Key('supervisor-home')),
           IconButton(
             key: const Key('supervisor-analytics'),
             tooltip: 'Analytics',

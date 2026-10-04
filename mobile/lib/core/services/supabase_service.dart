@@ -2,8 +2,10 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart'
-    show debugPrint, kIsWeb, visibleForTesting;
+    show kIsWeb, visibleForTesting;
 import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../utils/proctor_log.dart';
 
 /// Contract for the evidence uploader that the proctoring notifier depends on.
 ///
@@ -321,13 +323,13 @@ class SupabaseService {
       // deployer which one to fix.
       _initError = resolution.reason ??
           'No SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY in this build.';
-      debugPrint('SupabaseService: $_initError');
+      proctorLog('SupabaseService: $_initError');
       return _status;
     }
 
     if (_client != null) {
       if (_initialisedUrl != null && _initialisedUrl != settings.url) {
-        debugPrint(
+        proctorLog(
           'SupabaseService: already initialised against $_initialisedUrl; '
           'ignoring a second init for ${settings.url}.',
         );
@@ -359,13 +361,13 @@ class SupabaseService {
       _status = SupabaseInitStatus.ready;
       _initError = null;
       _listenToAuthState();
-      debugPrint('SupabaseService: ready at ${settings.url} '
+      proctorLog('SupabaseService: ready at ${settings.url} '
           '(session persistence: $_canPersistSession)');
     } catch (error, stackTrace) {
       _client = null;
       _status = SupabaseInitStatus.failed;
       _initError = error.toString();
-      debugPrint('SupabaseService: initialisation failed: $error\n$stackTrace');
+      proctorLog('SupabaseService: initialisation failed: $error\n$stackTrace');
     }
     return _status;
   }
@@ -383,7 +385,7 @@ class SupabaseService {
       await storage.hasAccessToken(); // blocked storage throws right here
       return true;
     } catch (error) {
-      debugPrint('SupabaseService: browser storage unavailable ($error) — '
+      proctorLog('SupabaseService: browser storage unavailable ($error) — '
           'continuing without session persistence.');
       return false;
     }
@@ -454,7 +456,7 @@ class SupabaseService {
     } on AuthException catch (error) {
       return AuthOutcome.failure(error.message); // expected, user-actionable
     } catch (error, stackTrace) {
-      debugPrint('SupabaseService: $what failed: $error\n$stackTrace');
+      proctorLog('SupabaseService: $what failed: $error\n$stackTrace');
       return AuthOutcome.failure(
         '$what failed. Check your connection and try again.',
       );
@@ -478,11 +480,11 @@ class SupabaseService {
     _authSubscription = listenToAuthState(
       auth.onAuthStateChange,
       onState: (state) {
-        debugPrint('SupabaseService: auth event ${state.event.name}');
+        proctorLog('SupabaseService: auth event ${state.event.name}');
         if (!_authStates.isClosed) _authStates.add(state);
       },
       onError: (error) =>
-          debugPrint('SupabaseService: auth stream error: $error'),
+          proctorLog('SupabaseService: auth stream error: $error'),
     );
   }
 
@@ -581,7 +583,7 @@ class SupabaseService {
       );
       return storage.getPublicUrl(path);
     } catch (error) {
-      debugPrint('Snapshot upload failed for $path: $error');
+      proctorLog('Snapshot upload failed for $path: $error');
       return null;
     }
   }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart' show SupabaseService;
+import '../../../../core/widgets/home_button.dart';
 import '../../../../core/widgets/responsive_layout.dart';
 import '../../../dashboard/presentation/pages/analytics_page.dart';
 import '../../../dashboard/presentation/pages/supervisor_exam_picker_page.dart';
@@ -256,6 +257,10 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
         automaticallyImplyLeading: false,
         title: const Text('Admin Dashboard'),
         actions: [
+          // The admin landing page itself: see the note on the supervisor
+          // console's own button - the affordance stays put so it is in the same
+          // place on every screen of this console.
+          const HomeButton(key: Key('admin-home')),
           IconButton(
             key: const Key('admin-exam-monitor'),
             tooltip: 'Exam monitor',

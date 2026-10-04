@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart' show debugPrint;
+import '../utils/proctor_log.dart';
 
 import '../../features/exam/domain/repositories/exam_repository.dart';
 import '../../features/proctoring/domain/entities/violation.dart';
@@ -117,7 +117,7 @@ class PendingViolation {
       // An unknown action_type (schema drift) or a mangled row: dropping it is
       // the only safe answer - logging it as a different violation would put
       // false evidence in front of a supervisor.
-      debugPrint('ProctorGuard: dropping unreadable queued violation: $error');
+      proctorLog('ProctorGuard: dropping unreadable queued violation: $error');
       return null;
     }
   }
@@ -192,7 +192,7 @@ class DirectViolationOutbox implements ViolationOutbox {
         disqualified: result.disqualified,
       );
     } catch (error) {
-      debugPrint(
+      proctorLog(
         'ProctorGuard: violation delivery failed (no queue attached): $error',
       );
       return null;
@@ -611,7 +611,7 @@ class OfflineSyncService implements ViolationOutbox {
         _notify();
         continue;
       } catch (error) {
-        debugPrint('ProctorGuard: answer still queued ($error)');
+        proctorLog('ProctorGuard: answer still queued ($error)');
         _offline('Could not sync your answers yet.');
         // The row stays queued either way; only the *pass* gives up, and only
         // after [maxPassFailures] rows have failed in it.
@@ -647,7 +647,7 @@ class OfflineSyncService implements ViolationOutbox {
           ),
         );
       } catch (error) {
-        debugPrint('ProctorGuard: violation still queued ($error)');
+        proctorLog('ProctorGuard: violation still queued ($error)');
         await _persistViolations();
         _offline('Could not deliver a proctoring log yet.');
         if (++failures >= maxPassFailures) return;
@@ -729,7 +729,7 @@ class OfflineSyncService implements ViolationOutbox {
         disqualified: result.disqualified,
       );
     } catch (error) {
-      debugPrint(
+      proctorLog(
         'ProctorGuard: violation queued for retry '
         '(${violation.type.dbValue}): $error',
       );
@@ -758,7 +758,7 @@ class OfflineSyncService implements ViolationOutbox {
     while (_violations.length > maxQueuedViolations) {
       final oldest = _violations.removeAt(0);
       dropped++;
-      debugPrint(
+      proctorLog(
         'ProctorGuard: violation queue full - dropped '
         '${oldest.violation.type.dbValue} from ${oldest.submissionId}',
       );
@@ -836,7 +836,7 @@ class OfflineSyncService implements ViolationOutbox {
       if (decoded is! Map) return const <String, dynamic>{};
       return decoded.map((key, value) => MapEntry(key.toString(), value));
     } catch (error) {
-      debugPrint('ProctorGuard: dropping an unreadable cached draft ($error)');
+      proctorLog('ProctorGuard: dropping an unreadable cached draft ($error)');
       return const <String, dynamic>{};
     }
   }
@@ -851,7 +851,7 @@ class OfflineSyncService implements ViolationOutbox {
           .map(Map<String, dynamic>.from)
           .toList();
     } catch (error) {
-      debugPrint('ProctorGuard: dropping an unreadable offline queue ($error)');
+      proctorLog('ProctorGuard: dropping an unreadable offline queue ($error)');
       return const <Map<String, dynamic>>[];
     }
   }

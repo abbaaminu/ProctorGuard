@@ -1,8 +1,10 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show debugPrint, kIsWeb;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/services.dart' show MissingPluginException;
 import 'package:permission_handler/permission_handler.dart';
+
+import '../utils/proctor_log.dart';
 
 enum StartupPermission { camera, microphone, systemAlertWindow }
 
@@ -123,7 +125,7 @@ class PermissionService {
           error is UnimplementedError ||
           error is MissingPluginException;
 
-      debugPrint(
+      proctorLog(
         'PermissionService: ${permission.name} request failed'
         '${unsupported ? ' (not supported on this platform)' : ''}: $error',
       );
@@ -189,7 +191,7 @@ class PermissionService {
     try {
       await openAppSettings();
     } catch (error) {
-      debugPrint('PermissionService: could not open settings: $error');
+      proctorLog('PermissionService: could not open settings: $error');
     }
   }
 
@@ -216,7 +218,7 @@ class PermissionService {
       }
       return PermissionState.unknown;
     } on TimeoutException {
-      debugPrint(
+      proctorLog(
         'PermissionService: ${permission.name} status did not answer within '
         '$statusTimeout',
       );
@@ -224,7 +226,7 @@ class PermissionService {
     } catch (error) {
       // UnsupportedError / MissingPluginException / PlatformException: nothing
       // usable here. Never a refusal — see [PermissionState].
-      debugPrint('PermissionService: ${permission.name} status failed: $error');
+      proctorLog('PermissionService: ${permission.name} status failed: $error');
       return PermissionState.unknown;
     }
   }

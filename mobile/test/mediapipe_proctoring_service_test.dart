@@ -83,47 +83,82 @@ void main() {
     });
   });
 
-  group('time grace period', () {
+  group('consecutive-frame threshold', () {
     late DateTime now;
 
     setUp(() => now = DateTime(2026, 1, 1, 12));
 
-    /// An engine whose sustained windows advance with [now] instead of the wall
-    /// clock, so a 3-second grace can be exercised instantly.
+    /// An engine on a clock the test owns. The counted conditions below never
+    /// read it — they count *frames*, which is the whole point — while the
+    /// multi-face cooldown does, so a 30-second cooldown can be exercised
+    /// instantly.
     MediaPipeProctoringService clocked() {
       final engine = MediaPipeProctoringService(clock: () => now);
       addTearDown(engine.dispose);
       return engine;
     }
 
-    test('a single missing-face frame is not a violation', () async {
+    /// Feeds [count] identical results through the engine, as the camera stream
+    /// would.
+    void feed(
+      MediaPipeProctoringService engine,
+      FaceFrameResult result,
+      int count,
+    ) {
+      for (var i = 0; i < count; i++) {
+        engine.handleResult(result);
+      }
+    }
+
+    test('two missing-face frames are not a violation, the third is',
+        () async {
       final engine = clocked();
       final seen = <GazeSignal>[];
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      engine.handleResult(const FaceFrameResult(faceCount: 0));
+      feed(engine, const FaceFrameResult(faceCount: 0), 2);
       await pumpEventQueue();
+      expect(seen, isEmpty, reason: 'a strict three-frame threshold');
 
-      expect(seen, isEmpty);
+      feed(engine, const FaceFrameResult(faceCount: 0), 1);
+      await pumpEventQueue();
+      expect(seen, <GazeSignal>[GazeSignal.noFace]);
     });
 
-    test('a sustained missing face logs no_face exactly once', () async {
+    test('three consecutive missing frames log no_face exactly once',
+        () async {
       final engine = clocked();
       final seen = <GazeSignal>[];
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      engine.handleResult(const FaceFrameResult(faceCount: 0)); // t0
-      now = now.add(const Duration(seconds: 2));
-      engine.handleResult(const FaceFrameResult(faceCount: 0)); // still inside
-      now = now.add(const Duration(seconds: 1)); // t0 + 3s
-      engine.handleResult(const FaceFrameResult(faceCount: 0)); // sustained
+      feed(engine, const FaceFrameResult(faceCount: 0), 3); // sustained
       now = now.add(const Duration(seconds: 30));
-      engine.handleResult(const FaceFrameResult(faceCount: 0)); // same episode
+      feed(engine, const FaceFrameResult(faceCount: 0), 40); // same episode
 
       await pumpEventQueue();
       expect(seen, <GazeSignal>[GazeSignal.noFace]);
+    });
+
+    test('a single visible frame resets the count, so the run must be unbroken',
+        () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      // Two frames out, one frame back, two frames out: never three in a row.
+      feed(engine, const FaceFrameResult(faceCount: 0), 2);
+      feed(engine, const FaceFrameResult(faceCount: 1), 1);
+      feed(engine, const FaceFrameResult(faceCount: 0), 2);
+
+      await pumpEventQueue();
+      expect(
+        seen,
+        isNot(contains(GazeSignal.noFace)),
+        reason: 'a dropped frame must not accumulate towards a strike',
+      );
     });
 
     test('the face returning re-arms a fresh absence episode', () async {
@@ -132,14 +167,9 @@ void main() {
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      engine.handleResult(const FaceFrameResult(faceCount: 0));
-      now = now.add(const Duration(seconds: 3));
-      engine.handleResult(const FaceFrameResult(faceCount: 0)); // no_face #1
-
-      engine.handleResult(const FaceFrameResult(faceCount: 1)); // visible again
-      engine.handleResult(const FaceFrameResult(faceCount: 0)); // fresh episode
-      now = now.add(const Duration(seconds: 3));
-      engine.handleResult(const FaceFrameResult(faceCount: 0)); // no_face #2
+      feed(engine, const FaceFrameResult(faceCount: 0), 3); // no_face #1
+      feed(engine, const FaceFrameResult(faceCount: 1), 1); // visible again
+      feed(engine, const FaceFrameResult(faceCount: 0), 3); // no_face #2
 
       await pumpEventQueue();
       expect(
@@ -154,31 +184,30 @@ void main() {
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      // 25 deg yaw and 29 deg pitch sit inside the relaxed tolerances.
+      // 25 deg yaw and 29 deg pitch sit inside the relaxed tolerances, for as
+      // many frames as the student keeps reading and typing.
       const inside =
           FaceFrameResult(faceCount: 1, yawDegrees: 25, pitchDegrees: 29);
-      engine.handleResult(inside);
-      now = now.add(const Duration(seconds: 10));
-      engine.handleResult(inside);
+      feed(engine, inside, 20);
 
       await pumpEventQueue();
       expect(seen, isNot(contains(GazeSignal.lookingAway)));
       expect(seen, contains(GazeSignal.centered));
     });
 
-    test('a sustained off-axis turn logs looking_away exactly once', () async {
+    test('two off-axis frames are not a violation, the third is', () async {
       final engine = clocked();
       final seen = <GazeSignal>[];
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
       const away = FaceFrameResult(faceCount: 1, yawDegrees: 45);
-      engine.handleResult(away);
-      now = now.add(const Duration(seconds: 3));
-      engine.handleResult(away);
-      now = now.add(const Duration(seconds: 30));
-      engine.handleResult(away); // still away: no repeat
+      feed(engine, away, 2);
 
+      await pumpEventQueue();
+      expect(seen, isEmpty, reason: 'a quick glance is not a violation');
+
+      feed(engine, away, 1);
       await pumpEventQueue();
       expect(
         seen.where((signal) => signal == GazeSignal.lookingAway),
@@ -186,7 +215,34 @@ void main() {
       );
     });
 
-    test('two faces are reported immediately, without a grace window',
+    test('three consecutive off-axis frames log looking_away exactly once',
+        () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      const away = FaceFrameResult(faceCount: 1, yawDegrees: 45);
+      feed(engine, away, 3);
+      now = now.add(const Duration(seconds: 30));
+      feed(engine, away, 40); // still away: no repeat
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+      );
+
+      // Back to centered, then three more frames away: a new episode.
+      feed(engine, const FaceFrameResult(faceCount: 1), 1);
+      feed(engine, away, 3);
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(2),
+      );
+    });
+
+    test('two faces are reported immediately, without a frame count',
         () async {
       final engine = clocked();
       final seen = <GazeSignal>[];
@@ -259,17 +315,17 @@ void main() {
       );
     });
 
-    test('resetSustained clears a half-elapsed window', () async {
+    test('resetSustained clears a half-counted episode', () async {
       final engine = clocked();
       final seen = <GazeSignal>[];
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      engine.handleResult(const FaceFrameResult(faceCount: 0));
-      now = now.add(const Duration(seconds: 2));
+      // Two of the three frames, then the camera is restarted: the count starts
+      // over, so one more missing frame is not enough.
+      feed(engine, const FaceFrameResult(faceCount: 0), 2);
       engine.resetSustained();
-      now = now.add(const Duration(seconds: 1));
-      engine.handleResult(const FaceFrameResult(faceCount: 0));
+      feed(engine, const FaceFrameResult(faceCount: 0), 1);
 
       await pumpEventQueue();
       expect(seen, isEmpty);
@@ -298,15 +354,16 @@ void main() {
   });
 
   group('engine defaults', () {
-    test('match the documented throttle / threshold / grace contract', () {
+    test('match the documented throttle / threshold / frame contract', () {
       expect(engine.inferenceInterval, const Duration(milliseconds: 150));
       // Relaxed tolerances: a turn under ~28 deg, and looking down under ~30 deg
       // to read/type, must not flag the student.
       expect(engine.offCenterThresholdDegrees, 28.0);
       expect(engine.pitchThresholdDegrees, 30.0);
-      expect(engine.lookAwayGraceDuration, const Duration(seconds: 3));
-      expect(engine.noFaceGraceDuration, const Duration(seconds: 3));
-      // A multi-face episode is latched rather than grace-windowed, so this is
+      // Strict *frames*, not seconds: three in a row of a missing face, or of a
+      // head past the tolerances. See `consecutiveFrameThreshold`.
+      expect(engine.consecutiveFrameThreshold, 3);
+      // A multi-face episode is latched rather than frame-counted, so this is
       // how long the student has to be *alone* before a second one counts.
       expect(engine.multipleFacesCooldown, const Duration(seconds: 30));
     });
@@ -330,7 +387,7 @@ void main() {
 
       engine.dispose();
 
-      // A centred face is the shape that emits immediately (no grace window), so this is
+      // A centred face is the shape that emits immediately (no frame count), so this is
       // the shortest path to the closed controller.
       expect(
         () => engine.handleResult(const FaceFrameResult(faceCount: 1)),
@@ -341,19 +398,20 @@ void main() {
       expect(await engine.signals.toList(), isEmpty);
     });
 
-    test('a sustained window is neither measured nor reported after dispose',
+    test('a half-counted episode is neither counted nor reported after dispose',
         () async {
-      // The grace windows underneath are the disqualification path: a `no_face` episode
-      // that keeps accumulating after teardown would be reported against a session that
-      // has already ended.
-      var now = DateTime(2026, 1, 1, 12);
-      final engine = MediaPipeProctoringService(clock: () => now);
+      // The frame counters underneath are the disqualification path: a `no_face`
+      // episode that keeps counting after teardown would be reported against a
+      // session that has already ended.
+      final engine = MediaPipeProctoringService();
       addTearDown(engine.dispose);
 
-      engine.handleResult(const FaceFrameResult(faceCount: 0));
+      engine.handleResult(const FaceFrameResult(faceCount: 0)); // 1 of 3
+      engine.handleResult(const FaceFrameResult(faceCount: 0)); // 2 of 3
       engine.dispose();
-      now = now.add(const Duration(seconds: 30)); // well past the grace window
-      engine.handleResult(const FaceFrameResult(faceCount: 0));
+      for (var i = 0; i < 5; i++) {
+        engine.handleResult(const FaceFrameResult(faceCount: 0));
+      }
 
       await pumpEventQueue();
       expect(await engine.signals.toList(), isEmpty);

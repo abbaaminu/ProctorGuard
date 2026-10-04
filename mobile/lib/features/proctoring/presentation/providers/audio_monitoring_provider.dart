@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/audio_monitor.dart';
 import '../../../../core/services/audio_noise_detector.dart';
+import '../../../../core/utils/proctor_log.dart';
 import 'proctoring_provider.dart';
 
 /// Everything the exam chrome needs to render the microphone indicator: the
@@ -194,6 +195,17 @@ class AudioMonitoringNotifier extends StateNotifier<AudioMonitoringState> {
     if (_detector.add(decibels)) {
       _violations++;
       _lastViolationAt = DateTime.now();
+      // The one line that makes this feature auditable from a debug console: what
+      // the microphone heard, what the room's own floor made the threshold, and
+      // how long the level had to hold. Without it, "audio never flagged
+      // anything" is indistinguishable from "the room was quiet".
+      proctorLog(
+        'ProctorGuard audio: audio_noise classified at '
+        '${decibels.toStringAsFixed(1)} dBFS (threshold '
+        '${_detector.thresholdDb.toStringAsFixed(1)} dBFS, floor '
+        '${_detector.roomFloorDb?.toStringAsFixed(1) ?? 'n/a'} dBFS, '
+        'sustain ${_detector.sustain.inMilliseconds} ms).',
+      );
       // Hand it to the proctoring notifier: same ladder, same server-side count,
       // same offline queue as every other violation.
       onNoiseDetected();

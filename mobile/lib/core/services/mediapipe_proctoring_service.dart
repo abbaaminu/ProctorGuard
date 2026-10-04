@@ -37,15 +37,18 @@ class MediaPipeProctoringService {
     this.inferenceInterval = const Duration(milliseconds: 150), // ~6-7 FPS
     this.offCenterThresholdDegrees = 28.0,
     this.pitchThresholdDegrees = 30.0,
-    this.lookAwayGraceDuration = const Duration(seconds: 3),
-    this.noFaceGraceDuration = const Duration(seconds: 3),
+    this.consecutiveFrameThreshold = 3,
     this.multipleFacesCooldown = const Duration(seconds: 30),
     this.sensorOrientation = 90,
     this.lensDirection = CameraLensDirection.front,
     this.mockCamera = mockCameraFromEnvironment,
     this.mockInterval = const Duration(seconds: 12),
     DateTime Function()? clock,
-  }) : _clock = clock ?? DateTime.now {
+  })  : assert(
+          consecutiveFrameThreshold > 0,
+          'a zero frame threshold would flag every single frame',
+        ),
+        _clock = clock ?? DateTime.now {
     if (mockCamera) _startMockFeed();
   }
 
@@ -60,7 +63,8 @@ class MediaPipeProctoringService {
 
   /// Yaw (left/right head turn) tolerance in degrees. Relaxed to ~28 so a quick
   /// glance sideways, or turning toward a second screen, is not an instant
-  /// violation - only a turn that stays past this for [lookAwayGraceDuration] is.
+  /// violation - only a turn that stays past this for [consecutiveFrameThreshold]
+  /// frames in a row is.
   final double offCenterThresholdDegrees;
 
   /// Pitch (up/down head tilt) tolerance in degrees. Deliberately a little wider
@@ -68,14 +72,18 @@ class MediaPipeProctoringService {
   /// reading and typing is normal exam behaviour, not cheating.
   final double pitchThresholdDegrees;
 
-  /// How long the head must stay past the yaw/pitch tolerances before a
-  /// [GazeSignal.lookingAway] is emitted (once per episode).
-  final Duration lookAwayGraceDuration;
-
-  /// How long the face must stay missing before a [GazeSignal.noFace] is
-  /// emitted (once per episode). This is the time grace period: a blink, a
-  /// dropped frame or a hand sweeping past the lens no longer burns a strike.
-  final Duration noFaceGraceDuration;
+  /// How many **consecutive frames** have to show the same condition - a missing
+  /// face, or a head past the yaw/pitch tolerances - before it is reported.
+  ///
+  /// Counted in frames rather than seconds on purpose: what is being judged is
+  /// what the detector actually saw, and `inferenceInterval` (so how much wall
+  /// time a frame stands for) is throttling, not evidence. Three in a row is a
+  /// strict threshold - one dropped frame, one hand sweeping past the lens, or
+  /// one frame the detector stumbled on no longer spends a strike - while a
+  /// student who has really left the frame or turned away still reaches it in
+  /// ~0.45 s at the default ~7 FPS. A single frame back in the tolerated pose
+  /// resets the count, so only an *unbroken* run of frames counts.
+  final int consecutiveFrameThreshold;
 
   /// How long the student has to be *alone* in frame before a second person can
   /// be reported again.
@@ -86,7 +94,8 @@ class MediaPipeProctoringService {
   /// boundary at all.
   final Duration multipleFacesCooldown;
 
-  /// Injectable time source, so the grace windows can be exercised in tests
+  /// Injectable time source. Only the multi-face cooldown and the frame throttle
+  /// below read it, but they read it directly, so a test can exercise either
   /// without waiting wall-clock seconds.
   final DateTime Function() _clock;
 
@@ -121,29 +130,28 @@ class MediaPipeProctoringService {
 
   DateTime _lastInferenceAt = DateTime.fromMillisecondsSinceEpoch(0);
 
-  /// Sustained-window bookkeeping. Each condition gets its own "since" stamp
-  /// plus an "already flagged" latch, so one long episode yields exactly one
-  /// signal - the student has to come back before the same condition can be
-  /// reported again. That is what stops a sustained absence or head turn from
-  /// stacking up disqualification flags.
-  DateTime? _offCenterSince;
-  DateTime? _faceMissingSince;
+  /// Consecutive-frame bookkeeping. Each condition gets its own counter plus an
+  /// "already flagged" latch, so one long episode yields exactly one signal - the
+  /// student has to come back before the same condition can be reported again.
+  /// That is what stops a sustained absence or head turn from stacking up
+  /// disqualification flags.
+  int _offCenterFrames = 0;
+  int _faceMissingFrames = 0;
   bool _lookAwayFlagged = false;
   bool _noFaceFlagged = false;
 
   /// When the most recent two-face frame was seen, and whether the multi-face
   /// signal has already been reported for the current episode.
   ///
-  /// [GazeSignal.multipleFaces] has no grace window - two people in frame is
-  /// unambiguous the moment it is seen, and making the student wait three
-  /// seconds to be told would be worse. The episode boundary is the opposite
-  /// condition instead: the latch re-arms only after [multipleFacesCooldown]
-  /// with a single face in frame, measured from the *last* two-face frame, so a
-  /// detector flickering between one and two faces at the edge of the frame
-  /// keeps pushing that boundary out. Without the latch the signal was emitted
-  /// once per inference (~7 a second at [inferenceInterval]) and the server's
-  /// three-strike rule closed the attempt within a second of a guest leaning
-  /// into shot.
+  /// [GazeSignal.multipleFaces] has no frame threshold - two people in frame is
+  /// unambiguous the moment it is seen, and making the student wait would be
+  /// worse. The episode boundary is the opposite condition instead: the latch
+  /// re-arms only after [multipleFacesCooldown] with a single face in frame,
+  /// measured from the *last* two-face frame, so a detector flickering between
+  /// one and two faces at the edge of the frame keeps pushing that boundary out.
+  /// Without the latch the signal was emitted once per inference (~7 a second at
+  /// [inferenceInterval]) and the server's three-strike rule closed the attempt
+  /// within a second of a guest leaning into shot.
   DateTime? _multipleFacesAt;
   bool _multipleFacesFlagged = false;
 
@@ -164,7 +172,7 @@ class MediaPipeProctoringService {
   Stream<GazeSignal> get signals => _signalController.stream;
 
   /// Emits alternating `noFace` / `lookingAway` signals on a timer. Kept
-  /// deliberately dumb — no grace period, no angle math — because its only job
+  /// deliberately dumb — no frame counting, no angle math — because its only job
   /// is to drive the escalation ladder (3 strikes → disqualified) so the
   /// overlay, the log rows, Storage upload and the supervisor's live feed can
   /// all be exercised without a camera.
@@ -192,24 +200,24 @@ class MediaPipeProctoringService {
   /// Tells the engine whether the camera stream is live.
   ///
   /// While `false` - the controller is initialising, was blocked, or the feed
-  /// was lost - [onCameraFrame] ignores incoming frames and every sustained
-  /// window is cleared, so an offline camera can never be mistaken for a missing
-  /// face. Turning it back on restarts the grace windows from scratch.
+  /// was lost - [onCameraFrame] ignores incoming frames and every counter is
+  /// cleared, so an offline camera can never be mistaken for a missing
+  /// face. Turning it back on restarts the counting from scratch.
   void setStreamActive(bool active) {
     _streamActive = active;
     if (!active) resetSustained();
   }
 
-  /// Clears every sustained-window timer and latch. Called when the camera goes
-  /// offline (see [setStreamActive]) and whenever the notifier pauses tracking,
-  /// so resuming never inherits a half-elapsed grace window.
+  /// Clears every consecutive-frame counter and latch. Called when the camera
+  /// goes offline (see [setStreamActive]) and whenever the notifier pauses
+  /// tracking, so resuming never inherits a half-counted episode.
   ///
   /// The multi-face latch goes with them: a feed that comes back with two people
   /// in front of it is a fresh episode, and carrying the cooldown across the gap
   /// would hide the guest who arrived while the camera was down.
   void resetSustained() {
-    _offCenterSince = null;
-    _faceMissingSince = null;
+    _offCenterFrames = 0;
+    _faceMissingFrames = 0;
     _multipleFacesAt = null;
     _lookAwayFlagged = false;
     _noFaceFlagged = false;
@@ -233,7 +241,7 @@ class MediaPipeProctoringService {
     // phantom "no face". The exam page flips this with [setStreamActive].
     if (!_streamActive) return;
 
-    // The injected clock, the same one the grace windows below are measured
+    // The injected clock, the same one the multi-face cooldown below is measured
     // against: one time base for the whole engine, so a host (or a test) that
     // supplies its own cannot have the throttle and the escalation rules
     // disagree about how much time has passed.
@@ -406,24 +414,24 @@ class MediaPipeProctoringService {
     return (yaw, pitch);
   }
 
-  /// Feeds one inference result through the grace/debounce logic.
+  /// Feeds one inference result through the frame-count/debounce logic.
   ///
-  /// Exposed beyond [onCameraFrame] so the sustained-threshold behaviour can be
+  /// Exposed beyond [onCameraFrame] so the consecutive-frame threshold can be
   /// unit-tested without a camera or ML Kit.
   @visibleForTesting
   void handleResult(FaceFrameResult result) => _handleResult(result);
 
-  /// Applies the time grace period to one detection result.
+  /// Applies the consecutive-frame threshold to one detection result.
   ///
   /// A single frame is never enough to flag the student: [GazeSignal.noFace]
   /// and [GazeSignal.lookingAway] are only emitted once the condition has held
-  /// for [noFaceGraceDuration] / [lookAwayGraceDuration] respectively, and each
-  /// episode emits at most once. The student has to return (a `centered` result
-  /// or a visible face) before the same condition can be reported again, so a
-  /// blink, a dropped frame, or one glance at the keyboard cannot accumulate
-  /// multiple disqualification flags.
+  /// for [consecutiveFrameThreshold] frames *in a row* (three, by default), and
+  /// each episode emits at most once. Any frame back in the tolerated state - a
+  /// visible face, a centered head - resets that count, so a blink, a dropped
+  /// frame, a hand sweeping past the lens or one glance at the keyboard cannot
+  /// accumulate multiple disqualification flags.
   ///
-  /// [GazeSignal.multipleFaces] is the one condition with no grace window (two
+  /// [GazeSignal.multipleFaces] is the one condition with no frame threshold (two
   /// people in frame needs no measuring), so it is latched instead: one episode,
   /// and the episode ends only once the student has been alone in frame for
   /// [multipleFacesCooldown].
@@ -432,20 +440,20 @@ class MediaPipeProctoringService {
     // lands here: `onCameraFrame` fire-and-forgets it (`.then(_handleResult)`), so
     // a frame captured before the page was popped can arrive after [dispose] ran.
     // Adding to the closed controller throws into that detached chain, and the
-    // grace windows underneath measure a session that no longer exists.
+    // counters underneath measure a session that no longer exists.
     if (_disposed || _signalController.isClosed) return;
 
     final now = _clock();
 
     if (result.faceCount == 0) {
-      // Face missing: a *sustained* absence becomes noFace. Without a face the
-      // head can no longer be "off centre", so close that window.
-      _offCenterSince = null;
+      // Face missing: three frames in a row without one becomes noFace. Without a
+      // face the head can no longer be "off centre", so that count starts over.
+      _offCenterFrames = 0;
       _lookAwayFlagged = false;
 
-      _faceMissingSince ??= now;
+      _faceMissingFrames++;
       if (!_noFaceFlagged &&
-          now.difference(_faceMissingSince!) >= noFaceGraceDuration) {
+          _faceMissingFrames >= consecutiveFrameThreshold) {
         _noFaceFlagged = true;
         _signalController.add(GazeSignal.noFace);
       }
@@ -453,18 +461,18 @@ class MediaPipeProctoringService {
     }
 
     // A face is visible again: close the missing-face episode so a later
-    // absence is measured (and reported) from scratch.
-    _faceMissingSince = null;
+    // absence is counted (and reported) from scratch.
+    _faceMissingFrames = 0;
     _noFaceFlagged = false;
 
     if (result.faceCount > 1) {
       // Two people in frame is unambiguous, so it is reported immediately
-      // rather than on a grace window - but once per episode, like the
-      // sustained conditions above. One guest leaning into shot is one
+      // rather than after a frame count - but once per episode, like the
+      // counted conditions above. One guest leaning into shot is one
       // violation; the latch is what stops it being one *per inference*, which
       // is how a single second of it used to reach the server's three-strike
       // limit and disqualify the attempt.
-      _offCenterSince = null;
+      _offCenterFrames = 0;
       _lookAwayFlagged = false;
       _multipleFacesAt = now;
       if (_multipleFacesFlagged) return;
@@ -491,15 +499,16 @@ class MediaPipeProctoringService {
         pitch.abs() > pitchThresholdDegrees;
 
     if (!isOffCenter) {
-      _offCenterSince = null;
+      // Back inside the tolerances: whatever was building is off, and this is
+      // also the signal that re-arms looking_away for a later episode.
+      _offCenterFrames = 0;
       _lookAwayFlagged = false;
       _signalController.add(GazeSignal.centered);
       return;
     }
 
-    _offCenterSince ??= now;
-    if (!_lookAwayFlagged &&
-        now.difference(_offCenterSince!) >= lookAwayGraceDuration) {
+    _offCenterFrames++;
+    if (!_lookAwayFlagged && _offCenterFrames >= consecutiveFrameThreshold) {
       _lookAwayFlagged = true;
       _signalController.add(GazeSignal.lookingAway);
     }

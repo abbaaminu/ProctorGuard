@@ -23,12 +23,14 @@ void main() {
     AudioNoiseDetector detector({
       Duration calibrationWindow = Duration.zero,
       Duration sustain = const Duration(seconds: 4),
+      Duration releaseGrace = const Duration(milliseconds: 400),
       Duration cooldown = const Duration(seconds: 5),
       int minCalibrationSamples = 1,
     }) =>
         AudioNoiseDetector(
           calibrationWindow: calibrationWindow,
           sustain: sustain,
+          releaseGrace: releaseGrace,
           cooldown: cooldown,
           minCalibrationSamples: minCalibrationSamples,
           clock: () => now,
@@ -101,6 +103,55 @@ void main() {
       expect(sensor.add(-30), isFalse); // a fresh window starts from here
       now = now.add(const Duration(seconds: 4));
       expect(sensor.add(-30), isTrue); // four unbroken seconds: counted once
+    });
+
+    test('the shipped defaults are the documented two-second window', () {
+      final sensor = AudioNoiseDetector();
+
+      // Two seconds is roughly one spoken sentence - the window a talking student
+      // has to fill before it is a strike - and the 400 ms grace is what carries
+      // it across the gaps between words. Anything shorter than the 250 ms
+      // capture interval would be no allowance at all.
+      expect(sensor.sustain, const Duration(seconds: 2));
+      expect(sensor.releaseGrace, const Duration(milliseconds: 400));
+      expect(sensor.calibrationWindow, const Duration(seconds: 4));
+      expect(sensor.cooldown, const Duration(seconds: 5));
+    });
+
+    test('a short gap between words is bridged, so talking does add up', () {
+      final sensor = detector(sustain: const Duration(seconds: 2));
+      sensor.add(-60); // calibrates in one sample: threshold -45
+
+      // Four samples a second, the rate the microphone reports at: loud, a 250 ms
+      // dip mid-sentence, loud again. A rule that reset on that single dip never
+      // reached its window, which is why talking produced no strikes at all.
+      expect(sensor.add(-25), isFalse); // opens the episode
+      now = now.add(const Duration(milliseconds: 250));
+      expect(sensor.add(-70), isFalse); // the gap between two words
+      expect(sensor.isNoisy, isFalse); // and the amber state goes with it
+      now = now.add(const Duration(milliseconds: 250));
+      expect(sensor.add(-25), isFalse); // the next word: the window continues
+      now = now.add(const Duration(milliseconds: 1500));
+      expect(sensor.add(-25), isTrue); // two seconds of talking, one strike
+    });
+
+    test('a quiet stretch longer than the grace ends the episode', () {
+      final sensor = detector(sustain: const Duration(seconds: 2));
+      sensor.add(-60); // threshold -45
+
+      expect(sensor.add(-25), isFalse); // opens the episode
+      now = now.add(const Duration(seconds: 1));
+      expect(sensor.add(-25), isFalse);
+
+      // A second of a genuinely quiet room: past the grace, so this is a new
+      // episode rather than the two halves counting as one.
+      now = now.add(const Duration(milliseconds: 250));
+      expect(sensor.add(-70), isFalse);
+      now = now.add(const Duration(seconds: 1));
+      expect(sensor.add(-25), isFalse, reason: 'a fresh window starts here');
+
+      now = now.add(const Duration(seconds: 2));
+      expect(sensor.add(-25), isTrue);
     });
 
     test('the cooldown keeps one long outburst to one strike', () {
@@ -487,6 +538,60 @@ void main() {
       // The microphone is still live afterwards: an audio strike warns the student,
       // it does not end audio proctoring.
       expect(notifier.state.monitor, AudioMonitorState.monitoring);
+    });
+
+    test('talking with gaps between words still reaches one violation',
+        () async {
+      // The end-to-end version of the detector's rule, at the rate the microphone
+      // actually reports: four samples a second, with the level dropping between
+      // words exactly as it does in a live room. Under the old "one sample below
+      // the threshold resets everything" rule this sentence produced nothing at
+      // all, which is what "audio never flags" looked like from the console.
+      var now = DateTime.utc(2026, 6, 1, 9);
+      final source = _FakeSource(emitOnListen: false);
+      var noises = 0;
+      final notifier = AudioMonitoringNotifier(
+        onNoiseDetected: () => noises++,
+        monitor: AudioMonitor(
+          source: source,
+          levelTimeout: const Duration(seconds: 30),
+        ),
+        detector: AudioNoiseDetector(
+          calibrationWindow: Duration.zero,
+          minCalibrationSamples: 1,
+          sustain: const Duration(seconds: 2),
+          releaseGrace: const Duration(milliseconds: 400),
+          cooldown: const Duration(minutes: 5),
+          clock: () => now,
+        ),
+      );
+      addTearDown(notifier.dispose);
+
+      await notifier.start();
+      source.emit(-70); // the room reports its own floor
+      await pumpEventQueue();
+      expect(notifier.state.calibrated, isTrue);
+
+      // Nine samples, 2.25 seconds: two seconds of speech interrupted by three
+      // word-gaps a quarter of a second long.
+      for (final decibels in <double>[
+        -25,
+        -70,
+        -25,
+        -60,
+        -28,
+        -70,
+        -22,
+        -30,
+        -26,
+      ]) {
+        now = now.add(const Duration(milliseconds: 250));
+        source.emit(decibels);
+        await pumpEventQueue();
+      }
+
+      expect(noises, 1);
+      expect(notifier.state.violations, 1);
     });
 
     test('the rendered state tracks the device, and a retry reopens it',

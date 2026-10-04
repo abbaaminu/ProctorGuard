@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../../core/widgets/home_button.dart';
 import '../providers/dashboard_providers.dart';
 
 class AnalyticsPage extends ConsumerWidget {
@@ -16,6 +17,10 @@ class AnalyticsPage extends ConsumerWidget {
       appBar: AppBar(
         title: const Text('Analytics'),
         actions: [
+          // Reachable from the supervisor console and from the admin dashboard,
+          // so "home" is whichever of the two opened it: the first route in the
+          // stack, which [HomeButton] pops to.
+          const HomeButton(key: Key('analytics-home')),
           IconButton(
             key: const Key('analytics-refresh'),
             tooltip: 'Refresh analytics',

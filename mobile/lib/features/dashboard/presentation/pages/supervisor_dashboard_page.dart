@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart';
+import '../../../../core/widgets/home_button.dart';
 import '../../domain/repositories/dashboard_repository.dart';
 import '../providers/dashboard_providers.dart';
 import 'analytics_page.dart';
@@ -200,6 +201,9 @@ class SupervisorDashboardPage extends ConsumerWidget {
       appBar: AppBar(
         title: Text('Live Monitor — $examTitle'),
         actions: [
+          // Back to whichever landing page this console was opened from, without
+          // unwinding the stack by hand - see [HomeButton].
+          const HomeButton(key: Key('monitor-home')),
           IconButton(
             key: const Key('monitor-analytics'),
             tooltip: 'Analytics',

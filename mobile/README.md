@@ -12,7 +12,8 @@ lib/
                             # post-login RoleGate router
     admin/                  # admin roster: create/delete accounts and manage roles
     exam/                   # domain entities, repo, student portal,
-                            # exam-taking UI
+                            # exam-taking UI (the page delegates to
+                            # ExamSessionController + extracted session widgets)
     proctoring/             # violation domain model, repo, Riverpod
                             # escalation notifier, full-screen overlay
     dashboard/              # staff analytics, supervisor monitoring and resets
@@ -410,6 +411,14 @@ per-exam status totals. Incident counts are bounded to the last 30 days and the
 repository pages through the full result sets so PostgREST row limits do not
 silently truncate the report. Read failures are surfaced with a retry action.
 
+Every console screen (the supervisor/lecturer home, the live monitor, analytics,
+the admin dashboard) carries the same **Home** control, `core/widgets/home_button.dart`.
+It pops to the *first* route of the stack, which is the landing page the role gate
+mounted, so one button works from any depth without a screen having to know which
+console it was opened from — three levels down (home → monitor → analytics) the
+alternative is a browser, where the platform back gesture does not exist. On the
+landing page itself there is nothing above it and the button keeps its place.
+
 ### Student Exam Portal
 
 `StudentExamPortalPage` lists every published exam (CS101 and MAT201 in
@@ -466,12 +475,18 @@ Details worth knowing:
   `"HTTP"`). A typed answer is written by "Save & next", the keyboard's done
   action, or the submit flush below — the field shows "Answer saved" once the
   server has it.
-* **One question per screen, with Previous/Next.** The session is paginated
-  rather than one long scroll: the app bar shows "Question X of Y", the action
-  bar carries a prominent **Previous** and **Next** (multiple choice) or
+* **One question per screen, with the whole paper one tap away.** The session is
+  paginated rather than one long scroll: the app bar shows "Question X of Y", the
+  action bar carries **Previous** and **Next** side by side (multiple choice) or
   **Save & next** (typed answer), and **Submit exam** replaces Next on the last
-  question. Moving between questions flushes an unsaved typed answer first, so
-  navigating never drops one.
+  question. Previous is always on screen — inert on question 1 rather than absent,
+  because a control that only appears on question 2 is a control nobody knows
+  exists. Above the question sits the review grid (`ExamQuestionPalette`, in
+  `widgets/exam_session_widgets.dart`): one tappable tile per question, **answered**
+  tiles filled and check-marked, **unattempted** ones neutral, the current one
+  ringed, and a "N answered • M not answered" counter. Tapping a tile jumps to that
+  question through the same `goTo()` the buttons use. Moving between questions
+  flushes an unsaved typed answer first, so navigating never drops one.
 * **`exams.duration_minutes` is enforced.** The countdown is anchored on
   `exam_submissions.started_at` (not on "now"), so a resumed attempt keeps its
   remaining time and one that is already past its deadline is submitted on the
@@ -479,16 +494,19 @@ Details worth knowing:
 * **Camera loss pauses proctoring and prompts the student.** The page listens to
   the `CameraController`; if the feed reports an error mid-session it calls
   `ProctoringNotifier.setCameraActive(false)`, which drops further `GazeSignal`s,
-  clears the engine's grace windows and shows a "restore the camera" prompt - an
+  clears the engine's frame counters and shows a "restore the camera" prompt - an
   offline feed no longer accumulates `no_face`/`looking_away` strikes. Frames
   that arrive before the stream is live are ignored too
   (`MediaPipeProctoringService.setStreamActive`), so initialising a camera is
   never read as "no face".
-* **The camera session includes the microphone.** `CameraController` is created
-  with `enableAudio: true`, so the attempt holds the microphone (RECORD_AUDIO on
-  Android, the browser's mic grant on web) alongside the video stream. A denied
-  microphone blocks the session exactly like a denied camera, and **Open
-  settings** appears when the OS will not prompt again.
+* **The camera is video-only; the microphone belongs to audio proctoring.**
+  `CameraController` is created with `enableAudio: false`. The camera plugin's own
+  audio capture is not used for anything — nothing here records sound — and asking
+  it for the microphone puts two clients on one input device, which is how the
+  independent `record` session behind `AudioMonitor` ends up unable to open and
+  audio proctoring sits in "Mic unavailable" for the whole attempt. The session
+  opens the microphone itself ([below](#microphone-proctoring-levels-not-recordings))
+  and reports a refusal with **Open settings** when the OS will not prompt again.
 * **Speaking is proctored from the microphone's own level, and the chip always says
   what the room sounds like.** A second, independent capture session
   (`AudioMonitor`, `record`'s `getAmplitude()`) streams dBFS samples into
@@ -644,18 +662,26 @@ the 3-strike rule:
 
 | Detector | Signal | `action_type` |
 | --- | --- | --- |
-| ML Kit face detection | no face / several faces / head pose off-axis, each held for a grace window before it counts | `no_face`, `multiple_faces`, `looking_away` |
+| ML Kit face detection | no face / several faces / head pose off-axis, each held for three consecutive frames before it counts | `no_face`, `multiple_faces`, `looking_away` |
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
 | `WebGuards` (Chrome/Edge) | tab hidden, window blurred, or HTML5 fullscreen left | `app_minimized` |
 | `AudioMonitor` + `AudioNoiseDetector` | a `record` capture session streams dBFS samples; the room's own floor is measured first, then speech sustained above it ([details below](#microphone-proctoring-levels-not-recordings)) | `audio_noise` |
 
-Camera signals are **sustained-threshold**, not per-frame: `looking_away` fires
-only after the head stays past ~28 deg yaw / ~30 deg pitch for 3s, and `no_face`
-after the face is missing for 3s - each episode reports once, so a blink, a
-dropped frame or a glance at the keyboard cannot burn a strike. `multiple_faces`
-is the exception and reports immediately. `ProctoringNotifier.setCameraActive`
-gates the whole camera set while the feed is not streaming.
+Camera signals are **counted in frames**, not measured in seconds: `looking_away`
+fires only after three *consecutive* frames show the head past ~28 deg yaw / ~30 deg
+pitch, and `no_face` after three consecutive frames with no face in them
+(`consecutiveFrameThreshold`). Frames are the honest unit here — `inferenceInterval`
+decides how much wall time a frame stands for and is throttling, not evidence — and
+at the ~7 FPS the engine throttles to, three frames is about 0.45 s: long enough that
+a blink, one dropped frame or one glance at the keyboard cannot burn a strike, short
+enough that a student who has really left the frame or turned to a second screen is
+reported while they are still doing it. Any frame back in the tolerated pose resets
+that count, so only an unbroken run counts, and each episode reports once.
+`multiple_faces` is the exception: two people in frame needs no measuring, so it
+reports immediately and is latched per episode instead.
+`ProctoringNotifier.setCameraActive` gates the whole camera set while the feed is not
+streaming.
 
 Audio is judged the same way, and the rules are deliberately pure Dart
 (`core/services/audio_noise_detector.dart`) so they can be tested without a
@@ -664,10 +690,15 @@ microphone: the first 4s (`calibrationWindow`) measure the room's floor, taking 
 drag the floor up to their own voice; the threshold becomes that floor + 12 dB
 (`speechMarginDb`), clamped to −45…−20 dBFS (`minThresholdDb`/`maxThresholdDb`)
 because a silent room's own noise floor would otherwise read as "talking"; the level
-must then stay above it for 4s *continuously* (`sustain`) — one sample below resets
-the window, which is what turns a cough, a chair creak or a breath into nothing — and
-after a strike the detector ignores the level for 5s (`cooldown`), so one long
-outburst is one strike rather than one every sample. Calibration doubles as the
+must then add up to 2s above it (`sustain`) — roughly one spoken sentence — and a gap
+below the threshold ends the episode only once it has lasted longer than 400 ms
+(`releaseGrace`). That gap allowance is what makes the rule catch **talking** rather
+than only an unbroken shout: at four samples a second a real sentence drops below the
+threshold between words, so a rule that reset on any single low sample never filled
+its window and logged nothing at all. A cough, a chair creak or a breath is still far
+too brief to add up, a room that has genuinely gone quiet ends the episode inside the
+grace, and after a strike the detector ignores the level for 5s (`cooldown`), so one
+long outburst is one strike rather than one every sample. Calibration doubles as the
 start-of-session grace period: nothing can be logged before it finishes.
 
 Kiosk bridge contract — MethodChannel `lock_task_channel`:
@@ -736,6 +767,19 @@ microphone pulled out mid-session — would queue the next one behind it *foreve
 reconnect is precisely the action that has to keep working. A release that does not come
 back inside 3s (`endTimeout`) is logged and given up on; the start that follows asks the
 device itself and reports what it finds, inside `startTimeout`.
+
+The level itself is validated on the way in rather than trusted. `record` reports
+**dBFS**: negative, 0 being full scale, with `-160` as the sentinel for "nothing to
+report" on every platform it ships to (Android's `DEFAULT_AMPLITUDE_DB`, iOS's
+`minAmplitudeDB`, the web delegates' `kMinAmplitude`) — so a normal exam room sits
+around −60…−20 and the meter's −60…0 window is the useful part of the scale rather than
+an arbitrary one. Anything non-finite, or outside that band, is dropped or clamped
+before it can reach the detector, where one bad sample would shift the calibration
+median the whole room is judged against. Two debug lines make the feature auditable
+from a console: `AudioMonitor` logs the first level of a session (`levels are flowing`,
+with the reading) and `AudioMonitoringNotifier` logs each classification (the level, the
+threshold it crossed, the measured floor and the sustain window). Without them, "audio
+proctoring never flagged anything" is indistinguishable from "the room was quiet".
 
 `AudioMonitoringNotifier` (`features/proctoring/.../audio_monitoring_provider.dart`)
 joins the two halves: the monitor owns the device, the detector owns the rules, and a

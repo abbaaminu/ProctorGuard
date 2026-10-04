@@ -1,7 +1,8 @@
 import 'dart:js_interop';
 
-import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:web/web.dart' as web;
+
+import '../utils/proctor_log.dart';
 
 import 'web_camera_permission.dart';
 
@@ -41,7 +42,7 @@ class BrowserWebCameraPermission implements WebCameraPermission {
       // NotAllowedError (denied / dismissed), NotFoundError (no device),
       // SecurityError (insecure origin such as http://<lan-ip>), or
       // `navigator.mediaDevices` being undefined on a non-secure context.
-      debugPrint('WebCameraPermission: camera/microphone probe refused: $error');
+      proctorLog('WebCameraPermission: camera/microphone probe refused: $error');
       return false;
     }
   }

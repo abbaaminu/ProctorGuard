@@ -81,6 +81,75 @@ void main() {
     });
   });
 
+  group('console home button', () {
+    testWidgets('Home returns to the landing page from any depth', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1200, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      final repository = _FakeDashboardRepository();
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            examSubmissionsStreamProvider('exam-1').overrideWith(
+              (ref) => Stream.value(<Map<String, dynamic>>[]),
+            ),
+            liveViolationFeedProvider(
+              'exam-1',
+            ).overrideWith((ref) => Stream.value(<Map<String, dynamic>>[])),
+            accountNamesProvider.overrideWith(
+              (ref) => Stream.value(<String, String>{}),
+            ),
+            dashboardRepositoryProvider.overrideWithValue(repository),
+          ],
+          child: MaterialApp(
+            home: Builder(
+              builder: (context) => Scaffold(
+                body: Center(
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const SupervisorDashboardPage(
+                          examId: 'exam-1',
+                          examTitle: 'Biology',
+                        ),
+                      ),
+                    ),
+                    child: const Text('open monitor'),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('open monitor'));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('monitor-home')), findsOneWidget);
+
+      // Another level down: the analytics view is pushed from the monitor, so the
+      // stack is landing page -> monitor -> analytics on a real console.
+      await tester.tap(find.byKey(const Key('monitor-analytics')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('analytics-home')), findsOneWidget);
+
+      // Home goes all the way back to the landing page, not one step back: the
+      // whole point is that nobody has to unwind a three-deep stack by hand.
+      await tester.tap(find.byKey(const Key('analytics-home')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('open monitor'), findsOneWidget);
+      expect(find.byKey(const Key('analytics-home')), findsNothing);
+      expect(find.byKey(const Key('monitor-home')), findsNothing);
+    });
+  });
+
   group('supervisor attempt reset', () {
     test('deletes the attempt before cleaning its snapshot objects', () async {
       final transport = _FakeTransport((request) {
