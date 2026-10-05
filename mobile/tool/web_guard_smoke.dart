@@ -12,9 +12,9 @@
 // `NoNetworkStatus`, which is why this file analyzes cleanly on every platform.
 import 'package:flutter/widgets.dart';
 
-import 'package:exam_proctor/core/services/lockdown_bootstrap.dart';
-import 'package:exam_proctor/core/services/network_status.dart';
-import 'package:exam_proctor/core/services/web_guards.dart';
+import 'package:proctorguard/core/services/lockdown_bootstrap.dart';
+import 'package:proctorguard/core/services/network_status.dart';
+import 'package:proctorguard/core/services/web_guards.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();

@@ -76,6 +76,22 @@ class ExamTakingPage extends ConsumerStatefulWidget {
   /// without a camera. `null` falls back to the compile-time flag.
   final bool? mockCamera;
 
+  /// `profiles.full_name`, printed on the exam surface by
+  /// [ExamCandidateHeader] so a roaming supervisor looking over a shoulder can
+  /// see whose attempt it is without opening the dashboard.
+  ///
+  /// Optional on purpose: the session itself needs neither of these, and a build
+  /// with no profile (widget tests, a desktop demo) simply renders no header
+  /// rather than a strip of blanks.
+  final String? candidateName;
+
+  /// `exams.title`, shown beside the candidate's name.
+  final String? examTitle;
+
+  /// `auth.users.email` — the closest thing to an identifier `profiles` has
+  /// (it carries no matric/registration column).
+  final String? candidateEmail;
+
   const ExamTakingPage({
     super.key,
     required this.examId,
@@ -85,6 +101,9 @@ class ExamTakingPage extends ConsumerStatefulWidget {
     this.webGuards,
     this.clock,
     this.mockCamera,
+    this.candidateName,
+    this.examTitle,
+    this.candidateEmail,
   });
 
   /// True when this session runs without a camera (simulated violations).
@@ -612,7 +631,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
 
     try {
       final shot = await controller.takePicture();
-      return shot.readAsBytes();
+      return await shot.readAsBytes();
     } on CameraException {
       return null;
     }
@@ -869,6 +888,15 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
 
   Future<bool?> _confirmSubmit() {
     final session = ref.read(examSessionControllerProvider(_args));
+    final marked = session.markedForReview.length;
+    // Only when there is something to warn about: the sentence is the last
+    // reminder a flag ever gets, and it would be noise on an exam where nobody
+    // used the marker.
+    final markedNote = marked == 0
+        ? ''
+        : '\n\n$marked '
+              '${marked == 1 ? 'question is' : 'questions are'} still marked '
+              'for review.';
     return showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -876,7 +904,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         content: Text(
           'You have answered ${session.savedQuestions.length} of '
           '${session.questions.length} questions. Submitting closes the attempt '
-          'for good.',
+          'for good.$markedNote',
         ),
         actions: [
           TextButton(
@@ -1120,6 +1148,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
               type: proctoringState.lastViolation,
               warningCount: proctoringState.warningCount,
               isFinal: proctoringState.disqualified,
+              // The same index the supervisor's grid shows for this attempt: it is
+              // derived from this session's own violation list, not passed in.
+              risk: proctoringState.risk,
               onDismiss: () {
                 if (proctoringState.disqualified) {
                   Navigator.of(context).popUntil((r) => r.isFirst);
@@ -1165,6 +1196,17 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Who is sitting this exam: the app bar is spent on the question
+          // number and the clock, and the counters below are about the paper,
+          // so identity gets its own strip.
+          if (widget.candidateName != null || widget.examTitle != null) ...[
+            ExamCandidateHeader(
+              candidateName: widget.candidateName ?? 'Candidate',
+              examTitle: widget.examTitle,
+              candidateEmail: widget.candidateEmail,
+            ),
+            const SizedBox(height: 12),
+          ],
           // The counters live here rather than in the app bar: three chips plus
           // the question number overflow a 360 dp phone's app bar, while a `Wrap`
           // here simply folds onto a second line.
@@ -1212,6 +1254,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
             // not saved is what the text field's own "Not saved yet" line already
             // says it is.
             answeredIds: session.savedQuestions,
+            // "I have to come back to this one" - the grid is the only place a
+            // flag can be seen next to what is still unanswered.
+            markedIds: session.markedForReview,
             onSelect: session.submitting
                 ? null
                 : (index) => unawaited(_session.goTo(index)),
@@ -1309,6 +1354,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     final first = session.currentIndex == 0;
     final last = session.currentIndex == session.questions.length - 1;
     final blocked = session.submitting;
+    final marked = session.markedForReview.contains(question.id);
 
     return Material(
       color: theme.colorScheme.surface,
@@ -1327,49 +1373,89 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
           // back-and-forth affordance discoverable at all.
           child: Row(
             children: [
-              const Spacer(),
-              TextButton.icon(
-                key: const Key('exam-previous'),
-                onPressed: blocked || first
+              // The mark toggle sits on the left, away from the Previous/Next
+              // pair: flagging is not navigation, and squeezing it between the two
+              // arrows would put "go back" and "flag this" one mis-tap apart.
+              IconButton(
+                key: const Key('exam-mark-review'),
+                onPressed: blocked
                     ? null
-                    : () => _session.goTo(session.currentIndex - 1),
-                icon: const Icon(Icons.chevron_left),
-                label: const Text('Previous'),
+                    : () => _session.toggleMarkForReview(question.id),
+                tooltip: marked ? 'Marked for review' : 'Mark for review',
+                icon: Icon(marked ? Icons.flag : Icons.outlined_flag),
+                color: marked ? theme.colorScheme.tertiary : null,
               ),
               const SizedBox(width: 8),
-              // Explicit per-question navigation. A multiple-choice answer still
-              // saves (and advances) on tap, but the student always has a
-              // prominent Next to move on without answering or after reviewing;
-              // a typed answer uses "Save & next", which persists through
-              // merge_submission_text_answer before it moves.
-              if (question.isFillInTheBlank && !last)
-                FilledButton.icon(
-                  key: const Key('exam-save-text'),
-                  onPressed: blocked || session.savingText
-                      ? null
-                      : () =>
-                            _session.saveTextAnswer(question.id, advance: true),
-                  icon: const Icon(Icons.check),
-                  label: Text(session.savingText ? 'Saving…' : 'Save & next'),
-                )
-              else if (!last)
-                FilledButton.icon(
-                  key: const Key('exam-next'),
-                  onPressed: blocked
-                      ? null
-                      : () => _session.goTo(session.currentIndex + 1),
-                  icon: const Icon(Icons.chevron_right),
-                  iconAlignment: IconAlignment.end,
-                  label: const Text('Next'),
-                )
-              else
-                FilledButton(
-                  key: const Key('exam-submit'),
-                  onPressed: blocked ? null : () => _finalSubmit(),
-                  child: Text(
-                    session.submitting ? 'Submitting…' : 'Submit exam',
-                  ),
+              // The nav pair lives in the *slack* of the bar rather than being
+              // pushed to the right edge with a Spacer: a Spacer would take an
+              // equal share of the free space and leave the labels shrinking into
+              // the middle of an empty bar (see [_ShrinkableLabel]).
+              Expanded(
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    // Flexible, so the two labels share whatever the bar has
+                    // left after the toggle rather than overflowing it: on a 360 dp
+                    // phone this row holds three controls, and the *word* is the
+                    // only part of a button that can give - the horizontal pads and
+                    // the 48 dp touch targets are Material minimums.
+                    Flexible(
+                      child: TextButton.icon(
+                        key: const Key('exam-previous'),
+                        onPressed: blocked || first
+                            ? null
+                            : () => _session.goTo(session.currentIndex - 1),
+                        icon: const Icon(Icons.chevron_left),
+                        label: const _ShrinkableLabel('Previous'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    // Explicit per-question navigation. A multiple-choice answer
+                    // still saves (and advances) on tap, but the student always has
+                    // a prominent Next to move on without answering or after
+                    // reviewing; a typed answer uses "Save & next", which persists
+                    // through merge_submission_text_answer before it moves.
+                    if (question.isFillInTheBlank && !last)
+                      Flexible(
+                        child: FilledButton.icon(
+                          key: const Key('exam-save-text'),
+                          onPressed: blocked || session.savingText
+                              ? null
+                              : () => _session.saveTextAnswer(
+                                  question.id,
+                                  advance: true,
+                                ),
+                          icon: const Icon(Icons.check),
+                          label: _ShrinkableLabel(
+                            session.savingText ? 'Saving…' : 'Save & next',
+                          ),
+                        ),
+                      )
+                    else if (!last)
+                      Flexible(
+                        child: FilledButton.icon(
+                          key: const Key('exam-next'),
+                          onPressed: blocked
+                              ? null
+                              : () => _session.goTo(session.currentIndex + 1),
+                          icon: const Icon(Icons.chevron_right),
+                          iconAlignment: IconAlignment.end,
+                          label: const _ShrinkableLabel('Next'),
+                        ),
+                      )
+                    else
+                      Flexible(
+                        child: FilledButton(
+                          key: const Key('exam-submit'),
+                          onPressed: blocked ? null : () => _finalSubmit(),
+                          child: _ShrinkableLabel(
+                            session.submitting ? 'Submitting…' : 'Submit exam',
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
+              ),
             ],
           ),
         ),
@@ -1377,3 +1463,26 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     );
   }
 }
+
+/// A button label that shrinks instead of overflowing its row.
+///
+/// The action bar has to hold three controls on a 360 dp phone, and a label is
+/// the only part of a button that can give: the horizontal pads and the 48 dp
+/// touch targets are Material minimums, and the icons say as much as the second
+/// half of the longest word. Scaling the *text* down (never up) means a wide
+/// system font, a long translation or a large accessibility text scale costs a
+/// slightly smaller word instead of a striped overflow past the bar.
+class _ShrinkableLabel extends StatelessWidget {
+  const _ShrinkableLabel(this.label);
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return FittedBox(
+      fit: BoxFit.scaleDown,
+      child: Text(label, maxLines: 1, softWrap: false),
+    );
+  }
+}
+

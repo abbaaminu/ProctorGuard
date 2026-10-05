@@ -1,19 +1,20 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:exam_proctor/core/services/audio_monitor.dart';
-import 'package:exam_proctor/core/services/key_value_store.dart';
-import 'package:exam_proctor/core/services/kiosk_service.dart';
-import 'package:exam_proctor/core/services/web_guards.dart';
-import 'package:exam_proctor/features/exam/domain/entities/exam.dart';
-import 'package:exam_proctor/features/exam/domain/entities/question.dart';
-import 'package:exam_proctor/features/exam/domain/entities/submission.dart';
-import 'package:exam_proctor/features/exam/domain/repositories/exam_repository.dart';
-import 'package:exam_proctor/features/exam/presentation/pages/exam_taking_page.dart';
-import 'package:exam_proctor/features/proctoring/domain/entities/violation.dart';
-import 'package:exam_proctor/features/proctoring/domain/repositories/proctoring_repository.dart';
-import 'package:exam_proctor/features/proctoring/presentation/providers/audio_monitoring_provider.dart';
-import 'package:exam_proctor/features/proctoring/presentation/providers/proctoring_provider.dart';
+import 'package:proctorguard/core/services/audio_monitor.dart';
+import 'package:proctorguard/core/services/key_value_store.dart';
+import 'package:proctorguard/core/services/kiosk_service.dart';
+import 'package:proctorguard/core/services/web_guards.dart';
+import 'package:proctorguard/features/exam/domain/entities/exam.dart';
+import 'package:proctorguard/features/exam/domain/entities/question.dart';
+import 'package:proctorguard/features/exam/domain/entities/submission.dart';
+import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
+import 'package:proctorguard/features/exam/presentation/pages/exam_taking_page.dart';
+import 'package:proctorguard/features/exam/presentation/widgets/exam_session_widgets.dart';
+import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
+import 'package:proctorguard/features/proctoring/domain/repositories/proctoring_repository.dart';
+import 'package:proctorguard/features/proctoring/presentation/providers/audio_monitoring_provider.dart';
+import 'package:proctorguard/features/proctoring/presentation/providers/proctoring_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -26,11 +27,17 @@ import 'package:flutter_test/flutter_test.dart';
 ///    has to end somewhere the student can leave from. A denied camera used to
 ///    throw out of `_bootstrap()` and leave the page on its loading spinner.
 ///  * **questions** — numbering ("Question 2 of 2"), multiple-choice tap targets,
-///    the fill-in-the-blank text field, and the rule that submitting flushes an
-///    unsaved text answer first (grading reads the server copy).
+///    the fill-in-the-blank text field, the rule that submitting flushes an
+///    unsaved text answer first (grading reads the server copy), and an action
+///    bar that holds three controls (mark for review + Previous + Next) on a
+///    360 dp phone without overflowing.
 ///  * **audio proctoring** — the microphone chip, and the rule that a blocked or
 ///    unplugged microphone is a visible, answerable prompt rather than a silent
 ///    gap in proctoring.
+///  * **review marker and candidate identity** — flagging a question for review
+///    (local-only, per question, warned about at submit) and the header that says
+///    who is sitting the exam, which is derived from the name because `profiles`
+///    carries no photo or matric number to show instead.
 ///
 /// The question half runs with `mockCamera: true`, which is the documented "no
 /// camera here" path (emulators, desktop, CI) and keeps the camera plugin out of
@@ -67,6 +74,9 @@ void main() {
     WebGuards? webGuards,
     DateTime Function()? clock,
     AudioLevelSource? audioSource,
+    String? candidateName,
+    String? examTitle,
+    String? candidateEmail,
   }) =>
       ProviderScope(
         overrides: [
@@ -98,6 +108,9 @@ void main() {
                         mockCamera: mockCamera,
                         webGuards: webGuards,
                         clock: clock,
+                        candidateName: candidateName,
+                        examTitle: examTitle,
+                        candidateEmail: candidateEmail,
                       ),
                     ),
                   ),
@@ -630,6 +643,15 @@ void main() {
 
       expect(find.text('Question 1 of 2'), findsOneWidget);
       expect(find.byKey(const Key('option-2')), findsOneWidget);
+      // The bar holds three controls (mark toggle + Previous + Next), and the
+      // labels give before the row does: the nav pair stays ordered and inside
+      // the viewport instead of ending in a stripe of overflow.
+      final toggle = tester.getRect(find.byKey(const Key('exam-mark-review')));
+      final previous = tester.getRect(find.byKey(const Key('exam-previous')));
+      final next = tester.getRect(find.byKey(const Key('exam-next')));
+      expect(previous.left, greaterThanOrEqualTo(toggle.right));
+      expect(next.left, greaterThanOrEqualTo(previous.right));
+      expect(next.right, lessThanOrEqualTo(360));
       // A RenderFlex overflow surfaces as an exception here.
       expect(tester.takeException(), isNull);
     });
@@ -647,6 +669,174 @@ void main() {
       expect(find.text('Question 1 of 2'), findsOneWidget);
       expect(find.byKey(const Key('option-1')), findsOneWidget);
       expect(tester.takeException(), isNull);
+    });
+  });
+
+  group('review marker and candidate identity', () {
+    testWidgets('a mark for review shows in the grid, the legend and the toggle',
+        (tester) async {
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      // The palette legend documents all three tile states whether or not a
+      // question is in them (that is its job: it is the key, not a status line),
+      // so the proof that nothing is marked is in the tiles themselves: neither
+      // one carries the flag yet.
+      expect(find.text('Marked for review'), findsOneWidget);
+      for (final index in [0, 1]) {
+        expect(
+          find.descendant(
+            of: find.byKey(Key('exam-palette-$index')),
+            matching: find.byIcon(Icons.flag),
+          ),
+          findsNothing,
+          reason: 'question ${index + 1} has not been marked',
+        );
+      }
+      expect(
+        tester
+            .widget<IconButton>(find.byKey(const Key('exam-mark-review')))
+            .tooltip,
+        'Mark for review',
+      );
+
+      await tester.tap(find.byKey(const Key('exam-mark-review')));
+      await tester.pumpAndSettle();
+
+      // The tile carries a flag, the legend explains it, and the toggle reads as
+      // pressed - the flag is not a mode, so the footer has to say which question
+      // it is about right now.
+      expect(
+        find.descendant(
+          of: find.byKey(const Key('exam-palette-0')),
+          matching: find.byIcon(Icons.flag),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.text('Marked for review'),
+        findsOneWidget,
+        reason: 'the legend is one key, not a line per marked question',
+      );
+      expect(
+        tester
+            .widget<IconButton>(find.byKey(const Key('exam-mark-review')))
+            .tooltip,
+        'Marked for review',
+      );
+      // Question 2 was not marked by marking question 1.
+      expect(
+        find.descendant(
+          of: find.byKey(const Key('exam-palette-1')),
+          matching: find.byIcon(Icons.flag),
+        ),
+        findsNothing,
+      );
+
+      // It survives the trip to the next question and back, which is the whole
+      // point of flagging one: coming back to it later.
+      await tester.tap(find.byKey(const Key('exam-next')));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<IconButton>(find.byKey(const Key('exam-mark-review')))
+            .tooltip,
+        'Mark for review',
+        reason: 'the mark belongs to question 1, not to the session',
+      );
+
+      await tester.tap(find.byKey(const Key('exam-previous')));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<IconButton>(find.byKey(const Key('exam-mark-review')))
+            .tooltip,
+        'Marked for review',
+      );
+    });
+    testWidgets('the submit dialog warns about what is still marked',
+        (tester) async {
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      // Flag question 1, then go to the last question and submit from there.
+      await tester.tap(find.byKey(const Key('exam-mark-review')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('exam-next')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('exam-submit')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Submit your exam?'), findsOneWidget);
+      // The flag is the last reminder the student gets, so the dialog counts what
+      // is still waiting for them beside what is answered.
+      expect(find.textContaining('1 question is still marked'), findsOneWidget);
+
+      await tester.tap(find.text('Keep working'));
+      await tester.pumpAndSettle();
+      // Cancelling leaves the attempt open and the mark intact.
+      expect(find.text('Question 2 of 2'), findsOneWidget);
+      expect(find.text('Marked for review'), findsOneWidget);
+    });
+
+    testWidgets('the submit dialog says nothing about marks when there are none',
+        (tester) async {
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('exam-next')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('exam-submit')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Submit your exam?'), findsOneWidget);
+      expect(find.textContaining('marked'), findsNothing);
+
+      await tester.tap(find.text('Keep working'));
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('names the candidate when the caller knows who is sitting it',
+        (tester) async {
+      await tester.pumpWidget(
+        pageUnderTest(
+          candidateName: 'Aisha Bello',
+          examTitle: 'CS101 Midterm',
+          candidateEmail: 'aisha.bello@university.edu',
+        ),
+      );
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('exam-candidate-header')), findsOneWidget);
+      expect(find.text('Aisha Bello'), findsOneWidget);
+      expect(find.text('CS101 Midterm'), findsOneWidget);
+      expect(find.text('aisha.bello@university.edu'), findsOneWidget);
+      // The avatar is derived from the name, not stored: `profiles` has no photo.
+      expect(find.text('AB'), findsOneWidget);
+    });
+
+    testWidgets('prints no header at all when the caller knows nothing',
+        (tester) async {
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      // An empty header row would be worse than none: it costs height on a small
+      // phone and says nothing.
+      expect(find.byKey(const Key('exam-candidate-header')), findsNothing);
+    });
+
+    test('initials come from the name, and never crash on an odd one', () {
+      expect(ExamCandidateHeader.initialsOf('Aisha Bello'), 'AB');
+      expect(ExamCandidateHeader.initialsOf('Aisha Bello-Okonkwo'), 'AO');
+      expect(ExamCandidateHeader.initialsOf('Bello'), 'B');
+      // Not a case the portal produces, but the avatar must not throw if a name
+      // ever arrives blank.
+      expect(ExamCandidateHeader.initialsOf('   '), '?');
     });
   });
 

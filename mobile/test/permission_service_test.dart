@@ -1,4 +1,4 @@
-import 'package:exam_proctor/core/services/permission_service.dart';
+import 'package:proctorguard/core/services/permission_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:permission_handler/permission_handler.dart';
 

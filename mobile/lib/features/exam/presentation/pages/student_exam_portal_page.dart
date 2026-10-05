@@ -114,6 +114,12 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
                   submissionId: submission.id,
                   durationMinutes: exam.durationMinutes,
                   startedAt: submission.startedAt,
+                  // Identity for the exam surface: the session screen has no
+                  // profile provider of its own, and the portal already holds both
+                  // (the gate passes `profiles.full_name` in as `studentName`).
+                  candidateName: widget.studentName,
+                  examTitle: exam.title,
+                  candidateEmail: SupabaseService.instance.currentUser?.email,
                 ),
         ),
       );

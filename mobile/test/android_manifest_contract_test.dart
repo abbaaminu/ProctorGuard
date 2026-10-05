@@ -1,7 +1,7 @@
 import 'dart:io';
 
-import 'package:exam_proctor/core/services/hardware_integrity_service.dart';
-import 'package:exam_proctor/core/services/kiosk_service.dart';
+import 'package:proctorguard/core/services/hardware_integrity_service.dart';
+import 'package:proctorguard/core/services/kiosk_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// The Kotlin half of the app lives in the app's own package: the rename out of

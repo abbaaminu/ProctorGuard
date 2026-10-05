@@ -1,16 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:exam_proctor/core/services/key_value_store.dart';
-import 'package:exam_proctor/core/services/network_status.dart';
-import 'package:exam_proctor/core/services/offline_sync_service.dart';
-import 'package:exam_proctor/core/utils/uuid.dart';
-import 'package:exam_proctor/features/exam/domain/entities/exam.dart';
-import 'package:exam_proctor/features/exam/domain/entities/question.dart';
-import 'package:exam_proctor/features/exam/domain/entities/submission.dart';
-import 'package:exam_proctor/features/exam/domain/repositories/exam_repository.dart';
-import 'package:exam_proctor/features/proctoring/domain/entities/violation.dart';
-import 'package:exam_proctor/features/proctoring/domain/repositories/proctoring_repository.dart';
+import 'package:proctorguard/core/services/key_value_store.dart';
+import 'package:proctorguard/core/services/network_status.dart';
+import 'package:proctorguard/core/services/offline_sync_service.dart';
+import 'package:proctorguard/core/utils/uuid.dart';
+import 'package:proctorguard/features/exam/domain/entities/exam.dart';
+import 'package:proctorguard/features/exam/domain/entities/question.dart';
+import 'package:proctorguard/features/exam/domain/entities/submission.dart';
+import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
+import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
+import 'package:proctorguard/features/proctoring/domain/repositories/proctoring_repository.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// The offline layer (requirement 1 and the retry half of requirement 4):

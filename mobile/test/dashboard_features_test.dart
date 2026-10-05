@@ -1,12 +1,12 @@
 import 'dart:convert';
 
-import 'package:exam_proctor/features/dashboard/data/repositories/dashboard_repository_impl.dart';
-import 'package:exam_proctor/features/dashboard/domain/entities/analytics_report.dart';
-import 'package:exam_proctor/features/dashboard/domain/entities/submission_reset_result.dart';
-import 'package:exam_proctor/features/dashboard/domain/repositories/dashboard_repository.dart';
-import 'package:exam_proctor/features/dashboard/presentation/pages/analytics_page.dart';
-import 'package:exam_proctor/features/dashboard/presentation/providers/dashboard_providers.dart';
-import 'package:exam_proctor/features/dashboard/presentation/pages/supervisor_dashboard_page.dart';
+import 'package:proctorguard/features/dashboard/data/repositories/dashboard_repository_impl.dart';
+import 'package:proctorguard/features/dashboard/domain/entities/analytics_report.dart';
+import 'package:proctorguard/features/dashboard/domain/entities/submission_reset_result.dart';
+import 'package:proctorguard/features/dashboard/domain/repositories/dashboard_repository.dart';
+import 'package:proctorguard/features/dashboard/presentation/pages/analytics_page.dart';
+import 'package:proctorguard/features/dashboard/presentation/providers/dashboard_providers.dart';
+import 'package:proctorguard/features/dashboard/presentation/pages/supervisor_dashboard_page.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';

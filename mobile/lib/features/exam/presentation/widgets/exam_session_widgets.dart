@@ -278,6 +278,11 @@ class ExamBlockingState extends StatelessWidget {
 ///  * **not answered** - nothing has been stored for it yet (a neutral outlined
 ///    tile).
 ///
+/// A third state rides on top of both: **marked for review** ([markedIds]) tints
+/// the tile with the tertiary pair and pins a small flag in its corner, so "I
+/// have to come back to this one" is visible in the same scan while the check
+/// still means answered.
+///
 /// The question currently on screen is ringed, so the same grid doubles as a
 /// "where am I in this paper" indicator, and the counts above it are the summary
 /// the student is really looking for: how much is left.
@@ -291,6 +296,7 @@ class ExamQuestionPalette extends StatelessWidget {
     required this.questions,
     required this.currentIndex,
     required this.answeredIds,
+    this.markedIds = const <String>{},
     this.onSelect,
   });
 
@@ -303,6 +309,13 @@ class ExamQuestionPalette extends StatelessWidget {
   /// Question ids whose answer is stored - the same set the counted chip and the
   /// submit summary read.
   final Set<String> answeredIds;
+
+  /// Question ids the student flagged for another look.
+  ///
+  /// A third state next to answered/not answered: an empty set renders exactly
+  /// the two-state grid this widget had before "Mark for review" existed, so a
+  /// caller that does not track marks (or an attempt that has none) is unchanged.
+  final Set<String> markedIds;
 
   /// Called with the index of the tapped question. Null disables the grid: a
   /// submit in flight must not let the paper change under it.
@@ -343,6 +356,7 @@ class ExamQuestionPalette extends StatelessWidget {
               _PaletteTile(
                 index: index,
                 answered: answeredIds.contains(questions[index].id),
+                marked: markedIds.contains(questions[index].id),
                 current: index == currentIndex,
                 onTap: onSelect == null ? null : () => onSelect!(index),
               ),
@@ -355,6 +369,7 @@ class ExamQuestionPalette extends StatelessWidget {
           children: [
             _PaletteLegend(answered: true),
             _PaletteLegend(answered: false),
+            _PaletteLegend(marked: true),
           ],
         ),
       ],
@@ -459,17 +474,20 @@ class _ExamFillInTheBlankFieldState extends State<ExamFillInTheBlankField> {
 
 
 
-/// One numbered tile: filled with a check when answered, neutral when not.
+/// One numbered tile: filled with a check when answered, corner-flagged when the
+/// student marked it for review, neutral when it is neither.
 class _PaletteTile extends StatelessWidget {
   const _PaletteTile({
     required this.index,
     required this.answered,
+    required this.marked,
     required this.current,
     required this.onTap,
   });
 
   final int index;
   final bool answered;
+  final bool marked;
   final bool current;
   final VoidCallback? onTap;
 
@@ -479,21 +497,37 @@ class _PaletteTile extends StatelessWidget {
     final number = '${index + 1}';
 
     // The unanswered state is deliberately the quieter of the two: "done" is what
-    // should read first when a student scans the grid for what is left.
-    final background = answered
-        ? scheme.primaryContainer
-        : scheme.surfaceContainerHighest;
-    final foreground = answered
-        ? scheme.onPrimaryContainer
-        : scheme.onSurfaceVariant;
+    // should read first when a student scans the grid for what is left. A marked
+    // tile takes the tertiary pair instead, so "flagged by me" can never read as
+    // "answered" - the flag is the reminder, the check stays the answer marker,
+    // and a tile can carry both.
+    final Color background;
+    final Color foreground;
+    if (marked) {
+      background = scheme.tertiaryContainer;
+      foreground = scheme.onTertiaryContainer;
+    } else if (answered) {
+      background = scheme.primaryContainer;
+      foreground = scheme.onPrimaryContainer;
+    } else {
+      background = scheme.surfaceContainerHighest;
+      foreground = scheme.onSurfaceVariant;
+    }
     final border = current
         ? scheme.primary
-        : (answered ? scheme.primary : scheme.outlineVariant);
+        : (marked
+              ? scheme.tertiary
+              : (answered ? scheme.primary : scheme.outlineVariant));
+
+    final states = <String>[
+      if (answered) 'answered',
+      if (marked) 'marked for review',
+    ];
 
     return Tooltip(
-      message: answered
-          ? 'Question $number — answered'
-          : 'Question $number — not answered yet',
+      message: states.isEmpty
+          ? 'Question $number — not answered yet'
+          : 'Question $number — ${states.join(', ')}',
       child: Material(
         color: background,
         shape: RoundedRectangleBorder(
@@ -509,23 +543,37 @@ class _PaletteTile extends StatelessWidget {
           child: SizedBox(
             width: 46,
             height: 40,
-            child: Center(
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (answered) ...[
-                    Icon(Icons.check, size: 12, color: foreground),
-                    const SizedBox(width: 2),
-                  ],
-                  Text(
-                    number,
-                    style: TextStyle(
-                      color: foreground,
-                      fontWeight: current ? FontWeight.w700 : FontWeight.w500,
-                    ),
+            child: Stack(
+              children: [
+                Center(
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (answered) ...[
+                        Icon(Icons.check, size: 12, color: foreground),
+                        const SizedBox(width: 2),
+                      ],
+                      Text(
+                        number,
+                        style: TextStyle(
+                          color: foreground,
+                          fontWeight:
+                              current ? FontWeight.w700 : FontWeight.w500,
+                        ),
+                      ),
+                    ],
                   ),
-                ],
-              ),
+                ),
+                // Pinned to the corner rather than put in the row with the
+                // number: two glyphs plus a two-digit number do not fit a 46 dp
+                // tile, and an overflowing tile is a red screen.
+                if (marked)
+                  Positioned(
+                    top: 1,
+                    right: 2,
+                    child: Icon(Icons.flag, size: 10, color: foreground),
+                  ),
+              ],
             ),
           ),
         ),
@@ -534,34 +582,151 @@ class _PaletteTile extends StatelessWidget {
   }
 }
 
-/// The key to [_PaletteTile]'s two colours, spelled out rather than assumed.
+/// The key to [_PaletteTile]'s states, spelled out rather than assumed.
 class _PaletteLegend extends StatelessWidget {
-  const _PaletteLegend({required this.answered});
+  const _PaletteLegend({this.answered = false, this.marked = false})
+    : assert(
+        !(answered && marked),
+        'the marked key is its own state, not the answered one',
+      );
 
   final bool answered;
+  final bool marked;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final answeredColor = theme.colorScheme.primary;
-    final unansweredColor = theme.colorScheme.onSurfaceVariant;
+    final scheme = theme.colorScheme;
+
+    final IconData icon;
+    final String label;
+    final Color color;
+    if (marked) {
+      icon = Icons.flag;
+      label = 'Marked for review';
+      color = scheme.tertiary;
+    } else if (answered) {
+      icon = Icons.check_circle;
+      label = 'Answered';
+      color = scheme.primary;
+    } else {
+      icon = Icons.radio_button_unchecked;
+      label = 'Not answered';
+      color = scheme.onSurfaceVariant;
+    }
 
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(
-          answered ? Icons.check_circle : Icons.radio_button_unchecked,
-          size: 14,
-          color: answered ? answeredColor : unansweredColor,
-        ),
+        Icon(icon, size: 14, color: color),
         const SizedBox(width: 4),
-        Text(
-          answered ? 'Answered' : 'Not answered',
-          style: theme.textTheme.labelSmall?.copyWith(
-            color: answered ? answeredColor : unansweredColor,
-          ),
-        ),
+        Text(label, style: theme.textTheme.labelSmall?.copyWith(color: color)),
       ],
+    );
+  }
+}
+
+
+/// Who is sitting this exam, and which exam it is, printed on the exam surface.
+///
+/// The app bar and the palette both belong to the *question* — "4 of 20", the
+/// clock, what is answered — and neither has room left on a 360 dp phone for the
+/// candidate's own identity. This strip carries it instead, above the question.
+///
+/// Only [candidateName] is required. [examTitle] and [candidateEmail] are rendered
+/// only when supplied, so a caller without them gets a one-line strip rather than
+/// a row of blanks. There is deliberately no avatar upload here: `profiles` has
+/// no photo column, so the initials tile is the whole of what the data supports.
+class ExamCandidateHeader extends StatelessWidget {
+  const ExamCandidateHeader({
+    super.key,
+    required this.candidateName,
+    this.examTitle,
+    this.candidateEmail,
+  });
+
+  final String candidateName;
+  final String? examTitle;
+
+  /// Shown under the name because it *is* the identifier this deployment has -
+  /// `profiles` carries no matric/registration number.
+  final String? candidateEmail;
+
+  /// Up to two initials for the tile: "Aisha Bello" -> "AB", a single name or an
+  /// email local part -> its first letter.
+  static String initialsOf(String name) {
+    final words = name
+        .split(RegExp(r'[\s@._-]+'))
+        .where((word) => word.isNotEmpty)
+        .toList();
+    if (words.isEmpty) return '?';
+    if (words.length == 1) return words.first.characters.first.toUpperCase();
+    return (words.first.characters.first + words.last.characters.first)
+        .toUpperCase();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+
+    return Container(
+      key: const Key('exam-candidate-header'),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      child: Row(
+        children: [
+          CircleAvatar(
+            radius: 16,
+            backgroundColor: scheme.primaryContainer,
+            child: Text(
+              initialsOf(candidateName),
+              style: theme.textTheme.labelMedium?.copyWith(
+                color: scheme.onPrimaryContainer,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  candidateName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (examTitle != null && examTitle!.isNotEmpty)
+                  Text(
+                    examTitle!,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                if (candidateEmail != null && candidateEmail!.isNotEmpty)
+                  Text(
+                    candidateEmail!,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

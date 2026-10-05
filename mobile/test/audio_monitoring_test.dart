@@ -1,8 +1,8 @@
 import 'dart:async';
 
-import 'package:exam_proctor/core/services/audio_monitor.dart';
-import 'package:exam_proctor/core/services/audio_noise_detector.dart';
-import 'package:exam_proctor/features/proctoring/presentation/providers/audio_monitoring_provider.dart';
+import 'package:proctorguard/core/services/audio_monitor.dart';
+import 'package:proctorguard/core/services/audio_noise_detector.dart';
+import 'package:proctorguard/features/proctoring/presentation/providers/audio_monitoring_provider.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// The audio half of proctoring, in the three layers it is built from:

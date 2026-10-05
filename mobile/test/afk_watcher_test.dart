@@ -1,4 +1,4 @@
-import 'package:exam_proctor/core/services/afk_watcher.dart';
+import 'package:proctorguard/core/services/afk_watcher.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 

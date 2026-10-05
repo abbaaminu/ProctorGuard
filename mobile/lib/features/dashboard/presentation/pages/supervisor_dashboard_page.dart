@@ -3,6 +3,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart';
 import '../../../../core/widgets/home_button.dart';
+import '../../../proctoring/domain/entities/proctoring_risk.dart';
+import '../../../proctoring/domain/entities/violation.dart';
+import '../../../proctoring/presentation/widgets/risk_index_chip.dart';
 import '../../domain/repositories/dashboard_repository.dart';
 import '../providers/dashboard_providers.dart';
 import 'analytics_page.dart';
@@ -197,6 +200,22 @@ class SupervisorDashboardPage extends ConsumerWidget {
       flagsBySubmission[id] = (flagsBySubmission[id] ?? 0) + 1;
     }
 
+    // The *kinds* of signal behind those flags, which is what the risk index
+    // reads: the feed is the same exam-scoped log stream, so the index needs no
+    // extra query and cannot disagree with the "N flags" printed beside it.
+    //
+    // A row whose `action_type` this build does not know still counts as a flag
+    // (see [_signalFor]) but does not widen the set of distinct signals, so one
+    // unreadable row cannot inflate the mix.
+    final signalsBySubmission = <String, Set<ViolationType>>{};
+    for (final log in violations.valueOrNull ?? const <Map<String, dynamic>>[]) {
+      final signal = _signalFor(log['action_type'] as String?);
+      if (signal == null) continue;
+      (signalsBySubmission[log['submission_id'] as String] ??=
+              <ViolationType>{})
+          .add(signal);
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: Text('Live Monitor — $examTitle'),
@@ -243,6 +262,17 @@ class SupervisorDashboardPage extends ConsumerWidget {
                               final score = row['score'];
                               final flags = flagsBySubmission[row['id']] ?? 0;
 
+                              // The same evidence the "N flags" count is made of,
+                              // scored: flags are the strikes, the mapped signals
+                              // are the mix. Zero flags short-circuits to "no
+                              // evidence", so an untouched attempt is never
+                              // labelled.
+                              final risk = ProctoringRisk.fromViolations(
+                                signalsBySubmission[row['id']] ??
+                                    const <ViolationType>{},
+                                serverStrikes: flags,
+                              );
+
                               return Card(
                                 margin: const EdgeInsets.symmetric(
                                   horizontal: 12,
@@ -268,6 +298,19 @@ class SupervisorDashboardPage extends ConsumerWidget {
                                   trailing: Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
+                                      // Band word only: the row already prints
+                                      // its flag count, and the tooltip carries
+                                      // the breakdown of what the score is made
+                                      // of. Hidden at zero flags so a clean row
+                                      // stays as quiet as it was.
+                                      if (flags > 0) ...[
+                                        RiskIndexChip(
+                                          key: Key('risk-${row['id']}'),
+                                          risk: risk,
+                                          compact: true,
+                                        ),
+                                        const SizedBox(width: 8),
+                                      ],
                                       Text(
                                         '$flags flags',
                                         style: TextStyle(
@@ -400,6 +443,23 @@ class _RosterSummary extends StatelessWidget {
             ),
       ),
     );
+  }
+}
+
+/// `proctoring_logs.action_type` → the signal it is, or `null` when this build
+/// does not know that type.
+///
+/// Nullable rather than [ViolationType.fromDb], which *throws* on drift: this
+/// runs against a live stream that a newer server can add a type to, and a
+/// supervisor's console must not take an `ArgumentError` because one row came
+/// from the future. The unknown row still counts as a flag; it just cannot widen
+/// the mix of distinct signals the risk index prices (see the caller).
+ViolationType? _signalFor(String? actionType) {
+  if (actionType == null) return null;
+  try {
+    return ViolationType.fromDb(actionType);
+  } on ArgumentError {
+    return null;
   }
 }
 

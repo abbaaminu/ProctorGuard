@@ -1,8 +1,8 @@
 import 'dart:async';
 
-import 'package:exam_proctor/core/services/supabase_service.dart';
-import 'package:exam_proctor/features/auth/presentation/pages/login_page.dart';
-import 'package:exam_proctor/main.dart';
+import 'package:proctorguard/core/services/supabase_service.dart';
+import 'package:proctorguard/features/auth/presentation/pages/login_page.dart';
+import 'package:proctorguard/main.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 

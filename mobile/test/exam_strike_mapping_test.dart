@@ -1,6 +1,6 @@
-import 'package:exam_proctor/core/services/hardware_integrity_service.dart';
-import 'package:exam_proctor/core/services/web_guards.dart';
-import 'package:exam_proctor/features/exam/presentation/exam_strike_mapping.dart';
+import 'package:proctorguard/core/services/hardware_integrity_service.dart';
+import 'package:proctorguard/core/services/web_guards.dart';
+import 'package:proctorguard/features/exam/presentation/exam_strike_mapping.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// The strike/violation rule, exercised on its own.

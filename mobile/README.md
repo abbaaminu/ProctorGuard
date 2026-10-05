@@ -854,6 +854,14 @@ written-down opt-out for a throwaway demo build and never for one a student runs
 - **iOS has no target.** `mobile/ios/README.md` records that decision and the checklist
   for porting to it; the Dart services degrade to `granted: false` / `unavailable`
   instead of throwing, so nothing in `lib/` has to change first.
+- **CI publishes these builds.** `.github/workflows/sync_release.yml` runs the same
+  `flutter build apk --release --split-per-abi` on every push to `main` (and every
+  `vX.Y.Z` tag) and mirrors the APKs, their SHA-256 checksums and a `latest.json`
+  into the public `abbaaminu/proctorguard-release` repository, which is what a
+  student downloads from. It rebuilds `android/key.properties` from repository
+  secrets instead of committing one, publishes no source and never keeps R8's
+  `mapping.txt` in the public repository; the secrets and the reasoning are listed
+  at the top of that workflow.
 
 ## Key design decisions worth knowing about
 - **Server-enforced escalation.** The 3-strike disqualify rule lives in

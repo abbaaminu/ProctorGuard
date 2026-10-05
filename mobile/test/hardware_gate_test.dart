@@ -1,8 +1,8 @@
 import 'dart:async';
 
-import 'package:exam_proctor/core/services/hardware_verification_service.dart';
-import 'package:exam_proctor/features/exam/domain/entities/exam.dart';
-import 'package:exam_proctor/features/exam/presentation/pages/exam_hardware_gate_page.dart';
+import 'package:proctorguard/core/services/hardware_verification_service.dart';
+import 'package:proctorguard/features/exam/domain/entities/exam.dart';
+import 'package:proctorguard/features/exam/presentation/pages/exam_hardware_gate_page.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 

@@ -1,4 +1,4 @@
-import 'package:exam_proctor/core/services/mediapipe_proctoring_service.dart';
+import 'package:proctorguard/core/services/mediapipe_proctoring_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Unit tests for the pure geometry of the proctoring engine.

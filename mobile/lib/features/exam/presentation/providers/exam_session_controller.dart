@@ -88,6 +88,7 @@ class ExamSessionState {
     this.textAnswers = const <String, String>{},
     this.savedText = const <String, String>{},
     this.savedQuestions = const <String>{},
+    this.markedForReview = const <String>{},
     this.savingText = false,
     this.remaining,
     this.loading = true,
@@ -142,6 +143,15 @@ class ExamSessionState {
   /// answers.
   final bool offlineSubmitPending;
 
+  /// Question ids the student flagged for another look ("Mark for review").
+  ///
+  /// Local to the attempt and deliberately not an answer: marking is the student
+  /// telling *themselves* to come back, so it is not sent to the server and not
+  /// graded. It survives navigation, which is the whole point — the review grid
+  /// shows it, and the submit dialog counts it, so "I was going to return to 7"
+  /// is still true after five questions have gone by.
+  final Set<String> markedForReview;
+
   ExamSessionState copyWith({
     List<Question>? questions,
     int? currentIndex,
@@ -149,6 +159,7 @@ class ExamSessionState {
     Map<String, String>? textAnswers,
     Map<String, String>? savedText,
     Set<String>? savedQuestions,
+    Set<String>? markedForReview,
     bool? savingText,
     Duration? remaining,
     bool clearRemaining = false,
@@ -166,6 +177,7 @@ class ExamSessionState {
     textAnswers: textAnswers ?? this.textAnswers,
     savedText: savedText ?? this.savedText,
     savedQuestions: savedQuestions ?? this.savedQuestions,
+    markedForReview: markedForReview ?? this.markedForReview,
     savingText: savingText ?? this.savingText,
     remaining: clearRemaining ? null : (remaining ?? this.remaining),
     loading: loading ?? this.loading,
@@ -479,6 +491,26 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
     await flushTextAnswer();
     if (!mounted) return;
     state = state.copyWith(currentIndex: index);
+  }
+
+  /// Adds [questionId] to the review list, or takes it off.
+  ///
+  /// Purely local and synchronous: marking is a note to self, not an answer, so
+  /// there is nothing to persist and nothing that can fail. It is ignored while
+  /// the attempt is closing (the paper must not change under a submit in flight)
+  /// and for an id that is not in this paper, so a stale tile cannot put an
+  /// unknown id in the grid.
+  void toggleMarkForReview(String questionId) {
+    if (!mounted) return;
+    if (state.submitting) return;
+    if (!state.questions.any((question) => question.id == questionId)) return;
+
+    // Copied, not mutated: `ExamSessionState` is handed around as a value and
+    // the same set instance must not change under a widget that already read it.
+    final marked = Set<String>.of(state.markedForReview);
+    if (!marked.remove(questionId)) marked.add(questionId);
+
+    state = state.copyWith(markedForReview: marked);
   }
 
   /// Runs the pre-submit gate: drain the queues, then decide whether the

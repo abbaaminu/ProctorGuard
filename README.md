@@ -107,6 +107,13 @@ lose proctoring signals but cannot change a result.
   in [Proctoring boundaries and risk register](#proctoring-boundaries-and-risk-register).
 - `.github/workflows/keep_alive.yml` pings the Supabase REST API twice a week;
   configure its repository secrets or remove the workflow on a paid plan.
+- `.github/workflows/sync_release.yml` builds the release APKs on every push to
+  `main` (and every `v*` tag) and mirrors only those artifacts into the separate
+  `abbaaminu/proctorguard-release` repository, so the app can be downloaded
+  without publishing this source. Its secrets - `RELEASE_PAT`,
+  `SUPABASE_PUBLISHABLE_KEY` and the four `ANDROID_KEYSTORE_*` - are documented at
+  the top of the workflow; a run without the signing ones stops with the keytool
+  instructions instead of publishing an APK signed with the public debug key.
 
 ## Verification
 

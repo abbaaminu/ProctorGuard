@@ -1,13 +1,13 @@
 import 'dart:typed_data';
 
-import 'package:exam_proctor/core/services/mediapipe_proctoring_service.dart';
-import 'package:exam_proctor/features/exam/domain/entities/exam.dart';
-import 'package:exam_proctor/features/exam/domain/entities/question.dart';
-import 'package:exam_proctor/features/exam/domain/entities/submission.dart';
-import 'package:exam_proctor/features/exam/domain/repositories/exam_repository.dart';
-import 'package:exam_proctor/features/proctoring/domain/entities/violation.dart';
-import 'package:exam_proctor/features/proctoring/domain/repositories/proctoring_repository.dart';
-import 'package:exam_proctor/features/proctoring/presentation/providers/proctoring_provider.dart';
+import 'package:proctorguard/core/services/mediapipe_proctoring_service.dart';
+import 'package:proctorguard/features/exam/domain/entities/exam.dart';
+import 'package:proctorguard/features/exam/domain/entities/question.dart';
+import 'package:proctorguard/features/exam/domain/entities/submission.dart';
+import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
+import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
+import 'package:proctorguard/features/proctoring/domain/repositories/proctoring_repository.dart';
+import 'package:proctorguard/features/proctoring/presentation/providers/proctoring_provider.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Covers the `--dart-define=MOCK_CAMERA=true` path and the violation-snapshot

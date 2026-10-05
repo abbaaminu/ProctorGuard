@@ -12,6 +12,7 @@ import '../../../../core/services/mediapipe_proctoring_service.dart';
 import '../../../../core/services/offline_sync_service.dart';
 import '../../../../core/services/supabase_service.dart';
 import '../../../../core/utils/uuid.dart';
+import '../../domain/entities/proctoring_risk.dart';
 import '../../domain/entities/violation.dart';
 import '../../domain/repositories/proctoring_repository.dart';
 import '../../../exam/domain/repositories/exam_repository.dart';
@@ -39,13 +40,31 @@ class ProctoringState {
   /// student instead of letting an unproctored session look normal.
   final bool cameraPaused;
 
+  /// Every violation logged in this session so far, in order.
+  ///
+  /// This is the attempt's own evidence list, and it is kept as a list rather
+  /// than folded into a number because the risk index is a function of the whole
+  /// session ([risk]): a score derived from the list cannot drift away from the
+  /// evidence it is supposed to summarise.
+  final List<ViolationType> violationTypes;
+
   const ProctoringState({
     this.warningCount = 0,
     this.showViolationOverlay = false,
     this.lastViolation,
     this.disqualified = false,
     this.cameraPaused = false,
+    this.violationTypes = const <ViolationType>[],
   });
+
+  /// The attempt's risk index, recomputed from [violationTypes].
+  ///
+  /// [ProctoringRisk.none] until something is actually logged, so a clean
+  /// session reads "Low risk · 0" rather than "unknown".
+  ProctoringRisk get risk => ProctoringRisk.fromViolations(
+        violationTypes,
+        serverStrikes: warningCount,
+      );
 
   ProctoringState copyWith({
     int? warningCount,
@@ -53,6 +72,7 @@ class ProctoringState {
     ViolationType? lastViolation,
     bool? disqualified,
     bool? cameraPaused,
+    List<ViolationType>? violationTypes,
   }) =>
       ProctoringState(
         warningCount: warningCount ?? this.warningCount,
@@ -60,6 +80,7 @@ class ProctoringState {
         lastViolation: lastViolation ?? this.lastViolation,
         disqualified: disqualified ?? this.disqualified,
         cameraPaused: cameraPaused ?? this.cameraPaused,
+        violationTypes: violationTypes ?? this.violationTypes,
       );
 }
 
@@ -306,11 +327,14 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     _lastLoggedAt[type] = now;
 
     // Show the full-screen alert immediately (optimistic UI) — the student
-    // must see the warning before any camera/storage/network round-trip.
+    // must see the warning before any camera/storage/network round-trip. The
+    // type is appended to the session's evidence list in the same write, so the
+    // risk index (`state.risk`) moves with the count instead of lagging behind it.
     state = state.copyWith(
       warningCount: state.warningCount + 1,
       showViolationOverlay: true,
       lastViolation: type,
+      violationTypes: <ViolationType>[...state.violationTypes, type],
     );
 
     // Then collect evidence, time-boxed: a camera that refuses to grab a still

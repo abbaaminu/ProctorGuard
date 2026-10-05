@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:exam_proctor/core/services/kiosk_service.dart';
+import 'package:proctorguard/core/services/kiosk_service.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 

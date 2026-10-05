@@ -1,6 +1,6 @@
-import 'package:exam_proctor/core/services/supabase_service.dart';
-import 'package:exam_proctor/core/widgets/setup_required_page.dart';
-import 'package:exam_proctor/main.dart';
+import 'package:proctorguard/core/services/supabase_service.dart';
+import 'package:proctorguard/core/widgets/setup_required_page.dart';
+import 'package:proctorguard/main.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 

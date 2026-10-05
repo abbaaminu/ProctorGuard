@@ -2,15 +2,16 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:exam_proctor/core/services/mediapipe_proctoring_service.dart';
-import 'package:exam_proctor/core/services/offline_sync_service.dart';
-import 'package:exam_proctor/features/exam/domain/entities/exam.dart';
-import 'package:exam_proctor/features/exam/domain/entities/question.dart';
-import 'package:exam_proctor/features/exam/domain/entities/submission.dart';
-import 'package:exam_proctor/features/exam/domain/repositories/exam_repository.dart';
-import 'package:exam_proctor/features/proctoring/domain/entities/violation.dart';
-import 'package:exam_proctor/features/proctoring/domain/repositories/proctoring_repository.dart';
-import 'package:exam_proctor/features/proctoring/presentation/providers/proctoring_provider.dart';
+import 'package:proctorguard/core/services/mediapipe_proctoring_service.dart';
+import 'package:proctorguard/core/services/offline_sync_service.dart';
+import 'package:proctorguard/features/exam/domain/entities/exam.dart';
+import 'package:proctorguard/features/exam/domain/entities/question.dart';
+import 'package:proctorguard/features/exam/domain/entities/submission.dart';
+import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
+import 'package:proctorguard/features/proctoring/domain/entities/proctoring_risk.dart';
+import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
+import 'package:proctorguard/features/proctoring/domain/repositories/proctoring_repository.dart';
+import 'package:proctorguard/features/proctoring/presentation/providers/proctoring_provider.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Anti-cheating inputs that do not come from the camera: the kiosk escape
@@ -270,6 +271,75 @@ void main() {
 
       expect(notifier.state.disqualified, isFalse);
       expect(notifier.state.warningCount, 0);
+    });
+  });
+
+  group('risk index (end to end)', () {
+    test('the mix of signals drives the score, and the third strike ends it',
+        () async {
+      // The chain both consoles read from: a detector -> `_registerViolation` ->
+      // `state.violationTypes` -> `state.risk`, which is the same object the
+      // supervisor's grid and the student's own overlay render. Asserted here and
+      // not only on `ProctoringRisk` because the *join* is where a regression would
+      // hide: a signal that logged but never widened the evidence list would leave
+      // the index reading "Low risk · 0" while the strike count climbed.
+      const gap = Duration(milliseconds: 2200); // longer than the 2s debounce
+      final repo = _RecordingProctoringRepository();
+      final notifier = _notifier(proctoringRepo: repo);
+      addTearDown(notifier.dispose);
+
+      // Nothing logged yet: the one state that is not evidence of anything.
+      expect(identical(notifier.state.risk, ProctoringRisk.none), isTrue);
+      expect(notifier.state.risk.label, 'Low');
+
+      notifier.reportAppMinimized(); // strike 1, one signal
+      await pumpEventQueue();
+      expect(notifier.state.risk.strikes, 1);
+      expect(notifier.state.risk.distinctTypes, 1);
+      expect(notifier.state.risk.score, 20); // 1*20
+      expect(notifier.state.risk.label, 'Moderate');
+
+      await Future<void>.delayed(gap);
+      notifier.reportAudioNoise(); // strike 2, a *different* detector
+      await pumpEventQueue();
+      expect(notifier.state.risk.score, 50); // 2*20 + 1*10 for the mix
+      expect(notifier.state.risk.label, 'High');
+
+      await Future<void>.delayed(gap);
+      notifier.reportDevtoolsDetected(); // strike 3, and a severe one
+      await pumpEventQueue();
+
+      // 3*20 + 2*10 + 15*1. The third strike is always at least "High", and this
+      // is the very sentence the lockout overlay prints under the chip.
+      expect(notifier.state.risk.score, 95);
+      expect(notifier.state.risk.label, 'Critical');
+      expect(
+        notifier.state.risk.explanation,
+        '3 violations across 3 signals, 1 of them serious',
+      );
+      expect(notifier.state.disqualified, isTrue);
+    });
+
+    test('a server count with no local evidence still scores the session',
+        () async {
+      // A resumed attempt - or one whose violations were logged from another
+      // device - starts with an empty local evidence list and a non-zero server
+      // count. An index that read 0 there would be describing a different session.
+      final outbox = _FakeOutbox();
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        outbox: outbox,
+      );
+      addTearDown(notifier.dispose);
+
+      outbox.emitRuling(warningCount: 2);
+      await pumpEventQueue();
+
+      expect(notifier.state.violationTypes, isEmpty);
+      expect(notifier.state.risk.strikes, 2);
+      expect(notifier.state.risk.distinctTypes, 0); // no local mix to price
+      expect(notifier.state.risk.score, 40); // 2*20
+      expect(notifier.state.risk.label, 'Moderate');
     });
   });
 
