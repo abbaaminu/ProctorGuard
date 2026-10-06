@@ -22,8 +22,8 @@ jobs:
           # doing its job rather than a refused query - which is all this needs:
           # one statement actually executed against the database.
           RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X GET "${{ secrets.SUPABASE_URL }}/rest/v1/profiles?select=id&limit=1" \
-            -H "apikey: ${{ secrets.SUPABASE_KEY }}" \
-            -H "Authorization: Bearer ${{ secrets.SUPABASE_KEY }}")
+            -H "apikey: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}")
 
           # Separate the body and status code for debugging
           BODY=$(echo "$RESPONSE" | sed '/HTTP_STATUS:/d')
