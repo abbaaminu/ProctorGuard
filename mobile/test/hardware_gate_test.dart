@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:proctorguard/core/services/hardware_verification_service.dart';
+import 'package:proctorguard/core/services/web_camera_permission.dart';
 import 'package:proctorguard/features/exam/domain/entities/exam.dart';
 import 'package:proctorguard/features/exam/presentation/pages/exam_hardware_gate_page.dart';
 import 'package:flutter/material.dart';
@@ -301,6 +302,121 @@ void main() {
     }
   });
 
+  group('the web gate answers from the browser probe alone', () {
+    // On the web the probe *is* the evidence: one `getUserMedia({video, audio})`
+    // resolves only when the browser granted a real camera and a real
+    // microphone, which is the question the gate exists to ask. Opening a
+    // capture session behind it is also what Chromium answers with
+    // `NotReadableError` ("another app or tab is already using the camera") while
+    // it is still releasing the device `availableCameras()` just probed — the
+    // refusal students were getting on a perfectly working camera.
+    //
+    // The probe is injected, so this runs on the Dart VM: `isSupported` is the
+    // only thing that routes to the web branch, and everything below is the real
+    // `verify()`.
+
+    test('a granted camera and microphone verify both devices', () async {
+      final report = await DeviceHardwareVerifier(
+        browserProbe: const _FakeBrowserProbe(
+          WebCameraAccess(granted: true, video: true, audio: true),
+        ),
+      ).verify();
+
+      expect(report.isVerified, isTrue);
+      expect(report.hasFailed, isFalse);
+      expect(report.settingsHint, isFalse);
+      // Not a mock build: the browser really did hand over a camera and a
+      // microphone, so nothing here claims simulated hardware.
+      expect(report.mock, isFalse);
+    });
+
+    test('a refused browser grant blocks both rows, with the settings hint',
+        () async {
+      final report = await DeviceHardwareVerifier(
+        browserProbe: const _FakeBrowserProbe(WebCameraAccess.refused()),
+      ).verify();
+
+      expect(report.isVerified, isFalse);
+      expect(report.camera.hasFailed, isTrue);
+      expect(report.microphone.hasFailed, isTrue);
+      // The student has to change it in the browser's own site settings, which
+      // is what the hint is for.
+      expect(report.settingsHint, isTrue);
+    });
+
+    test('a camera with no microphone is reported as the microphone', () async {
+      final report = await DeviceHardwareVerifier(
+        browserProbe: const _FakeBrowserProbe(
+          WebCameraAccess(granted: true, video: true),
+        ),
+      ).verify();
+
+      expect(report.camera.isVerified, isTrue);
+      expect(
+        report.microphone.hasFailed,
+        isTrue,
+        reason: 'a laptop with a camera and no microphone must name the '
+            'microphone, not report the pair as one failure',
+      );
+      expect(report.isVerified, isFalse);
+      expect(report.blockingMessage, contains('Microphone'));
+    });
+
+    test('a microphone with no camera is reported as the camera', () async {
+      final report = await DeviceHardwareVerifier(
+        browserProbe: const _FakeBrowserProbe(
+          WebCameraAccess(granted: true, audio: true),
+        ),
+      ).verify();
+
+      expect(report.camera.hasFailed, isTrue);
+      expect(report.microphone.isVerified, isTrue);
+      expect(report.isVerified, isFalse);
+      expect(report.blockingMessage, contains('Camera'));
+    });
+  });
+
+  group('the retryable "device is in use" codes', () {
+    // The web session re-opens the camera once for exactly these (see
+    // `ExamTakingPage._openCamera`), so the set has to stay in step with the
+    // sentences `cameraFailureMessage` already produces.
+    test('covers every spelling of "the device is busy"', () {
+      for (final code in <String>[
+        'cameraNotReadable',
+        'NotReadableError',
+        'TrackStartError',
+        'cameraInUse',
+      ]) {
+        expect(isDeviceBusyCameraCode(code), isTrue, reason: code);
+        expect(
+          cameraFailureMessage(code),
+          'another app or tab is already using the camera',
+          reason: 'a retried code must still say what the student can act on',
+        );
+      }
+    });
+
+    test('never covers a refusal or a device that is not there', () {
+      for (final code in <String?>[
+        'cameraAccess',
+        'CameraAccessDenied',
+        'NotAllowedError',
+        'audioAccess',
+        'cameraNotFound',
+        'NotFoundError',
+        null,
+        '',
+      ]) {
+        expect(isDeviceBusyCameraCode(code), isFalse, reason: '$code');
+      }
+    });
+
+    test('the wait is short enough not to read as a hang', () {
+      expect(webCameraOpenRetryDelay, greaterThan(Duration.zero));
+      expect(webCameraOpenRetryDelay, lessThan(const Duration(seconds: 3)));
+    });
+  });
+
   test('the real verifier blocks instead of throwing when the platform has no '
       'camera plugin', () async {
     // No plugin is registered in a test run — the same shape as a device whose
@@ -347,4 +463,21 @@ class _PendingVerifier implements HardwareVerifier {
 
   @override
   Future<void> openSettings() async {}
+}
+
+/// Stands in for the browser probe, which only exists in a web build.
+///
+/// `isSupported` is what routes `DeviceHardwareVerifier` down the web branch, so
+/// setting it true is all it takes to exercise the real `_webReport` on the VM —
+/// no browser, no `navigator.mediaDevices`, no camera plugin.
+class _FakeBrowserProbe implements WebCameraPermission {
+  const _FakeBrowserProbe(this.access);
+
+  final WebCameraAccess access;
+
+  @override
+  bool get isSupported => true;
+
+  @override
+  Future<WebCameraAccess> probe({bool audio = true}) async => access;
 }

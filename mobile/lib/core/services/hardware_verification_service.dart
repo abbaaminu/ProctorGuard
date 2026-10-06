@@ -157,7 +157,8 @@ String cameraFailureMessage(String? code) => switch (code) {
       'cameraAccess' || 'CameraAccessDenied' || 'NotAllowedError' =>
         'camera access was refused',
       'audioAccess' || 'AudioAccessDenied' => 'microphone access was refused',
-      'cameraNotReadable' || 'NotReadableError' || 'cameraInUse' =>
+      'cameraNotReadable' || 'NotReadableError' || 'TrackStartError' ||
+      'cameraInUse' =>
         'another app or tab is already using the camera',
       'cameraNotFound' || 'NotFoundError' => 'no camera was found',
       'cameraNotSupported' || 'NotSupportedError' =>
@@ -169,6 +170,39 @@ String cameraFailureMessage(String? code) => switch (code) {
 /// gate can point at the microphone row instead of the camera row.
 bool cameraFailureIsAudio(String? code) =>
     code == 'audioAccess' || code == 'AudioAccessDenied';
+
+/// True when a camera-plugin error code means the device is momentarily *held*
+/// rather than broken.
+///
+/// The codes are the same ones [cameraFailureMessage] words as "another app or
+/// tab is already using the camera": `camera_web` raises
+/// `CameraWebException` → `CameraException('cameraNotReadable', …)` for the
+/// DOMException `NotReadableError` / `TrackStartError` (or the raw `name`,
+/// depending on which layer rewrote it), and the native plugins have their own
+/// `cameraInUse` spelling.
+///
+/// This is worth its own name because a *busy* device is retryable while a
+/// *broken* one is not: on the web Chromium answers the open that follows
+/// `availableCameras()` with `NotReadableError` while it is still releasing the
+/// device that enumeration just probed, and the next attempt a moment later
+/// succeeds. The exam screen uses this to retry exactly that case once (see
+/// `ExamTakingPage._openCamera`).
+bool isDeviceBusyCameraCode(String? code) =>
+    code == 'cameraNotReadable' ||
+    code == 'NotReadableError' ||
+    code == 'TrackStartError' ||
+    code == 'cameraInUse';
+
+/// How long the exam screen waits before re-opening a camera the browser
+/// reported as still in use.
+///
+/// Long enough for the engine to finish tearing down the stream it was
+/// replacing (Chromium's own release is a frame or two of work, but a slow
+/// Android WebView or a Bluetooth headset's audio endpoint can take longer),
+/// and short enough that a student never reads it as a frozen start. Only used
+/// for [isDeviceBusyCameraCode] — a refusal or a missing device is final and is
+/// reported at once.
+const Duration webCameraOpenRetryDelay = Duration(milliseconds: 700);
 
 /// The pixel format ML Kit can consume, per platform.
 ///
@@ -191,10 +225,17 @@ ImageFormatGroup proctorImageFormatGroup() {
 /// and it is the session that decides. Opening the camera with `enableAudio`
 /// covers the microphone in the same step: on Android the plugin asks for
 /// `RECORD_AUDIO` as part of the session and reports `audioAccess` when the
-/// student refuses, and on the web `getUserMedia({video, audio})` rejects unless
-/// both are granted. That, plus the permission status, is what "verified" means
+/// student refuses. That, plus the permission status, is what "verified" means
 /// here — the session is released again immediately, because the exam screen
 /// opens its own for the duration of the attempt.
+///
+/// The **web** takes the other branch on purpose. There is no camera plugin
+/// status to read and no session worth opening (see [_webReport]): the one
+/// `getUserMedia({video, audio})` the browser probe makes resolves only when a
+/// real camera *and* a real microphone were granted, which is exactly the
+/// question this class exists to answer — and it is also the only way to ask it
+/// without the second open that Chromium reports as "another app or tab is
+/// already using the camera".
 class DeviceHardwareVerifier implements HardwareVerifier {
   DeviceHardwareVerifier({
     PermissionService? permissions,
@@ -251,17 +292,11 @@ class DeviceHardwareVerifier implements HardwareVerifier {
       return _fromDeniedPermissions(permissions.denied);
     }
 
-    // Web only: one getUserMedia call, which both prompts for the grant and
-    // unlocks device enumeration (camera_web drops devices without a deviceId,
-    // which is exactly what an ungranted browser reports).
-    if (_browserProbe.isSupported && !await _browserProbe.ensureAccess()) {
-      return const HardwareReport(
-        camera: DeviceProbe.failed(ProbeDevice.camera,
-            'The browser refused camera access for this site.'),
-        microphone: DeviceProbe.failed(ProbeDevice.microphone,
-            'The browser refused microphone access for this site.'),
-        settingsHint: true,
-      );
+    // Web: the browser's own answer is the whole verdict, and one
+    // `getUserMedia` call is what produces it — see [_webReport] for why no
+    // capture session is opened behind it here.
+    if (_browserProbe.isSupported) {
+      return _webReport(await _browserProbe.probe());
     }
 
     final List<CameraDescription> cameras;
@@ -333,6 +368,62 @@ class DeviceHardwareVerifier implements HardwareVerifier {
 
   @override
   Future<void> openSettings() => _permissions.openSettings();
+
+  /// The web verdict, built from the browser's own `getUserMedia` answer.
+  ///
+  /// There is deliberately no capture session behind this. On the web
+  /// `availableCameras()` already opens (and immediately stops) a stream per
+  /// device, and Chromium answers an `initialize()` that follows it with
+  /// `NotReadableError` — the "another app or tab is already using the camera"
+  /// row students were seeing — because the device it just enumerated has not
+  /// finished being released. Opening a third session on the gate bought
+  /// nothing: a resolved `getUserMedia({video, audio})` is the browser's own
+  /// statement that a real camera **and** a real microphone were granted, it is
+  /// the same answer the exam screen's session then confirms for real, and the
+  /// web is the one platform where the gate could not turn that stream into
+  /// face detection anyway. Fewer opens also means the microphone row is now
+  /// reported from the same grant as the camera row, instead of being inferred
+  /// from a camera session that may never have started.
+  HardwareReport _webReport(WebCameraAccess access) {
+    if (!access.granted) {
+      return const HardwareReport(
+        camera: DeviceProbe.failed(ProbeDevice.camera,
+            'The browser refused camera access for this site.'),
+        microphone: DeviceProbe.failed(ProbeDevice.microphone,
+            'The browser refused microphone access for this site.'),
+        settingsHint: true,
+      );
+    }
+
+    // One half arrived and the other did not: name the missing one rather than
+    // reporting the pair as one failure, so the student knows what to plug in or
+    // un-mute. This is how a laptop with a camera and no microphone reads.
+    if (!access.video || !access.audio) {
+      return HardwareReport(
+        camera: access.video
+            ? const DeviceProbe.verified(ProbeDevice.camera,
+                message: 'Live video is streaming.')
+            : const DeviceProbe.failed(ProbeDevice.camera,
+                'The browser granted access but no camera answered. '
+                'Check that a camera is connected and not hidden behind a '
+                'closed lid.'),
+        microphone: access.audio
+            ? const DeviceProbe.verified(ProbeDevice.microphone,
+                message: 'The recording session is open.')
+            : const DeviceProbe.failed(ProbeDevice.microphone,
+                'The browser granted access but no microphone answered. '
+                'Check that one is connected and selected.'),
+        settingsHint: true,
+      );
+    }
+
+    return const HardwareReport(
+      camera: DeviceProbe.verified(ProbeDevice.camera,
+          message: 'Live video is streaming.'),
+      microphone: DeviceProbe.verified(ProbeDevice.microphone,
+          message: 'The recording session is open.'),
+    );
+  }
 
   /// One refused permission is enough to block, and the report names it.
   HardwareReport _fromDeniedPermissions(List<StartupPermission> denied) {

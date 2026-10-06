@@ -19,7 +19,7 @@ class BrowserWebCameraPermission implements WebCameraPermission {
   bool get isSupported => true;
 
   @override
-  Future<bool> ensureAccess({bool audio = true}) async {
+  Future<WebCameraAccess> probe({bool audio = true}) async {
     try {
       final stream = await web.window.navigator.mediaDevices
           .getUserMedia(
@@ -30,6 +30,13 @@ class BrowserWebCameraPermission implements WebCameraPermission {
           )
           .toDart;
 
+      // Read the track lists *before* releasing them. A stopped track is gone
+      // from the stream's own view of itself on some engines, and "did the
+      // browser hand back a camera and a microphone" has to be answered from
+      // what arrived, not from what is left after the cleanup below.
+      final video = stream.getVideoTracks().toDart.isNotEmpty;
+      final captured = stream.getAudioTracks().toDart.isNotEmpty;
+
       // Release the probe immediately: the exam's own CameraController opens the
       // stream that is actually recorded, and holding a second one would keep
       // the capture LED on and can make the real request fail with "device in
@@ -37,13 +44,14 @@ class BrowserWebCameraPermission implements WebCameraPermission {
       for (final track in stream.getTracks().toDart) {
         track.stop();
       }
-      return true;
+
+      return WebCameraAccess(granted: true, video: video, audio: captured);
     } catch (error) {
       // NotAllowedError (denied / dismissed), NotFoundError (no device),
       // SecurityError (insecure origin such as http://<lan-ip>), or
       // `navigator.mediaDevices` being undefined on a non-secure context.
       proctorLog('WebCameraPermission: camera/microphone probe refused: $error');
-      return false;
+      return const WebCameraAccess.refused();
     }
   }
 }

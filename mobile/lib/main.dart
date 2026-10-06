@@ -7,6 +7,7 @@ import 'core/services/lockdown_bootstrap.dart';
 import 'core/services/permission_service.dart';
 import 'core/services/supabase_service.dart';
 import 'core/utils/proctor_log.dart';
+import 'core/widgets/refresh_on_resume.dart';
 import 'core/widgets/setup_required_page.dart';
 import 'features/admin/data/repositories/admin_user_repository_impl.dart';
 import 'features/admin/presentation/providers/admin_providers.dart';
@@ -126,7 +127,11 @@ class ExamProctorApp extends StatelessWidget {
       // staff console. Swap in go_router config when deep links matter —
       // every page takes plain constructor args.
       home: supabaseStatus == SupabaseInitStatus.ready
-          ? const RoleGate()
+          // Wrapped so coming back to the app re-reads the shared lists
+          // (published exams, the roster, authored papers, analytics) instead of
+          // serving whatever they cached when they were first opened — see
+          // [RefreshOnResume].
+          ? const RefreshOnResume(child: RoleGate())
           : SetupRequiredPage(
               status: supabaseStatus,
               detail: service.initError,

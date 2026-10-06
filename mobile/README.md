@@ -361,7 +361,8 @@ router today. Once `SupabaseService.signedInChanges` reports a session it:
    not load your profile" for a row that is about to arrive — after 1.5s the
    loading screen only adds a "Still trying…" hint so it does not look frozen.
    Only a row that is *still* absent after the window, a refused read, or an
-   unrecognised role becomes the retryable error below;
+   unrecognised role becomes the retryable error below — and a row that is still
+   absent is first given back (see "A missing profile row is given back");
 3. routes on the four values of the `public.user_role` enum:
    * `student` → `StudentExamPortalPage`
    * `lecturer` → `LecturerConsolePage` — the authoring and marking console for
@@ -369,6 +370,59 @@ router today. Once `SupabaseService.signedInChanges` reports a session it:
      is one tap away in its app bar
    * `supervisor` → `SupervisorExamPickerPage`
    * `admin` → `AdminDashboardPage`
+
+### A missing profile row is given back
+
+`ProfileRepositoryImpl.getProfile` does not stop at reporting the absence. Once
+every read in the window has found nothing it performs the one insert
+`profiles_insert_self_student` authorises — **its own** id (`id = auth.uid()`) with
+`role = 'student'`, and the name from the session's `user_metadata` (or the address
+when there is none) — and then reads the row back. An account created outside the
+app's own provisioning (by hand in the Supabase dashboard, or a seed whose
+`profiles` rows carry different ids) signs in perfectly well and then had nothing
+for that read to find, which is the "We could not load your profile — this account
+has no profile row yet" screen students were stuck on at *every* sign-in.
+
+The repair is deliberately the narrowest one that works:
+
+* it only runs once every read has failed, never alongside one;
+* it only runs when the session can name the account — with no session there is
+  nothing to write *about*, and the caller gets the same retryable message as
+  before;
+* it can never mint a staff login: the policy's `with check (role = 'student')`
+  refuses any other role, and the client sends nothing else;
+* it is best-effort — a refusal, a duplicate key or a dropped connection is logged
+  and left to the re-read, because a repair failing must still end on the honest
+  "ask your administrator" screen rather than a new crash.
+
+Every supported way of creating a staff account (`admin-create-user`, `seed.sql`,
+the SQL editor) writes the `profiles` row together with the account, so a staff
+login never reaches this path. An account hand-created in the Auth dashboard that
+*should* have been staff lands here as a student — the one case an administrator
+then fixes by setting the role, which `profiles_admin_all` allows.
+
+`userProfileProvider` is also `autoDispose`: signing out drops the family entry, so
+the next sign-in reads `profiles` again instead of being handed the previous answer
+— including the previous *error*, which used to make a transient failure look
+permanent until somebody pressed Try again.
+
+### Coming back to the app re-reads the shared lists
+
+`main.dart` wraps the router in `RefreshOnResume`
+(`lib/core/widgets/refresh_on_resume.dart`). The shared lists — published exams,
+the admin roster, the lecturer's own papers and the analytics report — are plain
+`FutureProvider`s that keep their first answer, which is what makes a second visit
+instant and also why a change made elsewhere (a paper published from a laptop, an
+account an administrator created) stayed invisible until the refresh button was
+found. A resume is the moment the user is entitled to expect "now", so that is when
+those answers are dropped. It is deliberately the *only* lifecycle event that does
+it: the permission dialog, the camera prompt and the notification shade all pass
+through `inactive`, and re-reading four lists for each of those would be noise. The
+same reasoning is why the list providers are `autoDispose` (reopening a screen
+reads again) and why the student portal and the supervisor picker invalidate the
+exam list themselves when they come back from a session or a monitor.
+`mobile/test/refresh_on_resume_test.dart` drives the real `flutter/lifecycle`
+messages through the binding, so the rule is pinned without a device.
 
 Lecturers and supervisors share `is_staff()` in the database, which is what lets
 both read every attempt on the monitor roster
@@ -764,9 +818,28 @@ Details worth knowing:
   reports *before* the camera grant — so `availableCameras()` legitimately
   returns an empty list on a page that has never been granted access, and a
   session used to conclude "no camera" and show the crossed-out placeholder.
-  `WebCameraPermission` now runs one `getUserMedia` probe (releasing the probe
-  tracks immediately) and the enumeration is retried, so the browser's own
-  prompt appears instead.
+  `WebCameraPermission.probe` now runs one `getUserMedia` (releasing the probe
+  tracks immediately) and reports *which* devices came back, and the enumeration
+  is retried, so the browser's own prompt appears instead. The **gate** answers
+  from that same probe rather than opening a capture session of its own: opening
+  one is what Chromium reports as `NotReadableError` — "another app or tab is
+  already using the camera" — while it is still releasing the device
+  `availableCameras()` just probed, and it bought nothing the probe had not
+  already proved (on the web there is no ML Kit to feed, and the session the exam
+  screen opens is the one that records). Fewer opens also means the checklist's
+  microphone row is reported from the same grant as the camera row instead of
+  being inferred from a session that may never have started.
+* **Raw camera frames only exist where the platform offers them.** The exam
+  screen asks `CameraPlatform.instance.supportsImageStreaming()` before calling
+  `startImageStream`: `camera_android_camerax` and `camera_avfoundation` answer
+  true, `camera_web` answers false — and calling it anyway threw
+  `UnimplementedError`, which is the "Proctoring could not start on this device"
+  screen a browser student used to get on a perfectly working camera. The preview
+  and the still-frame evidence are unaffected; what the web cannot do is pick a
+  face out of the feed, which the gate says out loud before the paper starts. A
+  camera the browser reports as **still in use** is re-opened once, after
+  `webCameraOpenRetryDelay`, because that one is a timing failure rather than a
+  broken device (`isDeviceBusyCameraCode` names the codes it covers).
 * **Answers are painted locally and saved through the RPCs.** The tap is durable
   on the device first (`OfflineSyncService`), so the round-trip to Supabase is off
   the critical path and a dropped connection no longer costs the answer — the

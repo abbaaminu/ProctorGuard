@@ -70,6 +70,15 @@ per paper, what the device check requires). See
 [mobile/README.md](./mobile/README.md), "Pre-exam instructions (the proctor guide
 and the exam rules)".
 
+Two things save a student a support call. If the signed-in account has no
+`profiles` row at all — one created by hand in the Auth dashboard, or a seed whose
+rows carry different ids — the app now writes the account its **own** `student` row
+(the only insert `profiles_insert_self_student` authorises) and signs in, instead
+of showing "we could not load your profile" at every attempt. And returning to the
+app re-reads the shared lists (published exams, the roster, the lecturer's papers,
+analytics), so a change made elsewhere appears without hunting for a refresh
+button. See [mobile/README.md](./mobile/README.md), "Role routing (post-login)".
+
 ## Proctoring boundaries and risk register
 
 ProctorGuard is a **signal, not a proof**. The detectors below establish
@@ -103,7 +112,14 @@ rather than left to be mistaken for more than it is.
   (HTML5 fullscreen plus tab/blur detection) instead.
 - **No on-device AI on the web.** There is no ML Kit for browsers, so a web
   session runs the browser guards and audio level only (or an explicit
-  mock/simulated session), with no face signals.
+  mock/simulated session), with no face signals. The browser is otherwise a fully
+  supported host: the device check accepts a granted `getUserMedia` as proof of a
+  real camera *and* microphone (with no second capture session of its own — that is
+  what Chromium reports as "another app or tab is already using the camera"), and
+  the session asks `CameraPlatform.instance.supportsImageStreaming()` before
+  `startImageStream`, because `camera_web` has no image stream to offer. Raw frames
+  and face signals are the only things missing; the preview, the still-frame
+  evidence and every browser guard are the same code path as the phone build.
 
 **Risk register**
 

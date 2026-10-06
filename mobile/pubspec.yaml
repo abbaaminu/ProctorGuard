@@ -25,6 +25,13 @@ dependencies:
 
   # Camera / on-device AI
   camera: ^0.12.1
+  # The camera plugin's platform interface, imported directly for
+  # `CameraPlatform.instance.supportsImageStreaming()`. That one question is what
+  # tells a platform that can hand over `CameraImage` frames (android, ios) apart
+  # from one that cannot (web) — which is what decides whether the exam screen may
+  # call `startImageStream` at all. Already a transitive dependency of `camera`;
+  # named here because this package imports it.
+  camera_platform_interface: ^2.13.1
   google_mlkit_face_detection: ^0.15.1
 
   # Microphone: audio loudness (dBFS) monitoring

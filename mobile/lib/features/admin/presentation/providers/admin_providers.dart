@@ -19,8 +19,12 @@ final adminUserRepositoryProvider = Provider<AdminUserRepository>(
 
 /// Every account the signed-in admin may see (`profiles_select_own_or_staff`
 /// scopes the rows server-side). Invalidate it to refetch — after creating an
-/// account, after re-roling one, or from the refresh button.
-final managedAccountsProvider = FutureProvider<List<ManagedAccount>>(
+/// account, after re-roling one, from the refresh button, and when the app comes
+/// back to the foreground (`RefreshOnResume`).
+///
+/// `autoDispose`, so reopening the dashboard reads the roster again instead of
+/// showing the copy it cached the first time.
+final managedAccountsProvider = FutureProvider.autoDispose<List<ManagedAccount>>(
   (ref) => ref.watch(adminUserRepositoryProvider).listAccounts(),
 );
 

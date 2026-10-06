@@ -146,7 +146,13 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
                 ),
         ),
       );
-      if (!mounted || result == null) return;
+      if (!mounted) return;
+      // The attempt just changed this student's state on a paper in the list (an
+      // `ongoing` attempt became `submitted`, or was closed as disqualified), so
+      // the cached list is stale the moment the session screen pops — refetch it
+      // rather than leaving the student to press refresh.
+      ref.invalidate(publishedExamsProvider);
+      if (result == null) return; // backed out without closing the attempt
       _showResult(exam, result);
     } catch (_) {
       if (mounted) {

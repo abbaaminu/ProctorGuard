@@ -37,6 +37,15 @@ class _ScriptedTransport extends http.BaseClient {
   /// refusal.
   int statusCode = 200;
 
+  /// Methods to answer with [refusalStatus] instead of [statusCode]: lets a test
+  /// refuse the `POST` an insert makes while leaving the reads alone, which is
+  /// how "the repair was refused but the reads still worked" is expressed
+  /// without a second transport.
+  final Set<String> refusedMethods = <String>{};
+
+  /// Status a [refusedMethods] request carries.
+  int refusalStatus = 403;
+
   final List<http.BaseRequest> requests = <http.BaseRequest>[];
 
   @override
@@ -49,7 +58,7 @@ class _ScriptedTransport extends http.BaseClient {
           _replies[index < _replies.length ? index : _replies.length - 1],
         ),
       ),
-      statusCode,
+      refusedMethods.contains(request.method) ? refusalStatus : statusCode,
       headers: const <String, String>{'content-type': 'application/json'},
       request: request,
     );
@@ -94,6 +103,7 @@ void main() {
   ProfileRepositoryImpl repository({
     List<Duration>? retryDelays,
     Future<void> Function(Duration)? wait,
+    ProfileIdentityReader? currentIdentity,
   }) =>
       ProfileRepositoryImpl(
         SupabaseClient(
@@ -103,6 +113,7 @@ void main() {
         ),
         retryDelays: retryDelays ?? ProfileRepositoryImpl.defaultRetryDelays,
         wait: wait ?? (duration) async {},
+        currentIdentity: currentIdentity,
       );
 
   group('a row that is there', () {
@@ -294,6 +305,179 @@ void main() {
       expect(
         repository().retryDelays,
         same(ProfileRepositoryImpl.defaultRetryDelays),
+      );
+    });
+  });
+
+  group('giving a missing row back (self-provisioning)', () {
+    // An account the app's own provisioning never wrote a row for — created by
+    // hand in the Supabase dashboard, or a seed whose `profiles` rows carry
+    // different ids — signs in perfectly well and then has nothing for the read
+    // to find. Reporting that absence on every sign-in is what students were
+    // stuck on, so the repository now performs the one insert
+    // `profiles_insert_self_student` authorises (its own id, `role = 'student'`)
+    // and reads the row back.
+    //
+    // The identity a real reader gets from `auth.currentUser` is injected here,
+    // because a unit test cannot mint a GoTrue session.
+
+    const identity = ProfileIdentity(
+      id: _userId,
+      email: 'aisha.bello@proctor.test',
+      fullName: 'Aisha Bello',
+    );
+
+    /// How many looks the look-window makes: one immediate, then one per delay.
+    /// Read back from the schedule rather than copied, so the request indices
+    /// below cannot drift from it.
+    final looks = ProfileRepositoryImpl.defaultRetryDelays.length + 1;
+
+    /// Every look answers "no row"; the insert's own response carries no body
+    /// (PostgREST returns none without `.select()`); the read-back finds the row
+    /// the insert created. That is the whole shape of the repair.
+    List<String> missingThenCreated() => <String>[
+          '[]', '[]', '[]', '[]', // the look-window
+          '[]', // the insert
+          profileRow(),
+        ];
+
+    test('creates the account its own student row, then signs it in', () async {
+      transport = _ScriptedTransport(missingThenCreated());
+
+      final profile = await repository(
+        currentIdentity: () => identity,
+      ).getProfile(_userId);
+
+      expect(profile.id, _userId);
+      expect(profile.role, UserRole.student);
+      expect(profile.displayName, 'Aisha Bello');
+      expect(profile.isStaff, isFalse);
+
+      // Four looks, one insert, one read-back — in that order.
+      expect(transport.requests.length, looks + 2);
+
+      final insert = transport.requests[looks] as http.Request;
+      expect(insert.method, 'POST');
+      expect(insert.url.path, '/rest/v1/profiles');
+      // The row is *the caller's own*, and only ever a student row: the policy's
+      // `with check (id = auth.uid() and role = 'student')` is the reason this
+      // cannot become a way to mint a staff login.
+      expect(insert.body, contains('"id":"$_userId"'));
+      expect(insert.body, contains('"role":"student"'));
+      expect(insert.body, contains('aisha.bello@proctor.test'));
+      expect(insert.body, contains('Aisha Bello'));
+
+      // The read that follows is the same one the gate always made, so the role
+      // that routes the account is read from the database rather than assumed.
+      final reread = transport.requests.last;
+      expect(reread.method, 'GET');
+      expect(reread.url.queryParameters['id'], 'eq.$_userId');
+    });
+
+    test('falls back to the address when the session has no name', () async {
+      transport = _ScriptedTransport(missingThenCreated());
+
+      await repository(
+        currentIdentity: () =>
+            const ProfileIdentity(id: _userId, email: 'aisha@proctor.test'),
+      ).getProfile(_userId);
+
+      final insert = transport.requests[looks] as http.Request;
+      // `profiles.full_name` is NOT NULL, so the address is the honest stand-in
+      // for a name the session never carried.
+      expect(insert.body, contains('"full_name":"aisha@proctor.test"'));
+    });
+
+    test('a refused insert is logged, and the sentence is unchanged', () async {
+      // The reads work (200, no row); the write is refused — RLS, a duplicate
+      // email, or a dropped connection. None of that may turn a repair that
+      // could not happen into a second, worse failure.
+      transport = _ScriptedTransport(<String>['[]'])
+        ..refusedMethods.add('POST');
+
+      await expectLater(
+        repository(currentIdentity: () => identity).getProfile(_userId),
+        throwsA(
+          isA<ProfileLookupException>().having(
+            (error) => error.message,
+            'message',
+            contains('no profile row yet'),
+          ),
+        ),
+      );
+
+      expect(transport.requests.length, looks + 2);
+      expect(transport.requests[looks].method, 'POST');
+    });
+
+    test('a repair with no session behind it is never attempted', () async {
+      // No identity: nothing to build a row from, and a row about somebody else
+      // is exactly what must not be written. Four looks and the honest sentence,
+      // unchanged from before this behaviour existed.
+      transport = _ScriptedTransport(<String>['[]']);
+
+      await expectLater(
+        repository().getProfile(_userId),
+        throwsA(isA<ProfileLookupException>()),
+      );
+
+      expect(transport.requests.length, looks);
+      expect(
+        transport.requests.every((request) => request.method == 'GET'),
+        isTrue,
+      );
+    });
+
+    test('an identity that is not the caller is never written', () async {
+      transport = _ScriptedTransport(<String>['[]']);
+
+      await expectLater(
+        repository(
+          currentIdentity: () => const ProfileIdentity(
+            id: '99999999-9999-4999-8999-999999999999',
+            email: 'somebody.else@proctor.test',
+          ),
+        ).getProfile(_userId),
+        throwsA(isA<ProfileLookupException>()),
+      );
+
+      expect(transport.requests.length, looks);
+      expect(
+        transport.requests.every((request) => request.method == 'GET'),
+        isTrue,
+        reason: 'a row keyed by another account is not this caller to create',
+      );
+    });
+
+    test('an identity with no address is not enough to build a row', () async {
+      transport = _ScriptedTransport(<String>['[]']);
+
+      await expectLater(
+        repository(
+          currentIdentity: () =>
+              const ProfileIdentity(id: _userId, email: '   '),
+        ).getProfile(_userId),
+        throwsA(isA<ProfileLookupException>()),
+      );
+
+      expect(transport.requests.length, looks);
+    });
+
+    test('a row that arrives during the window is still just a read', () async {
+      // The trigger landing late: the third look finds the row, so the repair
+      // never runs at all. This is the "nothing changed for a normal account"
+      // half of the contract.
+      transport = _ScriptedTransport(<String>['[]', '[]', profileRow()]);
+
+      final profile = await repository(
+        currentIdentity: () => identity,
+      ).getProfile(_userId);
+
+      expect(profile.role, UserRole.student);
+      expect(transport.requests.length, 3);
+      expect(
+        transport.requests.every((request) => request.method == 'GET'),
+        isTrue,
       );
     });
   });

@@ -23,14 +23,19 @@ final questionAuthoringRepositoryProvider =
 ///
 /// Invalidate after anything that changes the list *or* the counts on it —
 /// creating a paper, publishing one, authoring a question (the tile counts
-/// questions), or deleting either.
-final myAuthoredExamsProvider = FutureProvider<List<AuthoredExam>>(
+/// questions), or deleting either. The console also does that for itself when it
+/// returns from a paper's question or marking screen, and `RefreshOnResume` does
+/// it when the app comes back to the foreground.
+///
+/// `autoDispose`, so reopening the console reads the papers again rather than
+/// showing the copy it cached the first time.
+final myAuthoredExamsProvider = FutureProvider.autoDispose<List<AuthoredExam>>(
   (ref) => ref.watch(questionAuthoringRepositoryProvider).listMyExams(),
 );
 
 /// One paper's questions, answer keys included. Invalidate after every edit.
 final examQuestionsProvider =
-    FutureProvider.family<List<AuthoredQuestion>, String>(
+    FutureProvider.autoDispose.family<List<AuthoredQuestion>, String>(
   (ref, examId) =>
       ref.watch(questionAuthoringRepositoryProvider).listQuestions(examId),
 );
@@ -39,7 +44,7 @@ final examQuestionsProvider =
 /// the grading screen can render it without a second read. Invalidate after
 /// saving marks.
 final examAttemptsProvider =
-    FutureProvider.family<List<AttemptGrading>, String>(
+    FutureProvider.autoDispose.family<List<AttemptGrading>, String>(
   (ref, examId) =>
       ref.watch(questionAuthoringRepositoryProvider).listAttempts(examId),
 );

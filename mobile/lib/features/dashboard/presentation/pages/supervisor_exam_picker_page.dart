@@ -36,8 +36,8 @@ class SupervisorExamPickerPage extends ConsumerStatefulWidget {
 
 class _SupervisorExamPickerPageState
     extends ConsumerState<SupervisorExamPickerPage> {
-  void _openMonitor(Exam exam) {
-    Navigator.of(context).push(
+  Future<void> _openMonitor(Exam exam) async {
+    await Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => SupervisorDashboardPage(
           examId: exam.id,
@@ -46,6 +46,10 @@ class _SupervisorExamPickerPageState
         ),
       ),
     );
+    // A sitting watched and left is not a sitting unchanged: an attempt may have
+    // been reset, or a paper published while the monitor was open. Refetch the
+    // list on the way back instead of leaving it to the refresh button.
+    if (mounted) ref.invalidate(publishedExamsProvider);
   }
 
   @override

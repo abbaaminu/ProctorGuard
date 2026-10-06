@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
+import 'package:camera_platform_interface/camera_platform_interface.dart'
+    show CameraPlatform;
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, kIsWeb;
 // Only the binding is taken from here: the pointer *events* this page forwards
@@ -388,25 +390,11 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       (c) => c.lensDirection == CameraLensDirection.front,
       orElse: () => cameras.first,
     );
-    _cameraController = CameraController(
-      front,
-      ResolutionPreset.low,
-      // The camera is the camera: video frames for face detection, plus the
-      // occasional still as violation evidence. Nothing here records sound.
-      //
-      // Audio proctoring owns the microphone through its own capture session
-      // (`AudioMonitor` -> `record`), so a `CameraController` that claims the
-      // microphone too is competing with it for the input device - and where the
-      // OS hands the microphone to one client at a time, the second capture fails
-      // to open and audio proctoring sits in "Mic unavailable" for the whole
-      // attempt. The mic is opened by the session, not by the lens.
-      enableAudio: false,
-      imageFormatGroup: proctorImageFormatGroup(),
-    );
+
     // Every step below can fail on a real device, so the whole capture pipeline
     // reports itself instead of throwing.
     try {
-      await _cameraController!.initialize();
+      _cameraController = await _openCamera(front);
       // Watch the controller so a mid-session failure pauses proctoring and
       // prompts the student rather than letting the engine read a dead feed as
       // "no face".
@@ -418,13 +406,33 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       // Violation evidence: the notifier pulls a still frame from here whenever it
       // logs something, then uploads it to the proctor-snapshots bucket.
       notifier.attachSnapshotSource(_captureSnapshot);
-      await _cameraController!.startImageStream((image) {
-        notifier.engineOnFrame(
-          image,
-          deviceOrientation: _cameraController!.value.deviceOrientation,
+
+      // Raw frames only exist where the platform offers them. The browser does
+      // not: `camera_web` implements neither `onStreamedFrameAvailable` nor
+      // `supportsImageStreaming`, so `startImageStream` used to throw
+      // `UnimplementedError` and send a web student straight to "Proctoring
+      // could not start on this device" with a camera that was working. Asking
+      // the platform is the provider-agnostic way to tell the two apart; the
+      // preview and the still-frame evidence work on every platform either way.
+      if (CameraPlatform.instance.supportsImageStreaming()) {
+        await _cameraController!.startImageStream((image) {
+          notifier.engineOnFrame(
+            image,
+            deviceOrientation: _cameraController!.value.deviceOrientation,
+          );
+        });
+      } else {
+        proctorLog(
+          'ProctorGuard: this platform has no camera image stream — on-device '
+          'face detection is inactive for this attempt (see the gate\'s platform '
+          'note).',
         );
-      });
-      // Frames are flowing: hand camera-derived tracking to the engine.
+      }
+
+      // Frames are flowing where there are frames to flow: hand camera-derived
+      // tracking to the engine. On a platform with no image stream this only
+      // arms the gate the exam chrome reads — no signal can arrive from it, and
+      // the student was told so before the paper started.
       _setCameraStreaming(true);
     } on CameraException catch (error) {
       _failStart(
@@ -477,6 +485,68 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     }
     if (!mounted) return;
     _session.failStart(message, offerSettings: offerSettings);
+  }
+
+  /// Opens the capture session for [lens], riding out the one transient the
+  /// browser raises when a device was enumerated a moment ago.
+  ///
+  /// `camera_web`'s `availableCameras()` opens (and immediately stops) a stream
+  /// per device, and Chromium answers the `getUserMedia` that follows with
+  /// `NotReadableError` — the "another app or tab is already using the camera"
+  /// the plugin reports as `cameraNotReadable` — while it is still releasing the
+  /// device enumeration probed. That is a *timing* failure, not a broken device,
+  /// so one re-open on a fresh controller after [webCameraOpenRetryDelay] is the
+  /// whole fix. Scoped to that code and to the web: everywhere else the first
+  /// failure is the real answer, and a retry would only delay the message the
+  /// student needs.
+  Future<CameraController> _openCamera(CameraDescription lens) async {
+    // The camera is the camera: video frames for face detection, plus the
+    // occasional still as violation evidence. Nothing here records sound.
+    //
+    // Audio proctoring owns the microphone through its own capture session
+    // (`AudioMonitor` -> `record`), so a `CameraController` that claims the
+    // microphone too is competing with it for the input device - and where the
+    // OS hands the microphone to one client at a time, the second capture fails
+    // to open and audio proctoring sits in "Mic unavailable" for the whole
+    // attempt. The mic is opened by the session, not by the lens.
+    CameraController build() => CameraController(
+          lens,
+          ResolutionPreset.low,
+          enableAudio: false,
+          imageFormatGroup: proctorImageFormatGroup(),
+        );
+
+    final first = build();
+    try {
+      await first.initialize();
+      return first;
+    } catch (error) {
+      // Released either way: a controller whose start failed still holds the
+      // camera id it was handed, and dropping it is what lets the retry below
+      // open the lens at all.
+      await _releaseCamera(first);
+
+      if (error is! CameraException ||
+          !kIsWeb ||
+          !isDeviceBusyCameraCode(error.code)) {
+        rethrow;
+      }
+
+      proctorLog(
+        'ProctorGuard: the camera was still in use (${error.code}) — retrying '
+        'once after the device has been released.',
+      );
+      await Future<void>.delayed(webCameraOpenRetryDelay);
+
+      final second = build();
+      try {
+        await second.initialize();
+        return second;
+      } catch (_) {
+        await _releaseCamera(second);
+        rethrow;
+      }
+    }
   }
 
   /// Releases one capture session: stop the frames, then dispose the controller.
@@ -618,7 +688,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     proctorLog(
       'ProctorGuard: no camera visible yet — asking the browser for access.',
     );
-    if (!await probe.ensureAccess()) return cameras;
+    if (!(await probe.probe()).granted) return cameras;
 
     return availableCameras();
   }

@@ -10,7 +10,13 @@ final dashboardRepositoryProvider = Provider<DashboardRepository>(
   ),
 );
 
-final analyticsReportProvider = FutureProvider<AnalyticsReport>(
+/// The staff analytics report. Invalidate to refresh; the page also does that
+/// for itself from its refresh control, and `RefreshOnResume` does it when the
+/// app comes back to the foreground.
+///
+/// `autoDispose`, so reopening the page reads the report again rather than
+/// showing the copy it cached the first time.
+final analyticsReportProvider = FutureProvider.autoDispose<AnalyticsReport>(
   (ref) => ref.watch(dashboardRepositoryProvider).getAnalytics(),
 );
 
