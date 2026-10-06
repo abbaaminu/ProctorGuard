@@ -13,6 +13,8 @@ import 'features/admin/presentation/providers/admin_providers.dart';
 import 'features/auth/data/repositories/profile_repository_impl.dart';
 import 'features/auth/presentation/providers/profile_provider.dart';
 import 'features/auth/presentation/widgets/role_gate.dart';
+import 'features/authoring/data/repositories/question_authoring_repository_impl.dart';
+import 'features/authoring/presentation/providers/question_authoring_providers.dart';
 import 'features/dashboard/data/repositories/dashboard_repository_impl.dart';
 import 'features/dashboard/presentation/providers/dashboard_providers.dart';
 import 'features/exam/data/repositories/exam_repository_impl.dart';
@@ -76,6 +78,9 @@ Future<void> main() async {
         if (client != null)
           dashboardRepositoryProvider
               .overrideWithValue(DashboardRepositoryImpl(client)),
+        if (client != null)
+          questionAuthoringRepositoryProvider
+              .overrideWithValue(QuestionAuthoringRepositoryImpl(client)),
       ],
       child: ExamProctorApp(supabaseStatus: supabaseStatus),
     ),
@@ -130,4 +135,3 @@ class ExamProctorApp extends StatelessWidget {
     );
   }
 }
-

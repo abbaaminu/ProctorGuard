@@ -48,6 +48,21 @@ abstract class AdminUserRepository {
   /// when [userId] no longer exists.
   Future<void> updateRole({required String userId, required UserRole role});
 
+  /// Replaces the account's password through the `admin-reset-password` Edge
+  /// Function — the way an administrator hands somebody a fresh temporary
+  /// password when the old one is lost (this deployment has no self-service
+  /// reset mail).
+  ///
+  /// Admins may do this for any account, their own included: unlike a role
+  /// change or a deletion, it cannot lock the caller out of anything. [password]
+  /// is passed through untrimmed — its spaces are part of it. Throws
+  /// [AdminAccountException] when the caller is not an admin, when the account
+  /// no longer exists, or when the request never reached the server.
+  Future<void> resetPassword({
+    required String userId,
+    required String password,
+  });
+
   /// Permanently removes the Auth login and its profile through the
   /// `admin-delete-user` Edge Function. Related exams, attempts and incidents
   /// are removed by database cascades.

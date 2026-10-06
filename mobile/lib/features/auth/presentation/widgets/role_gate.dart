@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart';
 import '../../../admin/presentation/pages/admin_dashboard_page.dart';
+import '../../../authoring/presentation/pages/lecturer_console_page.dart';
 import '../../../dashboard/presentation/pages/supervisor_exam_picker_page.dart';
 import '../../../exam/presentation/pages/student_exam_portal_page.dart';
 import '../../domain/entities/user_profile.dart';
@@ -15,14 +16,26 @@ import '../providers/profile_provider.dart';
 ///
 ///   `student`               -> [StudentExamPortalPage]    (published exams ->
 ///                              exam session)
-///   `supervisor`, `lecturer`-> [SupervisorExamPickerPage] (pick an exam ->
+///   `supervisor`            -> [SupervisorExamPickerPage] (pick an exam ->
 ///                              live monitor)
+///   `lecturer`              -> [LecturerConsolePage]      (author a paper's
+///                              questions -> mark what came back; the live
+///                              monitor is one tap away in its app bar)
 ///   `admin`                 -> [AdminDashboardPage]        (create accounts,
 ///                              manage roles)
 ///
-/// Lecturers share the supervisor console: `is_staff()` treats them alike for
-/// reading profiles and monitoring a session, and the two roles differ only in
-/// what the institution calls them.
+/// Lecturers and supervisors share `is_staff()` in the database, which is what
+/// lets both read every attempt and every incident. They differ where the work
+/// differs: a lecturer owns the papers they wrote — only the author may edit a
+/// question or award marks on an essay (`grade_submission()` re-checks it) —
+/// while a supervisor runs the sitting and is the tier `is_exam_supervisor()`
+/// names for resetting an attempt. Lecturers therefore land on the authoring
+/// console, and reach the monitor through it.
+///
+/// They do not share the reset control. `canResetAttempts` is the schema's own
+/// rule — `is_exam_supervisor()` names `admin` and `supervisor`, not every
+/// member of staff — asked through [UserRole.canResetAttempts], so the gate and
+/// the live monitor cannot answer it differently.
 ///
 /// Auth events are what drive the rebuild, so the session the SDK restores from
 /// storage after a browser refresh lands here too.
@@ -69,10 +82,19 @@ class RoleGate extends ConsumerWidget {
                     studentName: profile.displayName,
                     onSignOut: () => _signOut(context, ref, userId),
                   ),
-                UserRole.supervisor || UserRole.lecturer =>
-                  SupervisorExamPickerPage(
+                UserRole.supervisor => SupervisorExamPickerPage(
                     supervisorName: profile.displayName,
-                    canResetAttempts: profile.role == UserRole.supervisor,
+                    canResetAttempts: profile.role.canResetAttempts,
+                    onSignOut: () => _signOut(context, ref, userId),
+                  ),
+                // A lecturer lands on the console that owns the work only they
+                // can do: authoring a paper and marking its answers. Their
+                // invigilation tools (the live monitor, and a reset control they
+                // are refused by the schema) are one tap away in that console's
+                // app bar, so `is_staff()`'s shared reading rights are still
+                // reachable — see `LecturerConsolePage._openMonitor`.
+                UserRole.lecturer => LecturerConsolePage(
+                    lecturerName: profile.displayName,
                     onSignOut: () => _signOut(context, ref, userId),
                   ),
                 UserRole.admin => AdminDashboardPage(

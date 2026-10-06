@@ -161,15 +161,22 @@ class SupervisorDashboardPage extends ConsumerWidget {
         ref.invalidate(examSubmissionsStreamProvider(examId));
         ref.invalidate(liveViolationFeedProvider(examId));
         if (!context.mounted) return;
-        final message = outcome.storageWarning == null
+        // Both warnings are caveats on a reset that *did* happen, so they are
+        // appended to the confirmation rather than replacing it — and a reset
+        // with neither reads as the plain success it is.
+        final warnings = <String>[
+          if (outcome.storageWarning != null) outcome.storageWarning!,
+          if (outcome.auditWarning != null) outcome.auditWarning!,
+        ];
+        final message = warnings.isEmpty
             ? 'Attempt reset. ${outcome.incidents} incident(s) and '
                 '${outcome.snapshots} snapshot(s) removed.'
-            : 'Attempt reset, but ${outcome.storageWarning}';
+            : 'Attempt reset, but ${warnings.join('; ')}';
         ScaffoldMessenger.of(context)
           ..hideCurrentSnackBar()
           ..showSnackBar(SnackBar(
             content: Text(message),
-            backgroundColor: outcome.storageWarning == null
+            backgroundColor: warnings.isEmpty
                 ? null
                 : Theme.of(context).colorScheme.error,
           ));

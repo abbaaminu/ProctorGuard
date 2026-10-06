@@ -62,6 +62,18 @@ void main() {
     questionText: 'What does the acronym HTTP stand for?',
     questionType: QuestionType.fillInTheBlank,
   );
+  const trueFalse = Question(
+    id: 'q-tf',
+    examId: 'exam-1',
+    questionText: 'A pull request may be merged before its checks pass.',
+    questionType: QuestionType.trueFalse,
+  );
+  const subjective = Question(
+    id: 'q-essay',
+    examId: 'exam-1',
+    questionText: 'Describe how you would review a change to authentication.',
+    questionType: QuestionType.subjective,
+  );
 
   late _StubExamRepository exams;
   late _SilentProctoringRepository proctoring;
@@ -193,7 +205,8 @@ void main() {
       expect(find.byKey(const Key('exam-sync-banner')), findsNothing);
     });
 
-    testWidgets('a typed answer survives the trip and the queue', (tester) async {
+    testWidgets('a typed answer survives the trip and the queue',
+        (tester) async {
       // Two questions, so the text one is not the last: "Save & next" only exists
       // while there is somewhere to advance to.
       exams = _StubExamRepository(
@@ -603,6 +616,72 @@ void main() {
       expect(find.byKey(const Key('option-1')), findsOneWidget);
     });
 
+    testWidgets('a true/false statement is two taps, and the word is stored',
+        (tester) async {
+      exams = _StubExamRepository(
+        questions: const <Question>[trueFalse, fillInTheBlank],
+      );
+
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('True'), findsOneWidget);
+      expect(find.text('False'), findsOneWidget);
+      // A tapped statement is not a typed one.
+      expect(find.byKey(const Key('exam-text-answer')), findsNothing);
+
+      // The two statements sit below the palette and the question on a phone, so
+      // the tap has to be brought into view first (as a student would scroll).
+      await tester.ensureVisible(find.byKey(const Key('exam-answer-false')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('exam-answer-false')));
+      await tester.pumpAndSettle();
+
+      // The *word* travels, not an option index: `submit_exam()` compares it
+      // (case-insensitively) with the row's `correct_text_answer`.
+      expect(exams.textAnswers, <String>['q-tf=false']);
+      expect(exams.optionAnswers, isEmpty);
+      // And it advances like a multiple-choice tap.
+      expect(find.text('Question 2 of 2'), findsOneWidget);
+      expect(find.text('1 of 2 answered'), findsOneWidget);
+    });
+
+    testWidgets(
+        'an essay is typed into its own box and saved through the queue',
+        (tester) async {
+      exams = _StubExamRepository(
+        questions: const <Question>[subjective, multipleChoice],
+      );
+
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('exam-essay-answer')), findsOneWidget);
+      // The screen says what happens to an essay, because nothing here scores it.
+      expect(
+        find.textContaining('nothing is scored as you type'),
+        findsOneWidget,
+      );
+
+      await tester.enterText(
+        find.byKey(const Key('exam-essay-answer')),
+        'I would read the diff for anything that stores or compares a secret.',
+      );
+      await tester.tap(find.byKey(const Key('exam-save-text')));
+      await tester.pumpAndSettle();
+
+      expect(exams.textAnswers, <String>[
+        'q-essay=I would read the diff for anything that stores or compares a '
+            'secret.',
+      ]);
+      expect(find.text('Question 2 of 2'), findsOneWidget);
+      expect(find.text('1 of 2 answered'), findsOneWidget);
+      // The essay's own field is gone with its question: no leaked text box.
+      expect(find.byKey(const Key('exam-essay-answer')), findsNothing);
+    });
+
     testWidgets('submitting flushes an unsaved text answer first',
         (tester) async {
       exams = _StubExamRepository(questions: const <Question>[fillInTheBlank]);
@@ -673,7 +752,8 @@ void main() {
   });
 
   group('review marker and candidate identity', () {
-    testWidgets('a mark for review shows in the grid, the legend and the toggle',
+    testWidgets(
+        'a mark for review shows in the grid, the legend and the toggle',
         (tester) async {
       await tester.pumpWidget(pageUnderTest());
       await tester.tap(find.text('open exam'));
@@ -781,7 +861,8 @@ void main() {
       expect(find.text('Marked for review'), findsOneWidget);
     });
 
-    testWidgets('the submit dialog says nothing about marks when there are none',
+    testWidgets(
+        'the submit dialog says nothing about marks when there are none',
         (tester) async {
       await tester.pumpWidget(pageUnderTest());
       await tester.tap(find.text('open exam'));
@@ -1006,7 +1087,8 @@ Future<void> pumpBootstrap(WidgetTester tester) async {
 /// exactly what the offline queue has to absorb (the first guarantee in the
 /// `OfflineSyncService` contract).
 class _StubExamRepository implements ExamRepository {
-  _StubExamRepository({this.questions = const <Question>[], this.online = true});
+  _StubExamRepository(
+      {this.questions = const <Question>[], this.online = true});
 
   final List<Question> questions;
   bool online;

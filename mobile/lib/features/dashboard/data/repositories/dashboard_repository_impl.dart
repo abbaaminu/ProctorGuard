@@ -15,28 +15,35 @@ class DashboardRepositoryImpl implements DashboardRepository {
 
   @override
   Future<AnalyticsReport> getAnalytics() async {
-    final since = DateTime.now().toUtc().subtract(analyticsWindow).toIso8601String();
+    final since =
+        DateTime.now().toUtc().subtract(analyticsWindow).toIso8601String();
     try {
       final results = await Future.wait([
-        _readAll((from, to) async => (await _client
-                .from('exams')
-                .select('id, title')
-                .order('id')
-                .range(from, to))
-            .cast<Map<String, dynamic>>()),
-        _readAll((from, to) async => (await _client
-                .from('exam_submissions')
-                .select('id, exam_id, status, score')
-                .order('id')
-                .range(from, to))
-            .cast<Map<String, dynamic>>()),
-        _readAll((from, to) async => (await _client
-                .from('proctoring_logs')
-                .select('submission_id')
-                .gte('timestamp', since)
-                .order('id')
-                .range(from, to))
-            .cast<Map<String, dynamic>>()),
+        _readAll(
+          (from, to) async => (await _client
+                  .from('exams')
+                  .select('id, title')
+                  .order('id')
+                  .range(from, to))
+              .cast<Map<String, dynamic>>(),
+        ),
+        _readAll(
+          (from, to) async => (await _client
+                  .from('exam_submissions')
+                  .select('id, exam_id, status, score')
+                  .order('id')
+                  .range(from, to))
+              .cast<Map<String, dynamic>>(),
+        ),
+        _readAll(
+          (from, to) async => (await _client
+                  .from('proctoring_logs')
+                  .select('submission_id')
+                  .gte('timestamp', since)
+                  .order('id')
+                  .range(from, to))
+              .cast<Map<String, dynamic>>(),
+        ),
       ]);
 
       final exams = results[0];
@@ -50,7 +57,11 @@ class DashboardRepositoryImpl implements DashboardRepository {
       for (final log in logs) {
         final examId = examBySubmission[log['submission_id']];
         if (examId != null) {
-          incidentsByExam.update(examId, (count) => count + 1, ifAbsent: () => 1);
+          incidentsByExam.update(
+            examId,
+            (count) => count + 1,
+            ifAbsent: () => 1,
+          );
         }
       }
 
@@ -108,15 +119,19 @@ class DashboardRepositoryImpl implements DashboardRepository {
   Future<SubmissionResetResult> resetSubmission(String submissionId) async {
     final List<Map<String, dynamic>> logs;
     try {
-      logs = await _readAll((from, to) async => (await _client
-              .from('proctoring_logs')
-              .select('snapshot_url')
-              .eq('submission_id', submissionId)
-              .order('id')
-              .range(from, to))
-          .cast<Map<String, dynamic>>());
+      logs = await _readAll(
+        (from, to) async => (await _client
+                .from('proctoring_logs')
+                .select('snapshot_url')
+                .eq('submission_id', submissionId)
+                .order('id')
+                .range(from, to))
+            .cast<Map<String, dynamic>>(),
+      );
     } on PostgrestException catch (error) {
-      throw DashboardException('Could not read attempt evidence: ${error.message}');
+      throw DashboardException(
+        'Could not read attempt evidence: ${error.message}',
+      );
     } catch (error) {
       throw DashboardException('Could not read attempt evidence: $error');
     }
@@ -129,13 +144,19 @@ class DashboardRepositoryImpl implements DashboardRepository {
         .toSet()
         .toList();
 
-    final List<dynamic> deleted;
+    // `.select(...)` makes PostgREST return the deleted row, which this needs
+    // twice over: a non-empty result proves the DELETE matched a row (RLS
+    // refuses silently, and the old one-column select could only ever say "not
+    // empty"), and `student_id`/`exam_id` are unrecoverable once the row is gone
+    // — the audit row below records them.
+    final List<Map<String, dynamic>> deleted;
     try {
-      deleted = await _client
-          .from('exam_submissions')
-          .delete()
-          .eq('id', submissionId)
-          .select('id');
+      deleted = (await _client
+              .from('exam_submissions')
+              .delete()
+              .eq('id', submissionId)
+              .select('id, student_id, exam_id'))
+          .cast<Map<String, dynamic>>();
     } on PostgrestException catch (error) {
       throw DashboardException('Could not reset the attempt: ${error.message}');
     } catch (error) {
@@ -148,31 +169,79 @@ class DashboardRepositoryImpl implements DashboardRepository {
       );
     }
 
-    if (paths.isEmpty) {
-      return SubmissionResetResult(incidents: logs.length, snapshots: 0);
+    // Storage second: what it reports is part of the audit row, so the audit
+    // write waits for the real outcome instead of guessing at it.
+    var snapshots = 0;
+    String? storageWarning;
+    if (paths.isNotEmpty) {
+      try {
+        snapshots =
+            (await _client.storage.from(snapshotBucket).remove(paths)).length;
+      } on StorageException catch (error) {
+        storageWarning =
+            '${paths.length} snapshot image(s) could not be removed: ${error.message}';
+      } catch (error) {
+        storageWarning =
+            '${paths.length} snapshot image(s) could not be removed: $error';
+      }
+    }
+
+    final auditWarning = await _logReset(
+      submission: deleted.first,
+      incidents: logs.length,
+      snapshots: snapshots,
+      storageWarning: storageWarning,
+    );
+
+    return SubmissionResetResult(
+      incidents: logs.length,
+      snapshots: snapshots,
+      storageWarning: storageWarning,
+      auditWarning: auditWarning,
+    );
+  }
+
+  /// Records a completed reset in `public.session_reset_logs` (schema.sql §7),
+  /// and returns a warning — or `null` when the row was written.
+  ///
+  /// Never throws. The attempt is already deleted by the time this runs, so
+  /// raising here would report a reset that *did* happen as a failure and invite
+  /// a retry against an attempt that no longer exists; the console shows the
+  /// message as a caveat on the successful outcome instead
+  /// ([SubmissionResetResult.auditWarning]).
+  ///
+  /// `actor_id` is deliberately *not* sent. The column defaults to `auth.uid()`
+  /// server-side and the insert policy re-checks `actor_id = auth.uid()`, so who
+  /// performed a reset is the database's answer, not this client's claim.
+  Future<String?> _logReset({
+    required Map<String, dynamic> submission,
+    required int incidents,
+    required int snapshots,
+    required String? storageWarning,
+  }) async {
+    final submissionId = submission['id'];
+    final studentId = submission['student_id'];
+    final examId = submission['exam_id'];
+    if (submissionId is! String || studentId is! String || examId is! String) {
+      return 'the reset could not be recorded in the audit trail: the deleted '
+          'row did not carry the ids it needs.';
     }
 
     try {
-      final removed =
-          await _client.storage.from(snapshotBucket).remove(paths);
-      return SubmissionResetResult(
-        incidents: logs.length,
-        snapshots: removed.length,
-      );
-    } on StorageException catch (error) {
-      return SubmissionResetResult(
-        incidents: logs.length,
-        snapshots: 0,
-        storageWarning:
-            '${paths.length} snapshot image(s) could not be removed: ${error.message}',
-      );
+      await _client.from('session_reset_logs').insert({
+        'submission_id': submissionId,
+        'student_id': studentId,
+        'exam_id': examId,
+        'incidents': incidents,
+        'snapshots': snapshots,
+        'storage_warning': storageWarning,
+      });
+      return null;
+    } on PostgrestException catch (error) {
+      return 'the reset could not be recorded in the audit trail: '
+          '${error.message}';
     } catch (error) {
-      return SubmissionResetResult(
-        incidents: logs.length,
-        snapshots: 0,
-        storageWarning:
-            '${paths.length} snapshot image(s) could not be removed: $error',
-      );
+      return 'the reset could not be recorded in the audit trail: $error';
     }
   }
 

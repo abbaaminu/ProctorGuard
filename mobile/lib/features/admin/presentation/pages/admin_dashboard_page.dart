@@ -20,11 +20,14 @@ import '../providers/admin_providers.dart';
 /// back instead. Both halves are needed — the gate decides *where a user
 /// lands*, the database decides *what they may do*.
 ///
-/// Creating an account is the one thing that cannot be a plain PostgREST call:
-/// `auth.users` is owned by Supabase Auth and `profiles_insert_self_student`
-/// rejects any role but 'student', so the page goes through the
-/// `admin-create-user` Edge Function, which holds the service_role key and
-/// performs both writes ([AdminUserRepository.createAccount]).
+/// Two actions here cannot be plain PostgREST calls — creating an account and
+/// resetting its password. `auth.users` is owned by Supabase Auth and
+/// `profiles_insert_self_student` rejects any role but 'student', so creating
+/// goes through the `admin-create-user` Edge Function; changing a password goes
+/// through `admin-reset-password`, for the same reason: only the service_role
+/// key can reach another account's credentials. Both functions hold that key and
+/// re-check the caller's role server-side ([AdminUserRepository.createAccount],
+/// [AdminUserRepository.resetPassword]).
 class AdminDashboardPage extends ConsumerStatefulWidget {
   const AdminDashboardPage({
     super.key,
@@ -110,7 +113,8 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
 
   /// The signed-in admin's own id — their roster row cannot be re-roled from
   /// here (demoting yourself would lock you out of the page that undoes it).
-  String? get _selfId => widget.adminId ?? SupabaseService.instance.currentUserId;
+  String? get _selfId =>
+      widget.adminId ?? SupabaseService.instance.currentUserId;
 
   Future<void> _createAccount() async {
     if (_submitting) return; // a double tap must not create two accounts
@@ -159,15 +163,84 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
 
     setState(() => _busyId = account.id);
     try {
-      await ref.read(adminUserRepositoryProvider).updateRole(
-            userId: account.id,
-            role: role,
-          );
+      await ref
+          .read(adminUserRepositoryProvider)
+          .updateRole(userId: account.id, role: role);
       if (!mounted) return;
       ref.invalidate(managedAccountsProvider);
       _showMessage(
         '${account.displayName} is now a ${role.label.toLowerCase()}.',
         isError: false,
+      );
+    } on AdminAccountException catch (error) {
+      _showMessage(error.message);
+    } finally {
+      if (mounted) setState(() => _busyId = null);
+    }
+  }
+
+  /// Sets a new password on [account] through the `admin-reset-password` Edge
+  /// Function — and then shows it, because a temporary password nobody wrote
+  /// down is not a reset.
+  ///
+  /// The dialog mirrors the create form's field: the same
+  /// [adminMinPasswordLength] floor the function enforces, typed twice so a typo
+  /// cannot become somebody's permanent password. Unlike a role change or a
+  /// deletion this is offered for the caller's own row too — it cannot lock the
+  /// administrator out of anything.
+  Future<void> _resetPassword(ManagedAccount account) async {
+    if (_busyId != null) return;
+    final password = await showDialog<String>(
+      context: context,
+      builder: (_) => _ResetPasswordDialog(account: account),
+    );
+    // Cancelled, or the page went away while the dialog was open.
+    if (password == null || !mounted) return;
+
+    setState(() => _busyId = account.id);
+    try {
+      await ref
+          .read(adminUserRepositoryProvider)
+          .resetPassword(userId: account.id, password: password);
+      if (!mounted) return;
+
+      // The reset is already applied server-side, so the row must stop claiming
+      // to be at work before the handover dialog opens: leaving the spinner up
+      // would hide the row's own actions while the administrator reads the
+      // password, for work that has finished.
+      setState(() => _busyId = null);
+
+      // The roster itself does not change (a password is not a column), so
+      // there is nothing to refetch: the account is identified by the row the
+      // administrator just acted on.
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text('New password for ${account.displayName}'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'This is the only time it is shown. Hand it over now and have '
+                'them change it after they sign in.',
+              ),
+              const SizedBox(height: 12),
+              SelectableText(
+                password,
+                key: const Key('admin-new-password-value'),
+                style: Theme.of(dialogContext).textTheme.titleMedium,
+              ),
+            ],
+          ),
+          actions: [
+            FilledButton(
+              key: const Key('admin-reset-password-done'),
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Done'),
+            ),
+          ],
+        ),
       );
     } on AdminAccountException catch (error) {
       _showMessage(error.message);
@@ -208,8 +281,10 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
           .deleteAccount(userId: account.id);
       if (!mounted) return;
       ref.invalidate(managedAccountsProvider);
-      _showMessage('Deleted ${account.displayName} and its related records.',
-          isError: false);
+      _showMessage(
+        'Deleted ${account.displayName} and its related records.',
+        isError: false,
+      );
     } on AdminAccountException catch (error) {
       _showMessage(error.message);
     } finally {
@@ -250,6 +325,7 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
       onRefresh: () => ref.invalidate(managedAccountsProvider),
       onChangeRole: _changeRole,
       onDelete: _deleteAccount,
+      onResetPassword: _resetPassword,
     );
 
     return Scaffold(
@@ -266,9 +342,8 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
             tooltip: 'Exam monitor',
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
-                builder: (_) => const SupervisorExamPickerPage(
-                  canResetAttempts: true,
-                ),
+                builder: (_) =>
+                    const SupervisorExamPickerPage(canResetAttempts: true),
               ),
             ),
             icon: const Icon(Icons.monitor_heart_outlined),
@@ -277,9 +352,7 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
             key: const Key('admin-analytics'),
             tooltip: 'Analytics',
             onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(
-                builder: (_) => const AnalyticsPage(),
-              ),
+              MaterialPageRoute<void>(builder: (_) => const AnalyticsPage()),
             ),
             icon: const Icon(Icons.analytics_outlined),
           ),
@@ -347,11 +420,7 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
                   )
                 : ListView(
                     padding: EdgeInsets.all(gutter),
-                    children: [
-                      form,
-                      const SizedBox(height: 24),
-                      roster,
-                    ],
+                    children: [form, const SizedBox(height: 24), roster],
                   ),
           ),
         ],
@@ -531,7 +600,8 @@ class _CreateAccountCard extends StatelessWidget {
 }
 
 /// The account roster: every profile row the caller may read, each with the
-/// menu that moves it to another role.
+/// menu that moves it to another role, the button that resets its password and
+/// the one that deletes it.
 class _RosterSection extends ConsumerWidget {
   const _RosterSection({
     required this.selfId,
@@ -539,6 +609,7 @@ class _RosterSection extends ConsumerWidget {
     required this.onRefresh,
     required this.onChangeRole,
     required this.onDelete,
+    required this.onResetPassword,
   });
 
   final String? selfId;
@@ -546,6 +617,7 @@ class _RosterSection extends ConsumerWidget {
   final VoidCallback onRefresh;
   final void Function(ManagedAccount account, UserRole role) onChangeRole;
   final void Function(ManagedAccount account) onDelete;
+  final void Function(ManagedAccount account) onResetPassword;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -604,6 +676,7 @@ class _RosterSection extends ConsumerWidget {
                         busy: busyId == account.id,
                         onChangeRole: (role) => onChangeRole(account, role),
                         onDelete: () => onDelete(account),
+                        onResetPassword: () => onResetPassword(account),
                       ),
                   ],
                 ),
@@ -660,16 +733,20 @@ class _AccountTile extends StatelessWidget {
     required this.busy,
     required this.onChangeRole,
     required this.onDelete,
+    required this.onResetPassword,
   });
 
   final ManagedAccount account;
 
-  /// The signed-in admin's own row: shown, but not editable (see [_selfId]).
+  /// The signed-in admin's own row: it cannot be re-roled from here and it
+  /// cannot be deleted (see [_AdminDashboardPageState._selfId]), but its password
+  /// can be reset — that locks nobody out of anything.
   final bool isSelf;
 
   final bool busy;
   final ValueChanged<UserRole> onChangeRole;
   final VoidCallback onDelete;
+  final VoidCallback onResetPassword;
 
   @override
   Widget build(BuildContext context) {
@@ -684,9 +761,8 @@ class _AccountTile extends StatelessWidget {
       ),
       title: Text(account.displayName),
       // An unnamed account *is* its e-mail address, so do not print it twice.
-      subtitle: account.displayName == account.email
-          ? null
-          : Text(account.email),
+      subtitle:
+          account.displayName == account.email ? null : Text(account.email),
       trailing: busy
           ? const SizedBox(
               height: 20,
@@ -731,6 +807,14 @@ class _AccountTile extends StatelessWidget {
                       avatar: const Icon(Icons.expand_more, size: 18),
                     ),
                   ),
+                // Offered for every row, the caller's own included: a password
+                // change cannot take away an administrator's own access.
+                IconButton(
+                  key: Key('admin-reset-password-${account.id}'),
+                  tooltip: 'Reset password',
+                  onPressed: onResetPassword,
+                  icon: const Icon(Icons.lock_reset_outlined),
+                ),
                 if (!isSelf)
                   IconButton(
                     key: Key('admin-delete-${account.id}'),
@@ -741,6 +825,133 @@ class _AccountTile extends StatelessWidget {
                   ),
               ],
             ),
+    );
+  }
+}
+
+/// The "set a new password" dialog: the password the administrator will hand
+/// over, typed twice.
+///
+/// Stateful and self-contained, like the create form: it owns its controllers
+/// so the page keeps none, and it returns the password through
+/// `Navigator.pop` — the page never sees a field it does not act on immediately.
+class _ResetPasswordDialog extends StatefulWidget {
+  const _ResetPasswordDialog({required this.account});
+
+  final ManagedAccount account;
+
+  @override
+  State<_ResetPasswordDialog> createState() => _ResetPasswordDialogState();
+}
+
+class _ResetPasswordDialogState extends State<_ResetPasswordDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _passwordController = TextEditingController();
+  final _confirmationController = TextEditingController();
+  bool _obscure = true;
+
+  @override
+  void dispose() {
+    _passwordController.dispose();
+    _confirmationController.dispose();
+    super.dispose();
+  }
+
+  /// The same floor as the create form and the Edge Function, so the message an
+  /// administrator reads here is the rule the server will apply.
+  String? _validatePassword(String? value) {
+    final password = value ?? '';
+    if (password.isEmpty) return 'Enter a new password';
+    if (password.length < adminMinPasswordLength) {
+      return 'Use at least $adminMinPasswordLength characters';
+    }
+    return null;
+  }
+
+  String? _validateConfirmation(String? value) =>
+      value == _passwordController.text ? null : 'The two passwords differ';
+
+  void _submit() {
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+    // Untrimmed: the server hashes the password verbatim, and a space at either
+    // end is part of it.
+    Navigator.pop(context, _passwordController.text);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return AlertDialog(
+      title: Text('Reset the password for ${widget.account.displayName}'),
+      content: Form(
+        key: _formKey,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'The account keeps its role, its exams and its attempts. Only '
+                'the password changes, and anyone already signed in stays '
+                'signed in.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextFormField(
+                key: const Key('admin-new-password'),
+                controller: _passwordController,
+                autofocus: true,
+                obscureText: _obscure,
+                textInputAction: TextInputAction.next,
+                decoration: InputDecoration(
+                  labelText: 'New password',
+                  prefixIcon: const Icon(Icons.key_outlined),
+                  border: const OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                    onPressed: () => setState(() => _obscure = !_obscure),
+                    icon: Icon(
+                      _obscure
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
+                    ),
+                    tooltip: _obscure ? 'Show password' : 'Hide password',
+                  ),
+                ),
+                validator: _validatePassword,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                key: const Key('admin-confirm-password'),
+                controller: _confirmationController,
+                obscureText: _obscure,
+                textInputAction: TextInputAction.done,
+                onFieldSubmitted: (_) => _submit(),
+                decoration: const InputDecoration(
+                  labelText: 'Repeat the new password',
+                  prefixIcon: Icon(Icons.check_circle_outline),
+                  border: OutlineInputBorder(),
+                ),
+                validator: _validateConfirmation,
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          key: const Key('admin-reset-password-cancel'),
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          key: const Key('admin-reset-password-submit'),
+          onPressed: _submit,
+          child: const Text('Set password'),
+        ),
+      ],
     );
   }
 }

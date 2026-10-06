@@ -13,20 +13,30 @@
 --     `questions`; they read the definer view `questions_public` (published
 --     exams only, neither `correct_option` nor `correct_text_answer`) while
 --     staff (`is_staff()`) read the raw table.
---   * Two question shapes share `questions`: `question_type = 'multiple_choice'`
---     (options + index) and `'fill_in_the_blank'` (`correct_text_answer`, graded
---     case-insensitively after trimming). Answers are merged by
---     `merge_submission_answer` (choice) or `merge_submission_text_answer`
---     (text).
+--   * Four question shapes share `questions`: `'multiple_choice'` (options + an
+--     index), `'true_false'` (`correct_text_answer` is 'true' or 'false'),
+--     `'fill_in_the_blank'` (`correct_text_answer`, graded case-insensitively
+--     after trimming) and `'subjective'` (no answer key at all — an essay, marked
+--     by hand). A choice answer is merged by `merge_submission_answer`; true/false
+--     and fill-in-the-blank go through `merge_submission_text_answer`, which is
+--     also what a true/false tap stores ('true' / 'false' as a JSON string).
 --   * Students cannot grade or close themselves with a direct UPDATE — the
---     RPCs `submit_exam` (grading, both shapes) and `register_violation`
+--     RPCs `submit_exam` (automatic grading) and `register_violation`
 --     (3-strike rule) are the only writers of status/score/submitted_at, and
---     both re-check that the caller owns the submission.
+--     both re-check that the caller owns the submission. A subjective answer is
+--     marked afterwards by the paper's owner through `grade_submission()`, which
+--     records the marks in `question_grades` (section 8) and recomputes `score`
+--     as automatic + awarded.
 --   * Evidence is append-only for clients: `proctoring_logs` has no INSERT
 --     policy, so register_violation() is the single write path. That RPC is
 --     idempotent per `client_event_id`, which is what lets the app queue a
 --     violation it could not deliver and replay it later without inventing a
 --     second strike (see `client_timestamp` / `client_event_id` in section 5).
+--   * A reset is itself evidence. Clearing an attempt destroys it together with
+--     its incident rows, so the call that does it also records what it
+--     destroyed in `session_reset_logs` (section 7): append-only, with
+--     `actor_id` defaulted from auth.uid() on the server, so the trail cannot be
+--     edited away by the person who just used it.
 -- =====================================================================
 
 create extension if not exists "uuid-ossp";
@@ -379,12 +389,15 @@ create table if not exists public.questions (
   id                  uuid primary key default uuid_generate_v4(),
   exam_id             uuid not null references public.exams(id) on delete cascade,
   question_text       text not null,
-  -- Two question shapes share this table:
+  -- Four question shapes share this table:
   --   'multiple_choice'   -> `options` are the tap targets, `correct_option` the index
+  --   'true_false'        -> `options` is empty, `correct_text_answer` is 'true' or 'false'
   --   'fill_in_the_blank' -> `options` is empty, `correct_text_answer` is graded
   --                          case-insensitively after trimming
+  --   'subjective'        -> neither key: an essay, marked by hand afterwards
   question_type       text not null default 'multiple_choice'
-                        check (question_type in ('multiple_choice', 'fill_in_the_blank')),
+                        check (question_type in ('multiple_choice', 'true_false',
+                                                 'fill_in_the_blank', 'subjective')),
   options             jsonb not null default '[]'::jsonb,
   correct_option      int,
   correct_text_answer text,
@@ -392,11 +405,17 @@ create table if not exists public.questions (
   created_at          timestamptz not null default now(),
   -- Exactly one answer key, matching the question's type. Without this a row
   -- could carry both (graded twice by submit_exam) or neither (ungradeable).
+  -- 'subjective' is the deliberate exception: the absence of a key is the shape.
   constraint questions_answer_key_shape check (
     (question_type = 'multiple_choice' and correct_option is not null)
     or
+    (question_type = 'true_false'
+      and lower(btrim(coalesce(correct_text_answer, ''))) in ('true', 'false'))
+    or
     (question_type = 'fill_in_the_blank'
       and coalesce(btrim(correct_text_answer), '') <> '')
+    or
+    question_type = 'subjective'
   )
 );
 
@@ -408,25 +427,43 @@ alter table public.questions alter column options set default '[]'::jsonb;
 -- A fill-in-the-blank row has no option index, so this column cannot stay NOT NULL.
 alter table public.questions alter column correct_option drop not null;
 
-do $$
-begin
-  if not exists (select 1 from pg_constraint where conname = 'questions_question_type_check') then
-    alter table public.questions
-      add constraint questions_question_type_check
-      check (question_type in ('multiple_choice', 'fill_in_the_blank'));
-  end if;
+-- Both shape rules are dropped by name and re-created rather than guarded with
+-- `if not exists`. This revision widened `question_type` from two values to four,
+-- and an `if not exists` guard would have left a live database holding the old
+-- two-value check - refusing to *store* a true/false or subjective question being
+-- authored in the console against a table that otherwise looks correct. Dropping
+-- first is still re-runnable, which is what a file applied twice needs.
+alter table public.questions
+  drop constraint if exists questions_question_type_check;
+alter table public.questions
+  add constraint questions_question_type_check
+  check (question_type in ('multiple_choice', 'true_false',
+                           'fill_in_the_blank', 'subjective'));
 
-  if not exists (select 1 from pg_constraint where conname = 'questions_answer_key_shape') then
-    alter table public.questions
-      add constraint questions_answer_key_shape
-      check (
-        (question_type = 'multiple_choice' and correct_option is not null)
-        or
-        (question_type = 'fill_in_the_blank'
-          and coalesce(btrim(correct_text_answer), '') <> '')
-      );
-  end if;
-end $$;
+alter table public.questions
+  drop constraint if exists questions_answer_key_shape;
+alter table public.questions
+  add constraint questions_answer_key_shape
+  check (
+    (question_type = 'multiple_choice' and correct_option is not null)
+    or
+    (question_type = 'true_false'
+      and lower(btrim(coalesce(correct_text_answer, ''))) in ('true', 'false'))
+    or
+    (question_type = 'fill_in_the_blank'
+      and coalesce(btrim(correct_text_answer), '') <> '')
+    or
+    question_type = 'subjective'
+  );
+
+-- `points` is what `submit_exam()` sums into `score`, so a zero-or-negative
+-- weight would let a paper mark itself down. The column has never had a floor;
+-- this is it. (Same drop-then-add shape as above: re-runnable, and it fails
+-- loudly at migration time if a database really does hold a negative weight,
+-- which is a row worth seeing rather than a rule worth skipping.)
+alter table public.questions drop constraint if exists questions_points_non_negative;
+alter table public.questions
+  add constraint questions_points_non_negative check (points >= 0);
 
 alter table public.questions enable row level security;
 
@@ -878,6 +915,132 @@ create policy "Proctor snapshots supervisor purge"
   );
 
 -- ---------------------------------------------------------------------
+-- 7. SESSION RESET LOGS (the audit trail behind "Reset attempt")
+-- ---------------------------------------------------------------------
+-- A supervisor's reset deletes the attempt *and* the incident rows, which makes
+-- it the one destructive staff action in the console: proctoring evidence
+-- disappears with it. This table is what keeps that from being invisible.
+--
+-- `DashboardRepositoryImpl.resetSubmission()` is the writer: it deletes the
+-- attempt first, purges the snapshot objects next, and then inserts one row here
+-- describing what it destroyed. It never throws on the last step - the attempt
+-- is already gone by then, so reporting a failure would invite a retry against
+-- an attempt that no longer exists. The console shows a failed write as a caveat
+-- on an otherwise successful reset instead
+-- (`SubmissionResetResult.auditWarning` in the Flutter app).
+--
+-- `actor_id` is the point of the table: it defaults to auth.uid() and the insert
+-- policy re-checks `actor_id = auth.uid()`, so *who* cleared an attempt is the
+-- database's answer rather than the client's claim. The Flutter repository
+-- deliberately never sends the column.
+--
+-- No foreign keys, on purpose. `submission_id` names the attempt this row
+-- describes, and that row was just deleted by the very action being recorded: a
+-- reference would either refuse every insert, or - with `on delete set null` -
+-- blank out the id that ties the record to the attempt it replaced. `student_id`
+-- and `exam_id` are kept as plain uuid evidence for the same reason, so an
+-- account or exam removed later cannot take its audit trail with it.
+-- (`exam_submissions` cascades still take the attempt, its answers and its
+-- `proctoring_logs` rows; this table sits outside that cascade by design.)
+create table if not exists public.session_reset_logs (
+  id              uuid primary key default uuid_generate_v4(),
+  submission_id   uuid not null,
+  student_id      uuid not null,
+  exam_id         uuid not null,
+  incidents       integer not null default 0 check (incidents >= 0),
+  snapshots       integer not null default 0 check (snapshots >= 0),
+  storage_warning text,
+  actor_id        uuid not null default auth.uid(),
+  created_at      timestamptz not null default now()
+);
+
+-- Fresh installs get the table from here; a project that already ran an earlier
+-- revision of this file gets it from
+-- supabase/migrations/session_reset_logs.sql, which carries the same DDL.
+alter table public.session_reset_logs enable row level security;
+
+drop policy if exists "session_reset_logs_select_staff" on public.session_reset_logs;
+drop policy if exists "session_reset_logs_insert_supervisor" on public.session_reset_logs;
+
+-- Read: the staff tier - the same audience that can already read the attempts
+-- and the incident rows behind them (`submissions_select_own_or_supervisor`,
+-- `logs_select_own_or_supervisor`). A lecturer who may see that an attempt is
+-- missing should be able to see that it was a reset rather than a hand-delete.
+-- Students get no rows: the record names the member of staff who ran it.
+create policy "session_reset_logs_select_staff"
+  on public.session_reset_logs for select
+  to authenticated
+  using (public.is_staff());
+
+-- Write: exactly the tier that may delete an attempt in the first place
+-- (`is_exam_supervisor()` is what `submissions_delete_supervisor` and the
+-- snapshot-purge policy use), and only in the caller's own name.
+create policy "session_reset_logs_insert_supervisor"
+  on public.session_reset_logs for insert
+  to authenticated
+  with check (public.is_exam_supervisor() and actor_id = auth.uid());
+
+-- There is deliberately NO update policy and NO delete policy. A record its own
+-- author can rewrite or remove is not a record; if one is ever wrong, the
+-- correction is another row (or SQL by the project owner), never an edit.
+
+-- ---------------------------------------------------------------------
+-- 8. QUESTION GRADES (the marks a person awarded, not the RPC)
+-- ---------------------------------------------------------------------
+-- `submit_exam()` grades the questions whose answer key it holds. A subjective
+-- answer has none: the mark is a judgement, so it is recorded here, one row per
+-- marked answer, by the paper's owner through `grade_submission()` (bottom of
+-- this file), which also folds the award into `exam_submissions.score`.
+--
+-- Why a table instead of a key inside `exam_submissions.answers`:
+-- `guard_submission_immutability` freezes `answers` the moment an attempt closes,
+-- and that is exactly right - a re-mark must read the words the student actually
+-- submitted. A mark is the *grader's* input, so it gets its own row rather than a
+-- rewrite of the student's evidence. It also keeps the two write paths apart:
+-- answers are written by the student while the attempt is open, marks by the
+-- lecturer after it closed.
+--
+-- `on delete cascade` from both parents, on purpose: "Reset attempt" or a deleted
+-- question has to take its marks with it, or `score` would keep counting marks for
+-- a question that no longer exists. (`session_reset_logs` deliberately sits
+-- outside that cascade - the trail of a reset is not part of what it destroyed.)
+create table if not exists public.question_grades (
+  id            uuid primary key default uuid_generate_v4(),
+  submission_id uuid not null references public.exam_submissions(id) on delete cascade,
+  question_id   uuid not null references public.questions(id) on delete cascade,
+  awarded       numeric not null check (awarded >= 0),
+  feedback      text,
+  graded_by     uuid not null default auth.uid(),
+  graded_at     timestamptz not null default now(),
+  -- One mark per answer: re-marking is an UPDATE of this row (the RPC upserts),
+  -- never a second opinion that `score` would then count twice.
+  unique (submission_id, question_id)
+);
+
+alter table public.question_grades enable row level security;
+
+drop policy if exists "question_grades_select_staff" on public.question_grades;
+
+-- Read: the staff tier, like the attempts and their incident rows - the lecturer
+-- marking a paper and the supervisor answering an appeal see the same marks.
+-- Students read no rows here: their total is on their own
+-- `exam_submissions.score`, which `submissions_select_own_or_supervisor` already
+-- lets them read.
+create policy "question_grades_select_staff"
+  on public.question_grades for select
+  to authenticated
+  using (public.is_staff());
+
+-- There is deliberately NO insert and NO update policy, the shape
+-- `proctoring_logs` uses: `grade_submission()` is SECURITY DEFINER and re-checks
+-- that the caller owns the paper, so it is the single write path. A lecturer who
+-- could insert these rows directly could also award marks on an exam they do not
+-- own - and could do it for a question they never read.
+--
+-- No delete policy either: a mark is corrected by re-marking, which the unique
+-- constraint above turns into an update of the same row.
+
+-- ---------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------
 create index if not exists idx_questions_exam_id on public.questions(exam_id);
@@ -888,6 +1051,14 @@ create index if not exists idx_submissions_student_id on public.exam_submissions
 create index if not exists idx_submissions_exam_status on public.exam_submissions(exam_id, status);
 create index if not exists idx_logs_submission_id on public.proctoring_logs(submission_id);
 create index if not exists idx_logs_timestamp on public.proctoring_logs(timestamp desc);
+-- The audit trail is read newest-first, and per exam when an appeal asks "what
+-- was cleared during this sitting".
+create index if not exists idx_session_reset_logs_created_at on public.session_reset_logs(created_at desc);
+create index if not exists idx_session_reset_logs_exam_id on public.session_reset_logs(exam_id);
+-- Per-answer marks are read by attempt (the unique (submission_id, question_id)
+-- above already serves that prefix); this walks the other way, for "which papers
+-- still owe marks on this question" and for the cascade when one is deleted.
+create index if not exists idx_question_grades_question_id on public.question_grades(question_id);
 
 -- ---------------------------------------------------------------------
 -- Realtime setup
@@ -1135,30 +1306,19 @@ begin
   end if;
 
   -- Grading is a sum of `questions.points` over the questions the student got
-  -- right, and it has to cover both question shapes:
+  -- right, and it has to cover every automatically graded shape:
   --   * multiple choice: the stored jsonb number equals `correct_option`
-  --   * fill in the blank: the stored jsonb string matches `correct_text_answer`
-  --     case-insensitively after trimming, so "  http " counts for "HTTP"
-  -- An unanswered question stores nothing, so `->>` is NULL and the comparison
-  -- is NULL (never true) - it simply does not score.
-  select coalesce(sum(q.points), 0)
-    into v_score
-  from public.questions q
-  join public.exam_submissions s on s.id = p_submission_id
-  where q.exam_id = v_exam
-    and (
-      (
-        q.question_type = 'multiple_choice'
-        and s.answers -> q.id::text = to_jsonb(q.correct_option)
-      )
-      or
-      (
-        q.question_type = 'fill_in_the_blank'
-        and coalesce(btrim(q.correct_text_answer), '') <> ''
-        and lower(btrim(s.answers ->> q.id::text)) =
-            lower(btrim(q.correct_text_answer))
-      )
-    );
+  --   * true/false and fill in the blank: the stored jsonb string matches
+  --     `correct_text_answer` case-insensitively after trimming, so "  http "
+  --     counts for "HTTP" and "TRUE" counts for "true"
+  -- A 'subjective' row never matches: it has no key, and its marks arrive later
+  -- through `grade_submission()` after a person read it. An unanswered question
+  -- stores nothing, so `->>` is NULL and the comparison is NULL (never true) - it
+  -- simply does not score.
+  --
+  -- The sum itself lives in `auto_graded_score()` so this close and a later
+  -- `grade_submission()` cannot drift apart about which answers count.
+  v_score := public.auto_graded_score(p_submission_id);
 
   update public.exam_submissions
   set status = 'submitted', submitted_at = v_submitted_at, score = v_score
@@ -1228,3 +1388,232 @@ end;
 $$;
 revoke execute on function public.merge_submission_text_answer(uuid, uuid, text) from public, anon;
 grant execute on function public.merge_submission_text_answer(uuid, uuid, text) to authenticated, service_role;
+
+-- ---------------------------------------------------------------------
+-- Automatic score of an attempt (RPC helper)
+-- ---------------------------------------------------------------------
+-- The single home of the automatic grading predicate: `submit_exam()` calls it
+-- when an attempt closes, and `grade_submission()` calls it again to recompute
+-- that same part after a subjective answer is marked. Two copies of "which
+-- answers count" is how a re-mark silently disagrees with the close before it.
+--
+-- SECURITY DEFINER because the caller's own policies would hide the answer key:
+-- `questions` has no student SELECT policy, so under invoker semantics every
+-- attempt would grade 0. It returns one number - never the key it read - and it
+-- answers only for an attempt the caller may already see.
+create or replace function public.auto_graded_score(p_submission_id uuid)
+returns numeric
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select coalesce(sum(q.points), 0)
+  from public.questions q
+  join public.exam_submissions s on s.id = p_submission_id
+  where q.exam_id = s.exam_id
+    and (s.student_id = auth.uid() or public.is_staff())
+    and (
+      (
+        q.question_type = 'multiple_choice'
+        and s.answers -> q.id::text = to_jsonb(q.correct_option)
+      )
+      or
+      (
+        q.question_type in ('fill_in_the_blank', 'true_false')
+        and coalesce(btrim(q.correct_text_answer), '') <> ''
+        and lower(btrim(s.answers ->> q.id::text)) =
+            lower(btrim(q.correct_text_answer))
+      )
+    );
+$$;
+
+comment on function public.auto_graded_score(uuid) is
+  'Automatic part of an attempt''s score (multiple-choice, true/false and fill-in-the-blank answers). Marks awarded by hand live in question_grades.';
+
+revoke execute on function public.auto_graded_score(uuid) from public, anon;
+grant execute on function public.auto_graded_score(uuid) to authenticated, service_role;
+
+-- ---------------------------------------------------------------------
+-- Marking the subjective answers (RPC)
+-- ---------------------------------------------------------------------
+-- The only writer of `question_grades`, and the only writer of a `score` a
+-- person influenced. `p_grades` is a JSON object keyed by question id, the same
+-- shape as `answers`:
+--
+--   { "<question uuid>": { "awarded": 7.5, "feedback": "Good structure." } }
+--
+-- Only the paper's owner (or an administrator) may call it, only for a
+-- *subjective* question of that paper, only for an attempt that has already been
+-- handed in, and never for more than the question is worth - the four ways a
+-- marking slip turns into somebody's wrong final mark. Everything else is
+-- refused with a status the app turns into prose.
+--
+-- Idempotent by construction: the marks are upserted and `score` is recomputed
+-- from the answers rather than incremented, so replaying the call after a dropped
+-- connection leaves the attempt exactly as it was, and a second read of the same
+-- essay is a correction of the same row rather than a second award.
+create or replace function public.grade_submission(
+  p_submission_id uuid,
+  p_grades        jsonb
+)
+returns table(final_score numeric, graded_answers int, ungraded_answers int)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_exam    uuid;
+  v_status  text;
+  v_owner   uuid;
+  v_entry   record;
+  v_awarded numeric;
+  v_points  numeric;
+  v_graded  int;
+  v_open    int;
+  v_score   numeric;
+begin
+  if auth.uid() is null then
+    raise exception 'authentication is required to grade an attempt'
+      using errcode = '42501';
+  end if;
+
+  if p_grades is null or jsonb_typeof(p_grades) <> 'object' then
+    raise exception 'the marks must be a json object keyed by question id'
+      using errcode = '22023';
+  end if;
+
+  select s.exam_id, s.status, e.created_by
+    into v_exam, v_status, v_owner
+  from public.exam_submissions s
+  join public.exams e on e.id = s.exam_id
+  where s.id = p_submission_id
+  for update of s;
+
+  if v_exam is null then
+    raise exception 'submission % does not exist', p_submission_id
+      using errcode = 'P0002';
+  end if;
+
+  -- The academic owner, not the wider invigilation tier: a supervisor may clear
+  -- an attempt, but the mark on somebody's paper is the lecturer's call. An
+  -- administrator is the deliberate exception - the role that can already
+  -- intervene in a submission directly.
+  if v_owner <> auth.uid() and not public.is_admin() then
+    raise exception 'only the exam owner may grade its answers'
+      using errcode = '42501';
+  end if;
+
+  -- An open attempt has not been handed in, so its answers can still change and
+  -- there is nothing final to mark yet.
+  if v_status = 'ongoing' then
+    raise exception 'submission % is still in progress', p_submission_id
+      using errcode = '55000';
+  end if;
+
+  -- A disqualified attempt is never graded: a score would imply it counts.
+  if v_status = 'disqualified' then
+    raise exception 'submission % was disqualified and is not graded',
+      p_submission_id
+      using errcode = '55000';
+  end if;
+
+  for v_entry in
+    select key as question_id, value as mark from jsonb_each(p_grades)
+  loop
+    select q.points into v_points
+    from public.questions q
+    where q.id = v_entry.question_id::uuid
+      and q.exam_id = v_exam
+      and q.question_type = 'subjective';
+
+    if v_points is null then
+      raise exception 'question % is not a subjective question of this exam',
+        v_entry.question_id
+        using errcode = '22023';
+    end if;
+
+    -- `is distinct from` rather than `<>`: a missing `awarded` key has a NULL
+    -- type, and NULL silently passes a plain inequality - the NULL mark would
+    -- then be refused by the column with a raw NOT NULL error instead of this
+    -- sentence.
+    if jsonb_typeof(v_entry.mark) is distinct from 'object'
+       or jsonb_typeof(v_entry.mark -> 'awarded') is distinct from 'number' then
+      raise exception 'question % needs a numeric "awarded" mark',
+        v_entry.question_id
+        using errcode = '22023';
+    end if;
+
+    v_awarded := (v_entry.mark ->> 'awarded')::numeric;
+
+    if v_awarded < 0 or v_awarded > v_points then
+      raise exception 'marks for question % must be between 0 and %',
+        v_entry.question_id, v_points
+        using errcode = '22023';
+    end if;
+
+    insert into public.question_grades
+      (submission_id, question_id, awarded, feedback, graded_by)
+    values (
+      p_submission_id,
+      v_entry.question_id::uuid,
+      v_awarded,
+      -- Capped like `merge_submission_text_answer`: a feedback box must not be
+      -- able to park an unbounded blob on a row a report will read. An empty box
+      -- is stored as NULL rather than as "", so "no remark" has one shape.
+      nullif(left(coalesce(v_entry.mark ->> 'feedback', ''), 2000), ''),
+      auth.uid()
+    )
+    on conflict (submission_id, question_id) do update
+      set awarded   = excluded.awarded,
+          feedback  = excluded.feedback,
+          graded_by = excluded.graded_by,
+          graded_at = now();
+  end loop;
+
+  -- What the console reports back: how much of this paper is marked, and what the
+  -- attempt is worth so far. Both are counted from the rows rather than from the
+  -- request, so a caller that sent three marks learns the same numbers the
+  -- attempt holds.
+  select count(*) filter (where g.id is not null)
+    into v_graded
+  from public.questions q
+  left join public.question_grades g
+    on g.question_id = q.id and g.submission_id = p_submission_id
+  where q.exam_id = v_exam
+    and q.question_type = 'subjective';
+
+  select count(*)
+    into v_open
+  from public.questions q
+  where q.exam_id = v_exam
+    and q.question_type = 'subjective'
+    and not exists (
+      select 1 from public.question_grades g
+      where g.submission_id = p_submission_id and g.question_id = q.id
+    );
+
+  -- `score` is rewritten from scratch - automatic marks plus what was awarded -
+  -- which is what makes a re-mark a correction, and why a partially marked
+  -- attempt already carries a meaningful total. `guard_submission_immutability`
+  -- allows this write to a closed row (score is exactly what a re-mark may
+  -- change) while still refusing any change to `answers`.
+  select public.auto_graded_score(p_submission_id)
+       + coalesce(sum(g.awarded), 0)
+    into v_score
+  from public.question_grades g
+  where g.submission_id = p_submission_id;
+
+  update public.exam_submissions
+  set score = v_score
+  where id = p_submission_id;
+
+  return query select v_score, v_graded, v_open;
+end;
+$$;
+
+comment on function public.grade_submission(uuid, jsonb) is
+  'Marks an attempt''s subjective answers (paper owner or admin only): upserts one question_grades row per answer and recomputes score as automatic + awarded. Idempotent.';
+
+revoke execute on function public.grade_submission(uuid, jsonb) from public, anon;
+grant execute on function public.grade_submission(uuid, jsonb) to authenticated, service_role;

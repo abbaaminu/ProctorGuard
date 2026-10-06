@@ -350,10 +350,20 @@ router today. Once `SupabaseService.signedInChanges` reports a session it:
 2. shows "Loading your profile…" with a spinner while that read is in flight;
 3. routes on the four values of the `public.user_role` enum:
    * `student` → `StudentExamPortalPage`
-   * `lecturer` / `supervisor` → `SupervisorExamPickerPage` — one console, because
-     `is_staff()` in the schema gives both roles the same data; the app does not
-     invent a second one just to have a label
+   * `lecturer` → `LecturerConsolePage` — the authoring and marking console for
+     the papers that account owns; the proctoring console (monitor + analytics)
+     is one tap away in its app bar
+   * `supervisor` → `SupervisorExamPickerPage`
    * `admin` → `AdminDashboardPage`
+
+Lecturers and supervisors share `is_staff()` in the database, which is what lets
+both read every attempt and every incident, but the two roles do different work:
+a lecturer owns the papers they wrote — only the author may edit a question or
+award the marks on an essay, and `grade_submission()` re-checks that — while a
+supervisor runs the sitting and is the tier `is_exam_supervisor()` names for
+resetting an attempt. Lecturers therefore land on the authoring console and reach
+the monitor through it, rather than sharing one screen that only fits one of the
+two jobs.
 
 A failed lookup (offline, no row, unrecognised role) renders a retryable error
 with a **Sign out** escape hatch instead of guessing a role — an unknown
@@ -375,6 +385,7 @@ in as a different account resolves a different profile.
 | List | `select().from('profiles')` ordered oldest-first (`created_at.asc.nullslast`), so a freshly created account appears at the end |
 | Change a role | `update({role}).eq('id', …)` with `.select('*')`; a row count of zero is treated as a failure, not a silent success. Your own row is not editable — it renders a plain `role (you)` chip |
 | Create an account | POSTs email, full name, a temporary password and a role to `/functions/v1/admin-create-user`, which answers `200` with the created row (`full_name`, also accepted as `fullName`) |
+| Reset a password | POSTs the account id and the new password to `/functions/v1/admin-reset-password` — `admin` only, and the one action allowed on your own row — then shows the password once |
 
 Every failure surfaces as one `AdminAccountException` whose message is already a
 sentence: PostgREST `42501` (a policy, or the `profiles_guard_role_change` trigger
@@ -388,6 +399,35 @@ The roster also supports permanent account deletion through
 attempts, and incidents are removed. The signed-in administrator cannot delete
 their own account, and the function independently enforces that rule.
 
+Passwords are reset through **`admin-reset-password`**. It is the one account
+action an administrator may also point at their **own** row: a password change
+cannot lock anybody out of a screen, and with no "forgot password" mail flow in
+this deployment, minting a temporary password and handing it over is how a
+locked-out person gets back in. The dialog takes it twice
+(`admin-new-password` / `admin-confirm-password`) — a typo in a field nobody can
+read back would otherwise become somebody's permanent password — and both fields
+are held to `adminMinPasswordLength`, the `MIN_PASSWORD_LENGTH = 6` floor the
+function enforces, so a password the server would refuse never leaves the dialog.
+On success the password is shown **once**, in a `SelectableText` the
+administrator has to dismiss: a temporary password nobody wrote down is not a
+reset. The roster itself does not change (a password is not a column), so nothing
+is refetched, and the row stops showing its spinner *before* that dialog opens —
+the work is already done, and a spinner turning behind a modal only hides the
+row's own actions.
+
+The role check is the server's, exactly as in `admin-create-user`: the JWT
+establishes *who* is asking, the caller's own `profiles.role` is read back
+through a client carrying the caller's token (so RLS filters it) and only then is
+the `service_role` key used. `admin` is the only role in `RESETTER_ROLES` —
+resetting an *attempt* is a proctoring action (`is_exam_supervisor()`), resetting
+a *password* is an identity action, and the schema keeps those in different
+hands — so a supervisor who calls it gets 403 and no write. A `404` from Auth is
+reported as "That account no longer exists — reload the list and try again."
+rather than as a refusal, because a stale roster row and a refused write are two
+different answers. Changing a password writes no `session_reset_logs` row: that
+table records the resets that destroy proctoring evidence, and Supabase Auth
+keeps its own record against `auth.users`.
+
 Creating a login needs the Edge Function because `profiles_insert_self_student`
 only lets a client insert its *own* row with `role = 'student'`; the function
 re-reads the caller's JWT against `profiles` with the anon key, refuses anyone
@@ -399,11 +439,33 @@ admin-create-user` and why the key never reaches the app).
 
 `SupervisorExamPickerPage` lists published exams and opens
 `SupervisorDashboardPage`, whose roster and incident feed are Supabase Realtime
-streams. Supervisors and admins can reset attempts from the roster; lecturers
-can monitor but do not receive reset controls. Reset deletes the attempt and
-cascaded incident records, then removes its snapshot objects through the Storage
-API. If Storage cleanup fails after the attempt is deleted, the UI reports that
-partial result instead of claiming full cleanup.
+streams. Whether the roster offers the reset control is decided in one place,
+`UserRole.canResetAttempts` — `admin` and `supervisor` only, which is
+`is_exam_supervisor()`'s own list in `supabase/schema.sql` read back out of the
+file by `schema_contract_test.dart`, so the role gate, the admin dashboard and
+the live monitor cannot disagree about it. Lecturers reach this same console from
+their own home (the app bar's Monitor action) and can watch a sitting, but arrive
+with `canResetAttempts: false`; `AdminDashboardPage` mounts its picker with the
+flag set, because only an admin can reach that screen.
+
+A reset deletes the attempt with its cascaded incident rows, purges the snapshot
+objects those rows pointed at through the Storage API, and then records what it
+did in **`public.session_reset_logs`** (`schema.sql` §7): the attempt, student
+and exam ids, the incident and snapshot counts, and the actor. `actor_id` defaults
+to `auth.uid()` and the insert policy re-checks `actor_id = auth.uid()`, so *who*
+cleared an attempt is the database's answer rather than this client's claim, and
+there is no UPDATE and no DELETE policy — the trail is append-only for every
+client, admin included. `supabase/migrations/session_reset_logs.sql` adds the
+table to a project that predates it; without it the reset still succeeds, and the
+console says so instead of hiding the gap.
+
+Both halves that can fail *after* the attempt is gone — the Storage purge and the
+audit insert — come back on the successful result rather than being thrown: the
+attempt no longer exists, so a raised failure would invite a retry against
+nothing, and a plain success would hide the gap. The console appends them to the
+confirmation ("Attempt reset, but …"), each naming the half that did not finish,
+and a failed purge counts zero snapshots removed, so the number never claims
+cleanup that did not happen.
 
 `AnalyticsPage` is available from the staff and admin homes and the live monitor.
 It reports attempts, completions, disqualification rate, mean scored result, and
@@ -419,10 +481,85 @@ console it was opened from — three levels down (home → monitor → analytics
 alternative is a browser, where the platform back gesture does not exist. On the
 landing page itself there is nothing above it and the button keeps its place.
 
+### Lecturer console (question authoring and marking)
+
+`LecturerConsolePage` (`lib/features/authoring/presentation/pages/`) is what
+`RoleGate` renders for `lecturer`: the papers **this account owns**
+(`created_by = auth.uid()` — `exams_select` would otherwise list every paper in
+the institution, and only the author may change one), each with its question and
+attempt counts, and the four things a lecturer does with a paper.
+
+| Screen | What it does |
+| --- | --- |
+| `LecturerConsolePage` | Lists the account's papers, creates one (a **draft** by default — a paper with no questions cannot be sat, so publishing one is refused with the fix named), publishes/unpublishes, deletes (naming the cascade), and opens either screen below |
+| `QuestionAuthoringPage` + `QuestionEditorDialog` | Adds, edits and deletes questions of all four shapes, with the answer key read back in words — the one client surface that holds a key |
+| `AttemptGradingPage` | Every handed-in attempt, newest first, with the ones still waiting for marks flagged ("1 to mark"), and the running total the server holds |
+| `AttemptReviewPage` | One attempt: each question with the student's stored answer, the automatic verdict (right / wrong / not answered) beside the key it was compared against, and marks + feedback boxes for the essays |
+
+**The four shapes.** `questions.question_type` holds `multiple_choice`,
+`true_false`, `fill_in_the_blank` or `subjective`; the editor swaps its answer
+fields with the type, and the paper's list labels each row with how it is marked:
+
+| Type | Answer key | Marked by |
+| --- | --- | --- |
+| Multiple choice | `correct_option`, the 0-based index into `options` | `submit_exam()` |
+| True / false | `correct_text_answer` is the word `true` / `false` | `submit_exam()` |
+| Fill in the blank | `correct_text_answer`, trimmed and case-insensitive | `submit_exam()` |
+| Essay (`subjective`) | *none* — the absence of a key **is** the shape | a person, through `grade_submission()` |
+
+`QuestionDraft.problem` mirrors `questions_answer_key_shape` and the new
+`points >= 0` floor, so the editor refuses locally what the database would refuse
+with a bare `23514` — and `toRow()` writes the key for the type in front of it and
+clears the others, so editing a row into another shape cannot leave a stale key
+behind. The database keeps its own copy of every rule.
+
+**Marking an essay.** `question_grades` (`schema.sql` §8) holds one row per
+hand-marked answer — `submission_id`, `question_id`, `awarded`, `feedback`,
+`graded_by` — with `unique (submission_id, question_id)`, so a re-mark is an
+update of the same row rather than a second award. It is deliberately *not* a key
+inside `exam_submissions.answers`: `guard_submission_immutability` freezes those
+answers the moment an attempt closes, which is exactly what makes a re-mark read
+the words the student actually submitted. Staff may read the table and **nobody
+may write it directly** — no insert, update or delete policy, the shape
+`proctoring_logs` uses for violations — because `grade_submission()` is the single
+write path. It checks the caller owns the paper (or is an administrator), refuses
+an attempt that is still in progress or was disqualified, refuses a question that
+is not `subjective`, refuses marks outside `0 … points`, upserts, and recomputes
+
+```
+exam_submissions.score = auto_graded_score(submission) + Σ question_grades.awarded
+```
+
+**Why `auto_graded_score()` exists.** The automatic part of a score used to be an
+inline sum inside `submit_exam()`. It now lives in one function that both the
+close and every re-mark call, so "which answers count" cannot drift between them —
+and it is where true/false grading was added, since the word comparison
+fill-in-the-blank already used is exactly what a true/false key needs.
+
+**What the marking screen reports.** "Waiting for marks" is derived from the rows,
+not from `status`: an attempt whose paper contains an essay is only *partly*
+graded when it is handed in, so the queue is exactly "which essays have no
+`question_grades` row yet". The running total shown is the server's own `score`,
+and the sentence after a save (`GradingOutcome.summary`) is built from the RPC's
+returned row — nothing on the screen is the client's arithmetic. An empty marks
+box means *not marked* rather than zero, so a first pass can save the essays that
+have been read without awarding nothing for the ones that have not.
+
+**Invigilation is not duplicated.** The console's app bar opens the supervisor
+console with `canResetAttempts: false` — the schema's own rule for this role. A
+lecturer can watch a sitting and read every attempt (`is_staff()`), but resetting
+one belongs to `is_exam_supervisor()`'s tier.
+
+**Seeded to try it on.** `seed.sql` gives the lecturer a published paper of their
+own (`GES301: Software Engineering Midterm`) with one question of each shape, and
+one handed-in attempt by Chidi whose essay is deliberately **unmarked** — so the
+console's list, the editor's four answer fields and the "1 to mark" queue all have
+something real in them on a fresh project.
+
 ### Student Exam Portal
 
-`StudentExamPortalPage` lists every published exam (CS101 and MAT201 in
-`seed.sql`) through `PublishedExamList`, and on tap:
+`StudentExamPortalPage` lists every published exam (CS101, MAT201 and the
+lecturer's GES301 in `seed.sql`) through `PublishedExamList`, and on tap:
 
 * runs the **mandatory device check first** (`ExamHardwareGatePage`): a real
   camera *and* a real microphone have to be opened and verified before anything
@@ -468,17 +605,23 @@ Details worth knowing:
 * **Every question is numbered explicitly** — "Question 3 of 5" in the app bar
   (both shapes), and the app bar also shows how many answers the *server* has
   stored ("3 of 5 answered").
-* **Two question shapes.** `multiple_choice` renders tap targets and saves the
-  option index through `merge_submission_answer`; `fill_in_the_blank` renders a
-  text field and saves through `merge_submission_text_answer`, graded
-  server-side case-insensitively after trimming (so `"  http "` scores for
-  `"HTTP"`). A typed answer is written by "Save & next", the keyboard's done
-  action, or the submit flush below — the field shows "Answer saved" once the
-  server has it.
+* **Four question shapes**, and the input follows the shape. `multiple_choice`
+  renders tap targets and saves the option index through
+  `merge_submission_answer`; `true_false` renders two tap targets (True / False)
+  and saves the **word** through `merge_submission_text_answer`, because that is
+  what a true/false row's key is compared against; `fill_in_the_blank` and
+  `subjective` (an essay) render a text field and save through
+  `merge_submission_text_answer`, graded server-side case-insensitively after
+  trimming for the first of those two (so `"  http "` scores for `"HTTP"`) and
+  marked by the lecturer afterwards for the second. A typed answer is written by
+  "Save & next", the keyboard's done action, or the submit flush below — the field
+  shows "Answer saved" once it is stored, and an essay says plainly that nothing
+  is scored as the student types (`ExamEssayField`).
 * **One question per screen, with the whole paper one tap away.** The session is
   paginated rather than one long scroll: the app bar shows "Question X of Y", the
-  action bar carries **Previous** and **Next** side by side (multiple choice) or
-  **Save & next** (typed answer), and **Submit exam** replaces Next on the last
+  action bar carries **Previous** and **Next** side by side (multiple choice and
+  true/false, which both record on tap) or **Save & next** (a typed answer, which
+  has no auto-advance to trigger on), and **Submit exam** replaces Next on the last
   question. Previous is always on screen — inert on question 1 rather than absent,
   because a control that only appears on question 2 is a control nobody knows
   exists. Above the question sits the review grid (`ExamQuestionPalette`, in
@@ -878,6 +1021,16 @@ written-down opt-out for a throwaway demo build and never for one a student runs
   delete policy: `register_violation` is the only writer, and it re-checks that
   the caller owns the submission, so RLS makes tampering with evidence
   impossible from a client.
+- **The reset trail is append-only too.** Clearing an attempt is the one
+  destructive staff action, so the same call that deletes the row writes
+  `public.session_reset_logs` (`schema.sql` §7): the attempt, student and exam
+  ids, the incident and snapshot counts, and the actor the database derived from
+  the caller's JWT — `actor_id` defaults to `auth.uid()` and the insert policy
+  re-checks it, so nobody can name somebody else as the actor. There is no
+  UPDATE and no DELETE policy, so no client, admin included, can rewrite or
+  erase the trail. A project that predates the table keeps resetting; the
+  console reports the missing audit row instead of pretending it was written
+  (`supabase/migrations/session_reset_logs.sql` is the fix).
 - **`app_minimized` detection accepts false positives.** `AppLifecycleState
   .inactive` fires for notification-shade pulls, incoming calls, *and*
   (on many Android builds) the screenshot flash — that's intentional

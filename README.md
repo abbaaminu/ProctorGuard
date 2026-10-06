@@ -1,8 +1,9 @@
 # ProctorGuard
 
 ProctorGuard is a Flutter exam-proctoring application backed by Supabase. The
-mobile/web Flutter app provides student exam sessions, supervisor monitoring and
-attempt resets, analytics for staff, and an admin account-management console.
+mobile/web Flutter app provides student exam sessions, lecturer question
+authoring and marking, supervisor monitoring and attempt resets, analytics for
+staff, and an admin account-management console.
 
 ```
 mobile/       Flutter app and staff/admin interfaces
@@ -14,6 +15,11 @@ supabase/     Schema, migrations, seed data, and Edge Functions
 - **Administrators** can list accounts, create logins, change roles, and
   permanently delete accounts from the Admin Dashboard. Creation and deletion
   use the `admin-create-user` and `admin-delete-user` Edge Functions.
+- **Lecturers** author the papers they own — multiple-choice, true/false,
+  fill-in-the-blank and essay questions — publish them when they are ready, and
+  mark the essays that come back. Only the paper's owner (or an administrator)
+  may change it or award marks on it: `grade_submission()` re-checks that
+  server-side, and the marks land in `public.question_grades`.
 - **Supervisors** can choose a published exam, monitor attempts and incidents in
   real time, and reset an attempt. Reset removes the submission and cascaded
   incident records so the student can start over; associated snapshots are
@@ -23,8 +29,11 @@ supabase/     Schema, migrations, seed data, and Edge Functions
   every operation.
 
 Roles are stored in the `public.user_role` enum: `student`, `lecturer`,
-`supervisor`, and `admin`. Lecturers can review attempts and analytics but
-cannot reset them. Only admins can manage accounts.
+`supervisor`, and `admin`. Lecturers own the papers they write: they author its
+questions and award the marks on its essays. Supervisors run the sitting and are
+the tier `is_exam_supervisor()` names for resetting an attempt — lecturers can
+watch a sitting through the same monitor but cannot reset. Only admins can manage
+accounts.
 
 ## Proctoring boundaries and risk register
 
@@ -70,7 +79,7 @@ rather than left to be mistaken for more than it is.
 | Sound that is not plain talking (TV, music, a second speaker) | Loudness cannot be attributed to a person or separated from other sound | Sustained-threshold rules (a median-calibrated room floor, a 2s window that tolerates the gaps between words) keep one-offs out; content is deliberately never captured |
 | Escape from the locked exam surface | Screen pinning (no Device Owner) and browser fullscreen can be left | An escape or a fullscreen exit becomes an `app_minimized` strike; the kiosk badge shows whether pinning is enforced or best-effort |
 | Detector evasion (rooted/virtualised device, camera spoof) | Client-side detectors can be defeated by a determined, technically capable student | Treat the client as untrusted: grading and the 3-strike rule are enforced **server-side** (`register_violation`, `submit_exam`) |
-| Evidence retention / privacy | Snapshots in `proctor-snapshots` are personal data with no automatic TTL by default | Set the bucket's visibility and a retention policy for your institution; snapshots are already deleted on an attempt reset |
+| Evidence retention / privacy | Snapshots in `proctor-snapshots` are personal data with no automatic TTL by default | Set the bucket's visibility and a retention policy for your institution; snapshots are already deleted on an attempt reset, which `session_reset_logs` records (who cleared which attempt, for whom, and how much evidence went with it) |
 
 The client is never the authority: **grading and the strike rule live on the
 server** (see `supabase/schema.sql`), so a modified or compromised client can
@@ -80,11 +89,32 @@ lose proctoring signals but cannot change a result.
 
 1. Create a Supabase project and run `supabase/schema.sql` in its SQL editor.
    For an existing project, run any unapplied files in `supabase/migrations/`;
-   each migration documents its purpose and verification steps.
+   each migration documents its purpose and verification steps, and one can be
+   applied on its own through the CLI:
+   ```powershell
+   supabase db query --linked -f supabase/migrations/session_reset_logs.sql
+   supabase db query --linked -f supabase/migrations/question_types_and_grading.sql
+   ```
+   `session_reset_logs.sql` is the one to check for on a project installed
+   earlier: without it, an attempt reset from the staff console still works, but
+   its audit row cannot be written and the console reports the gap
+   (`session_reset_logs` in [mobile/README.md](./mobile/README.md)).
+   `question_types_and_grading.sql` is the other: it widens `questions` from two
+   types to four and adds `question_grades` with `grade_submission()`. Without
+   it, a lecturer console can still author multiple-choice and fill-in-the-blank
+   questions, but the database refuses a true/false or essay row with
+   `questions_question_type_check`, and marking an essay fails with the file's
+   name in the message. Apply them in this order:
+   `question_types_and_grading.sql` replaces `submit_exam()` a second time, and
+   its body is the one that grades a true/false answer through
+   `auto_graded_score()`. Re-running the older
+   `secure_exam_access_and_deadlines.sql` after it would restore a body that
+   scores multiple-choice and fill-in-the-blank only.
 2. Deploy the account-management functions:
    ```powershell
    supabase functions deploy admin-create-user
    supabase functions deploy admin-delete-user
+   supabase functions deploy admin-reset-password
    ```
    The project supplies `SUPABASE_URL`, `SUPABASE_ANON_KEY` (or
    `SUPABASE_PUBLISHABLE_KEY`), and `SUPABASE_SERVICE_ROLE_KEY` to the
@@ -99,7 +129,11 @@ lose proctoring signals but cannot change a result.
 
 - Turn off public sign-ups if the institution provisions student accounts
   separately. Self-sign-up is limited to the `student` role by database policy.
-- Ensure the `admin-create-user` and `admin-delete-user` functions are deployed.
+- Apply `supabase/migrations/question_types_and_grading.sql` on any project that
+  predates the four question types. Until it runs, the lecturer console cannot
+  store a true/false or essay question, and cannot mark one.
+- Ensure the `admin-create-user`, `admin-delete-user` and `admin-reset-password`
+  functions are deployed.
 - Configure the Flutter app with the Supabase project URL and a publishable
   client key. Never embed a service-role or secret key in the app.
 - Review the `proctor-snapshots` bucket visibility and retention policy in

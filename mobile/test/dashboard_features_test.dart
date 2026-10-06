@@ -96,9 +96,9 @@ void main() {
       await tester.pumpWidget(
         ProviderScope(
           overrides: [
-            examSubmissionsStreamProvider('exam-1').overrideWith(
-              (ref) => Stream.value(<Map<String, dynamic>>[]),
-            ),
+            examSubmissionsStreamProvider(
+              'exam-1',
+            ).overrideWith((ref) => Stream.value(<Map<String, dynamic>>[])),
             liveViolationFeedProvider(
               'exam-1',
             ).overrideWith((ref) => Stream.value(<Map<String, dynamic>>[])),
@@ -151,47 +151,77 @@ void main() {
   });
 
   group('supervisor attempt reset', () {
-    test('deletes the attempt before cleaning its snapshot objects', () async {
-      final transport = _FakeTransport((request) {
-        if (request.url.path.endsWith('/proctoring_logs')) {
-          return jsonEncode([
-            {
-              'snapshot_url':
-                  'https://mock.supabase.co/storage/v1/object/public/'
-                  'proctor-snapshots/attempt-1/flag%201.jpg',
-            },
-            {
-              'snapshot_url':
-                  'https://mock.supabase.co/storage/v1/object/sign/'
-                  'proctor-snapshots/attempt-1/flag%201.jpg?token=secret',
-            },
-            {'snapshot_url': 'https://example.invalid/placeholder.jpg'},
-          ]);
-        }
-        if (request.method == 'DELETE' &&
-            request.url.path.endsWith('/exam_submissions')) {
-          return '[{"id":"attempt-1"}]';
-        }
-        if (request.url.path.contains('/storage/v1/object/')) return '[]';
-        fail('Unexpected request: ${request.method} ${request.url}');
-      });
-      final repository = DashboardRepositoryImpl(_client(transport));
+    test(
+      'deletes the attempt, purges its snapshots, then records the reset',
+      () async {
+        final transport = _FakeTransport((request) {
+          if (request.url.path.endsWith('/proctoring_logs')) {
+            return jsonEncode([
+              {
+                'snapshot_url':
+                    'https://mock.supabase.co/storage/v1/object/public/'
+                        'proctor-snapshots/attempt-1/flag%201.jpg',
+              },
+              {
+                'snapshot_url':
+                    'https://mock.supabase.co/storage/v1/object/sign/'
+                        'proctor-snapshots/attempt-1/flag%201.jpg?token=secret',
+              },
+              {'snapshot_url': 'https://example.invalid/placeholder.jpg'},
+            ]);
+          }
+          // `select('id, student_id, exam_id')`: the ids the audit row needs are
+          // unrecoverable once the row is gone, so the delete returns them.
+          if (request.method == 'DELETE' &&
+              request.url.path.endsWith('/exam_submissions')) {
+            return '[{"id":"attempt-1","student_id":"student-1",'
+                '"exam_id":"exam-1"}]';
+          }
+          if (request.url.path.contains('/storage/v1/object/')) return '[]';
+          if (request.method == 'POST' &&
+              request.url.path.endsWith('/session_reset_logs')) {
+            return '[]';
+          }
+          fail('Unexpected request: ${request.method} ${request.url}');
+        });
+        final repository = DashboardRepositoryImpl(_client(transport));
 
-      final result = await repository.resetSubmission('attempt-1');
+        final result = await repository.resetSubmission('attempt-1');
 
-      expect(result.incidents, 3);
-      expect(result.snapshots, 0);
-      expect(transport.requests.map((request) => request.url.path).toList(), [
-        '/rest/v1/proctoring_logs',
-        '/rest/v1/exam_submissions',
-        '/storage/v1/object/proctor-snapshots',
-      ]);
-      expect(
-        transport.bodies.last,
-        contains('attempt-1/flag 1.jpg'),
-        reason: 'duplicate URLs resolve to one decoded Storage object path',
-      );
-    });
+        expect(result.incidents, 3);
+        expect(result.snapshots, 0);
+        expect(result.storageWarning, isNull);
+        expect(result.auditWarning, isNull);
+        // Read the evidence, delete the attempt, purge its objects, and only then
+        // write the audit row: the row records what the purge really did, so it
+        // cannot be written before the purge has answered.
+        expect(transport.requests.map((request) => request.url.path).toList(), [
+          '/rest/v1/proctoring_logs',
+          '/rest/v1/exam_submissions',
+          '/storage/v1/object/proctor-snapshots',
+          '/rest/v1/session_reset_logs',
+        ]);
+        expect(
+          transport.bodies[2],
+          contains('attempt-1/flag 1.jpg'),
+          reason: 'duplicate URLs resolve to one decoded Storage object path',
+        );
+
+        // The audit row names the attempt it describes...
+        final audit = jsonDecode(transport.bodies.last) as Map<String, dynamic>;
+        expect(audit, <String, dynamic>{
+          'submission_id': 'attempt-1',
+          'student_id': 'student-1',
+          'exam_id': 'exam-1',
+          'incidents': 3,
+          'snapshots': 0,
+          'storage_warning': null,
+        });
+        // ...and names no actor: `actor_id` defaults to auth.uid() server-side and
+        // the insert policy re-checks it, so who ran the reset is the database's
+        // answer rather than this client's claim.
+      },
+    );
 
     test('does not report success when RLS deletes no rows', () async {
       final transport = _FakeTransport((request) {
@@ -288,18 +318,131 @@ void main() {
     expect(repository.resets, ['attempt-1']);
     expect(find.textContaining('Attempt reset'), findsOneWidget);
   });
+
+  test('a reset whose audit row was refused still reports the reset', () async {
+    final transport = _FakeTransport(
+      (request) {
+        if (request.url.path.endsWith('/proctoring_logs')) return '[]';
+        if (request.method == 'DELETE' &&
+            request.url.path.endsWith('/exam_submissions')) {
+          return '[{"id":"attempt-1","student_id":"student-1",'
+              '"exam_id":"exam-1"}]';
+        }
+        // What a project that has not run `supabase/migrations/
+        // session_reset_logs.sql` answers: PostgREST 404, `42P01`.
+        if (request.url.path.endsWith('/session_reset_logs')) {
+          return jsonEncode(<String, dynamic>{
+            'code': '42P01',
+            'message': 'relation "public.session_reset_logs" does not exist',
+          });
+        }
+        fail('Unexpected request: ${request.method} ${request.url}');
+      },
+      statusFor: (request) =>
+          request.url.path.endsWith('/session_reset_logs') ? 404 : 200,
+    );
+
+    final result = await DashboardRepositoryImpl(
+      _client(transport),
+    ).resetSubmission('attempt-1');
+
+    // The attempt is gone, so the reset is reported as done with a caveat
+    // naming the half that is missing - never as a failure, which would invite
+    // a retry against an attempt that no longer exists.
+    expect(result.incidents, 0);
+    expect(result.storageWarning, isNull);
+    expect(
+      result.auditWarning,
+      startsWith('the reset could not be recorded in the audit trail: '),
+    );
+    expect(
+      result.auditWarning,
+      contains('relation "public.session_reset_logs" does not exist'),
+    );
+    expect(transport.requests.last.url.path, '/rest/v1/session_reset_logs');
+  });
+
+  testWidgets('a reset that could not be audited says so', (tester) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    // What a live project without `supabase/migrations/session_reset_logs.sql`
+    // answers, as the console would show it.
+    final repository = _FakeDashboardRepository(
+      auditWarning: 'the reset could not be recorded in the audit trail: '
+          'relation "public.session_reset_logs" does not exist',
+    );
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          examSubmissionsStreamProvider('exam-1').overrideWith(
+            (ref) => Stream.value([
+              {
+                'id': 'attempt-1',
+                'student_id': 'student-1',
+                'status': 'ongoing',
+                'score': null,
+              },
+            ]),
+          ),
+          liveViolationFeedProvider(
+            'exam-1',
+          ).overrideWith((ref) => Stream.value(<Map<String, dynamic>>[])),
+          accountNamesProvider.overrideWith(
+            (ref) => Stream.value({'student-1': 'Aisha Bello'}),
+          ),
+          dashboardRepositoryProvider.overrideWithValue(repository),
+        ],
+        child: const MaterialApp(
+          home: SupervisorDashboardPage(
+            examId: 'exam-1',
+            examTitle: 'Biology',
+            canResetAttempts: true,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('reset-attempt-attempt-1')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(find.text('Reset attempt'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    // The attempt *was* removed, so the console leads with that and appends the
+    // half that is missing: reporting a bare failure would invite a retry
+    // against an attempt that no longer exists, and reporting a plain success
+    // would hide the gap in the trail.
+    expect(repository.resets, ['attempt-1']);
+    expect(find.textContaining('Attempt reset, but'), findsOneWidget);
+    expect(
+      find.textContaining('could not be recorded in the audit trail'),
+      findsOneWidget,
+    );
+  });
 }
 
 SupabaseClient _client(_FakeTransport transport) => SupabaseClient(
-  'https://mock.supabase.co',
-  'sb_publishable_mock',
-  httpClient: transport,
-);
+      'https://mock.supabase.co',
+      'sb_publishable_mock',
+      httpClient: transport,
+    );
 
 class _FakeTransport extends http.BaseClient {
-  _FakeTransport(this.respond);
+  _FakeTransport(this.respond, {this.statusFor});
 
   final String Function(http.BaseRequest request) respond;
+
+  /// Status per request — 200 unless a test needs one call to fail (the audit
+  /// insert, say). Retries apply to GET/HEAD only, so a failing POST is sent
+  /// exactly once and the recorded call sequence stays intact.
+  final int Function(http.BaseRequest request)? statusFor;
   final List<http.BaseRequest> requests = [];
   final List<String> bodies = [];
 
@@ -309,7 +452,7 @@ class _FakeTransport extends http.BaseClient {
     bodies.add(request is http.Request ? utf8.decode(request.bodyBytes) : '');
     return http.StreamedResponse(
       Stream<List<int>>.value(utf8.encode(respond(request))),
-      200,
+      statusFor?.call(request) ?? 200,
       headers: const {'content-type': 'application/json'},
       request: request,
     );
@@ -317,9 +460,13 @@ class _FakeTransport extends http.BaseClient {
 }
 
 class _FakeDashboardRepository implements DashboardRepository {
-  _FakeDashboardRepository({this.error});
+  _FakeDashboardRepository({this.error, this.auditWarning});
 
   final Object? error;
+
+  /// Set to make [resetSubmission] report a reset that *did* happen but whose
+  /// `session_reset_logs` row could not be written.
+  final String? auditWarning;
   int reads = 0;
   final List<String> resets = [];
 
@@ -349,6 +496,10 @@ class _FakeDashboardRepository implements DashboardRepository {
 
   Future<SubmissionResetResult> _reset(String submissionId) async {
     resets.add(submissionId);
-    return const SubmissionResetResult(incidents: 1, snapshots: 1);
+    return SubmissionResetResult(
+      incidents: 1,
+      snapshots: 1,
+      auditWarning: auditWarning,
+    );
   }
 }

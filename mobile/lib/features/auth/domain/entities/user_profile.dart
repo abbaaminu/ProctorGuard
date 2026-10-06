@@ -33,6 +33,21 @@ enum UserRole {
       };
 
   String get dbValue => name;
+
+  /// Who may clear a student's attempt and its proctoring evidence — the roles
+  /// `is_exam_supervisor()` names in `supabase/schema.sql`
+  /// (`role in ('admin', 'supervisor')`).
+  ///
+  /// The **policy** is the authority (`submissions_delete_supervisor`, plus the
+  /// Storage delete policy that lets the console drop the snapshots those rows
+  /// pointed at). This getter is the same question asked by the screens that
+  /// render the control, and it is asked in exactly *one* place for that
+  /// reason: the role gate, the admin dashboard and the live monitor must not
+  /// be able to disagree about whether an account may reset an attempt.
+  /// `schema_contract_test.dart` reads the role list back out of `schema.sql`
+  /// and fails if the two drift apart.
+  bool get canResetAttempts =>
+      this == UserRole.admin || this == UserRole.supervisor;
 }
 
 /// The `public.profiles` row for the authenticated account (1:1 with

@@ -179,12 +179,12 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// Identity of this session's controller. Rebuilt every frame, but `==` makes
   /// Riverpod hand back the same instance (see [ExamSessionArgs]).
   ExamSessionArgs get _args => ExamSessionArgs(
-    examId: widget.examId,
-    submissionId: widget.submissionId,
-    durationMinutes: widget.durationMinutes,
-    startedAt: widget.startedAt,
-    clock: widget.clock,
-  );
+        examId: widget.examId,
+        submissionId: widget.submissionId,
+        durationMinutes: widget.durationMinutes,
+        startedAt: widget.startedAt,
+        clock: widget.clock,
+      );
 
   ExamSessionController get _session =>
       ref.read(examSessionControllerProvider(_args).notifier);
@@ -376,9 +376,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       _failStart(
         kIsWeb
             ? 'No camera is available. Allow camera access for this site in your '
-                  'browser (and check the device has one), then tap Try again.'
+                'browser (and check the device has one), then tap Try again.'
             : 'No camera is available on this device. Proctoring needs a working '
-                  'front camera.',
+                'front camera.',
       );
       return;
     }
@@ -895,8 +895,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     final markedNote = marked == 0
         ? ''
         : '\n\n$marked '
-              '${marked == 1 ? 'question is' : 'questions are'} still marked '
-              'for review.';
+            '${marked == 1 ? 'question is' : 'questions are'} still marked '
+            'for review.';
     return showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -923,25 +923,26 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
 
   /// Warns that the server refused some answers (a closed attempt or a passed
   /// deadline) before the student closes the attempt for good.
-  Future<bool?> _confirmRejectedAnswers(int rejectedAnswers) => showDialog<bool>(
-    context: context,
-    barrierDismissible: false,
-    builder: (context) => AlertDialog(
-      title: const Text('Some answers were not saved'),
-      content: Text(
-        '$rejectedAnswers '
-        '${rejectedAnswers == 1 ? 'answer could' : 'answers could'} '
-        'not be saved because the attempt was closed or its deadline passed. '
-        'The server will grade only answers it accepted.',
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(true),
-          child: const Text('Submit saved answers'),
+  Future<bool?> _confirmRejectedAnswers(int rejectedAnswers) =>
+      showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          title: const Text('Some answers were not saved'),
+          content: Text(
+            '$rejectedAnswers '
+            '${rejectedAnswers == 1 ? 'answer could' : 'answers could'} '
+            'not be saved because the attempt was closed or its deadline passed. '
+            'The server will grade only answers it accepted.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Submit saved answers'),
+            ),
+          ],
         ),
-      ],
-    ),
-  );
+      );
 
   void _showMessage(String message) {
     if (!mounted) return;
@@ -1009,8 +1010,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         key: const Key('exam-time-up'),
         icon: Icons.timer_off_outlined,
         title: 'Time is up',
-        message:
-            'Your answers are saved, but the submission has not reached '
+        message: 'Your answers are saved, but the submission has not reached '
             'the server yet.',
         onRetry: () => _finalSubmit(timeUp: true),
         retryLabel: 'Send again',
@@ -1023,8 +1023,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         key: const Key('exam-offline-submit'),
         icon: Icons.cloud_off,
         title: 'Waiting for a connection',
-        message:
-            'Every answer is saved on this device, so nothing is lost. '
+        message: 'Every answer is saved on this device, so nothing is lost. '
             'Reconnect to hand the attempt in - it will go through as soon as '
             'the answers reach the server.',
         onRetry: _retryOfflineSubmit,
@@ -1045,8 +1044,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         key: const Key('exam-no-questions'),
         icon: Icons.help_outline,
         title: 'No questions yet',
-        message:
-            'This exam has no questions published yet. Tell your '
+        message: 'This exam has no questions published yet. Tell your '
             'supervisor — you can come back once they are added.',
         allowExit: true,
       );
@@ -1175,13 +1173,23 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     );
   }
 
-
   /// The question and its answer surface.
   ///
   /// Scrollable by construction. It used to be a `Column` with a `Spacer` inside
   /// a non-scrollable body, so a five-option question on a phone in landscape (or
   /// any large accessibility text scale) overflowed — and the overflow banner
   /// covered the last option.
+  /// Whether the answer stored for [question] is the one on screen — what the
+  /// three answer widgets mean by "saved".
+  ///
+  /// It works for the typed shapes *and* true/false: a true/false tap stores the
+  /// word through the same text plumbing, so both halves of the comparison come
+  /// from `textAnswers` / `savedText`.
+  bool _isAnswerSaved(ExamSessionState session, Question question) =>
+      session.savedQuestions.contains(question.id) &&
+      session.savedText[question.id] ==
+          (session.textAnswers[question.id] ?? '');
+
   Widget _buildQuestionPane(
     ExamSessionState session,
     Question question,
@@ -1233,8 +1241,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                 onRetry: () => unawaited(_retryAudioMonitoring()),
                 onOpenSettings:
                     audioState.monitor == AudioMonitorState.permissionDenied
-                    ? () => unawaited(PermissionService().openSettings())
-                    : null,
+                        ? () => unawaited(PermissionService().openSettings())
+                        : null,
               ),
             ],
           ),
@@ -1264,16 +1272,38 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
           const SizedBox(height: 16),
           Text(question.questionText, style: theme.textTheme.titleLarge),
           const SizedBox(height: 16),
-          if (question.isFillInTheBlank)
+          if (question.isTrueFalse)
+            // True/false: two tap targets. The tap stores the word through the
+            // text path (see `ExamSessionController.selectTrueFalse`), so it
+            // paints and advances exactly like a multiple-choice answer.
+            ExamTrueFalseField(
+              key: ValueKey(question.id),
+              selectedValue: session.textAnswers[question.id],
+              saved: _isAnswerSaved(session, question),
+              enabled: !session.submitting,
+              onSelected: (value) => unawaited(_session.selectTrueFalse(value)),
+            )
+          else if (question.isSubjective)
+            // An essay: the same durable plumbing as a fill-in-the-blank answer
+            // (draft to the cache on every keystroke, saved through
+            // merge_submission_text_answer) in a taller box. Nothing here scores
+            // it — its marks come from the lecturer after the attempt is handed
+            // in.
+            ExamEssayField(
+              key: ValueKey(question.id),
+              initialValue: session.textAnswers[question.id] ?? '',
+              saved: _isAnswerSaved(session, question),
+              enabled: !session.submitting,
+              onChanged: (value) => _session.cacheDraftText(question.id, value),
+              onSubmitted: (_) => _session.saveTextAnswer(question.id),
+            )
+          else if (question.isFillInTheBlank)
             // Fill in the blank: no options, a text field, and a "Save &
             // next" action (the field has no auto-advance to trigger on).
             ExamFillInTheBlankField(
               key: ValueKey(question.id),
               initialValue: session.textAnswers[question.id] ?? '',
-              saved:
-                  session.savedQuestions.contains(question.id) &&
-                  session.savedText[question.id] ==
-                      (session.textAnswers[question.id] ?? ''),
+              saved: _isAnswerSaved(session, question),
               enabled: !session.submitting,
               // Keystrokes go to the durable cache (no network write): losing the
               // app must not lose an answer that is still being typed.
@@ -1331,17 +1361,17 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         child: widget.mockMode
             ? const ExamMockCameraTile()
             : controller != null &&
-                  controller.value.isInitialized &&
-                  !controller.value.hasError
-            ? FittedBox(
-                fit: BoxFit.cover,
-                child: SizedBox(
-                  width: controller.value.previewSize?.height ?? 480,
-                  height: controller.value.previewSize?.width ?? 640,
-                  child: CameraPreview(controller),
-                ),
-              )
-            : const ExamCameraOfflineNotice(),
+                    controller.value.isInitialized &&
+                    !controller.value.hasError
+                ? FittedBox(
+                    fit: BoxFit.cover,
+                    child: SizedBox(
+                      width: controller.value.previewSize?.height ?? 480,
+                      height: controller.value.previewSize?.width ?? 640,
+                      child: CameraPreview(controller),
+                    ),
+                  )
+                : const ExamCameraOfflineNotice(),
       ),
     );
   }
@@ -1410,21 +1440,22 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                       ),
                     ),
                     const SizedBox(width: 8),
-                    // Explicit per-question navigation. A multiple-choice answer
-                    // still saves (and advances) on tap, but the student always has
-                    // a prominent Next to move on without answering or after
-                    // reviewing; a typed answer uses "Save & next", which persists
-                    // through merge_submission_text_answer before it moves.
-                    if (question.isFillInTheBlank && !last)
+                    // Explicit per-question navigation. A multiple-choice or
+                    // true/false answer still saves (and advances) on tap, but
+                    // the student always has a prominent Next to move on without
+                    // answering or after reviewing; a typed answer (fill in the
+                    // blank, essay) uses "Save & next", which persists through
+                    // merge_submission_text_answer before it moves.
+                    if (question.usesTextAnswer && !last)
                       Flexible(
                         child: FilledButton.icon(
                           key: const Key('exam-save-text'),
                           onPressed: blocked || session.savingText
                               ? null
                               : () => _session.saveTextAnswer(
-                                  question.id,
-                                  advance: true,
-                                ),
+                                    question.id,
+                                    advance: true,
+                                  ),
                           icon: const Icon(Icons.check),
                           label: _ShrinkableLabel(
                             session.savingText ? 'Saving…' : 'Save & next',
@@ -1485,4 +1516,3 @@ class _ShrinkableLabel extends StatelessWidget {
     );
   }
 }
-

@@ -17,6 +17,7 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
 
   static const String createAccountFunction = 'admin-create-user';
   static const String deleteAccountFunction = 'admin-delete-user';
+  static const String resetPasswordFunction = 'admin-reset-password';
 
   /// Supabase Auth's default minimum, mirrored by the Edge Function.
   static const int minPasswordLength = 6;
@@ -122,6 +123,43 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
   }
 
   @override
+  Future<void> resetPassword({
+    required String userId,
+    required String password,
+  }) async {
+    final FunctionResponse response;
+    try {
+      response = await _client.functions.invoke(
+        resetPasswordFunction,
+        // The function accepts `userId`/`accountId` too; `id` is the spelling
+        // the table uses, and `admin-delete-user` already takes.
+        body: {'id': userId, 'password': password},
+      );
+    } on FunctionException catch (error) {
+      throw AdminAccountException(_messageFromResetFunctionError(error));
+    } catch (_) {
+      throw const AdminAccountException(
+        'Could not reach the server. Check your connection and try again.',
+      );
+    }
+
+    final data = response.data;
+    if (data is Map<String, dynamic>) {
+      final error = data['error'];
+      if (error is String && error.isNotEmpty) {
+        throw AdminAccountException(error);
+      }
+      // The changed account's own id, echoed back: proof the function answered
+      // about the row this call named rather than about somebody else's.
+      if (data['id'] == userId) return;
+    }
+    throw const AdminAccountException(
+      'The password may not have been changed: the server response could not '
+      'be read. Sign in as that account to check, or reset it again.',
+    );
+  }
+
+  @override
   Future<void> deleteAccount({required String userId}) async {
     final FunctionResponse response;
     try {
@@ -212,6 +250,34 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
     }
     if (error.status == 401 || error.status == 403) {
       return 'Only an administrator can delete accounts.';
+    }
+    return 'The server refused the request (${error.status}). Try again.';
+  }
+
+  /// Reads the `{ error }` body `admin-reset-password` answers with.
+  ///
+  /// Same shape as the other two, and the same caveat about the 404 branch: the
+  /// function *itself* answers 404 with `{ error }` for an account that is gone,
+  /// and that message is read by the branch above — so reaching the 404 here
+  /// means the response carried no JSON body at all, which is what an
+  /// un-deployed function (or a proxy) returns.
+  static String _messageFromResetFunctionError(FunctionException error) {
+    if (error.status == 0) {
+      return 'Could not reach the server. Check your connection and try again.';
+    }
+    final details = error.details;
+    if (details is Map && details['error'] is String) {
+      return details['error'] as String;
+    }
+    if (details is String && details.trim().isNotEmpty) {
+      return details.trim();
+    }
+    if (error.status == 404) {
+      return 'The $resetPasswordFunction function is not deployed on this '
+          'project (see supabase/functions/admin-reset-password).';
+    }
+    if (error.status == 401 || error.status == 403) {
+      return 'Only an administrator can reset passwords.';
     }
     return 'The server refused the request (${error.status}). Try again.';
   }

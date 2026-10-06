@@ -147,9 +147,13 @@ insert into public.profiles (id, role, full_name, email) values
 on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------
--- 2. EXAMS  (public.exams) - both published, so the students' exam list
+-- 2. EXAMS  (public.exams) - all published, so the students' exam list
 --    and the monitor's exam picker are populated. created_by is the
---    supervisor above (exams are owner-scoped by RLS).
+--    owner RLS scopes the paper to: the supervisor above owns the two
+--    invigilated papers, and the lecturer owns GES301 - the paper the
+--    lecturer console's authoring and grading views are built around
+--    (the owner, not the wider staff tier, is who may edit a paper or
+--    award the marks on it).
 -- ---------------------------------------------------------------------
 insert into public.exams (id, title, created_by, duration_minutes, is_published, created_at) values
   ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
@@ -159,7 +163,11 @@ insert into public.exams (id, title, created_by, duration_minutes, is_published,
   ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2',
    'MAT201: Calculus Quiz',
    '11111111-1111-4111-8111-111111111111',
-   45, true, now() - interval '5 hours')
+   45, true, now() - interval '5 hours'),
+  ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3',
+   'GES301: Software Engineering Midterm',
+   '55555555-5555-4555-8555-555555555555',
+   50, true, now() - interval '3 hours')
 on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------
@@ -227,6 +235,39 @@ values
 on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------
+-- 3b. THE LECTURER'S PAPER  (public.questions, one row per shape)
+-- Four questions, one of each type the console can author, all four owned by
+-- the lecturer (GES301 above) so the authoring view has something to edit:
+--   * 'multiple_choice'   - options + the 0-based correct index (auto-graded)
+--   * 'true_false'        - no options; `correct_text_answer` is the word 'true',
+--                           which is also exactly what a true/false tap stores
+--                           in `exam_submissions.answers` (auto-graded)
+--   * 'fill_in_the_blank' - one accepted wording (auto-graded)
+--   * 'subjective'        - no answer key at all: it has none to leak, and its
+--                           marks arrive through `grade_submission()` when the
+--                           lecturer reads the answer (5 points below)
+-- ---------------------------------------------------------------------
+insert into public.questions
+  (id, exam_id, question_text, question_type, options, correct_option, correct_text_answer, points)
+values
+  ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb6', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3',
+   'Which process model delivers a working increment at the end of every short iteration?',
+   'multiple_choice', '["Waterfall","Scrum","Big design up front","V-Model"]'::jsonb, 1, null, 2),
+
+  ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb7', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3',
+   'A pull request may be merged before its automated checks have passed.',
+   'true_false', '[]'::jsonb, null, 'false', 1),
+
+  ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb8', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3',
+   'What is the practice of running the test suite automatically on every change called?',
+   'fill_in_the_blank', '[]'::jsonb, null, 'Continuous integration', 2),
+
+  ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb9', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3',
+   'Describe how you would review a change that touches authentication. Name the checks you would run and say what would make you reject the change.',
+   'subjective', '[]'::jsonb, null, null, 5)
+on conflict (id) do nothing;
+
+-- ---------------------------------------------------------------------
 -- 4. SAMPLE SUBMISSION  (public.exam_submissions)
 -- Aisha Bello sat CS101 and was auto-disqualified by the server-enforced
 -- 3-strike rule. `answers` maps question UUID -> 0-based selected option,
@@ -254,6 +295,46 @@ values
    now() - interval '9 minutes',
    now() - interval '90 seconds')
 on conflict do nothing;
+
+-- ---------------------------------------------------------------------
+-- 4b. A HANDED-IN ATTEMPT WITH AN ESSAY STILL TO MARK
+--     (public.exam_submissions + public.question_grades)
+-- Chidi sat the lecturer's GES301 paper and handed it in. `answers` holds all
+-- three shapes exactly as the merge RPCs write them - a bare number for the
+-- multiple-choice index, a JSON *string* for the true/false tap ('false' is the
+-- right answer and he said 'true') and for the typed fill-in-the-blank - plus
+-- the essay text under the subjective question's id.
+--
+-- `score` is 4: what `submit_exam()` could grade on its own. The essay is worth
+-- 5 more and has NO row in `question_grades`, which is what puts this attempt in
+-- the lecturer console's "waiting for marks" list. Marking it through
+-- `grade_submission()` stores one `question_grades` row and rewrites `score` as
+-- 4 + awarded.
+-- ---------------------------------------------------------------------
+insert into public.exam_submissions
+  (id, student_id, exam_id, answers, status, score, started_at, submitted_at)
+values
+  ('dddddddd-dddd-4ddd-8ddd-ddddddddddd2',
+   '33333333-3333-4333-8333-333333333333',   -- Chidi Okonkwo (student)
+   'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3',   -- GES301 (the lecturer's paper)
+   '{
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb6": 1,
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb7": "true",
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb8": "continuous integration",
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb9": "I would start by reading the diff for anything that stores or compares a secret, then check that the password path still goes through the hashing helper rather than a new comparison."
+    }'::jsonb,
+   'submitted',
+   4,                                        -- auto-graded part; 5 essay marks pending
+   now() - interval '40 minutes',
+   now() - interval '6 minutes')
+on conflict do nothing;
+
+-- No `question_grades` row is seeded on purpose: an unmarked essay is the state
+-- the grading view has to be able to show. To seed one instead - a mark already
+-- awarded, for a screenshot or a re-mark demo - the shape is:
+--   insert into public.question_grades (submission_id, question_id, awarded, feedback)
+--   values ('dddddddd-dddd-4ddd-8ddd-ddddddddddd2',
+--           'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb9', 3.5, 'Good threat model.')
 
 -- ---------------------------------------------------------------------
 -- 5. PROCTORING LOGS  (public.proctoring_logs)

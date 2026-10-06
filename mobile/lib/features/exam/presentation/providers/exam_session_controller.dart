@@ -64,12 +64,12 @@ class ExamSessionArgs {
 
   @override
   int get hashCode => Object.hash(
-    examId,
-    submissionId,
-    durationMinutes,
-    startedAt,
-    clock,
-  );
+        examId,
+        submissionId,
+        durationMinutes,
+        startedAt,
+        clock,
+      );
 }
 
 /// Everything the exam session screen renders that is **not** owned by a
@@ -170,25 +170,25 @@ class ExamSessionState {
     bool? submitting,
     bool? timeUpPending,
     bool? offlineSubmitPending,
-  }) => ExamSessionState(
-    questions: questions ?? this.questions,
-    currentIndex: currentIndex ?? this.currentIndex,
-    answers: answers ?? this.answers,
-    textAnswers: textAnswers ?? this.textAnswers,
-    savedText: savedText ?? this.savedText,
-    savedQuestions: savedQuestions ?? this.savedQuestions,
-    markedForReview: markedForReview ?? this.markedForReview,
-    savingText: savingText ?? this.savingText,
-    remaining: clearRemaining ? null : (remaining ?? this.remaining),
-    loading: loading ?? this.loading,
-    blockingError: clearBlockingError
-        ? null
-        : (blockingError ?? this.blockingError),
-    offerSettings: offerSettings ?? this.offerSettings,
-    submitting: submitting ?? this.submitting,
-    timeUpPending: timeUpPending ?? this.timeUpPending,
-    offlineSubmitPending: offlineSubmitPending ?? this.offlineSubmitPending,
-  );
+  }) =>
+      ExamSessionState(
+        questions: questions ?? this.questions,
+        currentIndex: currentIndex ?? this.currentIndex,
+        answers: answers ?? this.answers,
+        textAnswers: textAnswers ?? this.textAnswers,
+        savedText: savedText ?? this.savedText,
+        savedQuestions: savedQuestions ?? this.savedQuestions,
+        markedForReview: markedForReview ?? this.markedForReview,
+        savingText: savingText ?? this.savingText,
+        remaining: clearRemaining ? null : (remaining ?? this.remaining),
+        loading: loading ?? this.loading,
+        blockingError:
+            clearBlockingError ? null : (blockingError ?? this.blockingError),
+        offerSettings: offerSettings ?? this.offerSettings,
+        submitting: submitting ?? this.submitting,
+        timeUpPending: timeUpPending ?? this.timeUpPending,
+        offlineSubmitPending: offlineSubmitPending ?? this.offlineSubmitPending,
+      );
 }
 
 /// Owns one exam session's data, clock and offline-sync orchestration.
@@ -201,8 +201,8 @@ class ExamSessionState {
 /// platform services and rendering.
 class ExamSessionController extends StateNotifier<ExamSessionState> {
   ExamSessionController(this._ref, {required this.args})
-    : _clock = args.clock ?? DateTime.now,
-      super(const ExamSessionState());
+      : _clock = args.clock ?? DateTime.now,
+        super(const ExamSessionState());
 
   final Ref _ref;
   final ExamSessionArgs args;
@@ -280,9 +280,8 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
       if (!mounted) return;
       state = state.copyWith(
         questions: questions,
-        currentIndex: state.currentIndex >= questions.length
-            ? 0
-            : state.currentIndex,
+        currentIndex:
+            state.currentIndex >= questions.length ? 0 : state.currentIndex,
         loading: false,
       );
     } catch (error) {
@@ -290,8 +289,7 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
       if (!mounted) return;
       state = state.copyWith(
         loading: false,
-        blockingError:
-            'Could not load the questions for this exam. Check '
+        blockingError: 'Could not load the questions for this exam. Check '
             'your connection and tap Try again.',
       );
     }
@@ -374,6 +372,46 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
     if (!mounted) return;
     final saved = Set<String>.of(state.savedQuestions)..add(question.id);
     state = state.copyWith(
+      savedQuestions: saved,
+      currentIndex: state.currentIndex < state.questions.length - 1
+          ? state.currentIndex + 1
+          : state.currentIndex,
+    );
+  }
+
+  /// Records a true/false tap: paint, persist the word, advance.
+  ///
+  /// The answer travels the *text* path (`merge_submission_text_answer`), because
+  /// that is what a true/false row's key is compared against — the word 'true' or
+  /// 'false', not an option index — and it is therefore also what
+  /// `submit_exam()` reads when the attempt closes.
+  Future<void> selectTrueFalse(bool value) async {
+    final question = state.questions[state.currentIndex];
+    final word = value ? 'true' : 'false';
+
+    // Paint first, exactly as a multiple-choice tap does: nothing below is
+    // allowed to gate the tap feedback.
+    state = state.copyWith(
+      textAnswers: <String, String>{...state.textAnswers, question.id: word},
+    );
+
+    try {
+      await _persistText(question.id, word);
+    } catch (error) {
+      // Only reachable without a queue (see [_persistText]). Grading reads the
+      // *server* copy, so stay on the question instead of advancing past the
+      // only chance to save it.
+      proctorLog('ProctorGuard: answer autosave failed: $error');
+      onMessage?.call(
+        'Could not save that answer. Check your connection and tap again.',
+      );
+      return;
+    }
+
+    if (!mounted) return;
+    final saved = Set<String>.of(state.savedQuestions)..add(question.id);
+    state = state.copyWith(
+      savedText: <String, String>{...state.savedText, question.id: word},
       savedQuestions: saved,
       currentIndex: state.currentIndex < state.questions.length - 1
           ? state.currentIndex + 1
@@ -471,14 +509,17 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
     return true;
   }
 
-  /// Writes the current fill-in-the-blank answer if the cache does not have it
-  /// yet. Called before navigating away and before closing the attempt: grading
-  /// reads the server copy, and the queue is what gets it there.
+  /// Writes the current typed answer if the cache does not have it yet. Called
+  /// before navigating away and before closing the attempt: grading reads the
+  /// server copy, and the queue is what gets it there.
+  ///
+  /// Covers both typed shapes (fill in the blank and essay); a true/false answer
+  /// is written on the tap, so there is nothing unsaved here for it.
   Future<bool> flushTextAnswer() async {
     if (!mounted) return true;
 
     final question = state.questions[state.currentIndex];
-    if (!question.isFillInTheBlank) return true;
+    if (!question.usesTextAnswer) return true;
 
     final text = state.textAnswers[question.id] ?? '';
     if (state.savedText[question.id] == text) return true;
@@ -623,10 +664,10 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
 
   /// Puts the session back into a retryable state after a failed submit.
   void onSubmitFailed({required bool timeUp}) => state = state.copyWith(
-    submitting: false,
-    timeUpPending: timeUp,
-    offlineSubmitPending: !timeUp,
-  );
+        submitting: false,
+        timeUpPending: timeUp,
+        offlineSubmitPending: !timeUp,
+      );
 
   /// The student declined to submit the answers the server rejected: return to
   /// the question, with the retry/exit screen when the clock ran out.
@@ -645,10 +686,10 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
 
   /// Clears the blocking state so a retry shows the spinner again.
   void resetForRetry() => state = state.copyWith(
-    clearBlockingError: true,
-    offerSettings: false,
-    loading: true,
-  );
+        clearBlockingError: true,
+        offerSettings: false,
+        loading: true,
+      );
 
   @override
   void dispose() {
@@ -662,8 +703,5 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
 /// with the exam-taking page.
 final examSessionControllerProvider = StateNotifierProvider.autoDispose
     .family<ExamSessionController, ExamSessionState, ExamSessionArgs>(
-      (ref, args) => ExamSessionController(ref, args: args),
-    );
-
-
-
+  (ref, args) => ExamSessionController(ref, args: args),
+);

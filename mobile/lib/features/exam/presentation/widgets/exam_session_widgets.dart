@@ -26,8 +26,8 @@ class ExamRemainingChip extends StatelessWidget {
     final color = seconds <= 60
         ? Colors.redAccent
         : seconds <= 300
-        ? Colors.amber
-        : scheme.onSurface;
+            ? Colors.amber
+            : scheme.onSurface;
 
     return Tooltip(
       message: 'Time remaining',
@@ -137,9 +137,9 @@ class ExamCameraOfflineNotice extends StatelessWidget {
           'CAMERA\nOFFLINE',
           textAlign: TextAlign.center,
           style: Theme.of(context).textTheme.labelSmall?.copyWith(
-            color: Colors.redAccent,
-            height: 1.2,
-          ),
+                color: Colors.redAccent,
+                height: 1.2,
+              ),
         ),
       ],
     );
@@ -324,9 +324,8 @@ class ExamQuestionPalette extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final answeredCount = questions
-        .where((question) => answeredIds.contains(question.id))
-        .length;
+    final answeredCount =
+        questions.where((question) => answeredIds.contains(question.id)).length;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -382,8 +381,8 @@ class ExamQuestionPalette extends StatelessWidget {
 /// Stateful and keyed by question id (the parent passes `ValueKey(question.id)`),
 /// so moving between questions creates a fresh controller holding *that*
 /// question's saved text instead of leaking the previous answer into the next
-/// field.
-class ExamFillInTheBlankField extends StatefulWidget {
+/// field. Both typed answers share one implementation — see [_AnswerBox].
+class ExamFillInTheBlankField extends StatelessWidget {
   const ExamFillInTheBlankField({
     super.key,
     required this.initialValue,
@@ -400,11 +399,92 @@ class ExamFillInTheBlankField extends StatefulWidget {
   final ValueChanged<String> onSubmitted;
 
   @override
-  State<ExamFillInTheBlankField> createState() =>
-      _ExamFillInTheBlankFieldState();
+  Widget build(BuildContext context) => _AnswerBox(
+        fieldKey: const Key('exam-text-answer'),
+        label: 'Type your answer',
+        hintText: 'Your answer',
+        initialValue: initialValue,
+        saved: saved,
+        enabled: enabled,
+        onChanged: onChanged,
+        onSubmitted: onSubmitted,
+      );
 }
 
-class _ExamFillInTheBlankFieldState extends State<ExamFillInTheBlankField> {
+/// Text input for an essay.
+///
+/// The same durable path as [ExamFillInTheBlankField] — keystrokes go to the
+/// local cache, "Save & next" writes through `merge_submission_text_answer`, and
+/// the same 2000-character cap applies — with a taller box and a label that makes
+/// no claim about one accepted wording: this answer is marked by a person after
+/// the attempt is handed in.
+class ExamEssayField extends StatelessWidget {
+  const ExamEssayField({
+    super.key,
+    required this.initialValue,
+    required this.saved,
+    required this.enabled,
+    required this.onChanged,
+    required this.onSubmitted,
+  });
+
+  final String initialValue;
+  final bool saved;
+  final bool enabled;
+  final ValueChanged<String> onChanged;
+  final ValueChanged<String> onSubmitted;
+
+  @override
+  Widget build(BuildContext context) => _AnswerBox(
+        fieldKey: const Key('exam-essay-answer'),
+        label: 'Write your answer',
+        hintText: 'Write as much as the question needs.',
+        helperText: 'Marked after you hand in — nothing is scored as you type.',
+        minLines: 5,
+        maxLines: 12,
+        initialValue: initialValue,
+        saved: saved,
+        enabled: enabled,
+        onChanged: onChanged,
+        onSubmitted: onSubmitted,
+      );
+}
+
+/// The shared body of the two typed answers: a text box, the character cap that
+/// matches `merge_submission_text_answer()`, and the line that tells a student
+/// whether what they typed is stored yet.
+class _AnswerBox extends StatefulWidget {
+  const _AnswerBox({
+    required this.fieldKey,
+    required this.label,
+    required this.hintText,
+    required this.initialValue,
+    required this.saved,
+    required this.enabled,
+    required this.onChanged,
+    required this.onSubmitted,
+    this.minLines = 1,
+    this.maxLines = 4,
+    this.helperText,
+  });
+
+  final Key fieldKey;
+  final String label;
+  final String hintText;
+  final String? helperText;
+  final int minLines;
+  final int maxLines;
+  final String initialValue;
+  final bool saved;
+  final bool enabled;
+  final ValueChanged<String> onChanged;
+  final ValueChanged<String> onSubmitted;
+
+  @override
+  State<_AnswerBox> createState() => _AnswerBoxState();
+}
+
+class _AnswerBoxState extends State<_AnswerBox> {
   late final TextEditingController _controller = TextEditingController(
     text: widget.initialValue,
   );
@@ -422,57 +502,136 @@ class _ExamFillInTheBlankFieldState extends State<ExamFillInTheBlankField> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Type your answer', style: theme.textTheme.labelLarge),
+        Text(widget.label, style: theme.textTheme.labelLarge),
         const SizedBox(height: 8),
         TextField(
-          key: const Key('exam-text-answer'),
+          key: widget.fieldKey,
           controller: _controller,
           enabled: widget.enabled,
           textInputAction: TextInputAction.done,
-          minLines: 1,
-          maxLines: 4,
+          minLines: widget.minLines,
+          maxLines: widget.maxLines,
           // Matches the server-side cap in merge_submission_text_answer().
           maxLength: 2000,
           onChanged: widget.onChanged,
           onSubmitted: widget.onSubmitted,
-          decoration: const InputDecoration(
-            border: OutlineInputBorder(),
-            hintText: 'Your answer',
+          decoration: InputDecoration(
+            border: const OutlineInputBorder(),
+            hintText: widget.hintText,
+            helperText: widget.helperText,
+            helperMaxLines: 2,
           ),
         ),
-        Row(
-          children: [
-            Icon(
-              widget.saved
-                  ? Icons.check_circle_outline
-                  : Icons.cloud_off_outlined,
-              size: 14,
-              color: widget.saved
-                  ? Colors.green
-                  : theme.colorScheme.onSurfaceVariant,
-            ),
-            const SizedBox(width: 4),
-            Expanded(
-              child: Text(
-                widget.saved
-                    ? 'Answer saved'
-                    : 'Not saved yet — tap "Save & next", or Submit on the last '
-                          'question, to send it.',
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: widget.saved
-                      ? Colors.green
-                      : theme.colorScheme.onSurfaceVariant,
-                ),
-              ),
-            ),
-          ],
+        _AnswerSaveStatus(
+          saved: widget.saved,
+          message: widget.saved
+              ? 'Answer saved'
+              : 'Not saved yet — tap "Save & next", or Submit on the last '
+                  'question, to send it.',
         ),
       ],
     );
   }
 }
 
+/// True/false input: two tap targets, and the word the student chose.
+///
+/// The tap is written through the *text* answer path
+/// (`merge_submission_text_answer`), because that is what the row's key is
+/// compared against — the word 'true' or 'false', not an option index. The
+/// student never types it, though, so this is a pair of cards rather than a field
+/// with two valid spellings.
+class ExamTrueFalseField extends StatelessWidget {
+  const ExamTrueFalseField({
+    super.key,
+    required this.selectedValue,
+    required this.saved,
+    required this.enabled,
+    required this.onSelected,
+  });
 
+  /// 'true' or 'false' once the student has answered, and null while nothing is
+  /// stored under the question.
+  final String? selectedValue;
+
+  final bool saved;
+  final bool enabled;
+  final ValueChanged<bool> onSelected;
+
+  bool? get _selected => switch (selectedValue?.trim().toLowerCase()) {
+        'true' => true,
+        'false' => false,
+        _ => null,
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final selected = _selected;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Choose one', style: theme.textTheme.labelLarge),
+        const SizedBox(height: 8),
+        for (final value in const <bool>[true, false])
+          Card(
+            color:
+                selected == value ? theme.colorScheme.secondaryContainer : null,
+            child: ListTile(
+              key: Key('exam-answer-${value ? 'true' : 'false'}'),
+              title: Text(value ? 'True' : 'False'),
+              selected: selected == value,
+              trailing: selected == value
+                  ? const Icon(Icons.radio_button_checked)
+                  : null,
+              onTap: enabled ? () => onSelected(value) : null,
+            ),
+          ),
+        const SizedBox(height: 4),
+        _AnswerSaveStatus(
+          saved: saved,
+          message: saved
+              ? 'Answer saved'
+              : 'Not saved yet — tap an answer to send it.',
+        ),
+      ],
+    );
+  }
+}
+
+/// The "is what I chose stored yet?" line, shared by the two typed answers and
+/// the true/false pair so the three cannot word it differently.
+class _AnswerSaveStatus extends StatelessWidget {
+  const _AnswerSaveStatus({required this.saved, required this.message});
+
+  final bool saved;
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Row(
+      children: [
+        Icon(
+          saved ? Icons.check_circle_outline : Icons.cloud_off_outlined,
+          size: 14,
+          color: saved ? Colors.green : theme.colorScheme.onSurfaceVariant,
+        ),
+        const SizedBox(width: 4),
+        Expanded(
+          child: Text(
+            message,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: saved ? Colors.green : theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
 
 /// One numbered tile: filled with a check when answered, corner-flagged when the
 /// student marked it for review, neutral when it is neither.
@@ -516,8 +675,8 @@ class _PaletteTile extends StatelessWidget {
     final border = current
         ? scheme.primary
         : (marked
-              ? scheme.tertiary
-              : (answered ? scheme.primary : scheme.outlineVariant));
+            ? scheme.tertiary
+            : (answered ? scheme.primary : scheme.outlineVariant));
 
     final states = <String>[
       if (answered) 'answered',
@@ -585,10 +744,10 @@ class _PaletteTile extends StatelessWidget {
 /// The key to [_PaletteTile]'s states, spelled out rather than assumed.
 class _PaletteLegend extends StatelessWidget {
   const _PaletteLegend({this.answered = false, this.marked = false})
-    : assert(
-        !(answered && marked),
-        'the marked key is its own state, not the answered one',
-      );
+      : assert(
+          !(answered && marked),
+          'the marked key is its own state, not the answered one',
+        );
 
   final bool answered;
   final bool marked;
@@ -625,7 +784,6 @@ class _PaletteLegend extends StatelessWidget {
     );
   }
 }
-
 
 /// Who is sitting this exam, and which exam it is, printed on the exam surface.
 ///
@@ -730,4 +888,3 @@ class ExamCandidateHeader extends StatelessWidget {
     );
   }
 }
-
