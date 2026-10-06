@@ -52,29 +52,55 @@ void main() {
 
       expect(sensor.isCalibrated, isTrue);
       expect(sensor.roomFloorDb, -60);
-      // Floor + 12 dB of speech margin, clamped into the usable band: a -48 dBFS
-      // threshold would be so low that the microphone's own noise floor reads as
-      // talking.
-      expect(sensor.thresholdDb, -45);
+      // Floor -60 plus only 6 dB of speech margin (the median shrugs off the loud
+      // -20 sample): threshold -54, inside the sensitive band rather than clamped,
+      // so a quiet room stays quiet-sensitive.
+      expect(sensor.thresholdDb, -54);
     });
 
     test('the threshold follows the room, clamped so neither end is silly', () {
       final quietRoom = detector();
       quietRoom.add(-62);
-      expect(quietRoom.thresholdDb, -45); // -50 clamped up
+      expect(quietRoom.thresholdDb, -55); // -56 clamped up
 
       final hummingRoom = detector();
       hummingRoom.add(-38);
-      expect(hummingRoom.thresholdDb, -26); // -38 + 12, inside the band
+      expect(hummingRoom.thresholdDb, -32); // -38 + 6, inside the band
 
       final loudHall = detector();
       loudHall.add(-15);
-      expect(loudHall.thresholdDb, -20); // +12 clamped down
+      expect(loudHall.thresholdDb, -32); // +6 clamped down
+    });
+
+    test('quiet sound and steady background sound are flagged, not just a shout',
+        () {
+      // The behaviour a too-conservative margin gets wrong: something soft, well
+      // under the old "floor + 12 dB, clamped at -45..-20" rule, held for the
+      // sustain window must still be a strike.
+      final soft = detector(sustain: const Duration(seconds: 2));
+      soft.add(-60); // calibrates in one sample: threshold -54
+
+      expect(soft.add(-50), isFalse); // only 4 dB over: opens the window
+      expect(soft.isNoisy, isTrue);
+      now = now.add(const Duration(seconds: 2));
+      expect(soft.add(-50), isTrue); // soft, sustained sound is a strike
+
+      // A room that is loud on its own - a generator, a hall, a television the
+      // student cannot switch off before the sitting - must not raise the bar to
+      // "shout only". The upper clamp pins the threshold *below* the room's own
+      // floor, so its steady background is itself the finding.
+      final noisyRoom = detector(sustain: const Duration(seconds: 2));
+      noisyRoom.add(-28); // the room's own floor is -28, threshold pinned at -32
+
+      expect(noisyRoom.thresholdDb, -32); // below the floor, not raised to -20
+      expect(noisyRoom.add(-28), isFalse); // opens the window...
+      now = now.add(const Duration(seconds: 2));
+      expect(noisyRoom.add(-28), isTrue); // ...and steady background is a strike
     });
 
     test('a level held above the threshold is one strike', () {
       final sensor = detector(sustain: const Duration(seconds: 4));
-      sensor.add(-60); // calibrates in one sample: threshold -45
+      sensor.add(-60); // calibrates in one sample: threshold -54
 
       expect(sensor.add(-30), isFalse); // opens the window
       expect(sensor.isNoisy, isTrue); // amber on the chip, no strike yet
@@ -120,7 +146,7 @@ void main() {
 
     test('a short gap between words is bridged, so talking does add up', () {
       final sensor = detector(sustain: const Duration(seconds: 2));
-      sensor.add(-60); // calibrates in one sample: threshold -45
+      sensor.add(-60); // calibrates in one sample: threshold -54
 
       // Four samples a second, the rate the microphone reports at: loud, a 250 ms
       // dip mid-sentence, loud again. A rule that reset on that single dip never
@@ -137,7 +163,7 @@ void main() {
 
     test('a quiet stretch longer than the grace ends the episode', () {
       final sensor = detector(sustain: const Duration(seconds: 2));
-      sensor.add(-60); // threshold -45
+      sensor.add(-60); // threshold -54
 
       expect(sensor.add(-25), isFalse); // opens the episode
       now = now.add(const Duration(seconds: 1));

@@ -12,9 +12,12 @@ import 'dart:math' as math;
 ///  1. **Calibration.** The first [calibrationWindow] of the session measures the
 ///     room, and the threshold becomes *that room's* floor plus [speechMarginDb]
 ///     (clamped to [minThresholdDb]..[maxThresholdDb]). A quiet exam room therefore
-///     ends up much more sensitive than a hall with an air-conditioning hum, with
-///     no per-device configuration. Nothing can be logged before calibration
-///     finishes, which doubles as the start-of-session grace period.
+///     ends up far more sensitive than one with an air-conditioning hum, with no
+///     per-device configuration. Both the margin and the clamp band are set low on
+///     purpose, so quiet speech and steady background sound - a television, a
+///     second voice, traffic, a generator - are flagged rather than only a raised
+///     voice. Nothing can be logged before calibration finishes, which doubles as
+///     the start-of-session grace period.
 ///  2. **Sustained, not instantaneous.** The level has to add up to [sustain]
 ///     above the threshold; a dip below it only ends the episode once it has
 ///     lasted longer than [releaseGrace]. Bridging that single-sample dip is what
@@ -38,9 +41,9 @@ class AudioNoiseDetector {
     this.sustain = const Duration(seconds: 2),
     this.releaseGrace = const Duration(milliseconds: 400),
     this.cooldown = const Duration(seconds: 5),
-    this.speechMarginDb = 12,
-    this.minThresholdDb = -45,
-    this.maxThresholdDb = -20,
+    this.speechMarginDb = 6,
+    this.minThresholdDb = -55,
+    this.maxThresholdDb = -32,
     this.defaultThresholdDb = -30,
     this.minCalibrationSamples = 5,
     DateTime Function()? clock,
@@ -81,12 +84,20 @@ class AudioNoiseDetector {
   final Duration cooldown;
 
   /// How far above the measured room floor counts as human noise rather than the
-  /// room itself. ~12 dB over the floor is roughly the jump from a hum to a voice
-  /// at normal speaking volume.
+  /// room itself. 6 dB is a clear, *sustained* doubling of acoustic power over the
+  /// hum it is measured against, so the room's own level does not trip it - but it
+  /// is low enough that quiet speech (often only a few decibels over the floor) and
+  /// steady background sound are still caught, not just a raised voice.
   final double speechMarginDb;
 
-  /// Sensitivity bounds. Without the floor clamp a silent room would produce a
-  /// threshold so low that the microphone's own noise floor reads as "talking".
+  /// Sensitivity bounds. Without the clamp a silent room would produce a threshold
+  /// so low that the microphone's own noise floor reads as "talking", and a noisy
+  /// room one so high that only a shout counts.
+  ///
+  /// [minThresholdDb] keeps the threshold above the microphone's own self-noise,
+  /// [maxThresholdDb] stops a noisy room raising the bar out of reach. Both are
+  /// deliberately low so little sound and background sound are flagged, not only a
+  /// raised voice.
   final double minThresholdDb;
   final double maxThresholdDb;
 

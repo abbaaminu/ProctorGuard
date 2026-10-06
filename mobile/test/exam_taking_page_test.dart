@@ -1331,8 +1331,8 @@ class _FakeAudioSource implements AudioLevelSource {
 
   /// What the capture session reports once someone is reading it.
   ///
-  /// Quiet by default: -60 dBFS cannot trip the noise detector, whose threshold is
-  /// clamped to at most -45 dBFS, so merely opening the microphone is never a strike.
+  /// Quiet by default: -60 dBFS cannot trip the noise detector, whose threshold
+  /// never falls below -55 dBFS, so merely opening the microphone is never a strike.
   double level = -60;
 
   /// How many capture sessions were opened (the first start, plus every reconnect).

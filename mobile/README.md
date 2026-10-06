@@ -1003,19 +1003,26 @@ Audio is judged the same way, and the rules are deliberately pure Dart
 (`core/services/audio_noise_detector.dart`) so they can be tested without a
 microphone: the first 4s (`calibrationWindow`) measure the room's floor, taking the
 **median** rather than the mean so a student who starts talking immediately cannot
-drag the floor up to their own voice; the threshold becomes that floor + 12 dB
-(`speechMarginDb`), clamped to −45…−20 dBFS (`minThresholdDb`/`maxThresholdDb`)
-because a silent room's own noise floor would otherwise read as "talking"; the level
-must then add up to 2s above it (`sustain`) — roughly one spoken sentence — and a gap
-below the threshold ends the episode only once it has lasted longer than 400 ms
-(`releaseGrace`). That gap allowance is what makes the rule catch **talking** rather
-than only an unbroken shout: at four samples a second a real sentence drops below the
-threshold between words, so a rule that reset on any single low sample never filled
-its window and logged nothing at all. A cough, a chair creak or a breath is still far
-too brief to add up, a room that has genuinely gone quiet ends the episode inside the
-grace, and after a strike the detector ignores the level for 5s (`cooldown`), so one
-long outburst is one strike rather than one every sample. Calibration doubles as the
-start-of-session grace period: nothing can be logged before it finishes.
+drag the floor up to their own voice; the threshold becomes that floor + 6 dB
+(`speechMarginDb`), clamped to −55…−32 dBFS (`minThresholdDb`/`maxThresholdDb`). The
+margin is deliberately small — 6 dB is a clear, *sustained* doubling of acoustic power
+— and the band is deliberately low, so the rule flags **little and background sound**
+(quiet speech, a second voice, a television, traffic, a generator) rather than only a
+raised voice. The upper clamp does the heavy lifting in a noisy room: without it a room
+that is already loud on its own would raise the bar to "shout only" and log nothing,
+whereas pinned below the room's own floor that steady background *is* the finding. The
+lower clamp keeps a dead-silent room's threshold above the microphone's own self-noise,
+which would otherwise read as "talking". The level must then add up to 2s above it
+(`sustain`) — roughly one spoken sentence — and a gap below the threshold ends the
+episode only once it has lasted longer than 400 ms (`releaseGrace`). That gap allowance
+is what makes the rule catch **talking** rather than only an unbroken shout: at four
+samples a second a real sentence drops below the threshold between words, so a rule
+that reset on any single low sample never filled its window and logged nothing at all.
+A cough, a chair creak or a breath is still far too brief to add up, a room that has
+genuinely gone quiet ends the episode inside the grace, and after a strike the detector
+ignores the level for 5s (`cooldown`), so one long outburst is one strike rather than
+one every sample. Calibration doubles as the start-of-session grace period: nothing can
+be logged before it finishes.
 
 Kiosk bridge contract — MethodChannel `lock_task_channel`:
 
