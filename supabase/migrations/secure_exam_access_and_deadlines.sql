@@ -14,6 +14,24 @@ as $$
   );
 $$;
 
+-- The reset tier: `is_exam_supervisor()` plus the paper's lecturer. Resetting an
+-- attempt deletes the row and purges its snapshots, and the author of the paper
+-- is the one who most often needs to undo one (a wrong key, a wrong
+-- disqualification). The three policies below all ask this one predicate, so
+-- the delete, the purge and the audit row can never name different tiers.
+create or replace function public.is_attempt_resetter()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role in ('admin', 'supervisor', 'lecturer')
+  );
+$$;
+
 drop policy if exists "exams_update_owner" on public.exams;
 create policy "exams_update_owner"
   on public.exams for update
@@ -102,7 +120,7 @@ drop policy if exists "submissions_delete_supervisor" on public.exam_submissions
 create policy "submissions_delete_supervisor"
   on public.exam_submissions for delete
   to authenticated
-  using (public.is_exam_supervisor());
+  using (public.is_attempt_resetter());
 
 drop policy if exists "Proctor snapshots supervisor purge" on storage.objects;
 create policy "Proctor snapshots supervisor purge"
@@ -110,7 +128,7 @@ create policy "Proctor snapshots supervisor purge"
   to authenticated
   using (
     bucket_id = 'proctor-snapshots'
-    and public.is_exam_supervisor()
+    and public.is_attempt_resetter()
   );
 
 drop function if exists public.register_violation(uuid, text);

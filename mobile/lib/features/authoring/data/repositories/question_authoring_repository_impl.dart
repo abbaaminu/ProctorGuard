@@ -47,6 +47,7 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
           .from('exams')
           .select(
             'id, title, created_by, duration_minutes, is_published, '
+            'starts_at, ends_at, '
             'created_at, questions(count), exam_submissions(count)',
           )
           // The *mine* filter, and the same condition the write policies ask:
@@ -72,6 +73,8 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
     required String title,
     required int durationMinutes,
     required bool isPublished,
+    DateTime? startsAt,
+    DateTime? endsAt,
   }) async {
     final row = await _guard(() async {
       final data = await _client
@@ -84,8 +87,18 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
             'created_by': _userId,
             'duration_minutes': durationMinutes,
             'is_published': isPublished,
+            // The window is *optional*, so an absent bound is omitted rather
+            // than sent as null: the column's own default is NULL either way,
+            // and the request then says out loud what kind of paper this is.
+            // UTC, because `starts_at` / `ends_at` are timestamptz: the pickers
+            // work in the author's local zone and the instant is what is stored.
+            if (startsAt != null) 'starts_at': startsAt.toUtc().toIso8601String(),
+            if (endsAt != null) 'ends_at': endsAt.toUtc().toIso8601String(),
           })
-          .select('id, title, created_by, duration_minutes, is_published')
+          .select(
+            'id, title, created_by, duration_minutes, is_published, '
+            'starts_at, ends_at',
+          )
           .single();
       return data;
     });
@@ -450,6 +463,15 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
         // The RPC is missing: the upgrade migration has not been applied.
         return 'This project has no grading function yet. Run '
             'supabase/migrations/question_types_and_grading.sql, then try again.';
+      case '42703':
+      case 'PGRST204':
+        // A column this app reads or writes does not exist yet. The one that
+        // arrives here is the optional exam window: `exams.starts_at` /
+        // `ends_at` (the grading columns have their own 42P01/42883 above), and
+        // a project that predates scheduling answers a select of them with
+        // 42703 and an insert with PGRST204.
+        return 'This project has no exam scheduling columns yet. Run '
+            'supabase/migrations/optional_exam_scheduling.sql, then try again.';
       case '42P01':
         return 'This project is missing the grading tables. Run '
             'supabase/migrations/question_types_and_grading.sql, then try again.';

@@ -1,6 +1,7 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../domain/entities/exam.dart';
+import '../../domain/entities/exam_submit_result.dart';
 import '../../domain/entities/question.dart';
 import '../../domain/entities/submission.dart';
 import '../../domain/repositories/exam_repository.dart';
@@ -92,15 +93,19 @@ class ExamRepositoryImpl implements ExamRepository {
   }
 
   @override
-  Future<void> submitExam(String submissionId) async {
+  Future<ExamSubmitResult> submitExam(String submissionId) async {
     // Server-side grading: `submit_exam` computes `score` from the stored
     // answers (sum of `questions.points` for correct ones) and flips the status
     // in one transaction. It is the *only* way to close an attempt now that
     // there is no student UPDATE policy on exam_submissions — a patched client
     // cannot write its own score. Idempotent, so a retry is safe.
-    await _client.rpc('submit_exam', params: {
+    //
+    // It answers with `(result_status, final_score)`, which is the mark the
+    // student is shown straight away when the paper has no essay on it.
+    final response = await _client.rpc('submit_exam', params: {
       'p_submission_id': submissionId,
     });
+    return ExamSubmitResult.fromRpc(response);
   }
 
   @override

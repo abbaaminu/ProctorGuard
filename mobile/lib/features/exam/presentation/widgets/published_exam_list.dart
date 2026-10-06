@@ -7,12 +7,20 @@ import '../providers/exam_providers.dart';
 /// Loading / error / empty / list states for [publishedExamsProvider], shared by
 /// the student portal and the supervisor picker so both react to a slow or
 /// unreachable backend identically.
+///
+/// The two callers differ in exactly one way, which [lockWhenNotOpen] names: a
+/// **student** may not start a paper outside its `starts_at` / `ends_at` window,
+/// so the portal locks those tiles and says why, while a **supervisor** monitors
+/// whatever the picker offers — a sitting that has not opened yet, or one that
+/// closed an hour ago, is exactly the kind of paper they open the monitor on.
 class PublishedExamList extends ConsumerWidget {
   const PublishedExamList({
     super.key,
     required this.onOpen,
     this.openingExamId,
     this.emptyMessage = 'No exams have been published yet.',
+    this.lockWhenNotOpen = false,
+    this.clock,
   });
 
   /// Called with the exam the user tapped; the caller starts the submission (or
@@ -25,9 +33,19 @@ class PublishedExamList extends ConsumerWidget {
 
   final String emptyMessage;
 
+  /// Lock the tiles whose window has not opened, or has closed. Set by the
+  /// student portal; false for the supervisor's picker (see the class comment).
+  final bool lockWhenNotOpen;
+
+  /// The instant a tile's window is judged against, defaulting to the wall
+  /// clock. Injectable so a widget test can hold "now" still instead of racing
+  /// it — the same seam `HardwareVerifier` and `RoleGate.currentUserId` use.
+  final DateTime Function()? clock;
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final exams = ref.watch(publishedExamsProvider);
+    final now = (clock ?? DateTime.now)();
 
     return RefreshIndicator(
       onRefresh: () async => ref.invalidate(publishedExamsProvider),
@@ -48,6 +66,9 @@ class PublishedExamList extends ConsumerWidget {
                   exam: rows[i],
                   busy: openingExamId == rows[i].id,
                   enabled: openingExamId == null,
+                  lockReason: lockWhenNotOpen
+                      ? rows[i].closedReason(now)
+                      : null,
                   onTap: () => onOpen(rows[i]),
                 ),
               ),
@@ -79,31 +100,74 @@ class _ExamTile extends StatelessWidget {
     required this.busy,
     required this.enabled,
     required this.onTap,
+    this.lockReason,
   });
 
   final Exam exam;
   final bool busy;
   final bool enabled;
+
+  /// Why this paper cannot be started yet, or null when it can. Non-null makes
+  /// the tile inert: there is nothing to tap until the window opens (or, for a
+  /// closed paper, ever again), so the tile says so instead of offering a tap
+  /// that the server would refuse.
+  final String? lockReason;
+
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final locked = lockReason != null;
+
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
       child: ListTile(
         key: Key('exam-${exam.id}'),
-        enabled: enabled,
-        leading: const CircleAvatar(child: Icon(Icons.assignment_outlined)),
+        enabled: enabled && !locked,
+        leading: locked
+            ? CircleAvatar(
+                backgroundColor: theme.colorScheme.surfaceContainerHighest,
+                child: Icon(
+                  Icons.lock_clock,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              )
+            : const CircleAvatar(child: Icon(Icons.assignment_outlined)),
         title: Text(exam.title),
-        subtitle: Text('${exam.durationMinutes} minutes'),
+        // Two lines rather than one string: the duration is what the student
+        // plans the sitting around, the window is when it is offered, and a
+        // scheduled paper has both.
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('${exam.durationMinutes} minutes'),
+            if (exam.isScheduled)
+              Text(
+                exam.scheduleLabel,
+                key: Key('exam-window-${exam.id}'),
+              ),
+            if (locked)
+              Text(
+                lockReason!,
+                key: Key('exam-locked-${exam.id}'),
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.error,
+                ),
+              ),
+          ],
+        ),
+        isThreeLine: exam.isScheduled || locked,
         trailing: busy
             ? const SizedBox(
                 height: 20,
                 width: 20,
                 child: CircularProgressIndicator(strokeWidth: 2),
               )
-            : const Icon(Icons.chevron_right),
-        onTap: enabled ? onTap : null,
+            : locked
+                ? const Icon(Icons.lock_outline)
+                : const Icon(Icons.chevron_right),
+        onTap: enabled && !locked ? onTap : null,
       ),
     );
   }

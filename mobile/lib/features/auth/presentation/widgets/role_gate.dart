@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -25,17 +27,22 @@ import '../providers/profile_provider.dart';
 ///                              manage roles)
 ///
 /// Lecturers and supervisors share `is_staff()` in the database, which is what
-/// lets both read every attempt and every incident. They differ where the work
-/// differs: a lecturer owns the papers they wrote — only the author may edit a
-/// question or award marks on an essay (`grade_submission()` re-checks it) —
-/// while a supervisor runs the sitting and is the tier `is_exam_supervisor()`
-/// names for resetting an attempt. Lecturers therefore land on the authoring
-/// console, and reach the monitor through it.
+/// lets both read every attempt (the roster of any sitting, so a monitor can be
+/// opened for any exam). They differ where the work differs: a lecturer owns the
+/// papers they wrote - only the author may edit a question, award marks on an
+/// essay (`grade_submission()` re-checks it) or read the evidence recorded on
+/// that paper (the `owns_exam()` arm of `logs_select_own_or_supervisor` and of
+/// the reset audit policy) - while a supervisor runs any sitting and reads every
+/// paper's evidence. Lecturers therefore land on the authoring console, and reach
+/// the monitor through it.
 ///
-/// They do not share the reset control. `canResetAttempts` is the schema's own
-/// rule — `is_exam_supervisor()` names `admin` and `supervisor`, not every
-/// member of staff — asked through [UserRole.canResetAttempts], so the gate and
-/// the live monitor cannot answer it differently.
+/// The reset control is not one of the differences: `canResetAttempts` is the
+/// schema's own rule — `is_attempt_resetter()` names `admin`, `supervisor` **and
+/// `lecturer`**, because the paper's author is the one who has to repair a wrong
+/// key or a mis-aimed disqualification — asked through [UserRole.canResetAttempts]
+/// so the gate and the live monitor cannot answer it differently. The narrower
+/// tier that remains is the *intervention* one: `is_exam_supervisor()` still
+/// guards writing to somebody else's attempt row in place.
 ///
 /// Auth events are what drive the rebuild, so the session the SDK restores from
 /// storage after a browser refresh lands here too.
@@ -138,19 +145,68 @@ class RoleGate extends ConsumerWidget {
 
 /// Shown while `public.profiles` is being read — deliberately a full screen with a
 /// label, since this is the moment between "signed in" and "knows where to go".
-class _ProfileLoading extends StatelessWidget {
+///
+/// This screen covers the repository's silent retry window too:
+/// `ProfileRepositoryImpl.getProfile` looks again (on an increasing delay) when
+/// the first read finds no row, because a fresh session can be emitted a moment
+/// before the `handle_new_user` trigger's row is visible to that query. So the
+/// screen can legitimately be up for a second or two, and after [hintDelay] it
+/// says so rather than looking frozen. It never turns into the error screen by
+/// itself — only a real [ProfileLookupException] does that.
+class _ProfileLoading extends StatefulWidget {
   const _ProfileLoading();
+
+  /// Long enough that an ordinary load never shows the hint, short enough that a
+  /// retry in progress does.
+  static const Duration hintDelay = Duration(milliseconds: 1500);
+
+  @override
+  State<_ProfileLoading> createState() => _ProfileLoadingState();
+}
+
+class _ProfileLoadingState extends State<_ProfileLoading> {
+  /// One-shot: cancelled as soon as the loading screen goes away, so no timer is
+  /// left behind when the profile resolves (or errors) before it fires.
+  Timer? _hintUntilSlow;
+  bool _slow = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _hintUntilSlow = Timer(_ProfileLoading.hintDelay, () {
+      if (mounted) setState(() => _slow = true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _hintUntilSlow?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(
+    return Scaffold(
       body: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            CircularProgressIndicator(),
-            SizedBox(height: 16),
-            Text('Loading your profile…'),
+            const CircularProgressIndicator(),
+            const SizedBox(height: 16),
+            const Text('Loading your profile…'),
+            if (_slow) ...[
+              const SizedBox(height: 8),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32),
+                child: Text(
+                  'Still trying — your profile row can take a moment to appear '
+                  'after sign-in.',
+                  key: const Key('profile-loading-hint'),
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+            ],
           ],
         ),
       ),

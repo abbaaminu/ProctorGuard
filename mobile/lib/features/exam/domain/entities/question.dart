@@ -87,12 +87,19 @@ class Question extends Equatable {
   final QuestionType questionType;
   final List<String> options;
 
+  /// `questions.points` — what this question is worth, and therefore what the
+  /// session screen adds up into "7 of 10" when it shows an instant result. It is
+  /// the same number `submit_exam()` sums into `score` on the server, which is
+  /// why the two can be shown side by side.
+  final num points;
+
   const Question({
     required this.id,
     required this.examId,
     required this.questionText,
     this.questionType = QuestionType.multipleChoice,
     this.options = const <String>[],
+    this.points = 1,
   });
 
   factory Question.fromMap(Map<String, dynamic> map) => Question(
@@ -104,6 +111,10 @@ class Question extends Equatable {
         // all), so a missing `options` is an empty list rather than a crash.
         options:
             List<String>.from((map['options'] as List?) ?? const <String>[]),
+        // A row read before `question_types_and_grading.sql` has no `points`
+        // column at all; a paper is worth a point a question in that case, the
+        // column's own default.
+        points: map['points'] is num ? map['points'] as num : 1,
       );
 
   bool get isFillInTheBlank => questionType == QuestionType.fillInTheBlank;

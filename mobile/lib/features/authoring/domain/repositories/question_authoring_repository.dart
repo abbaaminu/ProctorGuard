@@ -28,10 +28,20 @@ abstract class QuestionAuthoringRepository {
 
   /// Creates a draft (or published) paper owned by the caller. The server fills
   /// `created_by` from the session; this never sends it.
+  ///
+  /// [startsAt] / [endsAt] are the *optional* window (`exams.starts_at` /
+  /// `exams.ends_at`), sent only when they are set: leaving a bound out stores
+  /// NULL, which is the unscheduled paper the column defaults to. They are
+  /// instants, so the implementation sends them as UTC; the console's pickers
+  /// produce local ones and the two ends are validated against each other before
+  /// this is called (the database's `exams_window_ordered` check is the second
+  /// line of defence, not the first).
   Future<AuthoredExam> createExam({
     required String title,
     required int durationMinutes,
     required bool isPublished,
+    DateTime? startsAt,
+    DateTime? endsAt,
   });
 
   /// Publishes a paper (making it visible to students and startable) or takes it

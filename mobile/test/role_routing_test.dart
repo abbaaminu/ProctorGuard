@@ -13,7 +13,9 @@ import 'package:proctorguard/features/authoring/domain/entities/authored_exam.da
 import 'package:proctorguard/features/authoring/domain/entities/authored_question.dart';
 import 'package:proctorguard/features/authoring/domain/repositories/question_authoring_repository.dart';
 import 'package:proctorguard/features/authoring/presentation/providers/question_authoring_providers.dart';
+import 'package:proctorguard/features/dashboard/presentation/pages/supervisor_exam_picker_page.dart';
 import 'package:proctorguard/features/exam/domain/entities/exam.dart';
+import 'package:proctorguard/features/exam/domain/entities/exam_submit_result.dart';
 import 'package:proctorguard/features/exam/domain/entities/question.dart';
 import 'package:proctorguard/features/exam/domain/entities/submission.dart';
 import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
@@ -256,6 +258,119 @@ void main() {
       await letSnackBarExpire(tester);
     });
 
+    testWidgets('an objective paper is marked the moment it is handed in', (
+      tester,
+    ) async {
+      exams.submissions[mat201Id] = const Submission(
+        id: 'sub-mat',
+        studentId: aishaId,
+        examId: mat201Id,
+        answers: <String, dynamic>{},
+        status: SubmissionStatus.ongoing,
+      );
+
+      await tester.pumpWidget(
+        portal(
+          builder: (_, _) => const _SessionThatClosesWith(
+            result: ExamSubmitResult(
+              status: SubmissionStatus.submitted,
+              score: 7,
+              maxScore: 10,
+              awaitingMarking: false,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('exam-$mat201Id')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('session-close')));
+      await tester.pumpAndSettle();
+
+      // The whole point of the instant result: `submit_exam` graded this paper
+      // before the student was back on the list, so the mark is shown rather than
+      // a "results will be released" that has nothing left to wait for.
+      expect(find.byKey(const Key('exam-result-dialog')), findsOneWidget);
+      expect(find.text('Your result'), findsOneWidget);
+      expect(find.textContaining('You scored 7 of 10'), findsOneWidget);
+      expect(find.text('Answers submitted'), findsNothing);
+
+      await tester.tap(find.byKey(const Key('exam-result-done')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('exam-result-dialog')), findsNothing);
+    });
+
+    testWidgets('a paper with an essay says the mark is not final yet', (
+      tester,
+    ) async {
+      exams.submissions[mat201Id] = const Submission(
+        id: 'sub-mat',
+        studentId: aishaId,
+        examId: mat201Id,
+        answers: <String, dynamic>{},
+        status: SubmissionStatus.ongoing,
+      );
+
+      await tester.pumpWidget(
+        portal(
+          builder: (_, _) => const _SessionThatClosesWith(
+            result: ExamSubmitResult(
+              status: SubmissionStatus.submitted,
+              score: 3,
+              maxScore: 10,
+              awaitingMarking: true,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('exam-$mat201Id')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('session-close')));
+      await tester.pumpAndSettle();
+
+      // A partial score presented as the final mark would be a lie, so this
+      // branch deliberately shows no number at all.
+      expect(find.text('Answers submitted'), findsOneWidget);
+      expect(find.textContaining('not final yet'), findsOneWidget);
+      expect(find.textContaining('You scored'), findsNothing);
+      expect(find.text('Your result'), findsNothing);
+    });
+
+    testWidgets('a disqualified close is reported with its own wording', (
+      tester,
+    ) async {
+      exams.submissions[mat201Id] = const Submission(
+        id: 'sub-mat',
+        studentId: aishaId,
+        examId: mat201Id,
+        answers: <String, dynamic>{},
+        status: SubmissionStatus.ongoing,
+      );
+
+      await tester.pumpWidget(
+        portal(
+          builder: (_, _) => const _SessionThatClosesWith(
+            result: ExamSubmitResult(
+              status: SubmissionStatus.disqualified,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('exam-$mat201Id')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('session-close')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Attempt disqualified'), findsOneWidget);
+      expect(find.textContaining('reset the attempt'), findsOneWidget);
+      expect(find.textContaining('You scored'), findsNothing);
+    });
+
     testWidgets('a failed submission start is surfaced, not swallowed', (
       tester,
     ) async {
@@ -331,6 +446,67 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('Student Exam Portal'), findsOneWidget);
+    });
+
+    testWidgets('a load that outlasts the retry window says so', (tester) async {
+      // The repository is still inside its silent retry window (`ProfileRepositoryImpl`,
+      // 2.45s in total) with the profile still unread.
+      final pending = Completer<UserProfile>();
+      profiles.behaviour = () => pending.future;
+
+      await tester.pumpWidget(gateUnderTest());
+      await tester.pump();
+
+      expect(find.byKey(const Key('profile-loading-hint')), findsNothing);
+
+      // Still inside the window an ordinary load resolves in: nothing says the
+      // slow path has been taken yet.
+      await tester.pump(const Duration(milliseconds: 1400));
+      expect(
+        find.byKey(const Key('profile-loading-hint')),
+        findsNothing,
+        reason: 'an ordinary load must not be told it is slow',
+      );
+
+      // ...and past the hint's 1500ms it does, because the screen may legitimately
+      // be up for a couple of seconds while a late row is retried.
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(find.byKey(const Key('profile-loading-hint')), findsOneWidget);
+      expect(find.textContaining('Still trying'), findsOneWidget);
+      // The hint is *added* to the loading screen, it does not replace it: the
+      // spinner stays and the error state is never shown for a row that may still
+      // be arriving.
+      expect(find.text('Loading your profile…'), findsOneWidget);
+      expect(find.text('We could not load your profile'), findsNothing);
+
+      // The row appears (late, exactly as the race delivers it) and the screen
+      // goes away with its hint.
+      pending.complete(aisha);
+      await tester.pumpAndSettle();
+
+      expect(find.text('Student Exam Portal'), findsOneWidget);
+      expect(find.byKey(const Key('profile-loading-hint')), findsNothing);
+    });
+
+    testWidgets('a profile that resolves in the window leaves no hint behind', (
+      tester,
+    ) async {
+      final pending = Completer<UserProfile>();
+      profiles.behaviour = () => pending.future;
+
+      await tester.pumpWidget(gateUnderTest());
+      await tester.pump();
+      expect(find.byKey(const Key('profile-loading-hint')), findsNothing);
+
+      // Resolve before the hint's delay, then run well past it: the loading screen
+      // owned the timer and cancels it on dispose, so neither a stale hint nor a
+      // `setState` after dispose can follow the account onto the console.
+      pending.complete(musa);
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 3));
+
+      expect(find.textContaining('Still trying'), findsNothing);
+      expect(find.text('Loading your profile…'), findsNothing);
     });
 
     testWidgets('a failed role lookup is retryable', (tester) async {
@@ -445,7 +621,7 @@ void main() {
       expect(find.text(mat201.title), findsNothing);
     });
 
-    testWidgets('reaches the proctoring console, without the reset tier',
+    testWidgets('reaches the proctoring console, with the reset tier',
         (tester) async {
       profiles.behaviour = () => Future<UserProfile>.value(musa);
 
@@ -456,10 +632,16 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('Supervisor Console'), findsOneWidget);
-      // A lecturer publishes and marks; the attempt-reset control belongs to the
-      // tier `is_exam_supervisor()` names, so the monitor they reach carries the
-      // same `canResetAttempts: false` the role does.
+      // A lecturer publishes and marks *and* repairs: the reset control belongs
+      // to the tier `is_attempt_resetter()` names (admin, supervisor, lecturer),
+      // and the monitor they reach is handed the role's own answer rather than a
+      // literal, so the two cannot disagree.
       expect(find.byKey(const Key('supervisor-home')), findsOneWidget);
+      final picker = tester.widget<SupervisorExamPickerPage>(
+        find.byType(SupervisorExamPickerPage),
+      );
+      expect(picker.canResetAttempts, UserRole.lecturer.canResetAttempts);
+      expect(picker.canResetAttempts, isTrue);
     });
   });
 
@@ -856,6 +1038,27 @@ class _FakeProfileRepository implements ProfileRepository {
 
 /// Stands in for `ExamRepositoryImpl`: published exams plus a submission per exam
 /// id (absent = a fresh `ongoing` one is returned), with an injectable failure.
+/// A stand-in session screen with the one behaviour the portal's result depends
+/// on: closing the attempt by popping the way `ExamTakingPage` does
+/// (`Navigator.pop(result)`), so "what is the student told?" can be asserted
+/// without a camera, a clock or a backend.
+class _SessionThatClosesWith extends StatelessWidget {
+  const _SessionThatClosesWith({required this.result});
+
+  final ExamSubmitResult result;
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: Center(
+          child: TextButton(
+            key: const Key('session-close'),
+            onPressed: () => Navigator.of(context).pop(result),
+            child: const Text('finish session'),
+          ),
+        ),
+      );
+}
+
 class _FakeExamRepository implements ExamRepository {
   _FakeExamRepository({this.exams = const <Exam>[]});
 
@@ -901,7 +1104,8 @@ class _FakeExamRepository implements ExamRepository {
   }) async {}
 
   @override
-  Future<void> submitExam(String submissionId) async {}
+  Future<ExamSubmitResult> submitExam(String submissionId) async =>
+      const ExamSubmitResult(status: SubmissionStatus.submitted);
 
   @override
   Future<void> markDisqualified(String submissionId) async {}
@@ -926,6 +1130,8 @@ class _FakeQuestionAuthoringRepository implements QuestionAuthoringRepository {
     required String title,
     required int durationMinutes,
     required bool isPublished,
+    DateTime? startsAt,
+    DateTime? endsAt,
   }) async =>
       throw UnimplementedError('not reached by the routing tests');
 

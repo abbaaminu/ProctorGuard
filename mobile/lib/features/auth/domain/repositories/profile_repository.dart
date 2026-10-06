@@ -16,8 +16,14 @@ class ProfileLookupException implements Exception {
 abstract class ProfileRepository {
   /// Reads `public.profiles` for [userId] (the **auth** user id).
   ///
-  /// Throws [ProfileLookupException] when there is no row, the role is
-  /// unrecognised, or the backend refuses — the gate renders that as a
-  /// retryable error instead of guessing a role.
+  /// Throws [ProfileLookupException] when the role is unrecognised, or when there
+  /// is still no row after the implementation's own short retry window — the gate
+  /// renders that as a retryable error instead of guessing a role.
+  ///
+  /// A row that is merely *late* (the sign-in race: the session is emitted a
+  /// moment before the database trigger's row becomes visible) is retried
+  /// silently by the implementation, so the returned future simply stays pending
+  /// — the caller's loading state covers the window. See
+  /// `ProfileRepositoryImpl.getProfile` for the schedule.
   Future<UserProfile> getProfile(String userId);
 }

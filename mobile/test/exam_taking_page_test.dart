@@ -6,6 +6,7 @@ import 'package:proctorguard/core/services/key_value_store.dart';
 import 'package:proctorguard/core/services/kiosk_service.dart';
 import 'package:proctorguard/core/services/web_guards.dart';
 import 'package:proctorguard/features/exam/domain/entities/exam.dart';
+import 'package:proctorguard/features/exam/domain/entities/exam_submit_result.dart';
 import 'package:proctorguard/features/exam/domain/entities/question.dart';
 import 'package:proctorguard/features/exam/domain/entities/submission.dart';
 import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
@@ -81,6 +82,9 @@ void main() {
 
   /// The session screen behind a launcher route, so submitting can actually pop
   /// back (popping the *root* route is not what production does).
+  ///
+  /// [onPopped] is handed whatever the session screen popped with — the instant
+  /// result the portal then shows the student (see [ExamSubmitResult]).
   Widget pageUnderTest({
     bool mockCamera = true,
     WebGuards? webGuards,
@@ -89,6 +93,7 @@ void main() {
     String? candidateName,
     String? examTitle,
     String? candidateEmail,
+    void Function(Object? result)? onPopped,
   }) =>
       ProviderScope(
         overrides: [
@@ -112,20 +117,22 @@ void main() {
             builder: (context) => Scaffold(
               body: Center(
                 child: ElevatedButton(
-                  onPressed: () => Navigator.of(context).push(
-                    MaterialPageRoute<void>(
-                      builder: (_) => ExamTakingPage(
-                        examId: 'exam-1',
-                        submissionId: 'sub-1',
-                        mockCamera: mockCamera,
-                        webGuards: webGuards,
-                        clock: clock,
-                        candidateName: candidateName,
-                        examTitle: examTitle,
-                        candidateEmail: candidateEmail,
-                      ),
-                    ),
-                  ),
+                  onPressed: () async {
+                    final popped = await Navigator.of(context)
+                        .push<Object?>(MaterialPageRoute<Object?>(
+                          builder: (_) => ExamTakingPage(
+                            examId: 'exam-1',
+                            submissionId: 'sub-1',
+                            mockCamera: mockCamera,
+                            webGuards: webGuards,
+                            clock: clock,
+                            candidateName: candidateName,
+                            examTitle: examTitle,
+                            candidateEmail: candidateEmail,
+                          ),
+                        ));
+                    onPopped?.call(popped);
+                  },
                   child: const Text('open exam'),
                 ),
               ),
@@ -706,6 +713,86 @@ void main() {
       expect(find.text('open exam'), findsOneWidget);
     });
 
+    testWidgets('submitting hands back the mark, the total and the paper shape',
+        (tester) async {
+      // Two marks of one point each, both graded automatically: `submit_exam`
+      // answers with the score it computed and this screen adds the total, so the
+      // portal can print "1 of 2" without grading anything itself.
+      exams = _StubExamRepository(
+        questions: const <Question>[multipleChoice, fillInTheBlank],
+        grading: const ExamSubmitResult(
+          status: SubmissionStatus.submitted,
+          score: 1,
+        ),
+      );
+      Object? popped;
+
+      await tester.pumpWidget(
+        pageUnderTest(onPopped: (result) => popped = result),
+      );
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      // Submit lives on the last question, so walk to it first.
+      await tester.tap(find.byKey(const Key('exam-next')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('exam-submit')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('exam-submit-confirm')));
+      await tester.pumpAndSettle();
+
+      expect(
+        popped,
+        const ExamSubmitResult(
+          status: SubmissionStatus.submitted,
+          score: 1,
+          maxScore: 2,
+          // Nothing on this paper needs a lecturer, so the result is final the
+          // moment the server answered.
+          awaitingMarking: false,
+        ),
+      );
+    });
+
+    testWidgets('a paper with an essay is handed back as still to be marked',
+        (tester) async {
+      // The score `submit_exam` returns here is only the automatic half: the
+      // essay is marked later by the paper's owner, and the portal must say so
+      // rather than present a partial number as the final mark.
+      exams = _StubExamRepository(
+        questions: const <Question>[multipleChoice, subjective],
+        grading: const ExamSubmitResult(
+          status: SubmissionStatus.submitted,
+          score: 1,
+        ),
+      );
+      Object? popped;
+
+      await tester.pumpWidget(
+        pageUnderTest(onPopped: (result) => popped = result),
+      );
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      // The essay is the second question, and submit lives on the last one.
+      await tester.tap(find.byKey(const Key('exam-next')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('exam-submit')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('exam-submit-confirm')));
+      await tester.pumpAndSettle();
+
+      expect(
+        popped,
+        const ExamSubmitResult(
+          status: SubmissionStatus.submitted,
+          score: 1,
+          maxScore: 2,
+          awaitingMarking: true,
+        ),
+      );
+    });
+
     testWidgets('fits a small phone viewport without overflowing',
         (tester) async {
       // 360x640 dp: a common small Android phone. The options used to sit in a
@@ -1088,10 +1175,20 @@ Future<void> pumpBootstrap(WidgetTester tester) async {
 /// `OfflineSyncService` contract).
 class _StubExamRepository implements ExamRepository {
   _StubExamRepository(
-      {this.questions = const <Question>[], this.online = true});
+      {this.questions = const <Question>[],
+      this.online = true,
+      this.grading = const ExamSubmitResult(
+        status: SubmissionStatus.submitted,
+        score: 4,
+      )});
 
   final List<Question> questions;
   bool online;
+
+  /// What `submit_exam` answers with, so a test can assert the result the session
+  /// screen hands back to the portal.
+  final ExamSubmitResult grading;
+
   final List<String> optionAnswers = <String>[];
   final List<String> textAnswers = <String>[];
   final List<String> submitted = <String>[];
@@ -1127,9 +1224,10 @@ class _StubExamRepository implements ExamRepository {
   }
 
   @override
-  Future<void> submitExam(String submissionId) async {
+  Future<ExamSubmitResult> submitExam(String submissionId) async {
     if (!online) throw const _NoNetwork();
     submitted.add(submissionId);
+    return grading;
   }
 
   @override

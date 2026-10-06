@@ -50,12 +50,14 @@ android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLoc
    browser guards below are platform-independent and work either way.
 4. Routing is wired: `RoleGate` reads `profiles.role` after sign-in and routes on
    the four values of the `public.user_role` enum — students to
-   `StudentExamPortalPage` (published exams → `ExamTakingPage`), `lecturer` and
-   `supervisor` (both staff, `is_staff()` in the schema) to
-   `SupervisorExamPickerPage` → `SupervisorDashboardPage`, and `admin` to
-   `AdminDashboardPage`. Admins manage accounts and can open the exam monitor;
-   supervisors can reset attempts; all staff can open analytics. Account
-   creation/deletion use `admin-create-user` and `admin-delete-user` Edge
+   `StudentExamPortalPage` (published exams → `ExamTakingPage`), `lecturer` to the
+   authoring console (`LecturerConsolePage`, whose app bar opens the same supervisor
+   console), `supervisor` to `SupervisorExamPickerPage` →
+   `SupervisorDashboardPage`, and `admin` to `AdminDashboardPage`. Admins manage
+   accounts and can open the exam monitor; `admin`, `supervisor` and `lecturer` can
+   reset attempts (`is_attempt_resetter()`, because the paper's author is the one
+   who repairs a wrong key); all staff can open analytics. Account creation and
+   deletion use `admin-create-user` and `admin-delete-user` Edge
    Functions because auth users cannot be managed through ordinary client
    table writes. Drop in `go_router` (`go_router` is *not* a dependency yet)
    when deep links matter — every page takes plain constructor args.
@@ -127,7 +129,10 @@ the supervisor console already renders).
 - The bucket, its size/mime limits and its policies live in
   `../supabase/schema.sql` §6: an authenticated student may only upload into
   their **own, still-ongoing** submission folder (mirroring the append-only
-  `proctoring_logs` policy), and no client may update or delete snapshots.
+  `proctoring_logs` policy), no client may *update* a snapshot, and deleting one is
+  the reset's own purge, allowed only for `is_attempt_resetter()`
+  (`Proctor snapshots supervisor purge`) — a student can never erase their own
+  evidence.
 
 ## Testing without a camera (`MOCK_CAMERA`)
 
@@ -347,7 +352,16 @@ router today. Once `SupabaseService.signedInChanges` reports a session it:
    (`ProfileRepositoryImpl` → `select().eq('id', userId).maybeSingle()`, allowed by
    the `profiles_select_own_or_staff` policy, whose `id = auth.uid()` half covers
    your own row even as a student);
-2. shows "Loading your profile…" with a spinner while that read is in flight;
+2. shows "Loading your profile…" with a spinner while that read is in flight —
+   **including while a late row is retried.** Signing in can report the session a
+   moment before the `handle_new_user` trigger's row is visible to a read, so
+   `getProfile` looks again on an increasing delay (0.25s, 0.7s, 1.5s: about 2.5s
+   at the outside) and the future simply stays **pending** for the whole window.
+   Nothing is reported in the meantime, so a fresh account never sees "We could
+   not load your profile" for a row that is about to arrive — after 1.5s the
+   loading screen only adds a "Still trying…" hint so it does not look frozen.
+   Only a row that is *still* absent after the window, a refused read, or an
+   unrecognised role becomes the retryable error below;
 3. routes on the four values of the `public.user_role` enum:
    * `student` → `StudentExamPortalPage`
    * `lecturer` → `LecturerConsolePage` — the authoring and marking console for
@@ -357,7 +371,16 @@ router today. Once `SupabaseService.signedInChanges` reports a session it:
    * `admin` → `AdminDashboardPage`
 
 Lecturers and supervisors share `is_staff()` in the database, which is what lets
-both read every attempt and every incident, but the two roles do different work:
+both read every attempt on the monitor roster
+(`submissions_select_own_or_supervisor`), but what was recorded *inside* a sitting
+is scoped more tightly: the incident feed (`proctoring_logs`) and the reset audit
+(`session_reset_logs`) are readable for every paper by the intervention tier
+(`is_exam_supervisor()`) and — for the paperwork a lecturer is accountable for —
+by the author of the paper the log belongs to (`owns_exam()` →
+`exams.created_by = auth.uid()`). Those stay *evidence* reads: a student still
+reads the incidents recorded on their own attempt, and the reset audit has no
+student tier at all, because a reset row names the member of staff who ran it. The
+two roles do different work:
 a lecturer owns the papers they wrote — only the author may edit a question or
 award the marks on an essay, and `grade_submission()` re-checks that — while a
 supervisor runs the sitting and is the tier `is_exam_supervisor()` names for
@@ -419,7 +442,7 @@ The role check is the server's, exactly as in `admin-create-user`: the JWT
 establishes *who* is asking, the caller's own `profiles.role` is read back
 through a client carrying the caller's token (so RLS filters it) and only then is
 the `service_role` key used. `admin` is the only role in `RESETTER_ROLES` —
-resetting an *attempt* is a proctoring action (`is_exam_supervisor()`), resetting
+resetting an *attempt* is a proctoring action (`is_attempt_resetter()`), resetting
 a *password* is an identity action, and the schema keeps those in different
 hands — so a supervisor who calls it gets 403 and no write. A `404` from Auth is
 reported as "That account no longer exists — reload the list and try again."
@@ -440,12 +463,14 @@ admin-create-user` and why the key never reaches the app).
 `SupervisorExamPickerPage` lists published exams and opens
 `SupervisorDashboardPage`, whose roster and incident feed are Supabase Realtime
 streams. Whether the roster offers the reset control is decided in one place,
-`UserRole.canResetAttempts` — `admin` and `supervisor` only, which is
-`is_exam_supervisor()`'s own list in `supabase/schema.sql` read back out of the
-file by `schema_contract_test.dart`, so the role gate, the admin dashboard and
-the live monitor cannot disagree about it. Lecturers reach this same console from
-their own home (the app bar's Monitor action) and can watch a sitting, but arrive
-with `canResetAttempts: false`; `AdminDashboardPage` mounts its picker with the
+`UserRole.canResetAttempts` — `admin`, `supervisor` **and** `lecturer`, which is
+`is_attempt_resetter()`'s own list in `supabase/schema.sql` read back out of the
+file by `schema_contract_test.dart`, so the role gate, the admin dashboard, the
+lecturer console and the live monitor cannot disagree about it. Lecturers reach
+this same console from their own home (the app bar's Monitor action) and can watch
+a sitting; what the lecturer's monitor shows *less* of is evidence — its incident
+feed comes back scoped to the papers they wrote (`owns_exam()`), where a
+supervisor's reads every paper's. `AdminDashboardPage` mounts its picker with the
 flag set, because only an admin can reach that screen.
 
 A reset deletes the attempt with its cascaded incident rows, purges the snapshot
@@ -496,6 +521,30 @@ attempt counts, and the four things a lecturer does with a paper.
 | `AttemptGradingPage` | Every handed-in attempt, newest first, with the ones still waiting for marks flagged ("1 to mark"), and the running total the server holds |
 | `AttemptReviewPage` | One attempt: each question with the student's stored answer, the automatic verdict (right / wrong / not answered) beside the key it was compared against, and marks + feedback boxes for the essays |
 
+**Optional scheduling.** `exams.starts_at` and `exams.ends_at` are both nullable,
+and "New paper" leaves them blank by default: an unscheduled paper is offered the
+moment it is published, which is how every paper behaved before scheduling existed
+— and every paper authored before the columns did. Setting either bound narrows
+that window:
+
+* the dialog picks a date and a time per bound (`showDatePicker` →
+  `showTimePicker`, `new-exam-starts-at` / `new-exam-ends-at`), with a clear
+  control on each so an accidental window is undone without leaving the dialog;
+* the pickers work in the author's own zone and `createExam()` sends **UTC**
+  (`timestamptz`), because the columns store instants;
+* an unset bound is **omitted** from the insert rather than sent as null, so the
+  request says out loud which kind of paper it is and the column keeps its NULL
+  default;
+* a window that does not end *after* it opens is refused in the dialog
+  (`new-exam-window-error`) as well as by the database's `exams_window_ordered`
+  check — the constraint is the backstop, not the first line;
+* the tile prints the window (`Exam.scheduleLabel`) and the half-open cases are
+  meaningful: "opens Monday" with no close, or a hard close with no opening time.
+
+`supabase/migrations/optional_exam_scheduling.sql` is the upgrade path for a
+project created before the columns, and carries the three server rules the window
+widens — see "Student Exam Portal" below and the migration's own header.
+
 **The four shapes.** `questions.question_type` holds `multiple_choice`,
 `true_false`, `fill_in_the_blank` or `subjective`; the editor swaps its answer
 fields with the type, and the paper's list labels each row with how it is marked:
@@ -545,10 +594,15 @@ returned row — nothing on the screen is the client's arithmetic. An empty mark
 box means *not marked* rather than zero, so a first pass can save the essays that
 have been read without awarding nothing for the ones that have not.
 
-**Invigilation is not duplicated.** The console's app bar opens the supervisor
-console with `canResetAttempts: false` — the schema's own rule for this role. A
-lecturer can watch a sitting and read every attempt (`is_staff()`), but resetting
-one belongs to `is_exam_supervisor()`'s tier.
+**Invigilation is not duplicated.** The console's app bar opens the *same*
+supervisor console (`SupervisorExamPickerPage` → the live monitor) rather than a
+second monitor screen, and its reset control is asked of the role
+(`UserRole.lecturer.canResetAttempts`) so this screen and the role gate cannot
+disagree — `is_attempt_resetter()` does name `lecturer`, because the paper's author
+is the one who repairs a wrong answer key. A lecturer can watch a sitting and read
+every attempt (`is_staff()` on the roster), but what was *recorded* in a sitting
+stays scoped to the papers they wrote (`owns_exam()`) — see "Role routing
+(post-login)" — where the supervisor tier reads every paper's.
 
 **Seeded to try it on.** `seed.sql` gives the lecturer a published paper of their
 own (`GES301: Software Engineering Midterm`) with one question of each shape, and
@@ -577,6 +631,52 @@ lecturer's GES301 in `seed.sql`) through `PublishedExamList`, and on tap:
   SnackBar and *not* reopened — exactly what Aisha hits on CS101 in the seed data,
   where the server disqualified her after three strikes;
 * a failed start shows "Could not start …" instead of a silent no-op.
+
+**The window, when the paper has one.** A tile prints its window
+(`5 Jan 2026, 09:00 – 17:00`), and a paper that has not opened yet — or has already
+closed — is **inert**: `PublishedExamList(lockWhenNotOpen: true)`, which is the
+*portal's* setting. The supervisor's picker deliberately leaves it off, because
+opening the monitor on a sitting that has closed is exactly what it is for. A
+locked tile swaps its chevron for the bound and says why ("It opens …" / "It
+closed …") instead of offering a tap the server would refuse, and `_openExam`
+re-checks the window before the device check, because the list was rendered from
+an earlier `now`. Nothing polls the clock: a student waiting for a paper to open
+pulls to refresh (or uses the app bar's refresh button).
+
+What actually enforces it is the database, in three places
+(`supabase/migrations/optional_exam_scheduling.sql`):
+
+| Rule | Effect |
+| --- | --- |
+| `submissions_insert_own_ongoing` | no attempt row before `starts_at` or after `ends_at`, so a patched client gets no session either |
+| `attempt_deadline()` | the attempt's own duration **capped by** `ends_at` — a paper that closes at 17:00 does not hand an attempt started at 16:50 a full hour |
+| `submit_exam()` | records that same deadline as `submitted_at`, and still grades from the answers that landed before it |
+
+A paper with neither bound is unaffected by all three: `coalesce(ends_at,
+'infinity')` is what keeps the pre-scheduling arithmetic identical.
+
+### Pre-exam instructions (the proctor guide and the exam rules)
+
+`ExamInstructionsDialog` (`lib/features/exam/presentation/widgets/`) is opened by
+`showExamInstructions(context, exam: …)` from the two places a student stands
+**before** a session — the portal's app bar (`portal-instructions`, before a paper
+is chosen) and the device-check gate (`gate-instructions`, "How the proctor
+works", sitting above "Start Exam"). It is a dialog rather than a page on purpose:
+neither screen loses its state (the checklist, the list) while it is read, and
+nothing in it is a decision to make. Two tabs:
+
+| Tab | What the student is told |
+| --- | --- |
+| `instructions-tab-proctor` | the camera (on for the whole sitting, faces checked on-device, a snapshot kept with each incident, and that a person reviews the recording), the microphone (noise above the room's own floor is what counts, the indicator shows the level, and a refused or unplugged mic says so instead of passing as fine), staying in the exam (the kiosk pin on a phone, the browser guards — tab/focus/fullscreen, copy/paste, back/reload), and that three confirmed strikes close the attempt as disqualified — including that a wrong one can be reset by the paper's author or a supervisor |
+| `instructions-tab-exam` | the clock (the paper's own duration from the start, a scheduled paper also closing at `ends_at`, answers saved as you go including offline, an unanswered question scoring nothing), when a mark appears (instantly for a paper with no written answers; after the lecturer marks the essays otherwise), one attempt per paper and what a reset clears, what the device check requires (and that a browser flags faces by review, not live), and what to do if something goes wrong |
+
+The wording deliberately matches the screens the student is about to meet — the
+audio indicator's "Mic unavailable", the kiosk badge, the portal's result dialog —
+so a state hit mid-session is one they have already read about.
+`mobile/test/exam_instructions_test.dart` pins both halves of the feature: the copy
+inside the tabs, and that **both** pre-exam screens actually reach the dialog (the
+portal with no paper chosen, the gate with its checklist still passed when the
+dialog closes).
 
 ### The exam session screen
 
@@ -1086,8 +1186,11 @@ written-down opt-out for a throwaway demo build and never for one a student runs
   rather than counted as "no face", so they can't burn a strike.
 - **`profiles.role` is the security boundary, so only an admin may move it.** The
   four values (`student`, `lecturer`, `supervisor`, `admin`) come from the
-  `public.user_role` enum, and every policy in `schema.sql` asks `is_staff()` /
-  `is_admin()` about it. RLS cannot restrict a *column*, so the
+  `public.user_role` enum, and `schema.sql` asks about it through the role
+  predicates — `is_staff()`, `is_admin()`, `is_exam_supervisor()`,
+  `is_attempt_resetter()` — and through ownership: `owns_exam()` scopes the
+  incident feed and the reset audit to the papers the reader wrote. RLS cannot
+  restrict a *column*, so the
   `profiles_guard_role_change` trigger raises `42501`
   ("profiles.role is immutable for non-admins") when a non-admin edits it —
   `profiles_admin_all` is the matching policy half, which is what the admin

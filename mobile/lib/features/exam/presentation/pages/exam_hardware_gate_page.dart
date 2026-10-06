@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../../../core/services/hardware_verification_service.dart';
 import '../../../../core/widgets/responsive_layout.dart';
 import '../../domain/entities/exam.dart';
+import '../widgets/exam_instructions_dialog.dart';
 
 /// The mandatory pre-exam hardware check.
 ///
@@ -118,6 +119,11 @@ class _ExamHardwareGatePageState extends State<ExamHardwareGatePage> {
                 settingsHint: report.settingsHint,
                 onCheckAgain: _runCheck,
                 onOpenSettings: _verifier.openSettings,
+                // The rules, one tap away and *before* the button that starts the
+                // attempt: the camera, the microphone's noise floor and the
+                // kiosk/browser rules are all about to become live.
+                onInstructions: () =>
+                    showExamInstructions(context, exam: widget.exam),
                 onStart: () => Navigator.of(context).pop(true),
                 onCancel: () => Navigator.of(context).pop(false),
               ),
@@ -331,6 +337,7 @@ class _GateActions extends StatelessWidget {
     required this.settingsHint,
     required this.onCheckAgain,
     required this.onOpenSettings,
+    required this.onInstructions,
     required this.onStart,
     required this.onCancel,
   });
@@ -340,6 +347,11 @@ class _GateActions extends StatelessWidget {
   final bool settingsHint;
   final VoidCallback onCheckAgain;
   final Future<void> Function() onOpenSettings;
+
+  /// Opens the pre-exam instructions. Never disabled and never part of the gate:
+  /// reading the rules is always possible, whatever the checklist says.
+  final VoidCallback onInstructions;
+
   final VoidCallback onStart;
   final VoidCallback onCancel;
 
@@ -373,6 +385,15 @@ class _GateActions extends StatelessWidget {
       child: const Text('Back to exams'),
     );
 
+    // Read-only, so it sits above the primary action rather than beside the
+    // controls that change the outcome of the check.
+    final instructions = TextButton.icon(
+      key: const Key('gate-instructions'),
+      onPressed: onInstructions,
+      icon: const Icon(Icons.menu_book_outlined, size: 18),
+      label: const Text('How the proctor works'),
+    );
+
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 420;
@@ -396,6 +417,7 @@ class _GateActions extends StatelessWidget {
             const SizedBox(height: 12),
             start,
             const SizedBox(height: 4),
+            instructions,
             cancel,
           ],
         );

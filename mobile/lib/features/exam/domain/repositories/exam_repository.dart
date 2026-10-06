@@ -1,4 +1,5 @@
 import '../entities/exam.dart';
+import '../entities/exam_submit_result.dart';
 import '../entities/question.dart';
 import '../entities/submission.dart';
 
@@ -33,7 +34,15 @@ abstract class ExamRepository {
     required String answer,
   });
 
-  Future<void> submitExam(String submissionId);
+  /// Closes the attempt and returns what `submit_exam()` graded.
+  ///
+  /// The RPC answers with `(result_status, final_score)`, which is what makes an
+  /// instant result possible without the client grading anything itself: an
+  /// attempt whose paper has no essay on it is finished the moment this returns,
+  /// and the screen can show the mark instead of "your results will be released
+  /// later". [ExamSubmitResult.withPaper] adds the two facts only the session
+  /// screen holds (the paper's total and whether an essay is still to be marked).
+  Future<ExamSubmitResult> submitExam(String submissionId);
 
   /// Used by the escalation logic in section 3 — auto-submits with
   /// 'disqualified' status. In practice this is a side effect of

@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:proctorguard/core/services/mediapipe_proctoring_service.dart';
 import 'package:proctorguard/core/services/offline_sync_service.dart';
 import 'package:proctorguard/features/exam/domain/entities/exam.dart';
+import 'package:proctorguard/features/exam/domain/entities/exam_submit_result.dart';
 import 'package:proctorguard/features/exam/domain/entities/question.dart';
 import 'package:proctorguard/features/exam/domain/entities/submission.dart';
 import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
@@ -810,7 +811,8 @@ class _RecordingExamRepository implements ExamRepository {
   }) async {}
 
   @override
-  Future<void> submitExam(String submissionId) async {}
+  Future<ExamSubmitResult> submitExam(String submissionId) async =>
+      const ExamSubmitResult(status: SubmissionStatus.submitted);
 
   @override
   Future<void> markDisqualified(String submissionId) async {

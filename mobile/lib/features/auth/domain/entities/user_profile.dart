@@ -35,19 +35,28 @@ enum UserRole {
   String get dbValue => name;
 
   /// Who may clear a student's attempt and its proctoring evidence — the roles
-  /// `is_exam_supervisor()` names in `supabase/schema.sql`
-  /// (`role in ('admin', 'supervisor')`).
+  /// `is_attempt_resetter()` names in `supabase/schema.sql`
+  /// (`role in ('admin', 'supervisor', 'lecturer')`).
   ///
-  /// The **policy** is the authority (`submissions_delete_supervisor`, plus the
-  /// Storage delete policy that lets the console drop the snapshots those rows
-  /// pointed at). This getter is the same question asked by the screens that
-  /// render the control, and it is asked in exactly *one* place for that
-  /// reason: the role gate, the admin dashboard and the live monitor must not
-  /// be able to disagree about whether an account may reset an attempt.
+  /// The **policies** are the authority (`submissions_delete_supervisor`, plus
+  /// the Storage delete policy that lets the console drop the snapshots those
+  /// rows pointed at, plus the audit insert). This getter is the same question
+  /// asked by the screens that render the control, and it is asked in exactly
+  /// *one* place for that reason: the role gate, the admin dashboard, the
+  /// lecturer console and the live monitor must not be able to disagree about
+  /// whether an account may reset an attempt.
   /// `schema_contract_test.dart` reads the role list back out of `schema.sql`
-  /// and fails if the two drift apart.
+  /// and the migrations and fails if the two drift apart.
+  ///
+  /// Lecturers are in the tier because they are the paper's author: they already
+  /// read every attempt through `is_staff()`, and the reset is the repair for the
+  /// mistakes only they can see. They are deliberately *not* in
+  /// `is_exam_supervisor()`, which is the narrower tier that may rewrite an
+  /// attempt in place (a status change or an after-the-fact re-grade).
   bool get canResetAttempts =>
-      this == UserRole.admin || this == UserRole.supervisor;
+      this == UserRole.admin ||
+      this == UserRole.supervisor ||
+      this == UserRole.lecturer;
 }
 
 /// The `public.profiles` row for the authenticated account (1:1 with

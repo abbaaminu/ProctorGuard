@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/di/providers.dart';
 import '../../../../core/services/offline_sync_service.dart';
 import '../../../../core/utils/proctor_log.dart';
+import '../../domain/entities/exam_submit_result.dart';
 import '../../domain/entities/question.dart';
 import '../../domain/repositories/exam_repository.dart';
 
@@ -648,9 +649,23 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
   /// before opening the confirmation dialog.
   bool get isSubmitting => state.submitting;
 
+  /// The paper as loaded, read-only.
+  ///
+  /// The page needs it for the instant result: the sum of [Question.points] is the
+  /// "of 10" beside the mark the server returned, and whether any question is an
+  /// essay is what decides between showing that mark and saying "still to be
+  /// marked". Both are the *same* facts grading uses server-side, so the two
+  /// cannot disagree.
+  List<Question> get questions => state.questions;
+
   /// Closes the attempt server-side. `submit_exam` grades and is idempotent, so
   /// a retry after a dropped connection is safe.
-  Future<void> submitToServer() => _exams.submitExam(_submissionId);
+  ///
+  /// The returned [ExamSubmitResult] is the server's own answer
+  /// (`result_status`, `final_score`) — the page hands it to the portal, which is
+  /// where an attempt with no essay on it is shown its mark straight away.
+  Future<ExamSubmitResult> submitToServer() =>
+      _exams.submitExam(_submissionId);
 
   /// Drops the drafts for this attempt: the server owns the answers now.
   ///

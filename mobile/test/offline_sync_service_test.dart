@@ -6,6 +6,7 @@ import 'package:proctorguard/core/services/network_status.dart';
 import 'package:proctorguard/core/services/offline_sync_service.dart';
 import 'package:proctorguard/core/utils/uuid.dart';
 import 'package:proctorguard/features/exam/domain/entities/exam.dart';
+import 'package:proctorguard/features/exam/domain/entities/exam_submit_result.dart';
 import 'package:proctorguard/features/exam/domain/entities/question.dart';
 import 'package:proctorguard/features/exam/domain/entities/submission.dart';
 import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
@@ -551,9 +552,10 @@ class _FlakyExamRepository implements ExamRepository {
   }
 
   @override
-  Future<void> submitExam(String submissionId) async {
+  Future<ExamSubmitResult> submitExam(String submissionId) async {
     if (!online) throw const _Offline();
     submitted.add(submissionId);
+    return const ExamSubmitResult(status: SubmissionStatus.submitted);
   }
 
   @override

@@ -1,8 +1,8 @@
 -- =====================================================================
 -- PROCTORGUARD - SESSION RESET LOGS (THE AUDIT TRAIL FOR "Reset attempt")
--- Adds `public.session_reset_logs`: one row per attempt a supervisor or admin
--- clears, naming the attempt, the student, the exam, how much evidence went with
--- it and who did it.
+-- Adds `public.session_reset_logs`: one row per attempt a supervisor, admin or
+-- lecturer clears, naming the attempt, the student, the exam, how much evidence
+-- went with it and who did it.
 --
 -- WHY THE TABLE EXISTS
 --   Reset is the one destructive staff action in the console: it deletes the
@@ -46,6 +46,47 @@
 --     caller's JWT, and be the only one there.
 -- =====================================================================
 
+-- The reset tier, repeated here so this file stays re-runnable on a database that
+-- predates it: `is_attempt_resetter()` is the same sentence
+-- `supabase/migrations/secure_exam_access_and_deadlines.sql` and section 2 of
+-- `schema.sql` carry (and what `submissions_delete_supervisor` asks). Re-running
+-- *this* file after either of those must not narrow the insert policy below back
+-- to the supervisor tier, which is why the definition lives here rather than only
+-- in the older files. `mobile/test/schema_contract_test.dart` reads the role list
+-- back out of `schema.sql` and this file and fails if they drift apart.
+create or replace function public.is_attempt_resetter()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role in ('admin', 'supervisor', 'lecturer')
+  );
+$$;
+
+-- `owns_exam()` is repeated here for the same reason the reset tier is: this file
+-- recreates `session_reset_logs_select_staff` below, and `create policy` is not
+-- idempotent, so the file has to be able to define the predicate that policy
+-- calls. Section 2 of `schema.sql` and
+-- `supabase/migrations/lecturer_scoped_log_reads.sql` carry the same definition.
+-- `mobile/test/schema_contract_test.dart` reads both policies back out of every
+-- file that declares them and fails if the tiers drift apart.
+create or replace function public.owns_exam(p_exam_id uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.exams
+    where id = p_exam_id and created_by = auth.uid()
+  );
+$$;
+
 create table if not exists public.session_reset_logs (
   id              uuid primary key default uuid_generate_v4(),
   submission_id   uuid not null,
@@ -63,23 +104,30 @@ alter table public.session_reset_logs enable row level security;
 drop policy if exists "session_reset_logs_select_staff" on public.session_reset_logs;
 drop policy if exists "session_reset_logs_insert_supervisor" on public.session_reset_logs;
 
--- Read: the staff tier, matching the visibility of the attempts and incident
--- rows themselves (`submissions_select_own_or_supervisor`,
--- `logs_select_own_or_supervisor`). Students read nothing: the row names the
--- member of staff who ran the reset.
+-- Read: the intervention tier (`is_exam_supervisor()`) sees every reset; a
+-- lecturer sees the resets recorded against the papers they wrote, through
+-- `owns_exam()` on the exam id this row carries as plain evidence. Students read
+-- nothing: the row names the member of staff who ran the reset.
+--
+-- Narrower than `is_staff()` on purpose. The tier that may read every *attempt*
+-- (the roster, `submissions_select_own_or_supervisor`) is not the tier that may
+-- read every *reset*: this row names another teacher's student, their exam and
+-- the actor who cleared it. The paper's owner still gets the row that explains
+-- why a card is missing from their own roster.
 create policy "session_reset_logs_select_staff"
   on public.session_reset_logs for select
   to authenticated
-  using (public.is_staff());
+  using (public.is_exam_supervisor() or public.owns_exam(exam_id));
 
--- Write: the tier that may delete an attempt at all (`is_exam_supervisor()` is
--- what `submissions_delete_supervisor` uses) and only in the caller's own name -
--- `actor_id` defaults to auth.uid() and this check rejects a client that tries to
--- name somebody else as the actor.
+-- Write: the tier that may delete an attempt at all (`is_attempt_resetter()` is
+-- what `submissions_delete_supervisor` uses, and it is the one predicate the
+-- delete, the snapshot purge and this row all ask) and only in the caller's own
+-- name - `actor_id` defaults to auth.uid() and this check rejects a client that
+-- tries to name somebody else as the actor.
 create policy "session_reset_logs_insert_supervisor"
   on public.session_reset_logs for insert
   to authenticated
-  with check (public.is_exam_supervisor() and actor_id = auth.uid());
+  with check (public.is_attempt_resetter() and actor_id = auth.uid());
 
 -- Deliberately no UPDATE and no DELETE policy: the trail is append-only for
 -- every client, admin included.

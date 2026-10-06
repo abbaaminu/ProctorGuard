@@ -29,6 +29,7 @@ import '../../../proctoring/presentation/providers/proctoring_provider.dart';
 import '../../../proctoring/presentation/widgets/audio_monitor_indicator.dart';
 import '../../../proctoring/presentation/widgets/fullscreen_lock_overlay.dart';
 import '../../../proctoring/presentation/widgets/violation_overlay.dart';
+import '../../domain/entities/exam_submit_result.dart';
 import '../../domain/entities/question.dart';
 import '../exam_strike_mapping.dart';
 import '../providers/exam_session_controller.dart';
@@ -847,15 +848,19 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     session.markSubmitting();
     try {
       // `submit_exam` grades on the server and is idempotent, so a retry after a
-      // dropped connection is safe.
-      await session.submitToServer();
+      // dropped connection is safe. It also *answers* with the mark it computed,
+      // which is what lets the portal show an instant result for a paper with no
+      // essay on it (see `_submitResult`).
+      final result = await session.submitToServer();
       if (!mounted) return;
       session.onSubmitted();
       // The server owns the answers now, so the drafts for this attempt are only
       // clutter. Queued violations are deliberately kept (see clearSession).
       await session.clearSession();
       if (!mounted) return;
-      Navigator.of(context).pop();
+      // Handed back to the portal, which decides what the student is told: it is
+      // the screen the student returns to, and the attempt is on its list.
+      Navigator.of(context).pop(_submitResult(result));
     } catch (error) {
       proctorLog('ProctorGuard: submit failed: $error');
       if (!mounted) return;
@@ -867,6 +872,27 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       }
     }
   }
+
+  /// The result handed back to the portal, built from the server's own answer
+  /// plus the two facts about the paper only this screen holds.
+  ///
+  /// An attempt whose paper has no essay on it is *finished* the moment
+  /// `submit_exam()` answers, so [ExamSubmitResult.hasFinalScore] comes out true
+  /// and the portal can print the mark; one with an essay is only partly graded
+  /// (the written answers are marked afterwards, by the paper's owner), and
+  /// saying that is the honest answer to "what did I get?".
+  ExamSubmitResult _submitResult(ExamSubmitResult result) =>
+      result.withPaper(
+        awaitingMarking:
+            _session.questions.any((question) => question.isSubjective),
+        // Every point on the paper, so "7 of 10" is the paper's own arithmetic
+        // and not a guess: `questions.points` is the same column `submit_exam()`
+        // sums on the server.
+        maxScore: _session.questions.fold<num>(
+          0,
+          (sum, question) => sum + question.points,
+        ),
+      );
 
   /// The "waiting for a connection" screen's retry: drain the queue and, when it
   /// is empty, go straight back to submitting (no second confirmation dialog -

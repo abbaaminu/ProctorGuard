@@ -185,7 +185,26 @@ void main() {
       final sql = schemaSql();
       if (sql == null) return;
 
-      expect(sql, contains('clock_timestamp() < s.started_at'));
+      // The deadline is answered in one place - `attempt_deadline()`, which caps
+      // the attempt's own duration by the exam window - so no copy of the raw
+      // arithmetic may remain: a second copy is how a scheduled paper's hard
+      // close silently stops applying to an answer write.
+      expect(
+        RegExp(r'public\.attempt_deadline\(').allMatches(sql).length,
+        greaterThanOrEqualTo(5),
+        reason: 'the definition, its grants, and the calls that depend on it',
+      );
+      expect(sql, isNot(contains('clock_timestamp() < s.started_at')));
+      expect(
+        sql,
+        contains('clock_timestamp() < public.attempt_deadline('),
+        reason: 'both answer-merge RPCs measure the same deadline',
+      );
+      expect(
+        sql,
+        contains('public.attempt_deadline(v_started_at, v_duration_minutes, v_ends_at)'),
+        reason: 'the close records the window-aware deadline',
+      );
       expect(sql, contains('v_submitted_at := least('));
       expect(sql, contains('authentication is required to submit an exam'));
       expect(sql, contains("and answers = '{}'::jsonb"));
@@ -249,7 +268,16 @@ void main() {
           '[{"result_status":"submitted","final_score":4}]';
       final repo = ExamRepositoryImpl(client);
 
-      await repo.submitExam('sub-1');
+      final result = await repo.submitExam('sub-1');
+
+      // The row the RPC answers with is the mark the student is shown the moment
+      // the attempt closes. `awaitingMarking` / `maxScore` are added by the
+      // session screen, which is the only place that knows the paper — so until
+      // it has said so, the result claims nothing final.
+      expect(result.status, SubmissionStatus.submitted);
+      expect(result.score, 4);
+      expect(result.awaitingMarking, isTrue);
+      expect(result.hasFinalScore, isFalse);
 
       final request = transport.requests.single;
       expect(request.method, 'POST');
@@ -258,6 +286,49 @@ void main() {
       final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
       expect(body.keys.toSet(), <String>{'p_submission_id'});
       expect(body['p_submission_id'], 'sub-1');
+
+      // The return shape the client reads back is the schema's own: `result_status`
+      // plus `final_score`. Drift here would silently turn every result into
+      // "submitted, unmarked".
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+      expect(
+        sql,
+        contains('returns table(result_status text, final_score numeric)'),
+      );
+    });
+
+    test('a final score is only claimed once the paper says it is final',
+        () async {
+      transport.responseBody =
+          '[{"result_status":"submitted","final_score":7}]';
+      final repo = ExamRepositoryImpl(client);
+
+      final objective = (await repo.submitExam('sub-1'))
+          .withPaper(awaitingMarking: false, maxScore: 10);
+      expect(objective.hasFinalScore, isTrue);
+      // "7 of 10", not "7.0 of 10": a whole-number mark is the common case and
+      // the decimal reads like a bug.
+      expect(objective.scoreLabel, '7 of 10');
+
+      // The same server row on a paper with an essay on it stays provisional —
+      // the number is only the automatic half until a lecturer marks the rest.
+      final withEssay = (await repo.submitExam('sub-1'))
+          .withPaper(awaitingMarking: true, maxScore: 10);
+      expect(withEssay.hasFinalScore, isFalse);
+      expect(withEssay.score, 7);
+    });
+
+    test('a body the client cannot read becomes "submitted, unmarked"', () async {
+      // The attempt is already closed server-side by the time this is parsed, so
+      // throwing would replace a finished exam with an error screen.
+      transport.responseBody = 'null';
+
+      final result = await ExamRepositoryImpl(client).submitExam('sub-1');
+
+      expect(result.status, SubmissionStatus.submitted);
+      expect(result.score, isNull);
+      expect(result.hasFinalScore, isFalse);
     });
 
     test(
@@ -620,46 +691,333 @@ void main() {
   });
 
   group('attempt-reset tier', () {
-    test('the console and is_exam_supervisor() allow exactly the same roles',
+    test('the console and is_attempt_resetter() allow exactly the same roles',
         () {
       // `UserRole.canResetAttempts` is what `role_gate.dart` hands the supervisor
-      // dashboard as `canResetAttempts`; the server grants the delete half of
-      // that action through `is_exam_supervisor()`. Drift in either direction is
-      // something the user sees: a reset control the server refuses, or an
-      // action the server would allow that is never offered.
+      // dashboard as `canResetAttempts` (and what the lecture console and the
+      // admin dashboard ask in their own way); the server grants the three halves
+      // of the same action - the DELETE, the snapshot purge and the audit row -
+      // through `is_attempt_resetter()`. Drift in either direction is something
+      // the user sees: a reset control the server refuses, or an action the
+      // server would allow that is never offered.
       final clientRoles =
-          UserRole.values.where((role) => role.canResetAttempts).toList();
-      expect(clientRoles, <UserRole>[UserRole.admin, UserRole.supervisor]);
+          UserRole.values.where((role) => role.canResetAttempts).toSet();
+      expect(clientRoles, <UserRole>{
+        UserRole.admin,
+        UserRole.supervisor,
+        // The paper's author can clear an attempt on it - the wrong answer key,
+        // the mis-aimed disqualification.
+        UserRole.lecturer,
+      });
 
       final sql = schemaSql();
       if (sql == null) return; // a checkout without ../supabase
 
       // Read the predicate out of the function instead of trusting a copy of
       // the sentence: the list is what the policies below actually enforce.
-      final match = RegExp(
-        r'create or replace function public\.is_exam_supervisor\(\)'
-        r'[\s\S]*?role in \(([^)]*)\)',
-      ).firstMatch(sql);
       expect(
-        match,
-        isNotNull,
-        reason: 'is_exam_supervisor() is missing from schema.sql',
+        _rolesNamedBy(sql, 'is_attempt_resetter'),
+        clientRoles,
+        reason: 'is_attempt_resetter() and UserRole.canResetAttempts disagree',
       );
-      final sqlRoles = RegExp(r"'(\w+)'")
-          .allMatches(match!.group(1)!)
-          .map((role) => UserRole.fromDb(role.group(1)!))
-          .toSet();
-      expect(sqlRoles, clientRoles.toSet());
 
-      // Every policy the console's reset rides on: the DELETE that removes the
-      // attempt, the Storage purge of its snapshots, and the audit row.
-      expect(sql, contains('using (public.is_exam_supervisor());'));
-      expect(sql, contains('and public.is_exam_supervisor()'));
+      // The intervention tier is deliberately narrower and must stay that way:
+      // the policy that writes into somebody else's attempt row in place, and
+      // the RPCs that act on another account's attempt, still ask this one.
+      expect(
+        _rolesNamedBy(sql, 'is_exam_supervisor'),
+        <UserRole>{UserRole.admin, UserRole.supervisor},
+      );
+
+      // Every policy the console's reset rides on asks the *reset* predicate: the
+      // DELETE that removes the attempt, the Storage purge of its snapshots, and
+      // the audit row.
+      expect(sql, contains('using (public.is_attempt_resetter());'));
+      expect(sql, contains('and public.is_attempt_resetter()'));
       expect(
         sql,
         contains(
-          'with check (public.is_exam_supervisor() and actor_id = auth.uid())',
+          'with check (public.is_attempt_resetter() and actor_id = auth.uid())',
         ),
+      );
+
+      // ...while the update policy is the one that keeps the narrower tier.
+      // (Normalised to `\n`: the file is checked out with the platform's line
+      // endings.)
+      expect(
+        sql.replaceAll('\r\n', '\n'),
+        contains('using (public.is_exam_supervisor())\n'
+            '  with check (public.is_exam_supervisor());'),
+      );
+
+      // Exactly four mentions: the definition plus those three policies. A fifth
+      // would be a policy somebody left on the old predicate (or a new caller
+      // that should be checked rather than copied).
+      expect(
+        RegExp(r'public\.is_attempt_resetter\(\)').allMatches(sql).length,
+        4,
+        reason: 'the function definition and its three policies',
+      );
+    });
+
+    test('every copy of the predicate names the same roles', () {
+      // The predicate is deliberately repeated so each SQL file stays re-runnable
+      // on a database that predates it (a `create policy` is not idempotent, so
+      // the file that recreates one has to be able to define what it calls). The
+      // cost of that is drift, which this test is here to refuse.
+      final copies = <String>[
+        '../supabase/schema.sql',
+        '../supabase/migrations/secure_exam_access_and_deadlines.sql',
+        '../supabase/migrations/session_reset_logs.sql',
+        '../supabase/migrations/staff_attempt_resets.sql',
+      ];
+      final expected =
+          UserRole.values.where((role) => role.canResetAttempts).toSet();
+
+      var checked = 0;
+      for (final path in copies) {
+        final file = File(path);
+        if (!file.existsSync()) continue; // a checkout without ../supabase
+        checked++;
+        expect(
+          _rolesNamedBy(file.readAsStringSync(), 'is_attempt_resetter'),
+          expected,
+          reason: '$path declares a different reset tier',
+        );
+      }
+      // A checkout that has the app but no ../supabase checks nothing - like
+      // schemaSql(), it must not pretend otherwise.
+      if (checked == 0) return;
+      expect(checked, copies.length);
+    });
+
+    test('the upgrade migration widens all three policies', () {
+      final file = File('../supabase/migrations/staff_attempt_resets.sql');
+      if (!file.existsSync()) return; // a checkout without ../supabase
+      final sql = file.readAsStringSync();
+
+      // A `create policy` on a name the old revision already used is a 42710
+      // unless the file drops it first.
+      for (final policy in <String>[
+        'submissions_delete_supervisor',
+        'Proctor snapshots supervisor purge',
+        'session_reset_logs_insert_supervisor',
+      ]) {
+        expect(
+          sql,
+          contains('drop policy if exists "$policy"'),
+          reason: '$policy is recreated without being dropped first',
+        );
+      }
+
+      // The audit policy is guarded: a project that has not applied
+      // session_reset_logs.sql has no table to put it on, and `create policy`
+      // would fail with 42P01 (the same failure the console reports as
+      // `auditWarning`).
+      expect(sql, contains("to_regclass('public.session_reset_logs')"));
+    });
+  });
+
+  /// What was recorded *inside* a sitting - the incident feed in
+  /// `proctoring_logs` and the reset audit in `session_reset_logs` - is readable
+  /// by the paper's author and by the intervention tier, while the roster a
+  /// monitor renders (`exam_submissions`) stays readable by every staff member.
+  ///
+  /// The asymmetry is the design (see the header of
+  /// `supabase/migrations/lecturer_scoped_log_reads.sql`), so it is pinned from
+  /// both sides here: the `owns_exam()` arm present on the two evidence policies,
+  /// the staff tier absent from them and still present on the roster.
+  group('lecturer-scoped evidence reads', () {
+    /// The `using (...)` predicate of `create policy "<policy>"`, whitespace
+    /// squashed to single spaces so the comparison does not depend on layout.
+    ///
+    /// Read out of the file rather than compared against a copy of the sentence:
+    /// the text in the file is what the server enforces. Null when [sql] does not
+    /// declare that policy (the upgrade migration assembles the reset policy
+    /// inside an `execute`, so it has no `create policy` line to read).
+    String? predicateOf(String sql, String policy) {
+      final match = RegExp(
+        'create policy "$policy"'
+        r'[\s\S]*?for select[\s\S]*?using \(([\s\S]*?)\);',
+      ).firstMatch(sql.replaceAll('\r\n', '\n'));
+      return match?.group(1)?.replaceAll(RegExp(r'\s+'), ' ').trim();
+    }
+
+    /// The body of `create or replace function public.<signature>(...)`,
+    /// whitespace squashed. Null when the file omits the function.
+    String? functionBody(String sql, String signature) {
+      final match = RegExp(
+        'create or replace function public\\.$signature'
+        r'[\s\S]*?as \$\$([\s\S]*?)\$\$;',
+      ).firstMatch(sql.replaceAll('\r\n', '\n'));
+      return match?.group(1)?.replaceAll(RegExp(r'\s+'), ' ').trim();
+    }
+
+    /// The body every copy of `owns_exam()` must have: the paper's author, asked
+    /// of the exam the evidence row names. `created_by` is the column the
+    /// authoring console already scopes edits with (`exams_update_owner`).
+    const ownerIsAuthor = 'select exists ( select 1 from public.exams '
+        'where id = p_exam_id and created_by = auth.uid() );';
+
+    test('the incident feed asks the owner as well as the intervention tier',
+        () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      final predicate = predicateOf(sql, 'logs_select_own_or_supervisor');
+      expect(predicate, isNotNull, reason: 'the policy left schema.sql');
+      // The student's own rows, the paper's author, the intervention tier.
+      expect(predicate, contains('s.student_id = auth.uid()'));
+      expect(predicate, contains('public.owns_exam(s.exam_id)'));
+      expect(predicate, contains('public.is_exam_supervisor()'));
+      // The staff tier is exactly what this policy dropped, and dropping it is
+      // what stops one lecturer reading the incidents gathered on another
+      // teacher's paper. (`is_exam_supervisor()` does not contain `is_staff`, so
+      // this really is the staff arm.)
+      expect(predicate, isNot(contains('is_staff')));
+    });
+
+    test('the reset audit asks the same question of the same evidence', () {
+      final schema = schemaSql();
+      if (schema == null) return;
+
+      final predicate = predicateOf(schema, 'session_reset_logs_select_staff');
+      expect(
+        predicate,
+        'public.is_exam_supervisor() or public.owns_exam(exam_id)',
+        reason: 'the reset row carries its exam id as plain evidence, so this '
+            'policy can ask owns_exam() directly instead of hopping through '
+            'the attempt the way the incident feed does',
+      );
+
+      // The file that introduced the table carries the identical sentence.
+      final introduced = File('../supabase/migrations/session_reset_logs.sql');
+      if (introduced.existsSync()) {
+        final sql = introduced.readAsStringSync().replaceAll('\r\n', '\n');
+        expect(predicateOf(sql, 'session_reset_logs_select_staff'), predicate);
+        expect(functionBody(sql, r'owns_exam\(p_exam_id uuid\)'), ownerIsAuthor);
+      }
+
+      // The upgrade file assembles the policy inside an `execute`, so what has to
+      // hold there is that the literal it concatenates contains this exact
+      // predicate - the same sentence, not a paraphrase of it.
+      final upgrade =
+          File('../supabase/migrations/lecturer_scoped_log_reads.sql');
+      if (upgrade.existsSync()) {
+        final sql = upgrade.readAsStringSync().replaceAll('\r\n', '\n');
+        expect(sql, contains(predicate!));
+      }
+
+      // Writes are a different question and are untouched: who may *clear* an
+      // attempt is still `is_attempt_resetter()`, whoever may read the row it
+      // leaves behind.
+      expect(
+        schema,
+        contains(
+          'with check (public.is_attempt_resetter() and actor_id = auth.uid())',
+        ),
+      );
+    });
+
+    test('the roster stays staff-wide: only the evidence was narrowed', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      // A lecturer may watch any sitting - "WHAT IT DOES NOT CHANGE" in
+      // lecturer_scoped_log_reads.sql - so the attempts keep the wide read. If
+      // this ever gains the ownership arm, a monitor opened on another teacher's
+      // paper would show an empty roster instead of the students in the room.
+      expect(
+        predicateOf(sql, 'submissions_select_own_or_supervisor'),
+        'student_id = auth.uid() or public.is_staff()',
+      );
+    });
+
+    test('every copy of owns_exam() is the same pinned definition', () {
+      // The helper is deliberately repeated so each SQL file stays re-runnable on
+      // a database that predates it (a `create policy` is not idempotent, so the
+      // file that recreates one has to be able to define what it calls). The cost
+      // of that is drift, which this test is here to refuse.
+      const copies = <String>[
+        '../supabase/schema.sql',
+        '../supabase/migrations/session_reset_logs.sql',
+        '../supabase/migrations/lecturer_scoped_log_reads.sql',
+      ];
+
+      var checked = 0;
+      for (final path in copies) {
+        final file = File(path);
+        if (!file.existsSync()) continue; // a checkout without ../supabase
+        checked++;
+        final sql = file.readAsStringSync().replaceAll('\r\n', '\n');
+
+        expect(
+          functionBody(sql, r'owns_exam\(p_exam_id uuid\)'),
+          ownerIsAuthor,
+          reason: '$path defines ownership as something other than created_by',
+        );
+        // SECURITY DEFINER with a pinned search_path, for the same reason as the
+        // role predicates: the policy calling this must not have to re-enter the
+        // policies on `exams`, and a hijacked path must not be able to swap the
+        // table underneath the ownership test.
+        expect(
+          sql,
+          contains('language sql\n'
+              'security definer\n'
+              'stable\n'
+              'set search_path = public\n'),
+          reason: '$path\'s owns_exam() is not the pinned SECURITY DEFINER form',
+        );
+      }
+      // A checkout that has the app but no ../supabase checks nothing - like
+      // schemaSql(), it must not pretend otherwise.
+      if (checked == 0) return;
+      expect(checked, copies.length);
+    });
+
+    test('the upgrade migration recreates both policies, guarded', () {
+      final file = File('../supabase/migrations/lecturer_scoped_log_reads.sql');
+      if (!file.existsSync()) return; // a checkout without ../supabase
+      final sql = file.readAsStringSync().replaceAll('\r\n', '\n');
+
+      // Re-runnable: a `create policy` on a name an earlier revision already used
+      // is a 42710 unless the file drops it first. `proctoring_logs` is part of
+      // the base schema, so that drop is unconditional...
+      expect(
+        sql,
+        contains('drop policy if exists "logs_select_own_or_supervisor"'),
+      );
+      // ...while the reset policy can only be dropped and recreated once the
+      // table is known to exist (see the guard below).
+      expect(
+        sql,
+        contains(
+          'execute \'drop policy if exists "session_reset_logs_select_staff" \'',
+        ),
+      );
+
+      // Both copies of the incident-feed policy agree, so re-running this file
+      // cannot land a different tier than a fresh schema.sql install gets.
+      final schema = schemaSql();
+      if (schema != null) {
+        expect(
+          predicateOf(sql, 'logs_select_own_or_supervisor'),
+          predicateOf(schema, 'logs_select_own_or_supervisor'),
+          reason: 'the upgrade path and the full schema disagree',
+        );
+      }
+
+      // The reset policy is created inside a table check: a project that has not
+      // applied session_reset_logs.sql has no table to put it on, and an
+      // unguarded `create policy` would stop the whole migration at 42P01.
+      expect(sql, contains("to_regclass('public.session_reset_logs')"));
+      expect(
+        RegExp('^create policy "([^"]+)"', multiLine: true)
+            .allMatches(sql)
+            .map((match) => match.group(1))
+            .toList(),
+        <String>['logs_select_own_or_supervisor'],
+        reason: 'only the incident-feed policy may be created unconditionally',
       );
     });
   });
@@ -755,7 +1113,8 @@ void main() {
       expect(source, contains('return json({ error: message }, status);'));
 
       // Admins only: a *password* reset is an identity action, a different tier
-      // from the attempt resets a supervisor may run (`is_exam_supervisor()`).
+      // from the attempt resets a lecturer or supervisor may run
+      // (`is_attempt_resetter()`).
       // The 403 sentence is deliberately the same string the repository falls
       // back to when a 401/403 body carries no `{ error }`.
       expect(
@@ -788,7 +1147,7 @@ void main() {
       expect(
         sql,
         contains(
-          'with check (public.is_exam_supervisor() and actor_id = auth.uid())',
+          'with check (public.is_attempt_resetter() and actor_id = auth.uid())',
         ),
       );
       // No foreign keys: the attempt this row describes has just been deleted by
@@ -1480,6 +1839,179 @@ void main() {
       );
     });
   });
+
+  /// Optional exam scheduling: the client's window (`Exam.startsAt` / `endsAt`)
+  /// against the server's (`exams.starts_at` / `ends_at`), in both the unified
+  /// schema and the upgrade migration an existing project applies.
+  group('optional exam scheduling', () {
+    test('the schema keeps the window optional and enforces it on start', () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      // Both nullable. An unscheduled paper is the default, so the bounds cannot
+      // be NOT NULL and cannot carry a default.
+      expect(sql, contains('starts_at        timestamptz,'));
+      expect(sql, contains('ends_at          timestamptz,'));
+      // A window that closes before it opens is refused by the database too, not
+      // only by the console's dialog.
+      expect(
+        sql,
+        contains(
+          'check (starts_at is null or ends_at is null or ends_at > starts_at)',
+        ),
+      );
+
+      // The window is enforced where an attempt row is created...
+      expect(sql, contains('and (e.starts_at is null or now() >= e.starts_at)'));
+      expect(sql, contains('and (e.ends_at  is null or now() <= e.ends_at)'));
+
+      // ...and capped where an attempt is answered and closed, through the one
+      // helper rather than a second copy of the arithmetic.
+      expect(
+        sql,
+        contains('create or replace function public.attempt_deadline('),
+      );
+      expect(
+        sql,
+        contains("coalesce(p_ends_at, 'infinity'::timestamptz)"),
+        reason: 'a paper with no close must keep the pre-scheduling deadline',
+      );
+    });
+
+    test('the upgrade migration carries the same DDL and the same policies', () {
+      final file = File('../supabase/migrations/optional_exam_scheduling.sql');
+      if (!file.existsSync()) return; // a checkout without ../supabase
+      final sql = file.readAsStringSync();
+
+      // A column added with `add column if not exists`, because
+      // `create table if not exists` in schema.sql cannot touch a table that is
+      // already there - the whole reason this file exists.
+      expect(sql, contains('add column if not exists starts_at timestamptz'));
+      expect(sql, contains('add column if not exists ends_at   timestamptz'));
+      expect(sql, contains('drop constraint if exists exams_window_ordered'));
+      // Recreating a policy on a name the old revision used is a 42710 unless it
+      // is dropped first.
+      expect(
+        sql,
+        contains('drop policy if exists "submissions_insert_own_ongoing"'),
+      );
+
+      // Every function whose behaviour the window changes is replaced, or a live
+      // project would keep grading and closing with the old deadline.
+      for (final fn in <String>[
+        'attempt_deadline',
+        'merge_submission_answer',
+        'merge_submission_text_answer',
+        'submit_exam',
+      ]) {
+        expect(
+          sql,
+          contains('create or replace function public.$fn('),
+          reason: '$fn is not replaced by the migration',
+        );
+      }
+    });
+
+    test('createExam sends the window as UTC, and omits it when unset', () async {
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'id': 'exam-9',
+        'title': 'GES301: Software Engineering Midterm',
+        'created_by': '11111111-1111-4111-8111-111111111111',
+        'duration_minutes': 50,
+        'is_published': true,
+        'starts_at': '2026-01-05T09:00:00+00:00',
+        'ends_at': '2026-01-05T17:00:00+00:00',
+      });
+
+      final repo = QuestionAuthoringRepositoryImpl(
+        client,
+        currentUserId: () => '11111111-1111-4111-8111-111111111111',
+      );
+      final created = await repo.createExam(
+        title: 'GES301: Software Engineering Midterm',
+        durationMinutes: 50,
+        isPublished: true,
+        startsAt: DateTime.parse('2026-01-05T09:00:00Z'),
+        endsAt: DateTime.parse('2026-01-05T17:00:00Z'),
+      );
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      // UTC, because the columns are timestamptz: the console's pickers work in
+      // the author's own zone and the instant is what is stored.
+      expect(body['starts_at'], '2026-01-05T09:00:00.000Z');
+      expect(body['ends_at'], '2026-01-05T17:00:00.000Z');
+      // The window the row came back with is parsed, not discarded: the console
+      // shows it on the tile it has just created.
+      expect(created.exam.startsAt?.toUtc(), DateTime.utc(2026, 1, 5, 9));
+      expect(created.exam.endsAt?.toUtc(), DateTime.utc(2026, 1, 5, 17));
+      expect(created.exam.isScheduled, isTrue);
+    });
+
+    test('an unscheduled paper sends no window keys at all', () async {
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'id': 'exam-10',
+        'title': 'GES302: Requirements Engineering',
+        'created_by': '11111111-1111-4111-8111-111111111111',
+        'duration_minutes': 30,
+        'is_published': false,
+      });
+
+      final repo = QuestionAuthoringRepositoryImpl(
+        client,
+        currentUserId: () => '11111111-1111-4111-8111-111111111111',
+      );
+      final created = await repo.createExam(
+        title: 'GES302: Requirements Engineering',
+        durationMinutes: 30,
+        isPublished: false,
+      );
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      // Omitted rather than sent as null: the column's own default is NULL, and
+      // the request says out loud which kind of paper this is.
+      expect(body.containsKey('starts_at'), isFalse);
+      expect(body.containsKey('ends_at'), isFalse);
+      // A database from before the columns existed answers without them, and that
+      // has to read as "unscheduled" rather than throwing.
+      expect(created.exam.isScheduled, isFalse);
+      expect(created.exam.startsAt, isNull);
+      expect(created.exam.scheduleLabel, 'Anytime');
+    });
+
+    test('a project without the columns names the migration to run', () async {
+      // PostgREST answers a *read* of a column the schema cache does not have
+      // with 42703 and a write with PGRST204. Both have to reach the console as
+      // the file to run: "could not load your papers" would leave a lecturer
+      // with nothing to do about it.
+      transport
+        ..statusCode = 400
+        ..responseBody = jsonEncode(<String, dynamic>{
+          'code': 'PGRST204',
+          'message': "Could not find the 'starts_at' column of 'exams' in the "
+              'schema cache',
+        });
+
+      final repo = QuestionAuthoringRepositoryImpl(
+        client,
+        currentUserId: () => '11111111-1111-4111-8111-111111111111',
+      );
+
+      await expectLater(
+        repo.createExam(
+          title: 'GES303: Software Testing',
+          durationMinutes: 30,
+          isPublished: false,
+        ),
+        throwsA(
+          isA<AuthoringException>().having(
+            (error) => error.message,
+            'message',
+            contains('optional_exam_scheduling.sql'),
+          ),
+        ),
+      );
+    });
+  });
 }
 
 /// Reads `supabase/schema.sql`, which sits next to `mobile/` in the repository.
@@ -1490,6 +2022,24 @@ void main() {
 String? schemaSql() {
   final file = File('../supabase/schema.sql');
   return file.existsSync() ? file.readAsStringSync() : null;
+}
+
+/// Reads the role list out of the `role in (...)` predicate of
+/// `create or replace function public.<name>()` in [sql], as [UserRole]s.
+///
+/// Null when the function is absent. Reading the sentence out of the definition
+/// rather than asserting a copy of it is what makes the reset-tier tests check
+/// what the policies actually enforce.
+Set<UserRole>? _rolesNamedBy(String sql, String function) {
+  final match = RegExp(
+    'create or replace function public\\.$function\\(\\)'
+    r'[\s\S]*?role in \(([^)]*)\)',
+  ).firstMatch(sql);
+  if (match == null) return null;
+  return RegExp(r"'(\w+)'")
+      .allMatches(match.group(1)!)
+      .map((role) => UserRole.fromDb(role.group(1)!))
+      .toSet();
 }
 
 /// Reads the upgrade migration a database created *before* the four question

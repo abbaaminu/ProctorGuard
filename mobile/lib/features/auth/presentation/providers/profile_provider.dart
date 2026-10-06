@@ -17,6 +17,11 @@ final profileRepositoryProvider = Provider<ProfileRepository>((ref) {
 ///
 /// `FutureProvider` gives the gate its three states for free: loading (spinner),
 /// error (retryable message) and data (route on `role`).
+///
+/// The loading state is the one that covers the sign-in race: the repository
+/// keeps looking for a row that is not there *yet* (`ProfileRepositoryImpl`), so
+/// this future stays pending through those attempts and the gate shows its
+/// spinner rather than an error about a profile that is about to exist.
 final userProfileProvider = FutureProvider.family<UserProfile, String>(
   (ref, userId) => ref.watch(profileRepositoryProvider).getProfile(userId),
 );

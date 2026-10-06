@@ -639,8 +639,77 @@ void main() {
         title: 'GES301: Software Engineering Midterm',
         durationMinutes: 45,
         isPublished: false,
+        startsAt: null,
+        endsAt: null,
       ));
       expect(find.textContaining('saved as a draft'), findsOneWidget);
+      await letSnackBarExpire(tester);
+    });
+
+    testWidgets('the window is optional, and only sent when it is set',
+        (tester) async {
+      await tester.pumpWidget(consoleUnderTest());
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('lecturer-new-exam')));
+      await tester.pumpAndSettle();
+
+      // Untouched, both bounds say they are unset — an unscheduled paper is the
+      // default, not a decision the author has to make.
+      expect(find.byKey(const Key('new-exam-starts-at')), findsOneWidget);
+      expect(find.byKey(const Key('new-exam-ends-at')), findsOneWidget);
+      expect(find.text('Not set — no bound on this paper'), findsNWidgets(2));
+
+      await tester.enterText(
+        find.byKey(const Key('new-exam-title')),
+        'GES301: Software Engineering Midterm',
+      );
+      await tester.tap(find.byKey(const Key('new-exam-create')));
+      await tester.pumpAndSettle();
+
+      expect(repo.created.single.startsAt, isNull);
+      expect(repo.created.single.endsAt, isNull);
+      await letSnackBarExpire(tester);
+    });
+
+    testWidgets('a window that closes before it opens is refused in the dialog',
+        (tester) async {
+      await tester.pumpWidget(consoleUnderTest());
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('lecturer-new-exam')));
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.byKey(const Key('new-exam-title')),
+        'GES301: Software Engineering Midterm',
+      );
+
+      // Both bounds picked through the real date and time pickers ("Closes"
+      // first, then "Opens"): a paper with no bounds opens both pickers on the
+      // same instant, so accepting each on its own default leaves the two ends
+      // *equal* — which is exactly the mistake this guards, and it needs no
+      // invented clock to reproduce.
+      await pickBound(tester, 'new-exam-ends-at');
+      await pickBound(tester, 'new-exam-starts-at');
+
+      await tester.tap(find.byKey(const Key('new-exam-create')));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('new-exam-window-error')), findsOneWidget);
+      expect(find.textContaining('must be after the opening time'),
+          findsOneWidget);
+      expect(repo.created, isEmpty);
+
+      // Clearing the closing bound is the fix, and the paper is created with
+      // only the opening one — a half-open window is meaningful.
+      await tester.tap(find.byKey(const Key('new-exam-ends-clear')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('new-exam-create')));
+      await tester.pumpAndSettle();
+
+      expect(repo.created.single.startsAt, isNotNull);
+      expect(repo.created.single.endsAt, isNull);
       await letSnackBarExpire(tester);
     });
 
@@ -1150,6 +1219,23 @@ Future<void> letSnackBarExpire(WidgetTester tester) async {
   await tester.pump(const Duration(milliseconds: 300));
 }
 
+/// Taps one of the "New paper" dialog's window fields and accepts both pickers
+/// it opens on their own defaults — the date picker's "OK", then the time
+/// picker's.
+///
+/// Deliberately not driving a specific instant: the fields offer "now" for a
+/// paper with no bounds and (for the closing bound) two hours after the opening
+/// one, and a test that asserts *ordering* only needs two real picker
+/// round-trips, not a clock the pickers would have to be told about.
+Future<void> pickBound(WidgetTester tester, String field) async {
+  await tester.tap(find.byKey(Key(field)));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('OK')); // the date
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('OK')); // the time
+  await tester.pumpAndSettle();
+}
+
 /// A viewport tall enough to build every card of a long list: the default
 /// 800×600 test surface only paints what fits, and these screens are lists of
 /// tall cards.
@@ -1169,8 +1255,22 @@ class _FakeAuthoring implements QuestionAuthoringRepository {
   List<AuthoredQuestion> questions = const <AuthoredQuestion>[];
   List<AttemptGrading> attempts = const <AttemptGrading>[];
 
-  final List<({String title, int durationMinutes, bool isPublished})> created =
-      <({String title, int durationMinutes, bool isPublished})>[];
+  /// What each `createExam` call asked for, in order — the console's contract
+  /// with the server, including the optional window.
+  final List<
+      ({
+        String title,
+        int durationMinutes,
+        bool isPublished,
+        DateTime? startsAt,
+        DateTime? endsAt,
+      })> created = <({
+    String title,
+    int durationMinutes,
+    bool isPublished,
+    DateTime? startsAt,
+    DateTime? endsAt,
+  })>[];
   final List<({String examId, QuestionDraft draft})> createdQuestions =
       <({String examId, QuestionDraft draft})>[];
   final List<String> deletedQuestions = <String>[];
@@ -1196,11 +1296,15 @@ class _FakeAuthoring implements QuestionAuthoringRepository {
     required String title,
     required int durationMinutes,
     required bool isPublished,
+    DateTime? startsAt,
+    DateTime? endsAt,
   }) async {
     created.add((
       title: title,
       durationMinutes: durationMinutes,
       isPublished: isPublished,
+      startsAt: startsAt,
+      endsAt: endsAt,
     ));
     return AuthoredExam(
       exam: Exam(
@@ -1209,6 +1313,8 @@ class _FakeAuthoring implements QuestionAuthoringRepository {
         createdBy: 'lecturer',
         durationMinutes: durationMinutes,
         isPublished: isPublished,
+        startsAt: startsAt,
+        endsAt: endsAt,
       ),
       questionCount: 0,
       attemptCount: 0,

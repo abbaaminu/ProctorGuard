@@ -4,7 +4,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/services/supabase_service.dart' show SupabaseService;
 import '../../../../core/widgets/home_button.dart';
 import '../../../../core/widgets/responsive_layout.dart';
+import '../../../auth/domain/entities/user_profile.dart';
 import '../../../dashboard/presentation/pages/supervisor_exam_picker_page.dart';
+import '../../../exam/domain/entities/exam.dart';
 import '../../domain/entities/authored_exam.dart';
 import '../../domain/repositories/question_authoring_repository.dart';
 import '../providers/question_authoring_providers.dart';
@@ -24,9 +26,12 @@ import 'question_authoring_page.dart';
 /// Invigilation is deliberately *not* duplicated here: a lecturer's monitoring
 /// and attempt-reset tools are the supervisor console's, one tap away in the app
 /// bar ([_openMonitor]). Lecturers share `is_staff()` with supervisors for
-/// reading, and differ where it matters — `canResetAttempts` is false for them
-/// (`is_exam_supervisor()` names admin and supervisor), and the paper is theirs
-/// to mark.
+/// reading, and share the *reset* tier with them too (`is_attempt_resetter()`),
+/// because resetting an attempt on the paper they wrote is their repair for a
+/// wrong key or a mis-aimed disqualification. What stays narrower is the
+/// intervention tier: `is_exam_supervisor()` still guards writing to somebody
+/// else's attempt row in place (a status change, an after-the-fact re-grade), and
+/// the paper is theirs to mark.
 class LecturerConsolePage extends ConsumerStatefulWidget {
   const LecturerConsolePage({
     super.key,
@@ -78,6 +83,10 @@ class _LecturerConsolePageState extends ConsumerState<LecturerConsolePage> {
                 title: request.title,
                 durationMinutes: request.durationMinutes,
                 isPublished: request.isPublished,
+                // Null for an unscheduled paper — the repository omits the key
+                // rather than sending null, so the column keeps its NULL default.
+                startsAt: request.startsAt,
+                endsAt: request.endsAt,
               );
       if (!mounted) return;
       ref.invalidate(myAuthoredExamsProvider);
@@ -123,8 +132,11 @@ class _LecturerConsolePageState extends ConsumerState<LecturerConsolePage> {
   }
 
   /// The supervisor console: the live monitor and the reset control, which is
-  /// the invigilation half of a lecturer's job. `canResetAttempts: false` is the
-  /// schema's own rule for this role, not a preference of this screen.
+  /// the invigilation half of a lecturer's job. The flag is asked of the role
+  /// rather than hard-coded, so this screen and the role gate cannot disagree:
+  /// `UserRole.lecturer.canResetAttempts` is the schema's own rule
+  /// (`is_attempt_resetter()` names admin, supervisor and lecturer), not a
+  /// preference of this screen.
   void _openMonitor() {
     final fallback = widget.lecturerName ??
         SupabaseService.instance.currentUser?.email ??
@@ -133,7 +145,7 @@ class _LecturerConsolePageState extends ConsumerState<LecturerConsolePage> {
       MaterialPageRoute<void>(
         builder: (_) => SupervisorExamPickerPage(
           supervisorName: fallback,
-          canResetAttempts: false,
+          canResetAttempts: UserRole.lecturer.canResetAttempts,
         ),
       ),
     );
@@ -327,25 +339,39 @@ class _LecturerConsolePageState extends ConsumerState<LecturerConsolePage> {
 
 /// What the "new paper" dialog answers with. A record would do, but this is read
 /// in two places and a name keeps the dialog's contract obvious.
+///
+/// [startsAt] / [endsAt] are local instants, or null for an unscheduled paper:
+/// the dialog's pickers work in the author's own zone and the repository is what
+/// converts to the UTC the column stores.
 class _NewExamRequest {
   const _NewExamRequest({
     required this.title,
     required this.durationMinutes,
     required this.isPublished,
+    this.startsAt,
+    this.endsAt,
   });
 
   final String title;
   final int durationMinutes;
   final bool isPublished;
+  final DateTime? startsAt;
+  final DateTime? endsAt;
 }
 
-/// The "new paper" dialog: a title, how long it runs, and whether it is visible
-/// to students yet.
+/// The "new paper" dialog: a title, how long it runs, an *optional* window, and
+/// whether it is visible to students yet.
 ///
 /// It opens on **draft** deliberately. A published paper appears in the student
 /// portal immediately, and a paper with no questions yet is a session that
 /// cannot be sat — so the default is the one that cannot go wrong, and the
 /// console's own Publish control is one tap away once questions exist.
+///
+/// The window is optional in the same spirit: an author who wants an unscheduled
+/// paper (the common case, and every paper the console could create before the
+/// columns existed) simply never taps the two pickers, and nothing is sent.
+/// Setting only one bound is allowed and meaningful — "opens Monday" with no
+/// close, or a hard close with no opening time.
 class _NewExamDialog extends StatefulWidget {
   const _NewExamDialog();
 
@@ -358,6 +384,17 @@ class _NewExamDialogState extends State<_NewExamDialog> {
   final _titleController = TextEditingController();
   final _durationController = TextEditingController(text: '60');
   bool _published = false;
+
+  /// Local instants, or null for "no bound". Both are cleared by the same
+  /// control that set them, so an accidental window is undone without leaving
+  /// the dialog.
+  DateTime? _startsAt;
+  DateTime? _endsAt;
+
+  /// Set when the two bounds disagree (or a clear leaves one behind in a way the
+  /// pair cannot express). Shown inside the dialog rather than as a snack bar:
+  /// the author is still editing the paper, so the fix belongs next to it.
+  String? _windowError;
 
   @override
   void dispose() {
@@ -380,15 +417,128 @@ class _NewExamDialogState extends State<_NewExamDialog> {
     return null;
   }
 
+  /// A date and a time in one tap-through, because a window is a date *and* an
+  /// instant: two controls per bound would be four interactions for one idea.
+  ///
+  /// `showDatePicker`/`showTimePicker` are inside `if (!mounted) return` guards:
+  /// the author may have closed the dialog while one was open, and the awaited
+  /// setState would then land on a disposed State.
+  Future<void> _pickBound({required bool isStart}) async {
+    final current = isStart ? _startsAt : _endsAt;
+    final fallback = isStart
+        ? (_endsAt ?? DateTime.now())
+        : (_startsAt?.add(const Duration(hours: 2)) ?? DateTime.now());
+
+    final date = await showDatePicker(
+      context: context,
+      initialDate: current ?? fallback,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2100),
+      helpText: isStart ? 'When the paper opens' : 'When the paper closes',
+    );
+    if (date == null || !mounted) return;
+
+    final time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(current ?? fallback),
+      helpText: isStart ? 'What time it opens' : 'What time it closes',
+    );
+    if (time == null || !mounted) return;
+
+    setState(() {
+      final picked =
+          DateTime(date.year, date.month, date.day, time.hour, time.minute);
+      if (isStart) {
+        _startsAt = picked;
+      } else {
+        _endsAt = picked;
+      }
+      _windowError = null;
+    });
+  }
+
+  void _clearBound({required bool isStart}) {
+    setState(() {
+      if (isStart) {
+        _startsAt = null;
+      } else {
+        _endsAt = null;
+      }
+      _windowError = null;
+    });
+  }
+
   void _submit() {
     if (!(_formKey.currentState?.validate() ?? false)) return;
+
+    final start = _startsAt;
+    final end = _endsAt;
+    // The database's `exams_window_ordered` check is the backstop, but a 23514
+    // from the server would arrive as "the server refused that paper" with the
+    // dialog already gone — and a window that closes before it opens is a
+    // mistake the author can see and fix here.
+    if (start != null && end != null && !end.isAfter(start)) {
+      setState(() {
+        _windowError = 'The closing time must be after the opening time.';
+      });
+      return;
+    }
+
     Navigator.pop(
       context,
       _NewExamRequest(
         title: _titleController.text.trim(),
         durationMinutes: int.parse(_durationController.text.trim()),
         isPublished: _published,
+        startsAt: start,
+        endsAt: end,
       ),
+    );
+  }
+
+  /// One optional bound, as a tappable field: the label says what the bound
+  /// means, the subtitle says either the instant or that this paper has none,
+  /// and the clear control appears only once there is something to clear.
+  ///
+  /// Not a `TextFormField`: a date is not typed, and a free-text parser is one
+  /// more way to get a wrong instant into `timestamptz`.
+  Widget _windowField({
+    required Key fieldKey,
+    required Key clearKey,
+    required IconData icon,
+    required String label,
+    required DateTime? value,
+    required bool isStart,
+  }) {
+    final theme = Theme.of(context);
+
+    return ListTile(
+      key: fieldKey,
+      onTap: () => _pickBound(isStart: isStart),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(4),
+        side: BorderSide(color: theme.colorScheme.outline),
+      ),
+      leading: Icon(icon),
+      title: Text(label),
+      subtitle: Text(
+        value == null
+            ? 'Not set — no bound on this paper'
+            : Exam.formatStamp(value),
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: value == null
+              ? theme.colorScheme.onSurfaceVariant
+              : theme.colorScheme.onSurface,
+        ),
+      ),
+      trailing: value == null
+          ? null
+          : IconButton(
+              key: clearKey,
+              tooltip: 'Clear',
+              onPressed: () => _clearBound(isStart: isStart),
+              icon: const Icon(Icons.clear),
+            ),
     );
   }
 
@@ -442,6 +592,42 @@ class _NewExamDialogState extends State<_NewExamDialog> {
                 ),
                 validator: _validateDuration,
               ),
+              const SizedBox(height: 16),
+              Text(
+                'Scheduling is optional. Leave both blank for a paper students '
+                'can take any time; set a closing time to give the sitting a '
+                'hard end.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 8),
+              _windowField(
+                fieldKey: const Key('new-exam-starts-at'),
+                clearKey: const Key('new-exam-starts-clear'),
+                icon: Icons.event_available_outlined,
+                label: 'Opens',
+                value: _startsAt,
+                isStart: true,
+              ),
+              const SizedBox(height: 8),
+              _windowField(
+                fieldKey: const Key('new-exam-ends-at'),
+                clearKey: const Key('new-exam-ends-clear'),
+                icon: Icons.event_busy_outlined,
+                label: 'Closes',
+                value: _endsAt,
+                isStart: false,
+              ),
+              if (_windowError != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  _windowError!,
+                  key: const Key('new-exam-window-error'),
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.colorScheme.error),
+                ),
+              ],
               const SizedBox(height: 8),
               SwitchListTile(
                 key: const Key('new-exam-publish'),
@@ -555,6 +741,16 @@ class _ExamCard extends StatelessWidget {
                 color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
+            // Only when the paper is actually scheduled: "Anytime" on every
+            // unscheduled paper would be noise on a list where that is the norm.
+            if (exam.exam.isScheduled)
+              Text(
+                exam.exam.scheduleLabel,
+                key: Key('exam-window-$id'),
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
             const SizedBox(height: 4),
             Wrap(
               spacing: 8,

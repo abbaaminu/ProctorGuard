@@ -27,6 +27,14 @@
 --     marked afterwards by the paper's owner through `grade_submission()`, which
 --     records the marks in `question_grades` (section 8) and recomputes `score`
 --     as automatic + awarded.
+--   * Exams are *optionally* scheduled. `exams.starts_at` / `exams.ends_at` are
+--     nullable; NULL on both (the default, and every paper authored before
+--     scheduling existed) means the paper is offered as soon as it is published.
+--     A window is enforced in two places and nowhere else:
+--     `submissions_insert_own_ongoing` refuses an attempt row before `starts_at`
+--     or after `ends_at`, and `attempt_deadline()` caps an attempt already in
+--     progress by `ends_at` â€” the same function the two answer-merge RPCs and
+--     `submit_exam()` read, so "how long have I got" has one answer (section 9).
 --   * Evidence is append-only for clients: `proctoring_logs` has no INSERT
 --     policy, so register_violation() is the single write path. That RPC is
 --     idempotent per `client_event_id`, which is what lets the app queue a
@@ -213,6 +221,10 @@ as $$
   );
 $$;
 
+-- The *intervention* tier: who may write to somebody else's attempt row (a
+-- status change or an after-the-fact re-grade) and who may read the incident
+-- feed. Deliberately not the same question as "who may reset one" - see
+-- is_attempt_resetter() below.
 create or replace function public.is_exam_supervisor()
 returns boolean
 language sql
@@ -223,6 +235,76 @@ as $$
   select exists (
     select 1 from public.profiles
     where id = auth.uid() and role in ('admin', 'supervisor')
+  );
+$$;
+
+-- The *reset* tier: who may clear a student's attempt and the evidence that
+-- went with it.
+--
+-- Resetting is the one destructive staff action in the console - it deletes the
+-- `exam_submissions` row (cascading to the answers and every `proctoring_logs`
+-- incident row) and then purges the snapshot objects that belonged to it - so
+-- the tier is wider than the read tier on purpose: the person most likely to
+-- need it is the lecturer who wrote the paper. They are the one who discovers
+-- the answer key was wrong, or that the wrong candidate was disqualified, and
+-- they can already read every attempt through `is_staff()`; withholding the
+-- repair from them while granting it to a supervisor who did not write the
+-- question buys nothing. They do *not* join `is_exam_supervisor()`: nothing
+-- here lets a lecturer rewrite a row in place, which is what that predicate
+-- still guards.
+--
+-- Every policy the reset rides on asks this one predicate
+-- (`submissions_delete_supervisor`, the `Proctor snapshots supervisor purge`
+-- storage policy, and `session_reset_logs_insert_supervisor`), so the tier is
+-- named once and the audit trail cannot end up disagreeing with the delete it
+-- records. `UserRole.canResetAttempts` in the Flutter app is the same list
+-- asked on the client; `mobile/test/schema_contract_test.dart` reads this
+-- sentence back out of the file and fails if the two drift apart.
+create or replace function public.is_attempt_resetter()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role in ('admin', 'supervisor', 'lecturer')
+  );
+$$;
+
+-- Does the caller own the paper a piece of evidence belongs to?
+--
+-- The read tier for *evidence* is deliberately narrower than the roster read.
+-- `is_staff()` may see every attempt (`submissions_select_own_or_supervisor`) -
+-- that is what makes a lecturer's monitor roster work on any sitting - but what
+-- was recorded *inside* a sitting is a different question: the incident rows in
+-- `proctoring_logs` and the reset audit rows in `session_reset_logs` name
+-- students, timings and sometimes the member of staff who acted. A lecturer sees
+-- those for the papers they wrote; the intervention tier
+-- (`is_exam_supervisor()`) sees them for every paper.
+--
+-- Asked with the evidence row's own exam id - `proctoring_logs` reaches it
+-- through `exam_submissions.exam_id`, `session_reset_logs` carries it as plain
+-- evidence - so the two policies cannot disagree about what "owns" means.
+-- `created_by` is the column the authoring console already scopes edits with
+-- (`exams_update_owner`, `questions_*_author`).
+--
+-- SECURITY DEFINER for the same reason as the role predicates above: the policy
+-- on `proctoring_logs` must not have to re-enter the policies on `exams` to
+-- answer this, and `set search_path` pins the lookup so a hijacked path cannot
+-- swap the table underneath. A policy that calls this may therefore be created on
+-- a database where `exams` is not readable by the caller at all.
+create or replace function public.owns_exam(p_exam_id uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.exams
+    where id = p_exam_id and created_by = auth.uid()
   );
 $$;
 
@@ -339,14 +421,49 @@ create trigger profiles_guard_role_change
 -- ---------------------------------------------------------------------
 -- 2. EXAMS
 -- ---------------------------------------------------------------------
+-- `starts_at` / `ends_at` are the *optional* scheduling window, and NULL on
+-- both is the default and the common case:
+--   * both NULL  -> an unscheduled paper: offered to students as soon as it is
+--                   published, exactly as every paper behaved before scheduling
+--                   existed;
+--   * starts_at  -> the paper is not offered before that instant;
+--   * ends_at    -> the paper closes then. No new attempt may be created after
+--                   it (`submissions_insert_own_ongoing`), and it *caps* the
+--                   effective deadline of an attempt still in progress, through
+--                   `attempt_deadline()` - so a hard close is a hard close.
+-- timestamptz, so a window means one instant everywhere the app runs; the
+-- console sends UTC and the clients render it in the student's own zone.
 create table if not exists public.exams (
   id               uuid primary key default uuid_generate_v4(),
   title            text not null,
   created_by       uuid not null references public.profiles(id) on delete cascade,
   duration_minutes int not null check (duration_minutes > 0),
   is_published     boolean not null default false,
+  starts_at        timestamptz,
+  ends_at          timestamptz,
   created_at       timestamptz not null default now()
 );
+
+-- The upgrade path for a project created before scheduling: the
+-- `create table if not exists` above is a no-op there, so the two columns are
+-- added in place instead of being lost. `supabase/migrations/
+-- optional_exam_scheduling.sql` carries the same statements, and the two files
+-- must be kept in step.
+alter table public.exams add column if not exists starts_at timestamptz;
+alter table public.exams add column if not exists ends_at   timestamptz;
+
+-- `drop constraint if exists` + `add constraint`, like the shape rules in
+-- section 3: the name may already exist on a live project, and an
+-- `if not exists` guard would silently keep the old definition.
+alter table public.exams drop constraint if exists exams_window_ordered;
+alter table public.exams
+  add constraint exams_window_ordered
+  check (starts_at is null or ends_at is null or ends_at > starts_at);
+
+comment on column public.exams.starts_at is
+  'When the paper is first offered to students. NULL = an unscheduled paper, offered as soon as it is published.';
+comment on column public.exams.ends_at is
+  'When the paper closes: no new attempt may be created, and an attempt still in progress is capped by this instant (see attempt_deadline()). NULL = no hard close.';
 
 alter table public.exams enable row level security;
 
@@ -625,6 +742,12 @@ create policy "submissions_select_own_or_supervisor"
 -- status, empty answers, no score or submit time, and the database's start
 -- timestamp on a published exam. Otherwise a client could preseed answers or
 -- choose a future start time to bypass the server-enforced deadline.
+--
+-- The window is asked here too, and this is the *only* server-side check on it:
+-- hiding a tile in the portal is courtesy, so a patched client gets no attempt
+-- row before `starts_at` or after `ends_at`. Both bounds are optional, so both
+-- tests are written as "NULL, or inside it" - an unscheduled paper (the common
+-- case, and every paper authored before scheduling existed) passes unchanged.
 create policy "submissions_insert_own_ongoing"
   on public.exam_submissions for insert
   to authenticated
@@ -637,7 +760,10 @@ create policy "submissions_insert_own_ongoing"
     and started_at = now()
     and exists (
       select 1 from public.exams e
-      where e.id = exam_id and e.is_published = true
+      where e.id = exam_id
+        and e.is_published = true
+        and (e.starts_at is null or now() >= e.starts_at)
+        and (e.ends_at  is null or now() <= e.ends_at)
     )
   );
 
@@ -658,14 +784,16 @@ create policy "submissions_update_supervisor"
 -- referential actions run outside row security, so this one policy is what lets
 -- the evidence go with the attempt.
 --
--- Same audience as the update policy above: admins and supervisors.
+-- The reset tier - wider than the update policy above by exactly one role. It is
+-- `is_attempt_resetter()` rather than `is_exam_supervisor()` for that reason: the
+-- lecturer who wrote the paper can clear an attempt, and a student cannot.
 -- Students are deliberately left out. A student who could delete their own row
 -- would be able to erase a graded attempt - and the evidence behind a
 -- disqualification - and then simply start the exam again.
 create policy "submissions_delete_supervisor"
   on public.exam_submissions for delete
   to authenticated
-  using (public.is_exam_supervisor());
+  using (public.is_attempt_resetter());
 
 -- A closed attempt stops being editable.
 --
@@ -817,13 +945,24 @@ alter table public.proctoring_logs enable row level security;
 drop policy if exists "logs_select_own_or_supervisor" on public.proctoring_logs;
 drop policy if exists "logs_insert_own_ongoing" on public.proctoring_logs;
 
+-- Read: your own attempt; the incident feed of *any* sitting for the
+-- intervention tier; and - for the lecturer who wrote the paper - the incidents
+-- recorded on their own exam.
+--
+-- The third arm is what makes a lecturer's monitor show violations instead of an
+-- empty feed, and it is scoped by `owns_exam()` rather than by the staff tier on
+-- purpose: a lecturer may read every attempt (the roster), but not the evidence
+-- gathered on somebody else's paper. A student still reads only their own rows.
+-- The ownership test rides on the same subquery as the student one, so the
+-- attempt row is fetched once either way.
 create policy "logs_select_own_or_supervisor"
   on public.proctoring_logs for select
   to authenticated
   using (
     exists (
       select 1 from public.exam_submissions s
-      where s.id = submission_id and s.student_id = auth.uid()
+      where s.id = submission_id
+        and (s.student_id = auth.uid() or public.owns_exam(s.exam_id))
     )
     or public.is_exam_supervisor()
   );
@@ -901,17 +1040,17 @@ create policy "Proctor snapshots upload own ongoing session"
 --
 -- This policy is therefore necessarily broader than the two above - it cannot be
 -- anchored to the submission folder, because by this point that folder no longer
--- resolves to a submission row. Supervisor-only is no wider than the delete
--- policy it serves (a supervisor can already delete any attempt, log rows
--- included), and it is what keeps the console from leaving orphaned blobs
--- behind: deleting the `storage.objects` rows without the Storage API would do
--- precisely that.
+-- resolves to a submission row. The reset tier is no wider than the delete
+-- policy it serves (whoever `is_attempt_resetter()` names can already delete any
+-- attempt, log rows included), and it is what keeps the console from leaving
+-- orphaned blobs behind: deleting the `storage.objects` rows without the Storage
+-- API would do precisely that.
 create policy "Proctor snapshots supervisor purge"
   on storage.objects for delete
   to authenticated
   using (
     bucket_id = 'proctor-snapshots'
-    and public.is_exam_supervisor()
+    and public.is_attempt_resetter()
   );
 
 -- ---------------------------------------------------------------------
@@ -962,23 +1101,28 @@ alter table public.session_reset_logs enable row level security;
 drop policy if exists "session_reset_logs_select_staff" on public.session_reset_logs;
 drop policy if exists "session_reset_logs_insert_supervisor" on public.session_reset_logs;
 
--- Read: the staff tier - the same audience that can already read the attempts
--- and the incident rows behind them (`submissions_select_own_or_supervisor`,
--- `logs_select_own_or_supervisor`). A lecturer who may see that an attempt is
--- missing should be able to see that it was a reset rather than a hand-delete.
--- Students get no rows: the record names the member of staff who ran it.
+-- Read: the intervention tier sees every reset; the paper's own lecturer sees the
+-- resets recorded against the exams they wrote (`owns_exam()` on the exam id the
+-- row carries as plain evidence). Students get no rows: the record names the
+-- member of staff who ran the reset.
+--
+-- Deliberately narrower than `is_staff()`. The tier that may read every *attempt*
+-- is not the tier that may read every *reset*: a reset row names another
+-- teacher's student, their exam and the actor who cleared it, which is exactly
+-- the "unrelated system log" a shared staff read would expose. A lecturer who is
+-- missing an attempt on their own paper still sees the row that explains why.
 create policy "session_reset_logs_select_staff"
   on public.session_reset_logs for select
   to authenticated
-  using (public.is_staff());
+  using (public.is_exam_supervisor() or public.owns_exam(exam_id));
 
 -- Write: exactly the tier that may delete an attempt in the first place
--- (`is_exam_supervisor()` is what `submissions_delete_supervisor` and the
+-- (`is_attempt_resetter()` is what `submissions_delete_supervisor` and the
 -- snapshot-purge policy use), and only in the caller's own name.
 create policy "session_reset_logs_insert_supervisor"
   on public.session_reset_logs for insert
   to authenticated
-  with check (public.is_exam_supervisor() and actor_id = auth.uid());
+  with check (public.is_attempt_resetter() and actor_id = auth.uid());
 
 -- There is deliberately NO update policy and NO delete policy. A record its own
 -- author can rewrite or remove is not a record; if one is ever wrong, the
@@ -1180,6 +1324,40 @@ revoke execute on function public.register_violation(uuid, text, text, timestamp
 grant execute on function public.register_violation(uuid, text, text, timestamptz, uuid) to authenticated, service_role;
 
 -- ---------------------------------------------------------------------
+-- The single home of "how long has this attempt got?"
+-- ---------------------------------------------------------------------
+-- `started_at` + the paper's `duration_minutes`, *capped* by the paper's own
+-- `ends_at` when it has one. Both RPCs below and `submit_exam()` ask this one
+-- function, so the deadline an answer is measured against and the deadline the
+-- close records can never disagree - the same reason `auto_graded_score()` owns
+-- the grading rule.
+--
+-- IMMUTABLE, and deliberately not SECURITY DEFINER: it reads no table, so there
+-- is nothing for RLS to filter and nothing to leak. `coalesce(..., 'infinity')`
+-- is what keeps an unscheduled paper (ends_at NULL) behaving exactly as it did
+-- before the columns existed.
+create or replace function public.attempt_deadline(
+  p_started_at       timestamptz,
+  p_duration_minutes int,
+  p_ends_at          timestamptz
+)
+returns timestamptz
+language sql
+immutable
+as $$
+  select least(
+    p_started_at + make_interval(mins => p_duration_minutes),
+    coalesce(p_ends_at, 'infinity'::timestamptz)
+  );
+$$;
+
+comment on function public.attempt_deadline(timestamptz, int, timestamptz) is
+  'The effective deadline of an attempt: started_at + duration_minutes, capped by the exam window''s ends_at (NULL ends_at = no cap).';
+
+revoke execute on function public.attempt_deadline(timestamptz, int, timestamptz) from public, anon;
+grant execute on function public.attempt_deadline(timestamptz, int, timestamptz) to authenticated, service_role;
+
+-- ---------------------------------------------------------------------
 -- Race-safe partial-answer merge (RPC)
 -- ---------------------------------------------------------------------
 create or replace function public.merge_submission_answer(
@@ -1212,8 +1390,11 @@ begin
       select 1
       from public.exams e
       where e.id = s.exam_id
-        and clock_timestamp() < s.started_at
-          + make_interval(mins => e.duration_minutes)
+        -- The paper's own close is a hard close: an answer that arrives after
+        -- `ends_at` is refused even while the attempt's duration has time left.
+        and clock_timestamp() < public.attempt_deadline(
+          s.started_at, e.duration_minutes, e.ends_at
+        )
     );
 
   if not found then
@@ -1239,6 +1420,10 @@ grant execute on function public.merge_submission_answer(uuid, uuid, int) to aut
 -- a reconnect is safe. `p_disqualified => true` is the client-side redundancy
 -- path for a disqualification the server has already applied via
 -- register_violation(); it never grades.
+--
+-- The deadline it records is `attempt_deadline()`: the attempt's own duration,
+-- capped by the paper's `ends_at` when the paper has a window, so a paper that
+-- closes at 17:00 does not hand an attempt started at 16:50 a full hour.
 create or replace function public.submit_exam(
   p_submission_id uuid,
   p_disqualified  boolean default false
@@ -1254,6 +1439,7 @@ declare
   v_status  text;
   v_started_at timestamptz;
   v_duration_minutes int;
+  v_ends_at timestamptz;
   v_submitted_at timestamptz;
   v_score   numeric;
 begin
@@ -1262,8 +1448,10 @@ begin
       using errcode = '42501';
   end if;
 
-  select s.student_id, s.exam_id, s.status, s.started_at, e.duration_minutes
-    into v_student, v_exam, v_status, v_started_at, v_duration_minutes
+  select s.student_id, s.exam_id, s.status, s.started_at,
+         e.duration_minutes, e.ends_at
+    into v_student, v_exam, v_status, v_started_at,
+         v_duration_minutes, v_ends_at
   from public.exam_submissions s
   join public.exams e on e.id = s.exam_id
   where s.id = p_submission_id
@@ -1289,10 +1477,12 @@ begin
   end if;
 
   -- Expired attempts are closed and graded from answers saved before the
-  -- deadline. Record the deadline as the effective submit time for late closes.
+  -- deadline. Record the deadline as the effective submit time for late closes:
+  -- `attempt_deadline()` is the attempt's own duration capped by the paper's
+  -- close, so a late arrival inside a scheduled window records the window's end.
   v_submitted_at := least(
     clock_timestamp(),
-    v_started_at + make_interval(mins => v_duration_minutes)
+    public.attempt_deadline(v_started_at, v_duration_minutes, v_ends_at)
   );
 
   -- A disqualified attempt is never graded: a score would imply it counts.
@@ -1329,7 +1519,7 @@ end;
 $$;
 
 comment on function public.submit_exam(uuid, boolean) is
-  'Closes and grades a student''s own attempt; late answer writes are rejected and an expired attempt is graded from saved answers. Idempotent.';
+  'Closes and grades a student''s own attempt; late answer writes are rejected and an expired attempt is graded from saved answers. The deadline is started_at + duration_minutes, capped by the exam window''s ends_at. Idempotent.';
 
 revoke execute on function public.submit_exam(uuid, boolean) from public, anon;
 grant execute on function public.submit_exam(uuid, boolean) to authenticated, service_role;
@@ -1376,8 +1566,11 @@ begin
       select 1
       from public.exams e
       where e.id = s.exam_id
-        and clock_timestamp() < s.started_at
-          + make_interval(mins => e.duration_minutes)
+        -- Same deadline as the option merge: whichever comes first, the
+        -- attempt's duration or the paper's close.
+        and clock_timestamp() < public.attempt_deadline(
+          s.started_at, e.duration_minutes, e.ends_at
+        )
     );
 
   if not found then

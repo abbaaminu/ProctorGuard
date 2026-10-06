@@ -5,8 +5,10 @@ import '../../../../core/services/supabase_service.dart' show SupabaseService;
 import '../../../../core/widgets/responsive_layout.dart';
 import '../../../proctoring/presentation/providers/proctoring_provider.dart';
 import '../../domain/entities/exam.dart';
+import '../../domain/entities/exam_submit_result.dart';
 import '../../domain/entities/submission.dart';
 import '../providers/exam_providers.dart';
+import '../widgets/exam_instructions_dialog.dart';
 import '../widgets/published_exam_list.dart';
 import 'exam_hardware_gate_page.dart';
 import 'exam_taking_page.dart';
@@ -44,6 +46,7 @@ class StudentExamPortalPage extends ConsumerStatefulWidget {
     this.examPageBuilder,
     this.hardwareGate,
     this.onSignOut,
+    this.clock,
   });
 
   /// Greeting name; the gate passes `profiles.full_name` ("Aisha Bello").
@@ -59,6 +62,11 @@ class StudentExamPortalPage extends ConsumerStatefulWidget {
   /// Sign-out shown in the app bar (the gate owns the Supabase call).
   final VoidCallback? onSignOut;
 
+  /// The instant a scheduled paper is judged against, defaulting to the wall
+  /// clock. Injectable for the same reason the list's own seam is: a widget test
+  /// asserts "this paper has not opened yet" without waiting for a real window.
+  final DateTime Function()? clock;
+
   @override
   ConsumerState<StudentExamPortalPage> createState() =>
       _StudentExamPortalPageState();
@@ -71,6 +79,16 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
 
   Future<void> _openExam(Exam exam) async {
     if (_openingExamId != null) return;
+
+    // The window, re-checked here as well as on the tile: the list was rendered
+    // from an earlier `now`, so a paper that closed in the meantime would still
+    // be tappable. The server refuses the attempt row either way
+    // (`submissions_insert_own_ongoing`), but a sentence beats a 42501.
+    final reason = exam.closedReason((widget.clock ?? DateTime.now)());
+    if (reason != null) {
+      _showMessage('“${exam.title}” is not open right now. $reason');
+      return;
+    }
 
     // The hardware gate runs *first*: no submission row is created and no
     // session screen is pushed until a real camera and microphone have been
@@ -101,8 +119,13 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
       }
 
       final builder = widget.examPageBuilder;
-      await Navigator.of(context).push(
-        MaterialPageRoute(
+      // The session screen hands its result back through the pop. That is what
+      // makes the result *instant* for a paper with no essay on it: `submit_exam`
+      // has already graded it by the time the student is back on this list, so the
+      // mark is shown here instead of being left for a "results will be released"
+      // that has nothing left to wait for.
+      final result = await Navigator.of(context).push<ExamSubmitResult>(
+        MaterialPageRoute<ExamSubmitResult>(
           // The default session screen gets the exam duration and the
           // submission's start time, which is what the countdown runs on; the
           // injectable builder stays a plain (examId, submissionId) factory so
@@ -123,6 +146,8 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
                 ),
         ),
       );
+      if (!mounted || result == null) return;
+      _showResult(exam, result);
     } catch (_) {
       if (mounted) {
         _showMessage(
@@ -144,6 +169,58 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
       ),
     );
     return verified ?? false;
+  }
+
+  /// What the student is told the moment an attempt closes.
+  ///
+  /// An objective paper is already marked when the session screen hands the result
+  /// back ([ExamSubmitResult.hasFinalScore]), so the score *is* the answer and it
+  /// is shown without a "results will be released later" hedge that has nothing
+  /// left to wait for. A paper with an essay on it says the opposite, in the same
+  /// place and with the same emphasis: the number the server returned is only the
+  /// automatic half, and a lecturer marks the written answers afterwards.
+  void _showResult(Exam exam, ExamSubmitResult result) {
+    final theme = Theme.of(context);
+
+    final String title;
+    final String body;
+    final IconData icon;
+
+    if (result.isDisqualified) {
+      title = 'Attempt disqualified';
+      body = 'Your "${exam.title}" attempt was closed as disqualified, so it '
+          'was not marked. Your supervisor can show you what happened, and can '
+          'reset the attempt if the decision was wrong.';
+      icon = Icons.gpp_bad_outlined;
+    } else if (result.hasFinalScore) {
+      title = 'Your result';
+      body = 'You scored ${result.scoreLabel} on "${exam.title}". That is your '
+          'final mark — every question on the paper was marked automatically.';
+      icon = Icons.emoji_events_outlined;
+    } else {
+      title = 'Answers submitted';
+      body = 'Your answers to "${exam.title}" are in. The written answers are '
+          'marked by your lecturer, so your score is not final yet — it appears '
+          'here once they are done.';
+      icon = Icons.mark_email_read_outlined;
+    }
+
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        key: const Key('exam-result-dialog'),
+        icon: Icon(icon, size: 40, color: theme.colorScheme.primary),
+        title: Text(title),
+        content: Text(body),
+        actions: [
+          FilledButton(
+            key: const Key('exam-result-done'),
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Done'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _showMessage(String message) {
@@ -169,6 +246,15 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
         automaticallyImplyLeading: false, // the gate is the only parent
         title: const Text('Student Exam Portal'),
         actions: [
+          IconButton(
+            key: const Key('portal-instructions'),
+            tooltip: 'Exam instructions',
+            // Available before any paper is chosen: what the proctor does, and
+            // what the paper's own rules are, are worth reading before deciding
+            // which one to sit.
+            onPressed: () => showExamInstructions(context),
+            icon: const Icon(Icons.menu_book_outlined),
+          ),
           IconButton(
             key: const Key('portal-refresh'),
             tooltip: 'Refresh',
@@ -211,6 +297,11 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
                 onOpen: _openExam,
                 openingExamId: _openingExamId,
                 emptyMessage: 'No exams are available for you right now.',
+                // A student may not start a paper outside its window; the
+                // supervisor's picker (the other caller) deliberately does not
+                // lock, because monitoring a closed sitting is its purpose.
+                lockWhenNotOpen: true,
+                clock: widget.clock,
               ),
             ),
           ),
