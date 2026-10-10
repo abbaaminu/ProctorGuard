@@ -137,6 +137,11 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
                   submissionId: submission.id,
                   durationMinutes: exam.durationMinutes,
                   startedAt: submission.startedAt,
+                  // The paper's hard close: the countdown is capped at it, the
+                  // same way `attempt_deadline()` caps the attempt server-side,
+                  // so the clock the student watches cannot outlast the window
+                  // their answers are accepted in.
+                  endsAt: exam.endsAt,
                   // Identity for the exam surface: the session screen has no
                   // profile provider of its own, and the portal already holds both
                   // (the gate passes `profiles.full_name` in as `studentName`).

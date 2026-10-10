@@ -60,6 +60,13 @@ class ExamTakingPage extends ConsumerStatefulWidget {
   /// `exam_submissions.started_at`; null counts from "now".
   final DateTime? startedAt;
 
+  /// `exams.ends_at`: the paper's hard close, or null when it has no window.
+  ///
+  /// Passed to the session controller, which caps the countdown at it exactly
+  /// as the server caps the attempt (`attempt_deadline()` in `schema.sql`), so
+  /// the visible clock never shows time an answer would be refused in.
+  final DateTime? endsAt;
+
   /// Browser guards for this session; injectable so tests can drive tab-switch
   /// and fullscreen behaviour on the VM, where the real implementation (and its
   /// DOM) does not exist.
@@ -101,6 +108,7 @@ class ExamTakingPage extends ConsumerStatefulWidget {
     required this.submissionId,
     this.durationMinutes,
     this.startedAt,
+    this.endsAt,
     this.webGuards,
     this.clock,
     this.mockCamera,
@@ -186,6 +194,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         submissionId: widget.submissionId,
         durationMinutes: widget.durationMinutes,
         startedAt: widget.startedAt,
+        endsAt: widget.endsAt,
         clock: widget.clock,
       );
 

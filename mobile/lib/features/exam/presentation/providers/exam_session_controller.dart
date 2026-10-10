@@ -45,6 +45,7 @@ class ExamSessionArgs {
     required this.submissionId,
     this.durationMinutes,
     this.startedAt,
+    this.endsAt,
     this.clock,
   });
 
@@ -52,6 +53,16 @@ class ExamSessionArgs {
   final String submissionId;
   final int? durationMinutes;
   final DateTime? startedAt;
+
+  /// `exams.ends_at`: the paper's hard close, or null when it has no window.
+  ///
+  /// The server treats it as a cap ([resolveDeadline] mirrors `attempt_deadline()`
+  /// in `schema.sql`), so an attempt started shortly before the close gets the
+  /// remaining minutes and not a fresh `duration_minutes` — and the clock the
+  /// student watches can never show time the server would refuse to accept an
+  /// answer in.
+  final DateTime? endsAt;
+
   final DateTime Function()? clock;
 
   @override
@@ -61,6 +72,7 @@ class ExamSessionArgs {
       other.submissionId == submissionId &&
       other.durationMinutes == durationMinutes &&
       other.startedAt == startedAt &&
+      other.endsAt == endsAt &&
       other.clock == clock;
 
   @override
@@ -69,6 +81,7 @@ class ExamSessionArgs {
         submissionId,
         durationMinutes,
         startedAt,
+        endsAt,
         clock,
       );
 }
@@ -296,19 +309,20 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
     }
   }
 
-  /// Enforces `args.durationMinutes`.
+  /// Enforces `args.durationMinutes` (capped by `args.endsAt`).
   ///
   /// The deadline is anchored on the submission's `started_at` rather than
   /// "now", so a resumed attempt (crash, refresh, reconnect) keeps counting down
   /// from where it left off — and one that is already past its deadline is
   /// submitted on the first tick instead of being given a fresh hour.
   void startCountdown() {
-    final minutes = args.durationMinutes;
-    if (minutes == null || minutes <= 0) return;
-
-    final deadline = (args.startedAt ?? _clock()).add(
-      Duration(minutes: minutes),
+    final deadline = resolveDeadline(
+      now: _clock(),
+      durationMinutes: args.durationMinutes,
+      startedAt: args.startedAt,
+      endsAt: args.endsAt,
     );
+    if (deadline == null) return;
 
     _countdown?.cancel();
     // The ticker is installed *before* the first tick: that tick is what submits
@@ -321,6 +335,42 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
     );
     _tickCountdown(deadline);
   }
+
+  /// The instant an attempt's countdown runs to, or null when it has no
+  /// duration to enforce.
+  ///
+  /// This is the client's reading of the server's `attempt_deadline()`
+  /// (`schema.sql`): `started_at + duration_minutes`, **capped by the paper's
+  /// own `ends_at`**. Both bounds have to be applied here, not just the
+  /// duration, or a paper that closes at 17:00 would show a student who started
+  /// at 16:50 a full hour of countdown while every answer the RPC received
+  /// after 17:00 was refused — the visible clock would outlast the window the
+  /// server enforces. `least()` on the server and this cap are the same rule,
+  /// so the two can never disagree.
+  ///
+  /// Pure and static on purpose: it is the one place the client and the server
+  /// answer "how long have I got?", and pinning it here lets a test hold both
+  /// clocks still instead of racing a real timer.
+  static DateTime? resolveDeadline({
+    required DateTime now,
+    required int? durationMinutes,
+    required DateTime? startedAt,
+    required DateTime? endsAt,
+  }) {
+    if (durationMinutes == null || durationMinutes <= 0) return null;
+
+    final byDuration = (startedAt ?? now).add(
+      Duration(minutes: durationMinutes),
+    );
+    // `ends_at` is a hard close on the server (`least()` in `attempt_deadline()`),
+    // so the earlier of the two is the deadline. A null `ends_at` is an
+    // unscheduled paper and leaves the duration alone, exactly as
+    // `coalesce(ends_at, 'infinity')` does.
+    if (endsAt != null && endsAt.isBefore(byDuration)) return endsAt;
+
+    return byDuration;
+  }
+
 
   void _tickCountdown(DateTime deadline) {
     if (!mounted) return;

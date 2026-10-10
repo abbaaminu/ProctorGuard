@@ -49,7 +49,11 @@
 //   a student's exam — because that action destroys proctoring evidence.
 //   Changing a password destroys nothing, and Supabase Auth keeps its own
 //   record against `auth.users`, so there is deliberately no row for it.
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+// The `npm:` specifier is what Deno resolves itself and what `npm-imports.d.ts`
+// declares for the TypeScript checker; the other two admin functions import the
+// same package the same way. (`https://esm.sh/...` resolved at runtime but has no
+// declaration here, so `npm run typecheck` reported TS2307 on it.)
+import { createClient } from "npm:@supabase/supabase-js@2";
 
 type Role = "admin" | "lecturer" | "supervisor" | "student";
 

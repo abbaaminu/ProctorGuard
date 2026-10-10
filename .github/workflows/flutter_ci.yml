@@ -50,3 +50,66 @@ jobs:
 
       - name: Full test suite
         run: flutter test
+
+  # Analysis and tests run against the Dart source; neither proves the release
+  # *build pipelines* compile - a Gradle/AGP bump or a plugin that only resolves
+  # under the release toolchain would stay green above and break on the tag.
+  # `sync_release.yml` does build the signed, split-per-ABI release APKs, but only
+  # after a push to `main` or a `vX.Y.Z` tag, which is too late to catch a PR.
+  #
+  # This job compiles both shipped targets on every push and every pull request.
+  # It deliberately uses `--release` for web (which needs no certificate) and
+  # `--debug` for Android: a release APK has to be signed, and the keystore lives
+  # in repository secrets that are not exposed to pull requests (and never to a
+  # fork), so a release APK here would fail on every PR that had no secrets. A
+  # debug APK exercises the same Gradle graph, the same plugin registration and
+  # the same manifest merge without needing a certificate - the *signing* half is
+  # what `sync_release.yml` covers, and `android/gradle.properties` keeps the R8
+  # shrink for that job alone.
+  #
+  # Placeholder `--dart-define`s: a build with `SUPABASE_URL=""` still compiles,
+  # but passing the real names is what proves the flags are still recognised.
+  build_artifacts:
+    name: build (web release + Android debug)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # `android/app/build.gradle.kts` pins source/target compatibility and
+      # `jvmTarget` to 17 and the wrapper runs Gradle 9.1, so the JDK is pinned
+      # here exactly as `sync_release.yml` pins it — a runner-image bump must not
+      # be able to change what the Android build compiles against.
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build web (release)
+        run: >-
+          flutter build web --release
+          --dart-define=SUPABASE_URL=https://ci.invalid
+          --dart-define=SUPABASE_PUBLISHABLE_KEY=ci-placeholder
+
+      # Nothing here is uploaded and no secret is read: this is a compile gate,
+      # not a publish step.
+      - name: Build Android (debug)
+        run: >-
+          flutter build apk --debug
+          --dart-define=SUPABASE_URL=https://ci.invalid
+          --dart-define=SUPABASE_PUBLISHABLE_KEY=ci-placeholder

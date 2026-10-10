@@ -120,6 +120,13 @@ rather than left to be mistaken for more than it is.
   `startImageStream`, because `camera_web` has no image stream to offer. Raw frames
   and face signals are the only things missing; the preview, the still-frame
   evidence and every browser guard are the same code path as the phone build.
+- **Android is the only *native* proctoring host.** The repository ships an
+  `android/` runner, an `ios/` scaffold and a `web/` target — and **no desktop
+  runner at all**. A macOS, Windows or Linux machine therefore takes part through
+  the web build in a browser, so the "no on-device AI on the web" boundary above
+  applies there too; there is no native desktop client whose kiosk or face
+  signals could be stronger. See
+  [mobile/README.md → Supported platforms](./mobile/README.md#supported-platforms-and-what-proctoring-each-one-gets).
 
 **Risk register**
 
@@ -128,6 +135,7 @@ rather than left to be mistaken for more than it is.
 | Impersonation / a stand-in on camera | Face detection is not face recognition and has no liveness check | Supervisor review of the attempt's evidence; add an identity-match + liveness step where the stakes require it |
 | A helper off-camera or on another device | The camera only sees in front of the lens; audio is level-only | `multiple_faces`, `no_face`, `looking_away`, `idle_afk` and `secondary_display_detected` signals, plus supervisor judgement |
 | Sound that is not plain talking (TV, music, a second speaker) | Loudness cannot be attributed to a person or separated from other sound | Sustained-threshold rules (a median-calibrated room floor, a 2s window that tolerates the gaps between words) keep one-offs out; content is deliberately never captured |
+| A microphone that fails mid-session (unplugged, grant revoked, another app took the input) | Level is the only audio signal, so a dead mic stops speech being detected at all | The chip reports `Mic lost` / `Mic unavailable` / `Mic blocked` — **never a false "quiet"** — with **Reconnect** / **Open settings**. A lost mic is an **unproctored gap, not a strike**: the attempt is deliberately *not* paused, so the gap shows up on the supervisor's timeline as a hole in the audio signal rather than a silent clean run |
 | Escape from the locked exam surface | Screen pinning (no Device Owner) and browser fullscreen can be left | An escape or a fullscreen exit becomes an `app_minimized` strike; the kiosk badge shows whether pinning is enforced or best-effort |
 | Detector evasion (rooted/virtualised device, camera spoof) | Client-side detectors can be defeated by a determined, technically capable student | Treat the client as untrusted: grading and the 3-strike rule are enforced **server-side** (`register_violation`, `submit_exam`) |
 | Evidence retention / privacy | Snapshots in `proctor-snapshots` are personal data with no automatic TTL by default | Set the bucket's visibility and a retention policy for your institution; snapshots are already deleted on an attempt reset, which `session_reset_logs` records (who cleared which attempt, for whom, and how much evidence went with it) |
@@ -213,6 +221,16 @@ lose proctoring signals but cannot change a result.
   `SUPABASE_PUBLISHABLE_KEY` and the four `ANDROID_KEYSTORE_*` - are documented at
   the top of the workflow; a run without the signing ones stops with the keytool
   instructions instead of publishing an APK signed with the public debug key.
+- `.github/workflows/flutter_ci.yml` is the per-push gate: analysis, the
+  schema/Android contract tests, the full suite, and a **build job** that compiles
+  the two shipped targets (`flutter build web --release` and
+  `flutter build apk --debug`). The APK there is deliberately a debug build —
+  a release APK needs the keystore secrets that are unavailable to pull requests,
+  and `sync_release.yml` is what builds and signs the real ones.
+- `.github/workflows/supabase_functions_ci.yml` type-checks the Deno Edge
+  Functions (`npm run typecheck` in `supabase/functions`) on every push and pull
+  request, so a mis-resolved import fails CI rather than `supabase functions
+  deploy` on a live project.
 
 ## Verification
 
@@ -226,5 +244,15 @@ flutter test
 
 The Flutter contract tests read `supabase/schema.sql` and the Edge Function
 source to ensure the client payloads and database contracts stay aligned.
-`supabase/functions/` also includes a TypeScript type-check for its Deno
-functions; see its `package.json`.
+
+The Edge Functions are Deno, so `flutter test` never compiles them. Type-check
+them the way CI does, from `supabase/functions/`:
+
+```powershell
+npm ci
+npm run typecheck
+```
+
+Zero TypeScript errors is the gate (`admin-reset-password` importing
+`https://esm.sh/...` was the one thing that failed it). It installs dev-only
+types from the checked-in `package-lock.json` and deploys nothing.

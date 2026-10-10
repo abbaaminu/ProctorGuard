@@ -879,6 +879,31 @@ the one under test.
 `mobile/test/exam_taking_page_test.dart` covers the blocking state and its
 retry/leave actions.
 
+## Supported platforms (and what proctoring each one gets)
+
+Only the runner folders that actually exist under `mobile/` are targets:
+`android/`, `ios/` and `web/`. The app compiles for all three, and **Android is
+the shipped one** — `build_apk.ps1` and `.github/workflows/sync_release.yml`
+publish the signed, split-per-ABI APKs students install.
+
+| Host | Builds | Face signals | Mic level | Screen lockdown |
+| --- | --- | --- | --- | --- |
+| Android (phone) | `flutter build apk` | ML Kit, on-device | `record` | Lock task / screen pinning + immersive chrome |
+| iOS | `flutter build ios` — needs the Podfile work in `ios/README.md` first | ML Kit, on-device | `record` | Best-effort only (`startLock` reports `granted: false`) |
+| Web (Chrome/Edge) | `flutter build web` | **none** — no ML Kit for browsers | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
+| macOS / Windows / Linux | — | — | — | — |
+
+**There is no `macos/`, `windows/` or `linux/` runner here, and that is a scope
+decision rather than an unfinished port.** A desktop machine takes part as a
+**browser host** — the `web` target above, sized for a wide window by
+`ResponsiveLayout` — which is why the "no on-device AI on the web" boundary in
+the root README applies to it. A native desktop build would ship a proctoring
+client that (on macOS in particular) cannot enter the lockdown the exam surface
+rests on and cannot reach ML Kit without another plugin, so it would *add* a
+supported platform whose proctoring is weaker than the browser's. Adding one is
+a new target with its own privacy and security review, not a `flutter create`
+away.
+
 ## Responsive layout (Android phone + desktop browser)
 
 The same screens run on a 320 dp phone and on a 1440 px Chrome/Edge window, so

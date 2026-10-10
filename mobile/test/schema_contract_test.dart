@@ -15,6 +15,7 @@ import 'package:proctorguard/features/exam/data/repositories/exam_repository_imp
 import 'package:proctorguard/features/exam/domain/entities/question.dart';
 import 'package:proctorguard/features/exam/domain/entities/submission.dart';
 import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
+import 'package:proctorguard/features/exam/presentation/providers/exam_session_controller.dart';
 import 'package:proctorguard/features/proctoring/data/repositories/proctoring_repository_impl.dart';
 import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -1875,6 +1876,47 @@ void main() {
         sql,
         contains("coalesce(p_ends_at, 'infinity'::timestamptz)"),
         reason: 'a paper with no close must keep the pre-scheduling deadline',
+      );
+    });
+
+    test('the client countdown is the same least() the server enforces', () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      // The server's one deadline helper: `started_at + duration`, capped by the
+      // paper's close (coalesced to infinity when it has none).
+      expect(
+        sql,
+        contains('p_started_at + make_interval(mins => p_duration_minutes)'),
+      );
+      expect(
+        sql,
+        contains("coalesce(p_ends_at, 'infinity'::timestamptz)"),
+      );
+
+      // `ExamSessionController.resolveDeadline` has to answer the *same* instant.
+      // It is the only client-side copy of that arithmetic, and it is what the
+      // student's clock counts down to: if it dropped the `ends_at` cap the page
+      // would keep showing time in which every write was already being refused.
+      expect(
+        ExamSessionController.resolveDeadline(
+          now: DateTime.utc(2026, 1, 5, 16, 55),
+          durationMinutes: 60,
+          startedAt: DateTime.utc(2026, 1, 5, 16, 50),
+          endsAt: DateTime.utc(2026, 1, 5, 17),
+        ),
+        DateTime.utc(2026, 1, 5, 17),
+        reason: 'least(16:50 + 60min, 17:00) is the paper\'s close',
+      );
+      expect(
+        ExamSessionController.resolveDeadline(
+          now: DateTime.utc(2026, 1, 5, 16, 55),
+          durationMinutes: 60,
+          startedAt: DateTime.utc(2026, 1, 5, 16, 50),
+          endsAt: null,
+        ),
+        DateTime.utc(2026, 1, 5, 17, 50),
+        reason: 'a NULL ends_at coalesces to infinity, so the duration stands',
       );
     });
 
