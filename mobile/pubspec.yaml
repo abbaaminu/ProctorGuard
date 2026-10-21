@@ -60,3 +60,16 @@ flutter_launcher_icons:
   image_path: "assets/icon/app_icon.png"
   android: true
   ios: false
+  # The browser build installs as a home-screen app off the same artwork, so it
+  # is generated from the same file as the launcher icon: `web/icons/Icon-*.png`
+  # and `web/favicon.png` are the four icons `web/manifest.json` and
+  # `web/index.html` point at. Regenerate with
+  # `dart run flutter_launcher_icons` after changing `app_icon.png` - the stock
+  # Flutter logo in those files is what a custom-domain install shows otherwise
+  # (`test/web_manifest_contract_test.dart` catches a manifest that points
+  # somewhere else, and a favicon too big to be a favicon).
+  web:
+    generate: true
+    image_path: "assets/icon/app_icon.png"
+    background_color: "#14284B"
+    theme_color: "#3F51B5"

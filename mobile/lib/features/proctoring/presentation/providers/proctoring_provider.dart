@@ -89,10 +89,10 @@ class ProctoringState {
 ///   - on violation: warningCount += 1, show full-screen overlay, log to DB
 ///   - at warningCount >= 3: auto-submit as 'disqualified' + forced exit
 ///
-/// Every signal — camera, audio, lifecycle, the browser's exam lockdown and the
-/// device-integrity probes — enters through the `report*` methods below, so the
-/// strike counter, the evidence upload and the disqualification rule live in
-/// exactly one place.
+/// Every signal — camera, audio, lifecycle, the browser's exam lockdown, the
+/// browser's face-detector bridge and the device-integrity probes — enters
+/// through the `report*` methods below, so the strike counter, the evidence
+/// upload and the disqualification rule live in exactly one place.
 ///
 /// Violations are delivered through a [ViolationOutbox] rather than straight to
 /// the repository, so "the network is gone" queues the row instead of losing it
@@ -199,6 +199,23 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
 
   /// Whether camera-derived signals are currently being evaluated.
   bool get cameraActive => _cameraActive;
+
+  /// A face signal that was classified off the main isolate's camera pipeline:
+  /// today, a browser page's own detector (see `WebFacePresenceMonitor`).
+  ///
+  /// This exists because the web build has no ML Kit and cannot hand frames to a
+  /// model, so the panel on the web is a *host* detector reporting through a
+  /// hook. It deliberately routes into the same handler the on-device engine
+  /// feeds, so a browser look-away goes through the identical ladder: the
+  /// camera-paused gate, the per-violation dedupe window, the snapshot, the
+  /// offline queue and the three-strike disqualification.
+  ///
+  /// The signal is one of the four [GazeSignal] values on-device inference also
+  /// emits - a page cannot name a violation, only what it saw - and the
+  /// threshold, sustain and latch rules stay in `WebFacePresenceMonitor`, so
+  /// "how long is a look away" is decided once per platform rather than once per
+  /// host script.
+  void reportGazeSignal(GazeSignal signal) => _handleGazeSignal(signal);
 
   void _handleGazeSignal(GazeSignal signal) {
     // A signal that arrived after the session was torn down must not touch the

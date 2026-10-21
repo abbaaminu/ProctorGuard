@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:math' as math;
 
 /// Turns a stream of loudness samples (dBFS) into `audio_noise` rulings.
@@ -19,33 +20,43 @@ import 'dart:math' as math;
 ///     voice. Nothing can be logged before calibration finishes, which doubles as
 ///     the start-of-session grace period.
 ///  2. **Sustained, not instantaneous.** The level has to add up to [sustain]
-///     above the threshold; a dip below it only ends the episode once it has
-///     lasted longer than [releaseGrace]. Bridging that single-sample dip is what
-///     makes the rule catch *talking* rather than only an unbroken shout: at four
-///     samples a second, a real sentence dips below the threshold between words,
-///     so a rule that reset on any one low sample never reached its window at all.
-///     A cough, a chair creak or the student drawing breath is still far too
-///     brief to add up, and a room that has genuinely gone quiet ends the episode
-///     within [releaseGrace]. A crescendo shorter than [sustain] is reported
-///     through [isNoisy] for the indicator, and never logged.
+///     above the threshold; a dip only ends the episode once it has lasted longer
+///     than [releaseGrace] *and* gone more than [hysteresisDb] under the
+///     threshold. Bridging that dip is what makes the rule catch *talking* rather
+///     than only an unbroken shout: at four samples a second, a real sentence dips
+///     below the threshold between words, so a rule that reset on any one low
+///     sample never reached its window at all. The hysteresis band is the second
+///     half of that: a quietly spoken syllable two or three decibels under the
+///     threshold is the middle of the same sentence, not a room that went quiet,
+///     so it must not start the [releaseGrace] clock at all. A cough, a chair
+///     creak or the student drawing breath is still far too brief to add up, and
+///     a room that has genuinely gone quiet ends the episode within
+///     [releaseGrace]. A crescendo shorter than [sustain] is reported through
+///     [isNoisy] for the indicator, and never logged.
 ///  3. **Cooldown.** After a strike the detector ignores the level for [cooldown],
 ///     so one long outburst is one strike rather than one every sample.
 ///
 /// The median (not the mean) is what calibration reads, so a student who talks
 /// through the first seconds of an exam cannot drag the room floor up to their
 /// voice - and even if the estimate is skewed, the clamp keeps the threshold
-/// usable.
+/// usable. It is measured **once**: the floor is a fact about this microphone and
+/// room, so a medians-of-the-whole-session estimate would chase every sound the
+/// student made instead of describing the room; [reset] is the one way to ask for
+/// a fresh measurement (it is called when the microphone comes back after an
+/// interruption).
 class AudioNoiseDetector {
   AudioNoiseDetector({
     this.calibrationWindow = const Duration(seconds: 4),
     this.sustain = const Duration(seconds: 2),
     this.releaseGrace = const Duration(milliseconds: 400),
+    this.hysteresisDb = 3,
     this.cooldown = const Duration(seconds: 5),
     this.speechMarginDb = 6,
     this.minThresholdDb = -55,
     this.maxThresholdDb = -32,
     this.defaultThresholdDb = -30,
     this.minCalibrationSamples = 5,
+    this.maxCalibrationSamples = 128,
     DateTime Function()? clock,
   })  : assert(sustain > Duration.zero, 'a zero sustain would log every sample'),
         assert(
@@ -53,8 +64,16 @@ class AudioNoiseDetector {
           'a negative grace would end every episode on the first dip',
         ),
         assert(
+          hysteresisDb >= 0,
+          'a negative band would make every dip start the release clock',
+        ),
+        assert(
           minThresholdDb <= maxThresholdDb,
           'the clamp bounds are the wrong way round',
+        ),
+        assert(
+          maxCalibrationSamples > 0,
+          'a zero cap would leave calibration with no samples at all',
         ),
         _now = clock ?? DateTime.now,
         _thresholdDb = defaultThresholdDb;
@@ -79,6 +98,28 @@ class AudioNoiseDetector {
   /// this restarts the window from scratch, which is what keeps one cough from
   /// being added to the next one.
   final Duration releaseGrace;
+
+  /// What to do with a sentence's quiet syllables.
+  ///
+  /// The threshold is a line a *sustained* level has to cross, not a line every
+  /// single sample has to stay above. Speech at conversation volume swings several
+  /// decibels between syllables, and a sample taken mid-syllable can land just
+  /// under the threshold even though the student is still talking. Counting that
+  /// as a dip starts [releaseGrace] early, and a second quiet syllable a few
+  /// hundred milliseconds later is then enough to throw away the part of the
+  /// sentence that had already accumulated.
+  ///
+  /// So a sample within this many decibels *below* the threshold is treated as
+  /// part of the episode rather than as a dip. It does not add to [sustain] (only a
+  /// sample over the line does), and it keeps the amber indicator on. 3 dB is
+  /// about the smallest change a listener hears as "half as loud", which is large
+  /// enough to cover syllable-to-syllable swing and far too small to mistake a
+  /// room that actually went quiet (typically 10-20 dB under the room floor) for
+  /// speech.
+  ///
+  /// Zero restores the strict rule - every sample under the threshold starts the
+  /// release clock - and is what a host that wants the old behaviour can pass.
+  final double hysteresisDb;
 
   /// How long after a strike the level is ignored.
   final Duration cooldown;
@@ -107,9 +148,23 @@ class AudioNoiseDetector {
   /// How many samples calibration needs before it will trust its median.
   final int minCalibrationSamples;
 
+  /// The most readings the calibration median is built from.
+  ///
+  /// The window is four seconds and [AudioMonitor] samples every 250 ms, so the
+  /// shipped defaults only ever collect about sixteen - but a source with a
+  /// different rate (a test, a host feeding frames) must not be able to turn a
+  /// once-per-session calculation into an unbounded buffer. Once the cap is
+  /// reached the oldest reading is dropped, so the median describes the *recent*
+  /// room, which is the one the student is sitting in.
+  ///
+  /// A cap below [minCalibrationSamples] is honoured, but the minimum is clamped
+  /// down to it: calibration then takes the whole [calibrationWindow] and every
+  /// reading it can keep, instead of waiting forever for samples it is deleting.
+  final int maxCalibrationSamples;
+
   final DateTime Function() _now;
 
-  final List<double> _calibrationSamples = <double>[];
+  final ListQueue<double> _calibrationSamples = ListQueue<double>();
   DateTime? _firstSampleAt;
   DateTime? _aboveSince;
 
@@ -138,6 +193,14 @@ class AudioNoiseDetector {
 
   /// How many samples have been fed in.
   int get samples => _samples;
+
+  /// How many readings the calibration median currently holds.
+  ///
+  /// Non-zero only while the room is being measured, capped at
+  /// [maxCalibrationSamples], and zero again once calibration is done (the
+  /// readings have no further use). Exposed for the diagnostics the audio
+  /// indicator and the tests read, the same way [peakDb] and [samples] are.
+  int get calibrationSampleCount => _calibrationSamples.length;
 
   /// True when the last sample was above the threshold but the [sustain] window
   /// has not filled yet - the difference between "the indicator glows amber" and
@@ -180,23 +243,36 @@ class AudioNoiseDetector {
       return false;
     }
 
-    if (decibels < _thresholdDb) {
-      // Back under the threshold. Whether this *ends* the episode is decided by
-      // the next sample that comes back above it: a dip shorter than
-      // [releaseGrace] - the gap between two words - is bridged, a longer quiet
-      // stretch restarts the window from scratch. Either way the amber "something
-      // is building" state is off: this sample is not the noise.
+    // Where a sample has to be to count as speech. Anything under this is a real
+    // dip; the band between it and the threshold is a quiet syllable.
+    final dipFloor = _thresholdDb - hysteresisDb;
+
+    if (decibels < dipFloor) {
+      // Genuinely quiet: more than [hysteresisDb] under the line, so this really
+      // is a break in the sound rather than a soft syllable. Whether it *ends* the
+      // episode is decided by the next sample that comes back over the line: a dip
+      // shorter than [releaseGrace] - the gap between two words - is bridged, a
+      // longer quiet stretch restarts the window from scratch. Either way the amber
+      // "something is building" state is off: this sample is not the noise.
       _belowSince ??= now;
       _noisy = false;
       return false;
     }
 
-    // Above the threshold again. Bridge the dip if it was short enough, so that
-    // talking (which is not one unbroken tone) still adds up to [sustain].
+    // Over the threshold, or close enough under it to be the same sentence. A dip
+    // that was already open is bridged if it was short enough, so that talking
+    // (which is not one unbroken tone) still adds up to [sustain].
     final belowSince = _belowSince;
     if (belowSince != null) {
       if (now.difference(belowSince) >= releaseGrace) _aboveSince = null;
       _belowSince = null;
+    }
+
+    if (decibels < _thresholdDb) {
+      // Inside the hysteresis band: no new above-threshold sample to count, but
+      // the episode is still open (and the indicator stays amber), so the window
+      // keeps running from where it started.
+      return false;
     }
 
     _aboveSince ??= now;
@@ -211,23 +287,37 @@ class AudioNoiseDetector {
   }
 
   void _collectCalibration(double decibels, DateTime now) {
-    _calibrationSamples.add(decibels);
+    _calibrationSamples.addLast(decibels);
+    // Bounded, so a source that samples far faster than `AudioMonitor` cannot grow
+    // the median's working set for the whole session. Old readings are the ones a
+    // room can have changed away from, so they go first.
+    while (_calibrationSamples.length > maxCalibrationSamples) {
+      _calibrationSamples.removeFirst();
+    }
 
     final started = _firstSampleAt;
     final elapsed = started == null ? Duration.zero : now.difference(started);
     if (elapsed < calibrationWindow) return;
     // The source may be slower than expected; waiting for a few real samples beats
-    // calibrating off one or two readings.
-    if (_calibrationSamples.length < minCalibrationSamples) return;
+    // calibrating off one or two readings. The requirement is clamped to the cap:
+    // a host that tunes the cap below [minCalibrationSamples] has said it keeps
+    // fewer readings than the default minimum, and calibration has to still
+    // *finish* rather than wait for samples it is deleting.
+    final required = math.min(minCalibrationSamples, maxCalibrationSamples);
+    if (_calibrationSamples.length < required) return;
 
     _roomFloorDb = _median(_calibrationSamples);
     _thresholdDb = (_roomFloorDb! + speechMarginDb)
         .clamp(minThresholdDb, maxThresholdDb)
         .toDouble();
+    // Measurement is over for this microphone: nothing reads the readings again
+    // (the floor is a fact now), and keeping them would be the one part of this
+    // detector that grows with session length.
+    _calibrationSamples.clear();
   }
 
-  /// Median of a copy, so calibration cannot see a partially sorted list.
-  static double _median(List<double> values) {
+  /// Median of a copy, so calibration cannot see a partially sorted queue.
+  static double _median(Iterable<double> values) {
     final sorted = List<double>.of(values)..sort();
     final middle = sorted.length ~/ 2;
     if (sorted.length.isOdd) return sorted[middle];

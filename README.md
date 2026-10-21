@@ -112,7 +112,13 @@ rather than left to be mistaken for more than it is.
   (HTML5 fullscreen plus tab/blur detection) instead.
 - **No on-device AI on the web.** There is no ML Kit for browsers, so a web
   session runs the browser guards and audio level only (or an explicit
-  mock/simulated session), with no face signals. The browser is otherwise a fully
+  mock/simulated session), with no face signals **of its own**. A browser can
+  still take part in face proctoring if the hosting page runs a detector: the app
+  installs one global hook (`window.proctorGuardFaceSignal('looking_away')`) for
+  the length of an attempt and judges what arrives there with the same
+  sustained-episode rules as the phone build — the detection is the host's, the
+  judgement is the app's. Without such a page those signals are simply **absent**
+  (never invented), and the supervisor sees that gap. The browser is otherwise a fully
   supported host: the device check accepts a granted `getUserMedia` as proof of a
   real camera *and* microphone (with no second capture session of its own — that is
   what Chromium reports as "another app or tab is already using the camera"), and
@@ -243,7 +249,11 @@ flutter test
 ```
 
 The Flutter contract tests read `supabase/schema.sql` and the Edge Function
-source to ensure the client payloads and database contracts stay aligned.
+source to ensure the client payloads and database contracts stay aligned. They
+also read `mobile/web/manifest.json`, `mobile/web/index.html` and the PNGs those
+two point at, so a browser install keeps ProctorGuard's own icon (relative URLs,
+real files, the artwork's `#14284B`) rather than Flutter's template logo — see
+[mobile/README.md](./mobile/README.md#web-install-surface-icons-manifest-favicon).
 
 The Edge Functions are Deno, so `flutter test` never compiles them. Type-check
 them the way CI does, from `supabase/functions/`:

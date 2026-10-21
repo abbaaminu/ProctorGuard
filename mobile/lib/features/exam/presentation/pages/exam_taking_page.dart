@@ -23,6 +23,8 @@ import '../../../../core/services/mediapipe_proctoring_service.dart';
 import '../../../../core/services/permission_service.dart';
 import '../../../../core/services/web_camera_permission.dart';
 import '../../../../core/services/web_exam_guard.dart';
+import '../../../../core/services/web_face_presence.dart';
+import '../../../../core/services/web_face_signal_source.dart';
 import '../../../../core/services/web_guards.dart';
 import '../../../../core/utils/proctor_log.dart';
 import '../../../../core/widgets/responsive_layout.dart';
@@ -72,6 +74,18 @@ class ExamTakingPage extends ConsumerStatefulWidget {
   /// DOM) does not exist.
   final WebGuards? webGuards;
 
+  /// The browser's face-detector hook for this session; injectable for the same
+  /// reason [webGuards] is.
+  ///
+  /// The web build has no on-device inference (no ML Kit, and the web camera
+  /// plugin cannot stream frames), so a host page that runs a detector reports
+  /// through [WebFaceSignalSource] and `WebFacePresenceMonitor` turns those
+  /// reports into the `looking_away`/`no_face`/`multiple_faces` signals the
+  /// notifier already understands. Null asks the platform for its own source,
+  /// which on Android, iOS, desktop and the VM reports "unsupported" and starts
+  /// nothing.
+  final WebFaceSignalSource? webFaceSignals;
+
   /// Clock the browser-guard timings read: the start-up grace and the fullscreen
   /// countdown. Null means the wall clock, which is what production uses.
   ///
@@ -110,6 +124,7 @@ class ExamTakingPage extends ConsumerStatefulWidget {
     this.startedAt,
     this.endsAt,
     this.webGuards,
+    this.webFaceSignals,
     this.clock,
     this.mockCamera,
     this.candidateName,
@@ -151,6 +166,15 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// Idle detection for this session: a screen nobody has touched for
   /// [AfkWatcher.defaultIdleThreshold] is an `idle_afk` violation.
   AfkWatcher? _afk;
+
+  /// The browser's face-detector bridge for this session (see
+  /// [ExamTakingPage.webFaceSignals]). Null on every platform that has no host
+  /// detector, which is every platform but the web.
+  WebFacePresenceMonitor? _facePresence;
+
+  /// The monitor's sustained signals, forwarded to the notifier. Kept so a
+  /// finished session can cancel it rather than hold the monitor alive.
+  StreamSubscription<GazeSignal>? _facePresenceSub;
 
   /// Whether this session's pointer route is registered on
   /// [GestureBinding.pointerRouter]. Tracked because removing a route that was
@@ -311,6 +335,12 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     final afk = AfkWatcher(onIdle: notifier.reportIdleAfk, clock: widget.clock);
     _afk = afk;
     afk.start();
+
+    // The browser's face bridge, where the platform has one. It is started with
+    // the session rather than with the camera because it is only a hook: the
+    // detections arrive from the page, and the notifier drops them while the
+    // camera is paused anyway.
+    _startFacePresence(notifier);
 
     // Pointer input is what keeps that idle window quiet. A router *route* rather
     // than a `Listener` widget: this only observes, and a global route sees the
@@ -833,15 +863,45 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     kiosk.dispose();
   }
 
-  /// Releases the idle watcher and the device-integrity probe.
+  /// Starts the browser's face-detector bridge, where the platform has one.
   ///
+  /// Nothing is started on a platform without a hook: the source reports
+  /// `isSupported == false` and is released immediately, so an Android or iOS
+  /// session adds no listener and no state (its faces come from ML Kit through
+  /// the engine the notifier already listens to). Nothing is invented either -
+  /// a browser whose host page has no detector keeps reporting the signals it
+  /// actually has rather than a `no_face` nobody measured.
+  void _startFacePresence(ProctoringNotifier notifier) {
+    final source = widget.webFaceSignals ?? WebFaceSignalSource();
+    if (!source.isSupported) {
+      source.dispose();
+      return;
+    }
+    final monitor = WebFacePresenceMonitor(source: source, clock: widget.clock)
+      ..start();
+    _facePresence = monitor;
+    // The notifier does the judging of *severity* (dedupe window, snapshot,
+    // strike ladder, disqualification); the monitor has already decided that a
+    // detection was sustained enough to be a signal.
+    _facePresenceSub = monitor.signals.listen(notifier.reportGazeSignal);
+  }
+
+  /// Releases the idle watcher, the browser's face bridge and the
+  /// device-integrity probe.
   /// Called by [dispose] and at the start of [_runBootstrap]: a retry re-runs the
   /// whole session setup, so without this the watcher the failed attempt started
   /// would keep its timer - and its key handler - behind the session that
-  /// replaced it. Both are idempotent.
+  /// replaced it. All of them are idempotent.
   void _releaseSessionWatchers() {
     _afk?.stop();
     _afk = null;
+    // The bridge's source is uninstalled by the monitor's dispose, so a finished
+    // exam leaves no `window.proctorGuardFaceSignal` behind for the page to keep
+    // calling.
+    unawaited(_facePresenceSub?.cancel());
+    _facePresenceSub = null;
+    _facePresence?.dispose();
+    _facePresence = null;
     // Guarded: this also runs for a bootstrap that never reached the registration
     // below, and `removeGlobalRoute` asserts on a route it does not know (see
     // [_pointerRouteAttached]).

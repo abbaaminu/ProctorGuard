@@ -46,7 +46,10 @@ android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLoc
    and use `estimateHeadPose` when your model emits 3D (x/y/z) landmarks.
    **On the web there is no ML Kit**, so a browser session runs either in mock
    mode (`.\run_app.ps1 -Mock`, or `--dart-define=MOCK_CAMERA=true`) or with a
-   webcam and no face signals; the audio hook (`reportAudioLevel`) and the
+   webcam and no face signals *of its own* — a hosting page can supply them
+   through the `proctorGuardFaceSignal` bridge (see
+   [Face signals on the web](#face-signals-on-the-web-the-host-page-bridge)); the
+   audio hook (`reportAudioLevel`) and the
    browser guards below are platform-independent and work either way.
 4. Routing is wired: `RoleGate` reads `profiles.role` after sign-in and routes on
    the four values of the `public.user_role` enum — students to
@@ -890,7 +893,7 @@ publish the signed, split-per-ABI APKs students install.
 | --- | --- | --- | --- | --- |
 | Android (phone) | `flutter build apk` | ML Kit, on-device | `record` | Lock task / screen pinning + immersive chrome |
 | iOS | `flutter build ios` — needs the Podfile work in `ios/README.md` first | ML Kit, on-device | `record` | Best-effort only (`startLock` reports `granted: false`) |
-| Web (Chrome/Edge) | `flutter build web` | **none** — no ML Kit for browsers | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
+| Web (Chrome/Edge) | `flutter build web` | **No ML Kit for browsers.** A host page may supply detections through the `proctorGuardFaceSignal` bridge ([below](#face-signals-on-the-web-the-host-page-bridge)) | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
 | macOS / Windows / Linux | — | — | — | — |
 
 **There is no `macos/`, `windows/` or `linux/` runner here, and that is a scope
@@ -903,6 +906,108 @@ rests on and cannot reach ML Kit without another plugin, so it would *add* a
 supported platform whose proctoring is weaker than the browser's. Adding one is
 a new target with its own privacy and security review, not a `flutter create`
 away.
+
+### Face signals on the web (the host-page bridge)
+
+A browser cannot run ML Kit, and `camera_web` cannot hand `CameraImage` frames to
+a model (`supportsImageStreaming()` is false there, so the exam page never calls
+`startImageStream` on the web). What the web build can do is **host** a detector
+someone else runs: `WebFaceSignalSource` (`lib/core/services/web_face_signal_source.dart`,
+DOM half in `web_face_signal_source_web.dart`) installs one global function with
+the attempt, and removes it when the attempt ends.
+
+```js
+// Once per detection, from any page-level detector (WASM, WebGPU, a remote
+// service - whatever the institution runs). One string argument.
+window.proctorGuardFaceSignal('centered');
+```
+
+| Message | Meaning | Becomes |
+| --- | --- | --- |
+| `centered` | face visible, head within tolerance | ends the current episode (never a strike itself) |
+| `looking_away` | face visible, head turned away | `looking_away`, if it holds for ~1.2s |
+| `no_face` | nothing in frame | `no_face`, if it holds for ~1.2s |
+| `multiple_faces` | a second person in frame | `multiple_faces`, at once (latched 30s) |
+| `pose:<yaw>,<pitch>` | head pose in degrees, instead of a verdict | this app applies its own tolerances (`28°` yaw / `30°` pitch) |
+
+`WebFacePresenceMonitor` (`web_face_presence.dart`) is the judgement, not the
+detection: it sustains a condition before reporting it, re-arms after `centered`,
+and ignores the first 5s, so a browser episode is worth exactly the strike a
+phone's is and arrives through the same `ProctoringNotifier.reportGazeSignal`
+door. Three consequences worth knowing:
+
+* **Nothing is invented.** `isSupported` is false everywhere but a web build with
+  the hook installed, so a browser with no detector reports **fewer** signals and
+  the attempt's timeline says so — it never logs a `no_face` for a student it
+  never looked at.
+* **The page cannot log violations**, only detections: unknown or malformed
+  strings are passed through and ignored, an empty or non-string argument is
+  dropped, and the vocabulary is checked here rather than by the host.
+* **The hook does not outlive the attempt.** It is installed with the session and
+  cleared on dispose, so a detector that keeps running on the page reports into
+  nothing after a submit.
+
+The DOM half is type-checked by `flutter analyze` and compiled by the web build;
+the rules are covered on the VM by `test/web_face_presence_test.dart`, and the
+exam page's use of them by the "the browser face bridge" group in
+`test/exam_taking_page_test.dart`.
+
+## Web install surface (icons, manifest, favicon)
+
+`flutter build web` is a deployable app, not just a page: Chrome/Edge offer
+**Install app**, and a custom domain is where institutions actually host it. That
+install surface is `web/manifest.json` + the `<link rel="icon">` /
+`apple-touch-icon` elements in `web/index.html`, and all of it draws ProctorGuard's
+own artwork — the same `assets/icon/app_icon.png` the Android launcher uses.
+
+| File | Size | Source |
+| --- | --- | --- |
+| `web/icons/Icon-192.png` | 192×192 | generated |
+| `web/icons/Icon-512.png` | 512×512 | generated |
+| `web/icons/Icon-maskable-192.png` | 192×192 | generated |
+| `web/icons/Icon-maskable-512.png` | 512×512 | generated |
+| `web/favicon.png` | 16×16 | generated |
+
+**They are generated, not drawn.** `pubspec.yaml`'s `flutter_launcher_icons:` block
+has a `web:` section (`generate: true`, `image_path: assets/icon/app_icon.png`,
+`background_color: "#14284B"`, `theme_color: "#3F51B5"`); after changing
+`app_icon.png` run, from `mobile/`:
+
+```powershell
+dart run flutter_launcher_icons
+```
+
+and commit the five files. They are checked in because `flutter build web` copies
+`web/` verbatim — a build machine never runs the generator, so the *committed*
+files are what a browser installs. (The maskable pair is byte-identical to the
+plain pair: the artwork is already drawn full-bleed on the navy background, so it
+needs no extra safe-zone padding. A square, opaque 192/512 with the shield inside
+the 80% circle is exactly what `purpose: maskable` wants. The 409 KB, 2720²
+`favicon.png` that used to sit here was a poster image sent to every tab strip;
+the generated 16 px one is 541 bytes.)
+
+Two rules hold the surface together, and `test/web_manifest_contract_test.dart`
+fails without them:
+
+* **Every URL is relative.** `manifest.json`'s `start_url`, `scope` and `icons[].src`
+  and every `href` in `index.html` are relative (`"."`, `"icons/Icon-192.png"`),
+  so they resolve against `<base href>` — the `--base-href` a sub-path deploy sets
+  (`https://example.edu/proctorguard/`). An absolute `/icons/Icon-192.png` 404s
+  there, and an absolute `https://<old host>/…` pins the install to the host it was
+  built on.
+* **The advertised size is the file's size.** `manifest.json` declares
+  `192x192`/`512x512` and both `purpose: ""` and `purpose: "maskable"` (Chrome
+  needs 192 **and** 512 before it offers installation), `index.html` links the
+  192 px icon for the tab strip plus the 16 px favicon, and `apple-touch-icon`
+  points at the 192 px icon — iOS asks for 180 px and scales it. A renamed or
+  resized file is a contract test failure, not an icon that silently disappears.
+
+The test does not trust the *filenames*, which is the bug this surface shipped
+with: all four `web/icons/*.png` were once Flutter's stock logo with the white
+corner while the manifest advertised them as the app's. It decodes the first pixel
+of each icon (PNG `IHDR` + the first `IDAT`, no image package) and requires the
+artwork's navy `#14284B`, so it fails both on an icon generated from the wrong
+source and on a skipped regeneration.
 
 ## Responsive layout (Android phone + desktop browser)
 

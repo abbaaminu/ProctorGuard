@@ -25,10 +25,24 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
   <meta name="apple-mobile-web-app-title" content="ProctorGuard">
-  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+  <link rel="apple-touch-icon" sizes="192x192" href="icons/Icon-192.png">
 
-  <!-- Favicon -->
-  <link rel="icon" type="image/png" href="favicon.png"/>
+  <!-- Favicon and app icons.
+
+       Every URL below is *relative*, and deliberately so: relative URLs resolve
+       against <base href> above, which is what `--base-href` rewrites for a
+       custom domain served from a sub-path (`https://example.edu/proctorguard/`).
+       An absolute `/icons/Icon-192.png` would 404 there and an absolute
+       `https://<old host>/...` would pin the app to the host it was built on,
+       which is exactly how an installed app ends up with a blank or wrong icon
+       after a move. Keep them relative; `test/web_manifest_contract_test.dart`
+       fails if one becomes absolute or stops resolving to a real file.
+
+       The 192 px icon is the one a retina tab strip wants; `favicon.png` (16 px,
+       generated with the rest by `dart run flutter_launcher_icons`) is the
+       small fallback. Neither is the stock Flutter logo. -->
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/Icon-192.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="favicon.png"/>
 
   <title>ProctorGuard — Exam Proctoring</title>
   <link rel="manifest" href="manifest.json">

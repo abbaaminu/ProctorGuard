@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:proctorguard/core/services/audio_monitor.dart';
 import 'package:proctorguard/core/services/key_value_store.dart';
 import 'package:proctorguard/core/services/kiosk_service.dart';
+import 'package:proctorguard/core/services/web_face_signal_source.dart';
 import 'package:proctorguard/core/services/web_guards.dart';
 import 'package:proctorguard/features/exam/domain/entities/exam.dart';
 import 'package:proctorguard/features/exam/domain/entities/exam_submit_result.dart';
@@ -90,6 +91,7 @@ void main() {
     WebGuards? webGuards,
     DateTime Function()? clock,
     AudioLevelSource? audioSource,
+    WebFaceSignalSource? webFaceSignals,
     String? candidateName,
     String? examTitle,
     String? candidateEmail,
@@ -125,6 +127,7 @@ void main() {
                             submissionId: 'sub-1',
                             mockCamera: mockCamera,
                             webGuards: webGuards,
+                            webFaceSignals: webFaceSignals,
                             clock: clock,
                             candidateName: candidateName,
                             examTitle: examTitle,
@@ -447,6 +450,106 @@ void main() {
         proctoring.violations.map((violation) => violation.type.dbValue),
         contains('copy_paste_attempt'),
       );
+    });
+  });
+
+  group('the browser face bridge (requirement 2, web)', () {
+    late _FakeFaceSource faces;
+    late DateTime now;
+
+    setUp(() {
+      faces = _FakeFaceSource();
+      now = DateTime.utc(2026, 6, 1, 9);
+    });
+
+    /// Opens the attempt and moves past the bridge's 5s start-up grace, so a
+    /// detection below is a real one rather than a student adjusting the camera.
+    ///
+    /// The clock is moved by hand for the same reason as the fullscreen group:
+    /// the grace is measured on the injected wall clock, not on the fake time a
+    /// widget test advances.
+    Future<void> openPastGrace(WidgetTester tester) async {
+      await tester.pumpWidget(
+        pageUnderTest(webFaceSignals: faces, clock: () => now),
+      );
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+      now = now.add(const Duration(seconds: 6));
+    }
+
+    testWidgets('a held look away is one looking_away strike', (tester) async {
+      await openPastGrace(tester);
+
+      faces.emit('looking_away');
+      await tester.pump();
+      await tester.pump();
+      expect(
+        proctoring.violations,
+        isEmpty,
+        reason: 'a glance at the keyboard is not a violation',
+      );
+
+      now = now.add(const Duration(milliseconds: 1300));
+      faces.emit('LOOKING_AWAY');
+      await tester.pump();
+      await tester.pump();
+
+      expect(proctoring.violations.single.type.dbValue, 'looking_away');
+      expect(find.text('Warning 1 / 3'), findsOneWidget);
+    });
+
+    testWidgets('a second person is reported as soon as the page sees them',
+        (tester) async {
+      await openPastGrace(tester);
+
+      // No sustain to wait out: two faces need no measuring.
+      faces.emit('multiple_faces');
+      await tester.pump();
+      await tester.pump();
+
+      expect(proctoring.violations.single.type.dbValue, 'multiple_faces');
+    });
+
+    testWidgets('nothing is judged while the page has no detector', (tester) async {
+      // Android, iOS, desktop, and a browser whose host page ships no detector:
+      // the source says so, the page releases it, and the attempt is proctored
+      // exactly as it was before the bridge existed.
+      faces = _FakeFaceSource(supported: false);
+      await tester.pumpWidget(
+        pageUnderTest(webFaceSignals: faces, clock: () => now),
+      );
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      expect(faces.disposed, isTrue, reason: 'an unsupported source is let go');
+
+      now = now.add(const Duration(seconds: 10));
+      faces.emit('looking_away');
+      faces.emit('multiple_faces');
+      await tester.pump();
+      await tester.pump();
+      expect(proctoring.violations, isEmpty);
+    });
+
+    testWidgets('leaving the attempt uninstalls the hook', (tester) async {
+      await openPastGrace(tester);
+      expect(faces.disposed, isFalse);
+
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump();
+
+      expect(
+        faces.disposed,
+        isTrue,
+        reason: 'the page must not keep a detector reporting into a closed '
+            'attempt',
+      );
+
+      // Late calls from a page that has not unloaded yet are ignored.
+      faces.emit('multiple_faces');
+      await tester.pump();
+      await tester.pump();
+      expect(proctoring.violations, isEmpty);
     });
   });
 
@@ -1314,6 +1417,40 @@ class _FakeWebGuards implements WebGuards {
 
   @override
   void dispose() {}
+}
+
+/// A host detector with no browser behind it, so the bridge's contract can be
+/// exercised on the VM (where `flutter test` runs and no DOM exists).
+///
+/// It stands in for `window.proctorGuardFaceSignal` exactly as `_FakeWebGuards`
+/// stands in for the DOM: the page under test is handed one, and each test states
+/// what the host detector saw.
+class _FakeFaceSource implements WebFaceSignalSource {
+  _FakeFaceSource({this.supported = true});
+
+  final bool supported;
+  final StreamController<String> controller =
+      StreamController<String>.broadcast();
+
+  /// Whether the exam page released the hook. A source left installed is a
+  /// detector still reporting into an attempt that has already ended.
+  bool disposed = false;
+
+  void emit(String message) {
+    if (!controller.isClosed) controller.add(message);
+  }
+
+  @override
+  bool get isSupported => supported;
+
+  @override
+  Stream<String> get messages => controller.stream;
+
+  @override
+  void dispose() {
+    disposed = true;
+    if (!controller.isClosed) controller.close();
+  }
 }
 
 /// A microphone with no platform channel behind it, and enough controls to
