@@ -172,6 +172,32 @@ void main() {
       await flush();
       expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
     });
+
+    test('a near-sideways turn needs no sustain', () async {
+      report('pose:70,0');
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.lookingAway],
+        reason: 'nothing on the screen is readable at 70 deg, so the first '
+            'detection is already the episode',
+      );
+
+      // Still one strike while the head stays there.
+      hold('pose:70,0');
+      await flush();
+      expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
+
+      // Facing the screen ends it, and the next turn is a fresh episode.
+      report('pose:0,0');
+      now = now.add(const Duration(seconds: 2));
+      report('pose:70,0');
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(2),
+      );
+    });
   });
 
   group('messages this app cannot read', () {

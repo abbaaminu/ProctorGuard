@@ -49,6 +49,9 @@ abstract final class WebFaceMessages {
 ///    away is reported again;
 ///  * `multiple_faces` is not sustained (two people need no measuring): it is
 ///    latched until the student has been alone for [multipleFacesCooldown];
+///  * a measured `pose:` turned past [immediateAwayYawDegrees] is reported on the
+///    detection itself: that far round, the student is not reading the screen,
+///    and waiting out the sustain would only delay a warning they are earning;
 ///  * nothing is reported during [startupGrace].
 ///
 /// The difference is the unit of "held". The engine counts consecutive frames,
@@ -56,7 +59,8 @@ abstract final class WebFaceMessages {
 /// detector may run at 2 fps or burst ten results from one buffered frame, so the
 /// web measures elapsed [sustain] instead. Same effect - a condition that keeps
 /// being true for about a second - without assuming a frame rate nothing
-/// guarantees.
+/// guarantees, and with the same single exception both sides make for a head
+/// that is already unmistakably turned.
 class WebFacePresenceMonitor {
   WebFacePresenceMonitor({
     required WebFaceSignalSource source,
@@ -65,6 +69,7 @@ class WebFacePresenceMonitor {
     this.multipleFacesCooldown = const Duration(seconds: 30),
     this.offCenterYawDegrees = 28.0,
     this.offCenterPitchDegrees = 30.0,
+    this.immediateAwayYawDegrees = 50.0,
     DateTime Function()? clock,
   })  : assert(
           sustain > Duration.zero,
@@ -81,6 +86,11 @@ class WebFacePresenceMonitor {
         assert(
           offCenterYawDegrees > 0 && offCenterPitchDegrees > 0,
           'a zero tolerance would call every head position off centre',
+        ),
+        assert(
+          immediateAwayYawDegrees >= offCenterYawDegrees,
+          'an "unambiguous" turn inside the ordinary tolerance would flag '
+          'every glance',
         ),
         _source = source,
         _now = clock ?? DateTime.now {
@@ -111,6 +121,25 @@ class WebFacePresenceMonitor {
   /// a verdict has already applied its own). The engine's defaults.
   final double offCenterYawDegrees;
   final double offCenterPitchDegrees;
+
+  /// Yaw past which a single `pose:` detection is already unambiguous evidence,
+  /// instead of [sustain] of it - the engine's
+  /// `MediaPipeProctoringService.immediateAwayThresholdDegrees`, for a monitor
+  /// that judges messages rather than frames.
+  ///
+  /// A near-sideways verdict is the one thing a sustain cannot improve on: there
+  /// is no reading of the screen at that angle, so the second message only makes
+  /// the student wait for a warning they have already earned. Anything between
+  /// [offCenterYawDegrees] and this line keeps the full sustain.
+  ///
+  /// Verdicts (`looking_away`) are deliberately not included: a page that sends
+  /// its own verdict may be running a looser threshold than this app's, and its
+  /// word alone is worth the sustain. Pitch is excluded for the engine's reason:
+  /// looking down at notes and a keyboard is normal exam behaviour.
+  ///
+  /// Must be at least [offCenterYawDegrees] (asserted): this may only shorten the
+  /// wait for a clearly turned head, never flag a glance.
+  final double immediateAwayYawDegrees;
 
   final WebFaceSignalSource _source;
   final DateTime Function() _now;
@@ -202,7 +231,12 @@ class WebFacePresenceMonitor {
     // not know. Ignoring it is the only honest reading: it is not evidence.
     if (pose == null) return;
 
-    if (pose.$1.abs() > offCenterYawDegrees ||
+    if (pose.$1.abs() > immediateAwayYawDegrees) {
+      // Past a near-sideways turn nothing is being read off the screen, so this
+      // detection is the episode: no sustain to sit through, exactly as the
+      // engine treats the same angle.
+      _onAway(now, immediate: true);
+    } else if (pose.$1.abs() > offCenterYawDegrees ||
         pose.$2.abs() > offCenterPitchDegrees) {
       _onAway(now);
     } else {
@@ -223,7 +257,7 @@ class WebFacePresenceMonitor {
     _emit(GazeSignal.noFace);
   }
 
-  void _onAway(DateTime now) {
+  void _onAway(DateTime now, {bool immediate = false}) {
     // A visible head means the absence episode is over, so a later one is
     // reported again - and a second person in frame may have left.
     _missingSince = null;
@@ -232,7 +266,9 @@ class WebFacePresenceMonitor {
 
     _awaySince ??= now;
     if (_awayFlagged) return;
-    if (now.difference(_awaySince!) < sustain) return;
+    // `immediate` is the near-sideways turn: unambiguous on the first detection,
+    // so the sustain window is skipped rather than filled.
+    if (!immediate && now.difference(_awaySince!) < sustain) return;
     _awayFlagged = true;
     _emit(GazeSignal.lookingAway);
   }

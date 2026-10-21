@@ -21,9 +21,9 @@ void main() {
 
   /// A detector that has already measured the room.
   ///
-  /// One `-60` dBFS sample with a zero-length window gives a `-54` dB threshold
-  /// (floor + 6, inside the clamp), so `-50` is over the line, `-56` is a quiet
-  /// syllable inside the default 3 dB band, and `-65` is a real dip.
+  /// One `-60` dBFS sample with a zero-length window gives a `-55` dB threshold
+  /// (floor + 5, the bottom of the clamp), so `-50` is over the line, `-56` is a
+  /// quiet syllable inside the default 3 dB band, and `-65` is a real dip.
   AudioNoiseDetector measured({double hysteresisDb = 3}) {
     final detector = AudioNoiseDetector(
       calibrationWindow: Duration.zero,
@@ -33,7 +33,7 @@ void main() {
     );
     detector.add(-60);
     expect(detector.isCalibrated, isTrue);
-    expect(detector.thresholdDb, -54);
+    expect(detector.thresholdDb, -55);
     return detector;
   }
 
@@ -41,11 +41,11 @@ void main() {
     test('a quiet syllable does not throw away the sentence', () {
       final sensor = measured();
 
-      expect(sensor.add(-50), isFalse); // 4 dB over: the window opens
+      expect(sensor.add(-50), isFalse); // 5 dB over: the window opens
       expect(sensor.isNoisy, isTrue);
 
       now = now.add(const Duration(seconds: 1));
-      // 2 dB under the line: a syllable, not a break in the sound. The window
+      // 1 dB under the line: a syllable, not a break in the sound. The window
       // keeps whatever it had instead of restarting from zero.
       expect(sensor.add(-56), isFalse);
       expect(
@@ -177,7 +177,7 @@ void main() {
 
       expect(sensor.isCalibrated, isTrue);
       expect(sensor.roomFloorDb, -77.5);
-      expect(sensor.thresholdDb, -55); // -77.5 + 6, clamped up to the floor
+      expect(sensor.thresholdDb, -55); // -77.5 + 5, clamped up to the floor
       expect(
         sensor.calibrationSampleCount,
         0,
@@ -222,6 +222,60 @@ void main() {
       expect(sensor.isCalibrated, isFalse);
       expect(sensor.thresholdDb, -30); // the uncalibrated default again
       expect(sensor.samples, 0);
+    });
+  });
+
+  group('shipped sensitivity', () {
+    /// A detector on the shipped tuning, already past calibration. `-60` measures
+    /// the room, so the threshold is -55 dB and `-40` is comfortably over it.
+    AudioNoiseDetector calibrated() {
+      final detector = AudioNoiseDetector(
+        calibrationWindow: Duration.zero,
+        minCalibrationSamples: 1,
+        clock: () => now,
+      );
+      detector.add(-60);
+      expect(detector.isCalibrated, isTrue);
+      return detector;
+    }
+
+    /// Feeds [duration] of continuous meter noise at `AudioMonitor`'s real rate -
+    /// one sample every 250 ms - and returns how many strikes it produced.
+    int sustainedNoise(AudioNoiseDetector detector, Duration duration) {
+      var strikes = 0;
+      final samples = duration.inMilliseconds ~/ 250;
+      for (var i = 0; i < samples; i++) {
+        now = now.add(const Duration(milliseconds: 250));
+        if (detector.add(-40)) strikes++;
+      }
+      return strikes;
+    }
+
+    test('two seconds of meter noise is one strike, not none and not two', () {
+      final sensor = calibrated();
+
+      expect(
+        sustainedNoise(sensor, const Duration(seconds: 2)),
+        1,
+        reason: 'the window plus the 250 ms sampling offset has to fit inside '
+            'the two to three seconds of noise the rule is meant to catch',
+      );
+    });
+
+    test('a one-second cough is still not enough', () {
+      final sensor = calibrated();
+
+      expect(sustainedNoise(sensor, const Duration(seconds: 1)), 0);
+      expect(sensor.isNoisy, isTrue, reason: 'suspicious, not a violation');
+    });
+
+    test('the spare half second absorbs the sampling offset', () {
+      // A burst that starts just after a sample only contributes its remainder to
+      // the window: 1.75 s of evidence from 2 s of noise. The shipped window is
+      // deliberately below that, so the burst is still logged.
+      final sensor = calibrated();
+      expect(sensor.sustain, const Duration(milliseconds: 1500));
+      expect(sustainedNoise(sensor, const Duration(milliseconds: 1750)), 1);
     });
   });
 }

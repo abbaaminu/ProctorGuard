@@ -928,13 +928,14 @@ window.proctorGuardFaceSignal('centered');
 | `looking_away` | face visible, head turned away | `looking_away`, if it holds for ~1.2s |
 | `no_face` | nothing in frame | `no_face`, if it holds for ~1.2s |
 | `multiple_faces` | a second person in frame | `multiple_faces`, at once (latched 30s) |
-| `pose:<yaw>,<pitch>` | head pose in degrees, instead of a verdict | this app applies its own tolerances (`28°` yaw / `30°` pitch) |
+| `pose:<yaw>,<pitch>` | head pose in degrees, instead of a verdict | this app applies its own tolerances (`28°` yaw / `30°` pitch), and reports a turn past `50°` yaw at once |
 
 `WebFacePresenceMonitor` (`web_face_presence.dart`) is the judgement, not the
-detection: it sustains a condition before reporting it, re-arms after `centered`,
-and ignores the first 5s, so a browser episode is worth exactly the strike a
-phone's is and arrives through the same `ProctoringNotifier.reportGazeSignal`
-door. Three consequences worth knowing:
+detection: it sustains a condition before reporting it (a measured `pose:` turned
+past `50°` yaw excepted — that far round, the first detection is already the
+episode), re-arms after `centered`, and ignores the first 5s, so a browser episode
+is worth exactly the strike a phone's is and arrives through the same
+`ProctoringNotifier.reportGazeSignal` door. Three consequences worth knowing:
 
 * **Nothing is invented.** `isSupported` is false everywhere but a web build with
   the hook installed, so a browser with no detector reports **fewer** signals and
@@ -1108,7 +1109,7 @@ the 3-strike rule:
 
 | Detector | Signal | `action_type` |
 | --- | --- | --- |
-| ML Kit face detection | no face / several faces / head pose off-axis, each held for three consecutive frames before it counts | `no_face`, `multiple_faces`, `looking_away` |
+| ML Kit face detection | no face / several faces / head pose off-axis, each held for three consecutive frames before it counts (a head turned past ~50 deg yaw counts at once) | `no_face`, `multiple_faces`, `looking_away` |
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
 | `WebGuards` (Chrome/Edge) | tab hidden, window blurred, or HTML5 fullscreen left | `app_minimized` |
@@ -1125,7 +1126,13 @@ enough that a student who has really left the frame or turned to a second screen
 reported while they are still doing it. Any frame back in the tolerated pose resets
 that count, so only an unbroken run counts, and each episode reports once.
 `multiple_faces` is the exception: two people in frame needs no measuring, so it
-reports immediately and is latched per episode instead.
+reports immediately and is latched per episode instead. There is one other: a head
+turned past ~50 deg yaw (`immediateAwayThresholdDegrees`) is past the point where
+anything on the screen could still be read, so it is reported on the first frame
+rather than the third — waiting two more frames would only delay a warning the
+student has already earned. Pitch is deliberately not included, because looking
+down at a keyboard or notes is ordinary exam behaviour. Any angle between the
+tolerance and that line keeps the full frame count.
 `ProctoringNotifier.setCameraActive` gates the whole camera set while the feed is not
 streaming.
 
@@ -1133,21 +1140,27 @@ Audio is judged the same way, and the rules are deliberately pure Dart
 (`core/services/audio_noise_detector.dart`) so they can be tested without a
 microphone: the first 4s (`calibrationWindow`) measure the room's floor, taking the
 **median** rather than the mean so a student who starts talking immediately cannot
-drag the floor up to their own voice; the threshold becomes that floor + 6 dB
+drag the floor up to their own voice; the threshold becomes that floor + 5 dB
 (`speechMarginDb`), clamped to −55…−32 dBFS (`minThresholdDb`/`maxThresholdDb`). The
-margin is deliberately small — 6 dB is a clear, *sustained* doubling of acoustic power
-— and the band is deliberately low, so the rule flags **little and background sound**
-(quiet speech, a second voice, a television, traffic, a generator) rather than only a
-raised voice. The upper clamp does the heavy lifting in a noisy room: without it a room
-that is already loud on its own would raise the bar to "shout only" and log nothing,
+margin is deliberately small — 5 dB is a clear, *sustained* step above the hum it is
+measured against — and the band is deliberately low, so the rule flags **little and
+background sound** (quiet speech, a second voice, a television, traffic, a generator)
+rather than only a raised voice. The upper clamp does the heavy lifting in a noisy
+room: without it a room that is already loud on its own would raise the bar to
+"shout only" and log nothing,
 whereas pinned below the room's own floor that steady background *is* the finding. The
 lower clamp keeps a dead-silent room's threshold above the microphone's own self-noise,
-which would otherwise read as "talking". The level must then add up to 2s above it
+which would otherwise read as "talking". The level must then add up to 1.5s above it
 (`sustain`) — roughly one spoken sentence — and a gap below the threshold ends the
 episode only once it has lasted longer than 400 ms (`releaseGrace`). That gap allowance
 is what makes the rule catch **talking** rather than only an unbroken shout: at four
 samples a second a real sentence drops below the threshold between words, so a rule
 that reset on any single low sample never filled its window and logged nothing at all.
+The window is shorter than the two to three seconds a supervisor would call talking on
+purpose: the meter is read every 250 ms, so a burst that starts just after a sample
+contributes only its remainder — two seconds of noise can arrive as 1.75 s of evidence,
+which a two-second window would never accept. The spare half second is headroom for
+that offset; the grace and the 3 dB hysteresis are what still keep one-offs out.
 A cough, a chair creak or a breath is still far too brief to add up, a room that has
 genuinely gone quiet ends the episode inside the grace, and after a strike the detector
 ignores the level for 5s (`cooldown`), so one long outburst is one strike rather than

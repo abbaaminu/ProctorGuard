@@ -498,6 +498,28 @@ void main() {
       expect(find.text('Warning 1 / 3'), findsOneWidget);
     });
 
+    testWidgets('a near-sideways head is one looking_away strike on sight',
+        (tester) async {
+      await openPastGrace(tester);
+
+      // The page measured the head, and 70 deg is past the point where anything
+      // on the screen could still be read - so the strike does not wait out a
+      // sustain the way a glance at 40 deg would.
+      faces.emit('pose:70,0');
+      await tester.pump();
+      await tester.pump();
+
+      expect(proctoring.violations.single.type.dbValue, 'looking_away');
+      expect(find.text('Warning 1 / 3'), findsOneWidget);
+
+      // Still held: the same episode is not a second strike.
+      now = now.add(const Duration(seconds: 2));
+      faces.emit('pose:70,5');
+      await tester.pump();
+      await tester.pump();
+      expect(proctoring.violations, hasLength(1));
+    });
+
     testWidgets('a second person is reported as soon as the page sees them',
         (tester) async {
       await openPastGrace(tester);

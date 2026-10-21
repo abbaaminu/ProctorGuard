@@ -47,11 +47,11 @@ import 'dart:math' as math;
 class AudioNoiseDetector {
   AudioNoiseDetector({
     this.calibrationWindow = const Duration(seconds: 4),
-    this.sustain = const Duration(seconds: 2),
+    this.sustain = const Duration(milliseconds: 1500),
     this.releaseGrace = const Duration(milliseconds: 400),
     this.hysteresisDb = 3,
     this.cooldown = const Duration(seconds: 5),
-    this.speechMarginDb = 6,
+    this.speechMarginDb = 5,
     this.minThresholdDb = -55,
     this.maxThresholdDb = -32,
     this.defaultThresholdDb = -30,
@@ -83,10 +83,18 @@ class AudioNoiseDetector {
 
   /// How long the level must add up to above the threshold before it is a strike.
   ///
-  /// Two seconds is roughly one spoken sentence: long enough that a cough, a
-  /// chair creak or a door cannot reach it, short enough that a student who
+  /// One and a half seconds is roughly one spoken sentence: long enough that a
+  /// cough, chair creak or door cannot reach it, short enough that a student who
   /// answers their phone or talks a neighbour through a question is caught while
   /// they are still doing it.
+  ///
+  /// Deliberately shorter than the two-to-three seconds of sound a supervisor
+  /// would call talking. `AudioMonitor` asks for a level every 250 ms, so a
+  /// burst that starts just after a sample only contributes its remainder to
+  /// the window: with a two-second window a two-second burst could land at
+  /// 1.75 s of evidence and never be logged - exactly the "audio never flags"
+  /// case. The spare half second absorbs that sampling offset; [releaseGrace]
+  /// and [hysteresisDb] are what still keep one-offs out.
   final Duration sustain;
 
   /// How much of a dip below the threshold is bridged instead of ending the
@@ -125,10 +133,10 @@ class AudioNoiseDetector {
   final Duration cooldown;
 
   /// How far above the measured room floor counts as human noise rather than the
-  /// room itself. 6 dB is a clear, *sustained* doubling of acoustic power over the
-  /// hum it is measured against, so the room's own level does not trip it - but it
-  /// is low enough that quiet speech (often only a few decibels over the floor) and
-  /// steady background sound are still caught, not just a raised voice.
+  /// room itself. 5 dB is a clear, *sustained* step above the hum it is measured
+  /// against, so the room's own level does not trip it - but it is low enough that
+  /// quiet speech (often only a few decibels over the floor) and steady background
+  /// sound are still caught, not just a raised voice.
   final double speechMarginDb;
 
   /// Sensitivity bounds. Without the clamp a silent room would produce a threshold

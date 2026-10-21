@@ -215,6 +215,53 @@ void main() {
       );
     });
 
+    test('a near-sideways turn is reported on the first frame', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      // 60 deg is past the point where the student could still be reading the
+      // screen, so waiting for the third frame would only delay the warning.
+      const turned = FaceFrameResult(faceCount: 1, yawDegrees: 60);
+      engine.handleResult(turned);
+
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+      );
+
+      // The latch still applies: one episode is one strike.
+      feed(engine, turned, 20);
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+      );
+    });
+
+    test('a steep tilt still waits for the frame count', () async {
+      // Pitch is judged over frames on purpose: looking down is normal exam
+      // behaviour, and one steep Euler estimate is worth confirming.
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      const down = FaceFrameResult(faceCount: 1, pitchDegrees: 60);
+      feed(engine, down, 2);
+      await pumpEventQueue();
+      expect(seen, isEmpty, reason: 'one steep frame is not evidence yet');
+
+      feed(engine, down, 1);
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+      );
+    });
+
     test('three consecutive off-axis frames log looking_away exactly once',
         () async {
       final engine = clocked();
@@ -360,6 +407,9 @@ void main() {
       // to read/type, must not flag the student.
       expect(engine.offCenterThresholdDegrees, 28.0);
       expect(engine.pitchThresholdDegrees, 30.0);
+      // A turn past this is unambiguous on its own: reported from the first
+      // frame rather than the third.
+      expect(engine.immediateAwayThresholdDegrees, 50.0);
       // Strict *frames*, not seconds: three in a row of a missing face, or of a
       // head past the tolerances. See `consecutiveFrameThreshold`.
       expect(engine.consecutiveFrameThreshold, 3);
