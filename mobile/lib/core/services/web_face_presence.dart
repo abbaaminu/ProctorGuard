@@ -42,9 +42,9 @@ abstract final class WebFaceMessages {
 ///
 /// The rules mirror `MediaPipeProctoringService`:
 ///
-///  * `no_face` and `looking_away` have to hold before they are reported, and
-///    each episode reports once - a glance at the keyboard, a blink, a hand
-///    passing the lens or a dropped frame cannot accumulate strikes;
+///  * `no_face` and `looking_away` have to hold for [sustain] before they are
+///    reported, and each episode reports once - so one look away is one strike,
+///    not one per detection, while a blink or a single dropped frame is nothing;
 ///  * a `centered` message ends the episode and re-arms it, so a *later* look
 ///    away is reported again;
 ///  * `multiple_faces` is not sustained (two people need no measuring): it is
@@ -54,22 +54,22 @@ abstract final class WebFaceMessages {
 ///    and waiting out the sustain would only delay a warning they are earning;
 ///  * nothing is reported during [startupGrace].
 ///
-/// The difference is the unit of "held". The engine counts consecutive frames,
-/// because it sees six a second and a frame is a millisecond of truth; a page's
-/// detector may run at 2 fps or burst ten results from one buffered frame, so the
-/// web measures elapsed [sustain] instead. Same effect - a condition that keeps
-/// being true for about a second - without assuming a frame rate nothing
-/// guarantees, and with the same single exception both sides make for a head
-/// that is already unmistakably turned.
+/// The difference is the unit of "held". The engine counts frames, because it sees
+/// several a second and a frame is a millisecond of truth; a page's detector may run
+/// at 2 fps or burst ten results from one buffered frame, so the web measures elapsed
+/// [sustain] instead - 300 ms, which is about one engine frame plus the poll it was
+/// caught in. Same effect - a head that has genuinely turned is reported almost
+/// immediately - without assuming a frame rate nothing guarantees, and with the same
+/// single exception both sides make for a head that is already unmistakably turned.
 class WebFacePresenceMonitor {
   WebFacePresenceMonitor({
     required WebFaceSignalSource source,
-    this.sustain = const Duration(milliseconds: 1200),
+    this.sustain = const Duration(milliseconds: 300),
     this.startupGrace = const Duration(seconds: 5),
     this.multipleFacesCooldown = const Duration(seconds: 30),
-    this.offCenterYawDegrees = 28.0,
-    this.offCenterPitchDegrees = 30.0,
-    this.immediateAwayYawDegrees = 50.0,
+    this.offCenterYawDegrees = 15.0,
+    this.offCenterPitchDegrees = 18.0,
+    this.immediateAwayYawDegrees = 30.0,
     DateTime Function()? clock,
   })  : assert(
           sustain > Duration.zero,
@@ -99,12 +99,17 @@ class WebFacePresenceMonitor {
 
   /// How long a condition has to hold before it is reported.
   ///
-  /// Longer than the engine's three consecutive frames (~450 ms at its 150 ms
-  /// interval) because the web's detector is a *page's* detector: it may be
-  /// slower, it may lag its own video, and its false positives are expensive -
-  /// a browser student has no way to prove a head that never turned. Just over a
-  /// second is still shorter than reading a question off a second screen and
-  /// coming back.
+  /// 300 ms: the same order as the on-device engine, where a single frame (~150 ms
+  /// at its default interval) past the tolerance is already a strike. The web
+  /// measures time rather than counting detections because a page's detector runs at
+  /// whatever rate it runs at; 300 ms is two detections at a 150 ms cadence and one
+  /// at a 300 ms cadence, so a slow detector is not a quieter one. The audit found
+  /// the earlier 1.2 s window let a browser student look away, read something off a
+  /// second screen and come back before anything was reported.
+  ///
+  /// Still not zero: a page's detector can report a single bad pose while a head is
+  /// genuinely moving (a turn *to* the screen, a nod), and 300 ms is below the time
+  /// it takes to read anything useful elsewhere.
   final Duration sustain;
 
   /// How long after [start] detections are ignored.
@@ -118,7 +123,8 @@ class WebFacePresenceMonitor {
   final Duration multipleFacesCooldown;
 
   /// Head-pose tolerances, used only for `pose:` messages (a detector that sends
-  /// a verdict has already applied its own). The engine's defaults.
+  /// a verdict has already applied its own). The engine's defaults: ~15 deg yaw and
+  /// ~18 deg pitch, tight enough that a face pointed off the screen is one strike.
   final double offCenterYawDegrees;
   final double offCenterPitchDegrees;
 

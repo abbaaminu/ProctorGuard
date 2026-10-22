@@ -230,12 +230,11 @@ ImageFormatGroup proctorImageFormatGroup() {
 /// opens its own for the duration of the attempt.
 ///
 /// The **web** takes the other branch on purpose. There is no camera plugin
-/// status to read and no session worth opening (see [_webReport]): the one
-/// `getUserMedia({video, audio})` the browser probe makes resolves only when a
-/// real camera *and* a real microphone were granted, which is exactly the
-/// question this class exists to answer — and it is also the only way to ask it
-/// without the second open that Chromium reports as "another app or tab is
-/// already using the camera".
+/// status to read and no session worth opening (see [_webReport]): the browser
+/// probe's own `getUserMedia` calls are the answer, one per device, which is
+/// exactly the question this class exists to answer — and it is also the only way
+/// to ask it without the second open that Chromium reports as "another app or tab
+/// is already using the camera".
 class DeviceHardwareVerifier implements HardwareVerifier {
   DeviceHardwareVerifier({
     PermissionService? permissions,
@@ -292,9 +291,9 @@ class DeviceHardwareVerifier implements HardwareVerifier {
       return _fromDeniedPermissions(permissions.denied);
     }
 
-    // Web: the browser's own answer is the whole verdict, and one
-    // `getUserMedia` call is what produces it — see [_webReport] for why no
-    // capture session is opened behind it here.
+    // Web: the browser's own answers are the whole verdict, and one
+    // `getUserMedia` call per device is what produces them — see [_webReport] for
+    // why no capture session is opened behind it here.
     if (_browserProbe.isSupported) {
       return _webReport(await _browserProbe.probe());
     }
@@ -369,7 +368,7 @@ class DeviceHardwareVerifier implements HardwareVerifier {
   @override
   Future<void> openSettings() => _permissions.openSettings();
 
-  /// The web verdict, built from the browser's own `getUserMedia` answer.
+  /// The web verdict, built from the browser's own `getUserMedia` answers.
   ///
   /// There is deliberately no capture session behind this. On the web
   /// `availableCameras()` already opens (and immediately stops) a stream per
@@ -377,14 +376,19 @@ class DeviceHardwareVerifier implements HardwareVerifier {
   /// `NotReadableError` — the "another app or tab is already using the camera"
   /// row students were seeing — because the device it just enumerated has not
   /// finished being released. Opening a third session on the gate bought
-  /// nothing: a resolved `getUserMedia({video, audio})` is the browser's own
-  /// statement that a real camera **and** a real microphone were granted, it is
-  /// the same answer the exam screen's session then confirms for real, and the
-  /// web is the one platform where the gate could not turn that stream into
-  /// face detection anyway. Fewer opens also means the microphone row is now
-  /// reported from the same grant as the camera row, instead of being inferred
-  /// from a camera session that may never have started.
+  /// nothing: a resolved `getUserMedia` is the browser's own statement that *that*
+  /// device was granted, it is the same answer the exam screen's session then
+  /// confirms for real, and the web is the one platform where the gate could not
+  /// turn that stream into face detection anyway.
+  ///
+  /// The probe asks twice (see `WebCameraAccess`), so each row is answered by its
+  /// own device. That is the fix for the old combined request: `{video, audio}`
+  /// rejects as a whole, so a laptop with a good camera and no microphone used to
+  /// produce *two* failures and send the student to fix the wrong one.
   HardwareReport _webReport(WebCameraAccess access) {
+    // Nothing at all was granted: both calls were rejected, so the only honest
+    // statement is that the browser said no to this site, and "Open settings" is
+    // where the student can undo it.
     if (!access.granted) {
       return const HardwareReport(
         camera: DeviceProbe.failed(ProbeDevice.camera,
@@ -395,33 +399,58 @@ class DeviceHardwareVerifier implements HardwareVerifier {
       );
     }
 
-    // One half arrived and the other did not: name the missing one rather than
-    // reporting the pair as one failure, so the student knows what to plug in or
-    // un-mute. This is how a laptop with a camera and no microphone reads.
-    if (!access.video || !access.audio) {
-      return HardwareReport(
-        camera: access.video
-            ? const DeviceProbe.verified(ProbeDevice.camera,
-                message: 'Live video is streaming.')
-            : const DeviceProbe.failed(ProbeDevice.camera,
-                'The browser granted access but no camera answered. '
+    // One row per device, from that device's own answer. The three cases are kept
+    // apart because they need different instructions: verified; the browser
+    // refused (a permission the student must change, hence `settingsHint`); or the
+    // call resolved but no track arrived (something to plug in).
+    DeviceProbe row(
+      ProbeDevice device, {
+      required bool present,
+      required bool refused,
+    }) {
+      if (present) {
+        return DeviceProbe.verified(
+          device,
+          message: device == ProbeDevice.camera
+              ? 'Live video is streaming.'
+              : 'The recording session is open.',
+        );
+      }
+      if (refused) {
+        return DeviceProbe.failed(
+          device,
+          device == ProbeDevice.camera
+              ? 'The browser refused camera access for this site.'
+              : 'The browser refused microphone access for this site.',
+        );
+      }
+      return DeviceProbe.failed(
+        device,
+        device == ProbeDevice.camera
+            ? 'The browser granted access but no camera answered. '
                 'Check that a camera is connected and not hidden behind a '
-                'closed lid.'),
-        microphone: access.audio
-            ? const DeviceProbe.verified(ProbeDevice.microphone,
-                message: 'The recording session is open.')
-            : const DeviceProbe.failed(ProbeDevice.microphone,
-                'The browser granted access but no microphone answered. '
-                'Check that one is connected and selected.'),
-        settingsHint: true,
+                'closed lid.'
+            : 'The browser granted access but no microphone answered. '
+                'Check that one is connected and selected.',
       );
     }
 
-    return const HardwareReport(
-      camera: DeviceProbe.verified(ProbeDevice.camera,
-          message: 'Live video is streaming.'),
-      microphone: DeviceProbe.verified(ProbeDevice.microphone,
-          message: 'The recording session is open.'),
+    final refused = access.videoRefused || access.audioRefused;
+
+    return HardwareReport(
+      camera: row(
+        ProbeDevice.camera,
+        present: access.video,
+        refused: access.videoRefused,
+      ),
+      microphone: row(
+        ProbeDevice.microphone,
+        present: access.audio,
+        refused: access.audioRefused,
+      ),
+      // Only offered when something was actually refused: settings cannot conjure
+      // a microphone that is not plugged in.
+      settingsHint: refused,
     );
   }
 

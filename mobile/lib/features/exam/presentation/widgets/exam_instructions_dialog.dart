@@ -64,10 +64,7 @@ class ExamInstructionsDialog extends StatelessWidget {
                     key: Key('instructions-tab-proctor'),
                     text: 'How the proctor works',
                   ),
-                  Tab(
-                    key: Key('instructions-tab-exam'),
-                    text: 'Exam rules',
-                  ),
+                  Tab(key: Key('instructions-tab-exam'), text: 'Exam rules'),
                 ],
               ),
               const SizedBox(height: 12),
@@ -120,11 +117,7 @@ class _RuleList extends StatelessWidget {
 /// A single rule. A widget rather than a string list so the icon's tint follows
 /// the theme, the same way the gate's checklist does.
 class _Rule extends StatelessWidget {
-  const _Rule({
-    required this.icon,
-    required this.heading,
-    required this.body,
-  });
+  const _Rule({required this.icon, required this.heading, required this.body});
 
   final IconData icon;
   final String heading;
@@ -166,18 +159,22 @@ const List<_Rule> _proctorRules = <_Rule>[
   _Rule(
     icon: Icons.videocam_outlined,
     heading: 'Your camera stays on',
-    body: 'It runs for the whole sitting and your face has to be visible. Frames '
-        'are checked on your own device for a missing or second face, and a '
-        'snapshot is kept with any incident. Everything recorded is reviewed by a '
-        'person, not judged by the app alone.',
+    body:
+        'It runs for the whole sitting and your face has to be visible. Frames '
+        'are checked on your own device for a missing or second face and for your '
+        'head turned away from the screen, and a snapshot is kept with any '
+        'incident. Every snapshot is reviewed by a person — the app does not '
+        'judge it alone.',
   ),
   _Rule(
     icon: Icons.mic_none_outlined,
     heading: 'Your microphone stays on',
-    body: 'The session listens for noise above the room\'s own level, so a cough, '
-        'a chair or a single word does not count against you — but sustained '
-        'talking, a second voice or steady background sound does, even a quiet '
-        'one at normal volume. Sustained noise is recorded as "Background noise", '
+    body:
+        'The session listens for noise above the room\'s own level, so a cough '
+        'or a chair does not count against you — but speech, a second voice or '
+        'steady background sound does, even a quiet one at normal volume. It '
+        'takes half a second of it: two words are enough, a single noise is not. '
+        'Sustained noise is recorded as "Background noise", '
         'and the '
         'indicator on the exam screen shows the level as it moves. If the '
         'microphone is refused or unplugged the screen says so — it is never '
@@ -186,7 +183,8 @@ const List<_Rule> _proctorRules = <_Rule>[
   _Rule(
     icon: Icons.phonelink_lock_outlined,
     heading: 'Stay in the exam',
-    body: 'On a phone the screen is pinned, so leaving the app — a call, another '
+    body:
+        'On a phone the screen is pinned, so leaving the app — a call, another '
         'app, the home button — is recorded as leaving the exam. In a browser the '
         'tab must stay focused and full screen: switching tabs or windows, '
         'right-click, copy/paste and back/reload are blocked, and switching away '
@@ -195,12 +193,13 @@ const List<_Rule> _proctorRules = <_Rule>[
   _Rule(
     icon: Icons.report_gmailerrorred_outlined,
     heading: 'Three confirmed strikes close the attempt',
-    body: 'Incidents are counted as they happen and your supervisor sees them '
+    body:
+        'Incidents are counted as they happen and your supervisor sees them '
         'live. Three confirmed strikes close the attempt as disqualified, and a '
         'disqualified attempt is not marked. A disqualification aimed at the '
         'wrong candidate can be undone — the paper\'s author or a supervisor can '
-        'reset the attempt, which clears it and its recording so it can be sat '
-        'again.',
+        'reset the attempt, which clears it, its incidents and its snapshots so '
+        'it can be sat again.',
   ),
 ];
 
@@ -209,7 +208,8 @@ const List<_Rule> _examRules = <_Rule>[
   _Rule(
     icon: Icons.timer_outlined,
     heading: 'The clock starts when you do',
-    body: 'Your attempt runs for the paper\'s own duration from the moment it '
+    body:
+        'Your attempt runs for the paper\'s own duration from the moment it '
         'starts. A paper with a scheduled window also closes at its end time — '
         'whichever comes first — so starting late does not extend the sitting. '
         'Answers are saved as you go, including offline, which replays when the '
@@ -218,7 +218,8 @@ const List<_Rule> _examRules = <_Rule>[
   _Rule(
     icon: Icons.emoji_events_outlined,
     heading: 'When you see your mark',
-    body: 'A paper with no written answers is marked the instant you submit, and '
+    body:
+        'A paper with no written answers is marked the instant you submit, and '
         'the score is shown to you there and then. A paper with written (essay) '
         'questions is only partly marked at that point: your lecturer reads and '
         'marks those answers afterwards, and the final score appears in this '
@@ -227,7 +228,8 @@ const List<_Rule> _examRules = <_Rule>[
   _Rule(
     icon: Icons.lock_outline,
     heading: 'One attempt per paper',
-    body: 'A submitted or disqualified attempt is closed for good and cannot be '
+    body:
+        'A submitted or disqualified attempt is closed for good and cannot be '
         'reopened. If it has to be retaken — a wrong answer key, a '
         'disqualification that was a mistake, a power cut — your supervisor or '
         'the paper\'s author resets it, which clears the old attempt so you can '
@@ -236,18 +238,19 @@ const List<_Rule> _examRules = <_Rule>[
   _Rule(
     icon: Icons.settings_applications_outlined,
     heading: 'Before you start',
-    body: 'The device check has to pass: a working camera and a working '
-        'microphone. In a browser, on-device face detection is not available, so '
-        'the camera still records and your attempt is still reviewed — faces are '
-        'flagged by a person afterwards rather than as they happen.',
+    body:
+        'The device check has to pass: a working camera and a working '
+        'microphone. In a browser there is no on-device face detector, so this '
+        'app cannot flag a face by itself: your camera still runs, and a '
+        'snapshot is kept with any incident a person can review.',
   ),
   _Rule(
     icon: Icons.support_agent_outlined,
     heading: 'If something goes wrong',
-    body: 'Do not leave the screen: a dropped connection keeps your answers and '
+    body:
+        'Do not leave the screen: a dropped connection keeps your answers and '
         'sends them when it returns. Say something to the invigilator rather than '
         'fixing it yourself — an interruption your supervisor knows about is '
         'explained, and one they do not is an incident.',
   ),
 ];
-

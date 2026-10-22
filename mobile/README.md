@@ -112,17 +112,22 @@ the `adb install -r` line. A release APK is signed with the keystore named by
 ## Violation snapshots (Supabase Storage)
 
 When the engine reports a violation, the notifier pulls a still from the live
-camera (`CameraController.takePicture`) and uploads it to the public
-`proctor-snapshots` bucket as `<submissionId>/<action_type>_<epoch-ms>.jpg`,
-then stores the public URL on the log row (`proctoring_logs.snapshot_url`, which
-the supervisor console already renders).
+camera (`CameraController.takePicture`) and uploads it to the **private**
+`proctor-snapshots` bucket as `<submissionId>/<action_type>_<epoch-ms>.jpg`. What
+goes on the log row (`proctoring_logs.snapshot_url`) is that bucket-relative
+**path**, not a URL: a path never expires, and the column names where the evidence
+is rather than a link that would go stale. The supervisor console mints a
+10-minute signed URL when a still is actually shown
+(`SupabaseService.signedSnapshotUrl`), so viewing evidence is a deliberate act
+with an expiry rather than a URL that keeps working forever once it is forwarded.
 
 - Capture and upload are **best-effort and time-boxed (5 s each)**: if the
   camera refuses a still while streaming, or Storage rejects the upload, the
   violation is still logged — just without a picture — so evidence collection
   can never delay the 3-strike escalation.
-- `register_violation(p_submission_id, p_action_type, p_snapshot_url)` now
-  carries the URL; the third argument is optional so older clients keep working.
+- `register_violation(p_submission_id, p_action_type, p_snapshot_url)` carries the
+  snapshot reference (the object path, or a pre-migration URL); the third argument
+  is optional so older clients keep working.
 - `register_violation` is `SECURITY DEFINER` (a student may neither insert into
   `proctoring_logs` nor update `exam_submissions`), so it re-checks that the
   caller owns the submission before writing anything. Without that guard any
@@ -130,12 +135,20 @@ the supervisor console already renders).
   submission id. A violation that arrives *after* the attempt closed is reported
   rather than logged, so late frames cannot pad the evidence.
 - The bucket, its size/mime limits and its policies live in
-  `../supabase/schema.sql` §6: an authenticated student may only upload into
-  their **own, still-ongoing** submission folder (mirroring the append-only
-  `proctoring_logs` policy), no client may *update* a snapshot, and deleting one is
-  the reset's own purge, allowed only for `is_attempt_resetter()`
+  `../supabase/schema.sql` §6. It is created `public = false`: Storage serves
+  nothing from it without a signature, and the read policy — the owning student or
+  any staff member — is what decides who may create one. An authenticated student
+  may only upload into their **own, still-ongoing** submission folder (mirroring
+  the append-only `proctoring_logs` policy), no client may *update* a snapshot, and
+  deleting one is the reset's own purge, allowed only for `is_attempt_resetter()`
   (`Proctor snapshots supervisor purge`) — a student can never erase their own
   evidence.
+- `SupabaseService.snapshotObjectPath` resolves every shape the column holds — the
+  path this build writes, a pre-migration `/object/public/...` URL, or a
+  console-minted `/object/sign/...?token=` one — so evidence written before the
+  bucket went private stays reviewable and still gets purged on a reset.
+  `supabase/migrations/private_proctor_snapshots.sql` flips an existing bucket and
+  re-asserts the same policies.
 
 ## Testing without a camera (`MOCK_CAMERA`)
 
@@ -724,7 +737,7 @@ nothing in it is a decision to make. Two tabs:
 
 | Tab | What the student is told |
 | --- | --- |
-| `instructions-tab-proctor` | the camera (on for the whole sitting, faces checked on-device, a snapshot kept with each incident, and that a person reviews the recording), the microphone (noise above the room's own floor is what counts, the indicator shows the level, and a refused or unplugged mic says so instead of passing as fine), staying in the exam (the kiosk pin on a phone, the browser guards — tab/focus/fullscreen, copy/paste, back/reload), and that three confirmed strikes close the attempt as disqualified — including that a wrong one can be reset by the paper's author or a supervisor |
+| `instructions-tab-proctor` | the camera (on for the whole sitting, faces checked on-device, a snapshot kept with each incident, and that a person reviews every snapshot), the microphone (noise above the room's own floor is what counts — half a second of it, so two words are enough and one cough is not — the indicator shows the level, and a refused or unplugged mic says so instead of passing as fine), staying in the exam (the kiosk pin on a phone, the browser guards — tab/focus/fullscreen, copy/paste, back/reload), and that three confirmed strikes close the attempt as disqualified — including that a wrong one can be reset by the paper's author or a supervisor |
 | `instructions-tab-exam` | the clock (the paper's own duration from the start, a scheduled paper also closing at `ends_at`, answers saved as you go including offline, an unanswered question scoring nothing), when a mark appears (instantly for a paper with no written answers; after the lecturer marks the essays otherwise), one attempt per paper and what a reset clears, what the device check requires (and that a browser flags faces by review, not live), and what to do if something goes wrong |
 
 The wording deliberately matches the screens the student is about to meet — the
@@ -821,17 +834,23 @@ Details worth knowing:
   reports *before* the camera grant — so `availableCameras()` legitimately
   returns an empty list on a page that has never been granted access, and a
   session used to conclude "no camera" and show the crossed-out placeholder.
-  `WebCameraPermission.probe` now runs one `getUserMedia` (releasing the probe
-  tracks immediately) and reports *which* devices came back, and the enumeration
-  is retried, so the browser's own prompt appears instead. The **gate** answers
-  from that same probe rather than opening a capture session of its own: opening
-  one is what Chromium reports as `NotReadableError` — "another app or tab is
-  already using the camera" — while it is still releasing the device
+  `WebCameraPermission.probe` now runs **two** short `getUserMedia` calls — video,
+  then audio — releasing each probe's tracks in a `finally` before the next one
+  opens, and reports *which* of the two devices came back. One combined
+  `{video: true, audio: true}` call is all-or-nothing: a missing or blocked
+  microphone rejects the whole promise, so the gate used to tell a student with a
+  perfectly good camera to fix their camera. Two probes also let the enumeration be
+  retried, so the browser's own prompt appears instead of `camera_web` silently
+  dropping every device whose `deviceId` is still empty. The **gate** answers from
+  those probes rather than opening a capture session of its own: opening one is
+  what Chromium reports as `NotReadableError` — "another app or tab is already
+  using the camera" — while it is still releasing the device
   `availableCameras()` just probed, and it bought nothing the probe had not
   already proved (on the web there is no ML Kit to feed, and the session the exam
   screen opens is the one that records). Fewer opens also means the checklist's
-  microphone row is reported from the same grant as the camera row instead of
-  being inferred from a session that may never have started.
+  microphone row is its own answer rather than being inferred from a session that
+  may never have started — a granted-but-trackless result is reported as such, not
+  as "fine".
 * **Raw camera frames only exist where the platform offers them.** The exam
   screen asks `CameraPlatform.instance.supportsImageStreaming()` before calling
   `startImageStream`: `camera_android_camerax` and `camera_avfoundation` answer
@@ -925,17 +944,20 @@ window.proctorGuardFaceSignal('centered');
 | Message | Meaning | Becomes |
 | --- | --- | --- |
 | `centered` | face visible, head within tolerance | ends the current episode (never a strike itself) |
-| `looking_away` | face visible, head turned away | `looking_away`, if it holds for ~1.2s |
-| `no_face` | nothing in frame | `no_face`, if it holds for ~1.2s |
+| `looking_away` | face visible, head turned away | `looking_away`, if it holds for 300ms |
+| `no_face` | nothing in frame | `no_face`, if it holds for 300ms |
 | `multiple_faces` | a second person in frame | `multiple_faces`, at once (latched 30s) |
-| `pose:<yaw>,<pitch>` | head pose in degrees, instead of a verdict | this app applies its own tolerances (`28°` yaw / `30°` pitch), and reports a turn past `50°` yaw at once |
+| `pose:<yaw>,<pitch>` | head pose in degrees, instead of a verdict | this app applies the same tolerances as the phone build (`15°` yaw / `18°` pitch, and a turn past `30°` yaw at once) |
 
 `WebFacePresenceMonitor` (`web_face_presence.dart`) is the judgement, not the
 detection: it sustains a condition before reporting it (a measured `pose:` turned
-past `50°` yaw excepted — that far round, the first detection is already the
+past `30°` yaw excepted — that far round, the first detection is already the
 episode), re-arms after `centered`, and ignores the first 5s, so a browser episode
 is worth exactly the strike a phone's is and arrives through the same
-`ProctoringNotifier.reportGazeSignal` door. Three consequences worth knowing:
+`ProctoringNotifier.reportGazeSignal` door. The 300ms window is the parity number:
+it is one of the shortest intervals a host detector is polled at (~3-10 fps), so a
+glance that would be a strike on the phone is a strike here too rather than waiting
+for a second of evidence the host may never send. Three consequences worth knowing:
 
 * **Nothing is invented.** `isSupported` is false everywhere but a web build with
   the hook installed, so a browser with no detector reports **fewer** signals and
@@ -1109,30 +1131,32 @@ the 3-strike rule:
 
 | Detector | Signal | `action_type` |
 | --- | --- | --- |
-| ML Kit face detection | no face / several faces / head pose off-axis, each held for three consecutive frames before it counts (a head turned past ~50 deg yaw counts at once) | `no_face`, `multiple_faces`, `looking_away` |
+| ML Kit face detection | no face (three consecutive frames) / several faces / head pose off-axis (one frame past ~15 deg yaw or ~18 deg pitch) | `no_face`, `multiple_faces`, `looking_away` |
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
 | `WebGuards` (Chrome/Edge) | tab hidden, window blurred, or HTML5 fullscreen left | `app_minimized` |
 | `AudioMonitor` + `AudioNoiseDetector` | a `record` capture session streams dBFS samples; the room's own floor is measured first, then speech sustained above it ([details below](#microphone-proctoring-levels-not-recordings)) | `audio_noise` |
 
 Camera signals are **counted in frames**, not measured in seconds: `looking_away`
-fires only after three *consecutive* frames show the head past ~28 deg yaw / ~30 deg
-pitch, and `no_face` after three consecutive frames with no face in them
-(`consecutiveFrameThreshold`). Frames are the honest unit here — `inferenceInterval`
-decides how much wall time a frame stands for and is throttling, not evidence — and
-at the ~7 FPS the engine throttles to, three frames is about 0.45 s: long enough that
-a blink, one dropped frame or one glance at the keyboard cannot burn a strike, short
-enough that a student who has really left the frame or turned to a second screen is
-reported while they are still doing it. Any frame back in the tolerated pose resets
-that count, so only an unbroken run counts, and each episode reports once.
-`multiple_faces` is the exception: two people in frame needs no measuring, so it
-reports immediately and is latched per episode instead. There is one other: a head
-turned past ~50 deg yaw (`immediateAwayThresholdDegrees`) is past the point where
-anything on the screen could still be read, so it is reported on the first frame
-rather than the third — waiting two more frames would only delay a warning the
-student has already earned. Pitch is deliberately not included, because looking
-down at a keyboard or notes is ordinary exam behaviour. Any angle between the
-tolerance and that line keeps the full frame count.
+fires on the **first** frame that shows the head past ~15 deg yaw or ~18 deg pitch
+(`consecutiveFrameThreshold` is 1), because at a normal viewing distance that is
+already pointing off the screen — and the audit's finding on the earlier three-frame
+count was that a student could glance down at a phone or read a second screen for
+~0.45 s and be back before anything was logged. `no_face` still waits for three
+consecutive frames without a face (`missingFaceFrameThreshold`), because that is the
+one signal a working detector also produces by accident (a blink behind glasses, a
+hand across the lens). Frames are the honest unit here — `inferenceInterval` decides
+how much wall time a frame stands for and is throttling, not evidence. Any frame
+back in the tolerated pose resets the counters, so only an unbroken run counts, and
+each episode reports once: a sustained look-away is one strike, not one per
+inference. `multiple_faces` is the exception: two people in frame needs no
+measuring, so it reports immediately and is latched per episode instead. There is
+one other: a head turned past ~30 deg yaw (`immediateAwayThresholdDegrees`) is past
+the point where anything on the screen could still be read, so it is reported even
+if the frame count is raised for a noisier detector. Browsers get the same rule from
+the other side of the stack — `web_face_presence.dart` reports a look-away that
+holds for 300 ms, which is the shortest interval a browser face detector can be
+asked for without depending on its frame rate.
 `ProctoringNotifier.setCameraActive` gates the whole camera set while the feed is not
 streaming.
 
@@ -1140,9 +1164,9 @@ Audio is judged the same way, and the rules are deliberately pure Dart
 (`core/services/audio_noise_detector.dart`) so they can be tested without a
 microphone: the first 4s (`calibrationWindow`) measure the room's floor, taking the
 **median** rather than the mean so a student who starts talking immediately cannot
-drag the floor up to their own voice; the threshold becomes that floor + 5 dB
+drag the floor up to their own voice; the threshold becomes that floor + 4 dB
 (`speechMarginDb`), clamped to −55…−32 dBFS (`minThresholdDb`/`maxThresholdDb`). The
-margin is deliberately small — 5 dB is a clear, *sustained* step above the hum it is
+margin is deliberately small — 4 dB is a clear, *sustained* step above the hum it is
 measured against — and the band is deliberately low, so the rule flags **little and
 background sound** (quiet speech, a second voice, a television, traffic, a generator)
 rather than only a raised voice. The upper clamp does the heavy lifting in a noisy
@@ -1150,17 +1174,21 @@ room: without it a room that is already loud on its own would raise the bar to
 "shout only" and log nothing,
 whereas pinned below the room's own floor that steady background *is* the finding. The
 lower clamp keeps a dead-silent room's threshold above the microphone's own self-noise,
-which would otherwise read as "talking". The level must then add up to 1.5s above it
-(`sustain`) — roughly one spoken sentence — and a gap below the threshold ends the
+which would otherwise read as "talking". The level must then add up to 500 ms above it
+(`sustain`) — two syllables, the shortest thing that is speech rather than an accident
+(the audit found the earlier 1.5 s window needed most of a sentence, so a student could
+read a question aloud or answer someone in the room and never be warned) — and a gap
+below the threshold ends the
 episode only once it has lasted longer than 400 ms (`releaseGrace`). That gap allowance
 is what makes the rule catch **talking** rather than only an unbroken shout: at four
 samples a second a real sentence drops below the threshold between words, so a rule
 that reset on any single low sample never filled its window and logged nothing at all.
-The window is shorter than the two to three seconds a supervisor would call talking on
+Half a second is well below the two to three seconds a supervisor would call talking on
 purpose: the meter is read every 250 ms, so a burst that starts just after a sample
-contributes only its remainder — two seconds of noise can arrive as 1.75 s of evidence,
-which a two-second window would never accept. The spare half second is headroom for
-that offset; the grace and the 3 dB hysteresis are what still keep one-offs out.
+contributes only its remainder — which is why the window is kept short instead of
+absorbing the offset with headroom. A one-off shorter than the window (a cough, a chair,
+a door) cannot fill it at all; the grace and the 3 dB hysteresis are what keep the gap
+between two words from restarting it.
 A cough, a chair creak or a breath is still far too brief to add up, a room that has
 genuinely gone quiet ends the episode inside the grace, and after a strike the detector
 ignores the level for 5s (`cooldown`), so one long outburst is one strike rather than

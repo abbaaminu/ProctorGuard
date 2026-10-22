@@ -26,23 +26,34 @@ abstract class WebCameraPermission {
   /// False on every non-web platform (and in VM widget tests).
   bool get isSupported;
 
-  /// Asks the browser for camera (and, by default, microphone) access, and
-  /// reports what the browser actually handed back.
+  /// Asks the browser for camera access and - by default - microphone access,
+  /// as **two independent `getUserMedia` calls**, and reports what the browser
+  /// actually handed back.
+  ///
+  /// Two calls, not one `{video, audio}` request: a combined request is
+  /// all-or-nothing, so a laptop with a working camera and no microphone (or one
+  /// whose microphone permission was blocked) rejects with `NotFoundError` and
+  /// the gate used to report *both* devices as refused - sending a student to fix
+  /// a camera that was never the problem. Asking separately means each row is
+  /// answered by its own device, and one refusal cannot hide the other half's
+  /// real state.
   ///
   /// The probe tracks are released before it returns, so the caller can go on
   /// to enumerate devices or open the session that is actually recorded. Never
   /// throws: a browser refusal (denied, no device, insecure origin) is a
-  /// [WebCameraAccess] with `granted == false`.
+  /// [WebCameraAccess] with the refused half marked.
   Future<WebCameraAccess> probe({bool audio = true});
 }
 
-/// What one browser `getUserMedia` probe found.
+/// What one browser probe found.
 ///
-/// One `getUserMedia({video, audio})` call answers two questions at once, which
-/// is why this is a record of *which* halves arrived rather than a bare
-/// yes/no: a laptop with a camera and no microphone gets a video track and no
-/// audio track, and that has to be reported as a microphone problem rather than
-/// as "the device cannot be proctored".
+/// A record of *which* halves arrived rather than a bare yes/no: a laptop with a
+/// camera and no microphone gets a video track and no audio track, and that has
+/// to be reported as a microphone problem rather than as "the device cannot be
+/// proctored". The refused flags separate the two ways a half can be missing -
+/// the browser said no (a permission the student must change) from the browser
+/// said yes but produced no track (a device to plug in) - because those need
+/// different instructions.
 ///
 /// The `video` / `audio` flags only carry meaning when [granted] is true, and
 /// they only carry meaning **on the web** — the other platforms never call
@@ -54,20 +65,33 @@ class WebCameraAccess {
     required this.granted,
     this.video = false,
     this.audio = false,
+    this.videoRefused = false,
+    this.audioRefused = false,
   });
 
   /// The browser refused: no grant, no stream, nothing to inspect.
-  const WebCameraAccess.refused() : this(granted: false);
+  const WebCameraAccess.refused()
+      : this(granted: false, videoRefused: true, audioRefused: true);
 
-  /// True when the browser resolved `getUserMedia` — including when the page
+  /// True when at least one of the probes resolved - including when the page
   /// already held the grant, since that resolves without prompting.
   final bool granted;
 
-  /// A live video track came with the stream.
+  /// A live video track came with the video probe.
   final bool video;
 
-  /// A live audio track came with the stream.
+  /// A live audio track came with the audio probe.
   final bool audio;
+
+  /// The video probe was rejected by the browser (`NotAllowedError`,
+  /// `NotFoundError`, `SecurityError` on an insecure origin).
+  final bool videoRefused;
+
+  /// The audio probe was rejected by the browser.
+  ///
+  /// False when the caller asked for a camera-only probe ([WebCameraPermission
+  /// .probe] with `audio: false`) - nothing was asked, so nothing is claimed.
+  final bool audioRefused;
 
   /// Both devices were proved usable.
   bool get isComplete => granted && video && audio;

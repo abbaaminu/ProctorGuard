@@ -149,25 +149,25 @@ class _ProbeRow extends StatelessWidget {
 
     final (Widget leading, Color tint) = switch (probe.outcome) {
       ProbeOutcome.verified => (
-          Icon(Icons.check_circle, color: Colors.green.shade400),
-          Colors.green.shade400,
-        ),
+        Icon(Icons.check_circle, color: Colors.green.shade400),
+        Colors.green.shade400,
+      ),
       ProbeOutcome.failed => (
-          Icon(Icons.error_outline, color: scheme.error),
-          scheme.error,
-        ),
+        Icon(Icons.error_outline, color: scheme.error),
+        scheme.error,
+      ),
       ProbeOutcome.running => (
-          const SizedBox(
-            height: 20,
-            width: 20,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
-          scheme.onSurfaceVariant,
+        const SizedBox(
+          height: 20,
+          width: 20,
+          child: CircularProgressIndicator(strokeWidth: 2),
         ),
+        scheme.onSurfaceVariant,
+      ),
       ProbeOutcome.pending => (
-          Icon(Icons.circle_outlined, color: scheme.onSurfaceVariant),
-          scheme.onSurfaceVariant,
-        ),
+        Icon(Icons.circle_outlined, color: scheme.onSurfaceVariant),
+        scheme.onSurfaceVariant,
+      ),
     };
 
     return Card(
@@ -178,11 +178,7 @@ class _ProbeRow extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             // Fixed 24dp slot keeps the two rows aligned while one of them spins.
-            SizedBox(
-              height: 24,
-              width: 24,
-              child: Center(child: leading),
-            ),
+            SizedBox(height: 24, width: 24, child: Center(child: leading)),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
@@ -248,8 +244,8 @@ class _MockHardwareBanner extends StatelessWidget {
 ///
 /// Not a refusal and not a mock — the attempt is a real one, with a real camera
 /// and a real microphone, and it starts either way. What changes is how the
-/// evidence can be used afterwards: every frame is still captured and reviewed,
-/// but nothing flags a missing or second face automatically, so the student
+/// evidence can be used afterwards: every incident still keeps a snapshot for
+/// review, but nothing flags a missing or second face automatically, so the student
 /// should not expect the strike rules they were told about to fire in a browser.
 class _FaceDetectionInactiveBanner extends StatelessWidget {
   const _FaceDetectionInactiveBanner();
@@ -271,16 +267,14 @@ class _FaceDetectionInactiveBanner extends StatelessWidget {
             const SizedBox(width: 10),
             Expanded(
               child: Text(
-                'This exam is running in a browser, where on-device face '
-                'detection is not available. Your camera and microphone are '
-                'still checked and the attempt is still recorded for review — '
-                'but faces are not flagged automatically, so a second person on '
-                'screen or a covered camera will be caught by the recording, '
-                'not as it happens.',
-                style: Theme.of(context)
-                    .textTheme
-                    .bodySmall
-                    ?.copyWith(color: scheme.onSurface),
+                'This exam is running in a browser, which has no face detector '
+                'of its own — faces are checked only if the page the exam was '
+                'opened in supplies them. Your camera and microphone are still '
+                'checked, and a snapshot is kept whenever a violation is '
+                'logged, so the evidence still reaches a person in review.',
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: scheme.onSurface),
               ),
             ),
           ],
@@ -315,10 +309,9 @@ class _BlockingWarning extends StatelessWidget {
             Expanded(
               child: Text(
                 message,
-                style: Theme.of(context)
-                    .textTheme
-                    .bodyMedium
-                    ?.copyWith(color: scheme.onErrorContainer),
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: scheme.onErrorContainer,
+                ),
               ),
             ),
           ],

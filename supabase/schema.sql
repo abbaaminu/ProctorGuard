@@ -874,6 +874,15 @@ create table if not exists public.proctoring_logs (
                    )
                  ),
   timestamp      timestamptz not null default now(),
+  -- The evidence still for this incident: the *bucket-relative object path*
+  -- inside the private `proctor-snapshots` bucket
+  -- (`<submission_id>/<action_type>_<epoch-ms>.jpg`, see section 6), not a URL.
+  -- A URL would either have to be public - anyone holding it could view a
+  -- student's face, forever - or signed and dead long before an appeal. The
+  -- reader mints a short-lived URL from this path when it actually shows the
+  -- still (`createSignedUrl`, bounded by the bucket's RLS policy).
+  -- Rows written before the bucket went private hold a public URL here; readers
+  -- normalise both shapes (mobile: `SupabaseService.snapshotObjectPath`).
   snapshot_url   text
 );
 
@@ -979,12 +988,24 @@ create policy "logs_select_own_or_supervisor"
 -- Path convention written by the mobile app (core/services/supabase_service.dart):
 --   <submission_id>/<action_type>_<epoch-ms>.jpg
 -- so the first folder is always the submission the snapshot belongs to.
--- The bucket is public so the supervisor app can render the snapshot URL;
--- anyone holding a URL can fetch that snapshot, so treat it as
--- unguessable rather than secret. The policies below still scope uploads to
--- the owning student. Everything here is idempotent - safe to re-run.
+--
+-- The bucket is PRIVATE. A snapshot is a photograph of a student's face, and a
+-- public bucket served every one of them to anybody who had (or guessed, or was
+-- forwarded) the URL - from a log export, a screenshot of the console, a shared
+-- link - with no expiry and no way to revoke it short of deleting the object.
+-- Private means Storage serves nothing from here without a signature:
+--   * the app stores the bucket-relative *path* on `proctoring_logs.snapshot_url`
+--     and mints a short-lived URL when it (or the console) actually shows the
+--     still: `storage.from('proctor-snapshots').createSignedUrl(path, 600)`;
+--   * the signature is minted under the caller's own JWT, so the read policy
+--     below still decides who may create one - the owning student, or staff;
+--   * a leaked URL now dies within minutes, and the object behind it stays
+--     protected even while the URL lives.
+-- `public = false` on an existing installation is the migration: re-running this
+-- block flips the bucket in place, because the file limits and mime types are set
+-- with `on conflict do update` below.
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
-values ('proctor-snapshots', 'proctor-snapshots', true, 5242880, array['image/jpeg', 'image/png'])
+values ('proctor-snapshots', 'proctor-snapshots', false, 5242880, array['image/jpeg', 'image/png'])
 on conflict (id) do update
   set public             = excluded.public,
       file_size_limit    = excluded.file_size_limit,
@@ -995,10 +1016,11 @@ drop policy if exists "Proctor snapshots upload access" on storage.objects;
 drop policy if exists "Proctor snapshots upload own ongoing session" on storage.objects;
 drop policy if exists "Proctor snapshots supervisor purge" on storage.objects;
 
--- Read: the student who owns the submission, or any supervisor (public buckets
--- already serve /object/public/... without a policy; this covers list()/download()
--- through the SDKs). Supervisor-wide on purpose, to match
--- submissions_select_own_or_supervisor.
+-- Read: the student who owns the submission, or any member of staff. With the
+-- bucket private this is not a convenience any more - it is the only thing that
+-- lets anybody read a still at all, because Storage refuses both the object and
+-- the signature without it (signing is a SELECT under the hood). Supervisor-wide
+-- on purpose, to match submissions_select_own_or_supervisor.
 create policy "Proctor snapshots read access"
   on storage.objects for select
   to authenticated
@@ -1036,7 +1058,7 @@ create policy "Proctor snapshots upload own ongoing session"
 -- staff app's "Reset attempt". That action deletes the submission row first (the
 -- DELETE that `submissions_delete_supervisor` authorizes, whose cascade takes
 -- the log rows with it) and then has to drop the stills those rows pointed at: a
--- reset that left a student's images in a public bucket would not be a reset.
+-- reset that left a student's images behind in Storage would not be a reset.
 --
 -- This policy is therefore necessarily broader than the two above - it cannot be
 -- anchored to the submission folder, because by this point that folder no longer
@@ -1227,7 +1249,10 @@ end $$;
 -- Server-side 3-strike escalation (RPC)
 -- ---------------------------------------------------------------------
 -- p_snapshot_url is optional, so a client that only knows the violation type
--- keeps working. The 2-argument overload is dropped explicitly: leaving it in
+-- keeps working. Its value is the *object path* inside the private
+-- `proctor-snapshots` bucket (section 6), not a URL - see the column comment on
+-- `proctoring_logs.snapshot_url`. The 2-argument overload is dropped explicitly:
+-- leaving it in
 -- place would make `register_violation(uuid, text)` ambiguous ("function
 -- register_violation(uuid, text) is not unique") now that a defaulted
 -- 3-argument version exists.

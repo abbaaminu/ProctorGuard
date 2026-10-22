@@ -178,36 +178,54 @@ void main() {
       );
     });
 
-    test('a minor head turn or a look down stays centered', () async {
+    test('a glance at the keyboard stays centered', () async {
       final engine = clocked();
       final seen = <GazeSignal>[];
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      // 25 deg yaw and 29 deg pitch sit inside the relaxed tolerances, for as
-      // many frames as the student keeps reading and typing.
-      const inside =
-          FaceFrameResult(faceCount: 1, yawDegrees: 25, pitchDegrees: 29);
-      feed(engine, inside, 20);
+      // 12 deg yaw and 15 deg pitch sit inside the 15 / 18 deg tolerances, for as
+      // many frames as the student keeps reading and typing. The second case is the
+      // boundary itself: the comparison is strict, so a head exactly on the line is
+      // still centered and a normal sitting position can never nudge a strike.
+      feed(
+        engine,
+        const FaceFrameResult(faceCount: 1, yawDegrees: 12, pitchDegrees: 15),
+        10,
+      );
+      feed(
+        engine,
+        const FaceFrameResult(faceCount: 1, yawDegrees: 15, pitchDegrees: -18),
+        10,
+      );
 
       await pumpEventQueue();
       expect(seen, isNot(contains(GazeSignal.lookingAway)));
       expect(seen, contains(GazeSignal.centered));
     });
 
-    test('two off-axis frames are not a violation, the third is', () async {
+    test('one off-axis frame is a strike, not a third', () async {
       final engine = clocked();
       final seen = <GazeSignal>[];
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      const away = FaceFrameResult(faceCount: 1, yawDegrees: 45);
-      feed(engine, away, 2);
+      // Web parity, and the reason the threshold is one: a turn past 15 deg is
+      // reported on the frame it is seen. Counting frames here would mean three
+      // inferences - most of a second at the detector's rate - in which the student
+      // is looking at a second screen and nothing is logged. Yaw 20 is past the
+      // tolerance but under the 30 deg unambiguous-turn bypass, so this is the
+      // counted path at a threshold of one.
+      engine.handleResult(const FaceFrameResult(faceCount: 1, yawDegrees: 20));
 
       await pumpEventQueue();
-      expect(seen, isEmpty, reason: 'a quick glance is not a violation');
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+      );
 
-      feed(engine, away, 1);
+      // The latch still applies: a held turn is one episode, not one per frame.
+      feed(engine, const FaceFrameResult(faceCount: 1, yawDegrees: 20), 20);
       await pumpEventQueue();
       expect(
         seen.where((signal) => signal == GazeSignal.lookingAway),
@@ -222,7 +240,7 @@ void main() {
       addTearDown(sub.cancel);
 
       // 60 deg is past the point where the student could still be reading the
-      // screen, so waiting for the third frame would only delay the warning.
+      // screen, so it bypasses the frame count entirely.
       const turned = FaceFrameResult(faceCount: 1, yawDegrees: 60);
       engine.handleResult(turned);
 
@@ -241,20 +259,18 @@ void main() {
       );
     });
 
-    test('a steep tilt still waits for the frame count', () async {
-      // Pitch is judged over frames on purpose: looking down is normal exam
-      // behaviour, and one steep Euler estimate is worth confirming.
+    test('a look down past the pitch tolerance is caught on the first frame',
+        () async {
+      // Pitch has its own, slightly wider tolerance (18 deg against 15) because
+      // reading a question on paper and typing both lower the chin - but a chin
+      // that far down is as good a reason to look at the student as a turned head,
+      // and it is judged on the same single frame.
       final engine = clocked();
       final seen = <GazeSignal>[];
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      const down = FaceFrameResult(faceCount: 1, pitchDegrees: 60);
-      feed(engine, down, 2);
-      await pumpEventQueue();
-      expect(seen, isEmpty, reason: 'one steep frame is not evidence yet');
-
-      feed(engine, down, 1);
+      engine.handleResult(const FaceFrameResult(faceCount: 1, pitchDegrees: 25));
       await pumpEventQueue();
       expect(
         seen.where((signal) => signal == GazeSignal.lookingAway),
@@ -262,7 +278,7 @@ void main() {
       );
     });
 
-    test('three consecutive off-axis frames log looking_away exactly once',
+    test('a held turn logs looking_away once, and a return re-arms it',
         () async {
       final engine = clocked();
       final seen = <GazeSignal>[];
@@ -270,7 +286,7 @@ void main() {
       addTearDown(sub.cancel);
 
       const away = FaceFrameResult(faceCount: 1, yawDegrees: 45);
-      feed(engine, away, 3);
+      engine.handleResult(away);
       now = now.add(const Duration(seconds: 30));
       feed(engine, away, 40); // still away: no repeat
       await pumpEventQueue();
@@ -279,9 +295,9 @@ void main() {
         hasLength(1),
       );
 
-      // Back to centered, then three more frames away: a new episode.
+      // Back to centered, then away again: a new episode.
       feed(engine, const FaceFrameResult(faceCount: 1), 1);
-      feed(engine, away, 3);
+      engine.handleResult(away);
       await pumpEventQueue();
       expect(
         seen.where((signal) => signal == GazeSignal.lookingAway),
@@ -403,16 +419,19 @@ void main() {
   group('engine defaults', () {
     test('match the documented throttle / threshold / frame contract', () {
       expect(engine.inferenceInterval, const Duration(milliseconds: 150));
-      // Relaxed tolerances: a turn under ~28 deg, and looking down under ~30 deg
-      // to read/type, must not flag the student.
-      expect(engine.offCenterThresholdDegrees, 28.0);
-      expect(engine.pitchThresholdDegrees, 30.0);
-      // A turn past this is unambiguous on its own: reported from the first
-      // frame rather than the third.
-      expect(engine.immediateAwayThresholdDegrees, 50.0);
-      // Strict *frames*, not seconds: three in a row of a missing face, or of a
-      // head past the tolerances. See `consecutiveFrameThreshold`.
-      expect(engine.consecutiveFrameThreshold, 3);
+      // Tight tolerances, matched to the web detector: a turn past 15 deg, and
+      // looking down past 18 deg, is reported.
+      expect(engine.offCenterThresholdDegrees, 15.0);
+      expect(engine.pitchThresholdDegrees, 18.0);
+      // A turn past this is unambiguous on its own: reported even if the frame
+      // count is raised for a noisier detector.
+      expect(engine.immediateAwayThresholdDegrees, 30.0);
+      // A look-away is reported from the first frame past the tolerances. See
+      // `consecutiveFrameThreshold`.
+      expect(engine.consecutiveFrameThreshold, 1);
+      // A missing *face* is still counted, and deliberately not one: a working
+      // detector drops a single frame on its own. See `missingFaceFrameThreshold`.
+      expect(engine.missingFaceFrameThreshold, 3);
       // A multi-face episode is latched rather than frame-counted, so this is
       // how long the student has to be *alone* before a second one counts.
       expect(engine.multipleFacesCooldown, const Duration(seconds: 30));

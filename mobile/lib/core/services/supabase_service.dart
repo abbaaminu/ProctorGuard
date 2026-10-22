@@ -11,6 +11,12 @@ import '../utils/proctor_log.dart';
 ///
 /// Declared here (rather than passing the singleton around) so the notifier
 /// can be unit-tested with a fake and stays free of Supabase wiring.
+///
+/// Returns the snapshot's **storage path** inside
+/// [SupabaseService.snapshotBucket] (`<submissionId>/<actionType>_<epochMs>.jpg`),
+/// not a URL: the bucket is private, so a URL has to be minted when somebody
+/// authorized actually looks at the still (see
+/// [SupabaseService.signedSnapshotUrl]).
 typedef SnapshotUploader = Future<String?> Function({
   required String submissionId,
   required String actionType,
@@ -235,8 +241,24 @@ class SupabaseService {
   SupabaseService._();
   static final SupabaseService instance = SupabaseService._();
 
-  /// Public bucket holding violation snapshots (see schema.sql §6).
+  /// Private bucket holding violation snapshots (see schema.sql §6).
+  ///
+  /// Private on purpose: a snapshot is a photograph of a student's face, and a
+  /// public bucket makes every stored still readable by anyone who ever sees a
+  /// link - including one scraped out of a log export or a screenshot of the
+  /// console. Storage serves nothing from it without a signature; the app mints
+  /// one on demand ([signedSnapshotUrl]) and the RLS policy on
+  /// `storage.objects` still decides who may ask.
   static const String snapshotBucket = 'proctor-snapshots';
+
+  /// How long a minted snapshot URL stays valid.
+  ///
+  /// Minutes, not days: long enough for a supervisor to open the still they just
+  /// clicked, short enough that a leaked URL is worthless by the time anyone
+  /// finds it. A URL is only ever a view of the object - the object itself is
+  /// still behind the bucket's policy, and a fresh one can be minted at any
+  /// time by anyone the policy admits.
+  static const Duration snapshotUrlTtl = Duration(minutes: 10);
 
   SupabaseClient? _client;
   SupabaseInitStatus _status = SupabaseInitStatus.notConfigured;
@@ -544,12 +566,54 @@ class SupabaseService {
   }) =>
       '$submissionId/${actionType}_${(at ?? DateTime.now()).millisecondsSinceEpoch}.jpg';
 
+  /// The bucket-relative object path that a stored
+  /// `proctoring_logs.snapshot_url` value points at.
+  ///
+  /// Rows written by this build hold the path itself (`<sub>/<file>.jpg`), because
+  /// the bucket is private and a signed URL would expire long before the evidence
+  /// is reviewed. Rows written while the bucket was public hold
+  /// `/storage/v1/object/public/proctor-snapshots/<sub>/<file>.jpg`, and a
+  /// console-minted one holds `/storage/v1/object/sign/...` with a token in the
+  /// query - all three resolve to the same object here, which is what lets a
+  /// pre-migration attempt still be purged, signed and reviewed.
+  ///
+  /// Returns `null` for anything that is not a snapshot reference: an empty
+  /// string, a bare bucket name, a path with no folder, or a URL that belongs to
+  /// somewhere else entirely (the dashboard used to write a placeholder one).
+  static String? snapshotObjectPath(String value) {
+    final uri = Uri.tryParse(value.trim());
+    if (uri == null) return null;
+
+    final segments = uri.pathSegments;
+    // Both URL shapes carry the bucket as a *segment*, so the object is whatever
+    // follows it - and the query string (a signed URL's token) is already gone by
+    // the time `pathSegments` exists.
+    final bucketIndex = segments.indexOf(snapshotBucket);
+    if (bucketIndex >= 0) {
+      return bucketIndex == segments.length - 1
+          ? null
+          : segments.skip(bucketIndex + 1).join('/');
+    }
+
+    // A bucket-relative path: no scheme, no host, and at least a folder and a
+    // file. Anything else is a URL for a different bucket or no snapshot at all.
+    if (uri.hasScheme || uri.hasAuthority || segments.length < 2) return null;
+    return segments.join('/');
+  }
+
   /// Uploads violation evidence as `<submissionId>/<actionType>_<epochMs>.jpg`
-  /// and returns the public URL to store on the `proctoring_logs` row.
+  /// into the private [snapshotBucket], and returns the **path** to store on the
+  /// `proctoring_logs` row.
   ///
   /// The path layout is what the Storage policies key off: the first folder must
   /// be the submission id, and the policy only allows it while that submission
   /// is the caller's own and still `ongoing`.
+  ///
+  /// The return value is a path rather than a URL because the bucket is private
+  /// and a signed URL is short-lived by design: the row has to outlive every URL
+  /// minted from it, so it keeps the one identifier that never goes stale and the
+  /// URL is produced when somebody actually reads the evidence
+  /// ([signedSnapshotUrl]).
   ///
   /// Returns `null` — never throws — when the upload cannot happen (offline,
   /// policy rejection, quota): a missing picture must not stop the violation from
@@ -581,9 +645,38 @@ class SupabaseService {
           cacheControl: '3600', // evidence never changes; let the CDN hold it
         ),
       );
-      return storage.getPublicUrl(path);
+      return path;
     } catch (error) {
       proctorLog('Snapshot upload failed for $path: $error');
+      return null;
+    }
+  }
+
+  /// Mints a short-lived read URL for a snapshot this caller is allowed to see.
+  ///
+  /// [path] is a stored `snapshot_url` value: the object path
+  /// [uploadViolationSnapshot] returned, or - for a row written before the bucket
+  /// went private - a full `/object/public/...` URL. Both are normalised through
+  /// [snapshotObjectPath], so the console and a reset keep working across the
+  /// migration.
+  ///
+  /// The bucket's RLS policy is still the authority: this signs what the signed-in
+  /// user may read (the owning student, or staff), and Storage refuses the rest.
+  /// Returns `null` - never throws - when there is no client, the value is not a
+  /// snapshot reference, or Storage refuses.
+  Future<String?> signedSnapshotUrl(String path, {Duration? ttl}) async {
+    final client = _client;
+    if (client == null) return null;
+
+    final object = snapshotObjectPath(path);
+    if (object == null) return null;
+
+    try {
+      return await client.storage
+          .from(snapshotBucket)
+          .createSignedUrl(object, (ttl ?? snapshotUrlTtl).inSeconds);
+    } catch (error) {
+      proctorLog('Could not sign snapshot $object: $error');
       return null;
     }
   }

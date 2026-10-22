@@ -412,8 +412,13 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     if (ruling.disqualified) unawaited(_forceDisqualify());
   }
 
-  /// Captures a still frame and stores it in the public `proctor-snapshots`
-  /// bucket, returning the URL to attach to the log row.
+  /// Captures a still frame and stores it in the private `proctor-snapshots`
+  /// bucket, returning the object path to attach to the log row.
+  ///
+  /// A path, not a URL: the bucket is private, so a URL would either be public
+  /// (the audit's finding) or expired before the evidence is reviewed. Whoever
+  /// reads the row signs the path on demand
+  /// (`SupabaseService.signedSnapshotUrl`).
   ///
   /// Every step is optional: mock-camera sessions never attach a source, a
   /// capture can fail, an upload can be rejected — in all of those cases this

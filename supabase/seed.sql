@@ -346,21 +346,24 @@ on conflict do nothing;
 -- The app never writes a 4th row - ProctoringNotifier returns early once
 -- `disqualified` is set and register_violation() flips the status on the 3rd
 -- strike - so 3 logs + status='disqualified' is the consistent shape.
--- snapshot_url shows what a Storage bucket would hold; this script uploads
--- no real files, so the project ref is a placeholder.
+-- snapshot_url holds the bucket-relative Storage *path*, the same value the app
+-- stores after an upload (`<submission_id>/<action_type>_<epoch-ms>.jpg`). The
+-- bucket is private, so this is an identifier rather than a link: this script
+-- uploads no real files either way, so nothing resolves until a still exists at
+-- that path.
 -- ---------------------------------------------------------------------
 insert into public.proctoring_logs (id, submission_id, action_type, timestamp, snapshot_url) values
   ('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1',
    'dddddddd-dddd-4ddd-8ddd-ddddddddddd1',
    'looking_away',
    now() - interval '5 minutes',
-   'https://<project-ref>.supabase.co/storage/v1/object/public/proctor-snapshots/dddddddd-dddd-4ddd-8ddd-ddddddddddd1/gaze-away-1.jpg'),
+   'dddddddd-dddd-4ddd-8ddd-ddddddddddd1/looking_away_1.jpg'),
 
   ('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2',
    'dddddddd-dddd-4ddd-8ddd-ddddddddddd1',
    'no_face',
    now() - interval '3 minutes',
-   'https://<project-ref>.supabase.co/storage/v1/object/public/proctor-snapshots/dddddddd-dddd-4ddd-8ddd-ddddddddddd1/face-missing-1.jpg'),
+   'dddddddd-dddd-4ddd-8ddd-ddddddddddd1/no_face_1.jpg'),
 
   ('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee3',
    'dddddddd-dddd-4ddd-8ddd-ddddddddddd1',

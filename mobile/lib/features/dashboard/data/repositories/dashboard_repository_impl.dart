@@ -1,5 +1,6 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../../../../core/services/supabase_service.dart';
 import '../../domain/entities/analytics_report.dart';
 import '../../domain/entities/submission_reset_result.dart';
 import '../../domain/repositories/dashboard_repository.dart';
@@ -7,7 +8,9 @@ import '../../domain/repositories/dashboard_repository.dart';
 class DashboardRepositoryImpl implements DashboardRepository {
   DashboardRepositoryImpl(this._client);
 
-  static const snapshotBucket = 'proctor-snapshots';
+  /// The private evidence bucket, shared with the writer so a reset can never
+  /// look in a different bucket from the one snapshots are uploaded to.
+  static const snapshotBucket = SupabaseService.snapshotBucket;
   static const analyticsWindow = Duration(days: 30);
   static const pageSize = 500;
 
@@ -256,12 +259,14 @@ class DashboardRepositoryImpl implements DashboardRepository {
     }
   }
 
-  static String? _snapshotPath(String url) {
-    final uri = Uri.tryParse(url);
-    if (uri == null) return null;
-    final segments = uri.pathSegments;
-    final bucketIndex = segments.indexOf(snapshotBucket);
-    if (bucketIndex < 0 || bucketIndex == segments.length - 1) return null;
-    return segments.skip(bucketIndex + 1).join('/');
-  }
+  /// The object path behind a stored `proctoring_logs.snapshot_url` value.
+  ///
+  /// Delegated to [SupabaseService.snapshotObjectPath], which knows all three
+  /// shapes a row can hold: the bucket-relative path this build writes (the
+  /// bucket is private, so there is no public URL to store), a pre-migration
+  /// `/object/public/...` URL, and a signed `/object/sign/...?token=...` one. A
+  /// reset has to purge whichever it finds, and a URL that is not a snapshot at
+  /// all is `null` rather than a path Storage would refuse.
+  static String? _snapshotPath(String value) =>
+      SupabaseService.snapshotObjectPath(value);
 }

@@ -75,8 +75,7 @@ void main() {
   });
 
   group('register_violation RPC payload', () {
-    test('sends exactly the schema argument names and maps the result',
-        () async {
+    test('sends exactly the schema argument names and maps the result', () async {
       transport.responseBody = '[{"warning_count": 2, "disqualified": false}]';
       final repo = ProctoringRepositoryImpl(client);
 
@@ -85,8 +84,10 @@ void main() {
         violation: Violation(
           type: ViolationType.lookingAway,
           timestamp: DateTime.utc(2026, 1, 1, 10, 30),
-          snapshotUrl: 'https://mock.supabase.co/storage/v1/object/public/'
-              'proctor-snapshots/sub-1/looking_away_1.jpg',
+          // A stored snapshot reference is the bucket-relative *path* the upload
+          // returned, not a URL: the bucket is private and a signed URL would
+          // expire long before the evidence is reviewed.
+          snapshotUrl: 'sub-1/looking_away_1.jpg',
           clientEventId: '9f1a4d0e-0f6b-4a1e-9a2b-6c2d2b7a3f11',
         ),
       );
@@ -105,7 +106,7 @@ void main() {
       });
       expect(body['p_submission_id'], 'sub-1');
       expect(body['p_action_type'], 'looking_away');
-      expect(body['p_snapshot_url'], contains('/proctor-snapshots/sub-1/'));
+      expect(body['p_snapshot_url'], 'sub-1/looking_away_1.jpg');
       // The *detection* time travels with the row, so a violation delivered late
       // by the offline queue is still placed correctly in the audit trail
       // (`timestamp` on the row remains the server's receipt time).
@@ -203,7 +204,9 @@ void main() {
       );
       expect(
         sql,
-        contains('public.attempt_deadline(v_started_at, v_duration_minutes, v_ends_at)'),
+        contains(
+          'public.attempt_deadline(v_started_at, v_duration_minutes, v_ends_at)',
+        ),
         reason: 'the close records the window-aware deadline',
       );
       expect(sql, contains('v_submitted_at := least('));
@@ -299,26 +302,30 @@ void main() {
       );
     });
 
-    test('a final score is only claimed once the paper says it is final',
-        () async {
-      transport.responseBody =
-          '[{"result_status":"submitted","final_score":7}]';
-      final repo = ExamRepositoryImpl(client);
+    test(
+      'a final score is only claimed once the paper says it is final',
+      () async {
+        transport.responseBody =
+            '[{"result_status":"submitted","final_score":7}]';
+        final repo = ExamRepositoryImpl(client);
 
-      final objective = (await repo.submitExam('sub-1'))
-          .withPaper(awaitingMarking: false, maxScore: 10);
-      expect(objective.hasFinalScore, isTrue);
-      // "7 of 10", not "7.0 of 10": a whole-number mark is the common case and
-      // the decimal reads like a bug.
-      expect(objective.scoreLabel, '7 of 10');
+        final objective = (await repo.submitExam(
+          'sub-1',
+        )).withPaper(awaitingMarking: false, maxScore: 10);
+        expect(objective.hasFinalScore, isTrue);
+        // "7 of 10", not "7.0 of 10": a whole-number mark is the common case and
+        // the decimal reads like a bug.
+        expect(objective.scoreLabel, '7 of 10');
 
-      // The same server row on a paper with an essay on it stays provisional —
-      // the number is only the automatic half until a lecturer marks the rest.
-      final withEssay = (await repo.submitExam('sub-1'))
-          .withPaper(awaitingMarking: true, maxScore: 10);
-      expect(withEssay.hasFinalScore, isFalse);
-      expect(withEssay.score, 7);
-    });
+        // The same server row on a paper with an essay on it stays provisional —
+        // the number is only the automatic half until a lecturer marks the rest.
+        final withEssay = (await repo.submitExam(
+          'sub-1',
+        )).withPaper(awaitingMarking: true, maxScore: 10);
+        expect(withEssay.hasFinalScore, isFalse);
+        expect(withEssay.score, 7);
+      },
+    );
 
     test('a body the client cannot read becomes "submitted, unmarked"', () async {
       // The attempt is already closed server-side by the time this is parsed, so
@@ -535,8 +542,7 @@ void main() {
           role: UserRole.lecturer,
         );
 
-    test('createAccount posts the trimmed payload to the Edge Function',
-        () async {
+    test('createAccount posts the trimmed payload to the Edge Function', () async {
       // The function answers 200 with the created row; `functions.invoke` treats
       // any 2xx as success, so the status itself is not load-bearing.
       transport.statusCode = 200;
@@ -634,8 +640,7 @@ void main() {
   });
 
   group('role contract', () {
-    test('the client and the Edge Function agree on the roles and the floor',
-        () {
+    test('the client and the Edge Function agree on the roles and the floor', () {
       // Supabase Auth's default minimum: a shorter password would be accepted
       // by the form and refused after the administrator had already typed it.
       expect(adminMinPasswordLength, AdminUserRepositoryImpl.minPasswordLength);
@@ -646,8 +651,9 @@ void main() {
 
       final source = file.readAsStringSync();
       // Same four roles, same order, on both sides of the wire.
-      final expected =
-          UserRole.values.map((role) => '"${role.dbValue}"').join(', ');
+      final expected = UserRole.values
+          .map((role) => '"${role.dbValue}"')
+          .join(', ');
       expect(source, contains('const ROLES = [$expected]'));
       // `{ error }` is what `_messageFromFunctionError` reads out of a 4xx.
       expect(source, contains('return json({ error: message }, status);'));
@@ -692,8 +698,7 @@ void main() {
   });
 
   group('attempt-reset tier', () {
-    test('the console and is_attempt_resetter() allow exactly the same roles',
-        () {
+    test('the console and is_attempt_resetter() allow exactly the same roles', () {
       // `UserRole.canResetAttempts` is what `role_gate.dart` hands the supervisor
       // dashboard as `canResetAttempts` (and what the lecture console and the
       // admin dashboard ask in their own way); the server grants the three halves
@@ -701,8 +706,9 @@ void main() {
       // through `is_attempt_resetter()`. Drift in either direction is something
       // the user sees: a reset control the server refuses, or an action the
       // server would allow that is never offered.
-      final clientRoles =
-          UserRole.values.where((role) => role.canResetAttempts).toSet();
+      final clientRoles = UserRole.values
+          .where((role) => role.canResetAttempts)
+          .toSet();
       expect(clientRoles, <UserRole>{
         UserRole.admin,
         UserRole.supervisor,
@@ -725,10 +731,10 @@ void main() {
       // The intervention tier is deliberately narrower and must stay that way:
       // the policy that writes into somebody else's attempt row in place, and
       // the RPCs that act on another account's attempt, still ask this one.
-      expect(
-        _rolesNamedBy(sql, 'is_exam_supervisor'),
-        <UserRole>{UserRole.admin, UserRole.supervisor},
-      );
+      expect(_rolesNamedBy(sql, 'is_exam_supervisor'), <UserRole>{
+        UserRole.admin,
+        UserRole.supervisor,
+      });
 
       // Every policy the console's reset rides on asks the *reset* predicate: the
       // DELETE that removes the attempt, the Storage purge of its snapshots, and
@@ -747,8 +753,10 @@ void main() {
       // endings.)
       expect(
         sql.replaceAll('\r\n', '\n'),
-        contains('using (public.is_exam_supervisor())\n'
-            '  with check (public.is_exam_supervisor());'),
+        contains(
+          'using (public.is_exam_supervisor())\n'
+          '  with check (public.is_exam_supervisor());',
+        ),
       );
 
       // Exactly four mentions: the definition plus those three policies. A fifth
@@ -772,8 +780,9 @@ void main() {
         '../supabase/migrations/session_reset_logs.sql',
         '../supabase/migrations/staff_attempt_resets.sql',
       ];
-      final expected =
-          UserRole.values.where((role) => role.canResetAttempts).toSet();
+      final expected = UserRole.values
+          .where((role) => role.canResetAttempts)
+          .toSet();
 
       var checked = 0;
       for (final path in copies) {
@@ -857,11 +866,11 @@ void main() {
     /// The body every copy of `owns_exam()` must have: the paper's author, asked
     /// of the exam the evidence row names. `created_by` is the column the
     /// authoring console already scopes edits with (`exams_update_owner`).
-    const ownerIsAuthor = 'select exists ( select 1 from public.exams '
+    const ownerIsAuthor =
+        'select exists ( select 1 from public.exams '
         'where id = p_exam_id and created_by = auth.uid() );';
 
-    test('the incident feed asks the owner as well as the intervention tier',
-        () {
+    test('the incident feed asks the owner as well as the intervention tier', () {
       final sql = schemaSql();
       if (sql == null) return; // a checkout without ../supabase
 
@@ -886,7 +895,8 @@ void main() {
       expect(
         predicate,
         'public.is_exam_supervisor() or public.owns_exam(exam_id)',
-        reason: 'the reset row carries its exam id as plain evidence, so this '
+        reason:
+            'the reset row carries its exam id as plain evidence, so this '
             'policy can ask owns_exam() directly instead of hopping through '
             'the attempt the way the incident feed does',
       );
@@ -896,14 +906,18 @@ void main() {
       if (introduced.existsSync()) {
         final sql = introduced.readAsStringSync().replaceAll('\r\n', '\n');
         expect(predicateOf(sql, 'session_reset_logs_select_staff'), predicate);
-        expect(functionBody(sql, r'owns_exam\(p_exam_id uuid\)'), ownerIsAuthor);
+        expect(
+          functionBody(sql, r'owns_exam\(p_exam_id uuid\)'),
+          ownerIsAuthor,
+        );
       }
 
       // The upgrade file assembles the policy inside an `execute`, so what has to
       // hold there is that the literal it concatenates contains this exact
       // predicate - the same sentence, not a paraphrase of it.
-      final upgrade =
-          File('../supabase/migrations/lecturer_scoped_log_reads.sql');
+      final upgrade = File(
+        '../supabase/migrations/lecturer_scoped_log_reads.sql',
+      );
       if (upgrade.existsSync()) {
         final sql = upgrade.readAsStringSync().replaceAll('\r\n', '\n');
         expect(sql, contains(predicate!));
@@ -963,11 +977,14 @@ void main() {
         // table underneath the ownership test.
         expect(
           sql,
-          contains('language sql\n'
-              'security definer\n'
-              'stable\n'
-              'set search_path = public\n'),
-          reason: '$path\'s owns_exam() is not the pinned SECURITY DEFINER form',
+          contains(
+            'language sql\n'
+            'security definer\n'
+            'stable\n'
+            'set search_path = public\n',
+          ),
+          reason:
+              '$path\'s owns_exam() is not the pinned SECURITY DEFINER form',
         );
       }
       // A checkout that has the app but no ../supabase checks nothing - like
@@ -1013,10 +1030,10 @@ void main() {
       // unguarded `create policy` would stop the whole migration at 42P01.
       expect(sql, contains("to_regclass('public.session_reset_logs')"));
       expect(
-        RegExp('^create policy "([^"]+)"', multiLine: true)
-            .allMatches(sql)
-            .map((match) => match.group(1))
-            .toList(),
+        RegExp(
+          '^create policy "([^"]+)"',
+          multiLine: true,
+        ).allMatches(sql).map((match) => match.group(1)).toList(),
         <String>['logs_select_own_or_supervisor'],
         reason: 'only the incident-feed policy may be created unconditionally',
       );
@@ -1029,11 +1046,10 @@ void main() {
     const someoneElseId = '33333333-3333-4333-8333-333333333333';
 
     Future<void> resetPassword() => AdminUserRepositoryImpl(
-          client,
-        ).resetPassword(userId: aishaId, password: 'Temporary123!');
+      client,
+    ).resetPassword(userId: aishaId, password: 'Temporary123!');
 
-    test('posts the account id and the password to the Edge Function',
-        () async {
+    test('posts the account id and the password to the Edge Function', () async {
       transport.responseBody = jsonEncode(<String, dynamic>{
         'id': aishaId,
         'email': 'aisha.bello@proctor.test',
@@ -1224,7 +1240,7 @@ void main() {
         addTearDown(() => SupabaseService.instance.debugSetClient(null));
 
         final before = DateTime.now().millisecondsSinceEpoch;
-        final url = await SupabaseService.instance.uploadViolationSnapshot(
+        final path = await SupabaseService.instance.uploadViolationSnapshot(
           submissionId: 'sub-1',
           actionType: 'no_face',
           bytes: Uint8List.fromList(<int>[1, 2, 3, 4]),
@@ -1249,18 +1265,16 @@ void main() {
         expect(multipart.fields['cacheControl'], '3600');
         expect(multipart.headers['x-upsert'], 'false');
 
-        // The URL stored on the log row comes from getPublicUrl().
-        expect(url, isNotNull);
-        expect(
-          url,
-          contains(
-            '/storage/v1/object/public/proctor-snapshots/sub-1/no_face_',
-          ),
-        );
-        expect(url, endsWith('.jpg'));
+        // What comes back is the bucket-relative **path** that goes on the log
+        // row: the bucket is private, so a URL minted here would be dead long
+        // before anybody reviews the evidence. Note the absence of `/public/`.
+        expect(path, isNotNull);
+        expect(path, startsWith('sub-1/no_face_'));
+        expect(path, endsWith('.jpg'));
+        expect(path, isNot(contains('/storage/v1/')));
 
         final stamp = int.parse(
-          RegExp(r'no_face_(\d+)\.jpg').firstMatch(url!)!.group(1)!,
+          RegExp(r'no_face_(\d+)\.jpg').firstMatch(path!)!.group(1)!,
         );
         expect(stamp, inInclusiveRange(before, after));
       },
@@ -1276,6 +1290,146 @@ void main() {
         ),
         'sub-9/looking_away_1700000000000.jpg',
       );
+    });
+
+    test('snapshotObjectPath resolves every shape a stored row can hold', () {
+      const object = 'sub-1/looking_away_1.jpg';
+
+      // What this build writes: the path itself.
+      expect(SupabaseService.snapshotObjectPath(object), object);
+
+      // What rows written while the bucket was public hold.
+      expect(
+        SupabaseService.snapshotObjectPath(
+          'https://mock.supabase.co/storage/v1/object/public/'
+          'proctor-snapshots/$object',
+        ),
+        object,
+      );
+
+      // What a console-minted signed URL holds: the token is query, not path.
+      expect(
+        SupabaseService.snapshotObjectPath(
+          'https://mock.supabase.co/storage/v1/object/sign/'
+          'proctor-snapshots/$object?token=eyJhbGciOi',
+        ),
+        object,
+      );
+
+      // Not snapshot references: nothing to sign, and the dashboard's old
+      // placeholder must not be mistaken for one.
+      for (final value in <String>[
+        '',
+        '   ',
+        'proctor-snapshots',
+        'https://mock.supabase.co/storage/v1/object/public/proctor-snapshots',
+        'https://example.com/elsewhere/thing.jpg',
+        'unavailable',
+      ]) {
+        expect(
+          SupabaseService.snapshotObjectPath(value),
+          isNull,
+          reason: '"$value" is not a snapshot reference',
+        );
+      }
+    });
+
+    test(
+      'signedSnapshotUrl asks Storage to sign the object, not a URL',
+      () async {
+        transport.responseBody =
+            '{"signedURL": "/object/sign/proctor-snapshots/sub-1/no_face_1.jpg'
+            '?token=sig"}';
+        SupabaseService.instance.debugSetClient(client);
+        addTearDown(() => SupabaseService.instance.debugSetClient(null));
+
+        // A pre-migration public URL still resolves: the console copies rows from
+        // both sides of the change.
+        final url = await SupabaseService.instance.signedSnapshotUrl(
+          'https://mock.supabase.co/storage/v1/object/public/'
+          'proctor-snapshots/sub-1/no_face_1.jpg',
+        );
+
+        final request = transport.requests.single;
+        expect(request.method, 'POST');
+        expect(
+          request.url.path,
+          '/storage/v1/object/sign/proctor-snapshots/sub-1/no_face_1.jpg',
+        );
+        // Ten minutes, from the shipped default - a leaked link is worthless
+        // before it can be passed around.
+        expect(
+          jsonDecode(transport.bodies.single) as Map<String, dynamic>,
+          containsPair('expiresIn', 600),
+        );
+
+        expect(
+          url,
+          'https://mock.supabase.co/storage/v1/object/sign/'
+          'proctor-snapshots/sub-1/no_face_1.jpg?token=sig',
+        );
+      },
+    );
+
+    test('signedSnapshotUrl refuses a value that is not a snapshot', () async {
+      SupabaseService.instance.debugSetClient(client);
+      addTearDown(() => SupabaseService.instance.debugSetClient(null));
+
+      // No request at all: there is nothing to sign, so asking Storage would
+      // only turn a placeholder into an error in the console.
+      expect(
+        await SupabaseService.instance.signedSnapshotUrl('unavailable'),
+        isNull,
+      );
+      expect(transport.requests, isEmpty);
+    });
+
+    test('the private-bucket migration matches schema.sql section 6', () {
+      final migration = File(
+        '../supabase/migrations/private_proctor_snapshots.sql',
+      );
+      final schema = File('../supabase/schema.sql');
+      if (!migration.existsSync() || !schema.existsSync()) return;
+
+      final sql = migration.readAsStringSync();
+      final fresh = schema.readAsStringSync();
+
+      // Re-runnable: an existing bucket is flipped in place rather than
+      // duplicated, and every policy is dropped before it is recreated (42710
+      // otherwise). The old upload-policy name is dropped too, so a project
+      // installed before the ownership check cannot keep a broader insert policy.
+      expect(sql, contains('on conflict (id) do update'));
+      for (final policy in <String>[
+        'Proctor snapshots read access',
+        'Proctor snapshots upload access',
+        'Proctor snapshots upload own ongoing session',
+        'Proctor snapshots supervisor purge',
+      ]) {
+        expect(
+          sql,
+          contains('drop policy if exists "$policy"'),
+          reason: '$policy is recreated without being dropped first',
+        );
+      }
+
+      // `public = false` is the whole migration: it is what makes a signed URL
+      // the only way to read a still. Pinned in the file that flips an existing
+      // project and in the one a fresh install runs.
+      const privateBucket =
+          "values ('proctor-snapshots', 'proctor-snapshots', false,";
+      expect(sql, contains(privateBucket));
+      expect(fresh, contains(privateBucket));
+
+      // Parity, not a second design: the upgrade path has to create the same
+      // three policies a fresh install gets.
+      for (final policy in <String>[
+        'Proctor snapshots read access',
+        'Proctor snapshots upload own ongoing session',
+        'Proctor snapshots supervisor purge',
+      ]) {
+        expect(sql, contains('create policy "$policy"'));
+        expect(fresh, contains('create policy "$policy"'));
+      }
     });
   });
 
@@ -1355,13 +1509,13 @@ void main() {
 
     test('Question.fromMap reads every shape from the safe view', () {
       Question parse(String type) => Question.fromMap(<String, dynamic>{
-            'id': 'q-1',
-            'exam_id': 'exam-1',
-            'question_text': 'Sample',
-            'question_type': type,
-            'options': <String>[],
-            'points': 2,
-          });
+        'id': 'q-1',
+        'exam_id': 'exam-1',
+        'question_text': 'Sample',
+        'question_type': type,
+        'options': <String>[],
+        'points': 2,
+      });
 
       expect(parse('true_false').questionType, QuestionType.trueFalse);
       expect(parse('true_false').isTrueFalse, isTrue);
@@ -1413,39 +1567,42 @@ void main() {
       );
     });
 
-    test('a new paper is created owned by the caller, and nothing else',
-        () async {
-      transport.responseBody = jsonEncode(<String, dynamic>{
-        'id': 'exam-9',
-        'title': 'GES301: Software Engineering Midterm',
-        'created_by': '11111111-1111-4111-8111-111111111111',
-        'duration_minutes': 50,
-        'is_published': false,
-      });
+    test(
+      'a new paper is created owned by the caller, and nothing else',
+      () async {
+        transport.responseBody = jsonEncode(<String, dynamic>{
+          'id': 'exam-9',
+          'title': 'GES301: Software Engineering Midterm',
+          'created_by': '11111111-1111-4111-8111-111111111111',
+          'duration_minutes': 50,
+          'is_published': false,
+        });
 
-      final exam = await repo.createExam(
-        title: 'GES301: Software Engineering Midterm',
-        durationMinutes: 50,
-        isPublished: false,
-      );
+        final exam = await repo.createExam(
+          title: 'GES301: Software Engineering Midterm',
+          durationMinutes: 50,
+          isPublished: false,
+        );
 
-      expect(transport.requests.single.url.path, endsWith('/rest/v1/exams'));
-      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
-      // `exams_insert_supervisor_only` checks both halves, so both are sent: the
-      // caller's own id, and the draft state the dialog defaults to.
-      expect(body, <String, dynamic>{
-        'title': 'GES301: Software Engineering Midterm',
-        'created_by': '11111111-1111-4111-8111-111111111111',
-        'duration_minutes': 50,
-        'is_published': false,
-      });
-      // A paper that has just been created has nothing under it, so no second
-      // read is issued to learn that its counts are zero.
-      expect(transport.requests, hasLength(1));
-      expect(exam.questionCount, 0);
-      expect(exam.attemptCount, 0);
-      expect(exam.statusLabel, 'Draft');
-    });
+        expect(transport.requests.single.url.path, endsWith('/rest/v1/exams'));
+        final body =
+            jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+        // `exams_insert_supervisor_only` checks both halves, so both are sent: the
+        // caller's own id, and the draft state the dialog defaults to.
+        expect(body, <String, dynamic>{
+          'title': 'GES301: Software Engineering Midterm',
+          'created_by': '11111111-1111-4111-8111-111111111111',
+          'duration_minutes': 50,
+          'is_published': false,
+        });
+        // A paper that has just been created has nothing under it, so no second
+        // read is issued to learn that its counts are zero.
+        expect(transport.requests, hasLength(1));
+        expect(exam.questionCount, 0);
+        expect(exam.attemptCount, 0);
+        expect(exam.statusLabel, 'Draft');
+      },
+    );
 
     test('the console asks for its own papers, with both counts', () async {
       transport.responseBody = jsonEncode(<Map<String, dynamic>>[
@@ -1479,38 +1636,43 @@ void main() {
       expect(exams.single.statusLabel, 'Published');
     });
 
-    test('a true/false question is sent as a word, with no option index',
-        () async {
-      transport.responseBody = jsonEncode(<String, dynamic>{
-        'id': 'q-7',
-        'exam_id': 'exam-9',
-        'question_text': 'A pull request may be merged before its checks pass.',
-        'question_type': 'true_false',
-        'options': <dynamic>[],
-        'correct_option': null,
-        'correct_text_answer': 'false',
-        'points': 1,
-      });
+    test(
+      'a true/false question is sent as a word, with no option index',
+      () async {
+        transport.responseBody = jsonEncode(<String, dynamic>{
+          'id': 'q-7',
+          'exam_id': 'exam-9',
+          'question_text':
+              'A pull request may be merged before its checks pass.',
+          'question_type': 'true_false',
+          'options': <dynamic>[],
+          'correct_option': null,
+          'correct_text_answer': 'false',
+          'points': 1,
+        });
 
-      final question = await repo.createQuestion(
-        examId: 'exam-9',
-        draft: const QuestionDraft(
-          questionType: QuestionType.trueFalse,
-          questionText: 'A pull request may be merged before its checks pass.',
-          correctTextAnswer: 'False',
-        ),
-      );
+        final question = await repo.createQuestion(
+          examId: 'exam-9',
+          draft: const QuestionDraft(
+            questionType: QuestionType.trueFalse,
+            questionText:
+                'A pull request may be merged before its checks pass.',
+            correctTextAnswer: 'False',
+          ),
+        );
 
-      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
-      // The shape `questions_answer_key_shape` accepts for 'true_false': the key
-      // is the word, lowercased, and there is no option index at all.
-      expect(body['question_type'], 'true_false');
-      expect(body['correct_text_answer'], 'false');
-      expect(body['correct_option'], isNull);
-      expect(body['options'], isEmpty);
-      expect(body['exam_id'], 'exam-9');
-      expect(question.answerSummary, 'False');
-    });
+        final body =
+            jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+        // The shape `questions_answer_key_shape` accepts for 'true_false': the key
+        // is the word, lowercased, and there is no option index at all.
+        expect(body['question_type'], 'true_false');
+        expect(body['correct_text_answer'], 'false');
+        expect(body['correct_option'], isNull);
+        expect(body['options'], isEmpty);
+        expect(body['exam_id'], 'exam-9');
+        expect(question.answerSummary, 'False');
+      },
+    );
 
     test('an incomplete draft is refused locally, with the sentence', () async {
       await expectLater(
@@ -1570,60 +1732,65 @@ void main() {
       expect(body['options'], isEmpty);
     });
 
-    test('a signed-out console refuses instead of writing a stray row',
-        () async {
-      final anonymous = QuestionAuthoringRepositoryImpl(
-        client,
-        currentUserId: () => null,
-      );
+    test(
+      'a signed-out console refuses instead of writing a stray row',
+      () async {
+        final anonymous = QuestionAuthoringRepositoryImpl(
+          client,
+          currentUserId: () => null,
+        );
 
-      await expectLater(
-        anonymous.listMyExams(),
-        throwsA(
-          isA<AuthoringException>().having(
-            (error) => error.message,
-            'message',
-            contains('signed out'),
+        await expectLater(
+          anonymous.listMyExams(),
+          throwsA(
+            isA<AuthoringException>().having(
+              (error) => error.message,
+              'message',
+              contains('signed out'),
+            ),
           ),
-        ),
-      );
-      await expectLater(
-        anonymous.createExam(
-          title: 'GES301',
-          durationMinutes: 50,
-          isPublished: false,
-        ),
-        throwsA(isA<AuthoringException>()),
-      );
-      expect(transport.requests, isEmpty);
-    });
+        );
+        await expectLater(
+          anonymous.createExam(
+            title: 'GES301',
+            durationMinutes: 50,
+            isPublished: false,
+          ),
+          throwsA(isA<AuthoringException>()),
+        );
+        expect(transport.requests, isEmpty);
+      },
+    );
 
-    test('a PostgREST refusal becomes a sentence a lecturer can act on',
-        () async {
-      transport.statusCode = 403;
-      transport.responseBody = jsonEncode(<String, dynamic>{
-        'message':
-            'new row violates row-level security policy for table "questions"',
-        'code': '42501',
-      });
+    test(
+      'a PostgREST refusal becomes a sentence a lecturer can act on',
+      () async {
+        transport.statusCode = 403;
+        transport.responseBody = jsonEncode(<String, dynamic>{
+          'message':
+              'new row violates row-level security policy for table "questions"',
+          'code': '42501',
+        });
 
-      await expectLater(
-        repo.createQuestion(
-          examId: 'exam-9',
-          draft: const QuestionDraft(
-            questionType: QuestionType.subjective,
-            questionText: 'Explain the difference between a stack and a queue.',
+        await expectLater(
+          repo.createQuestion(
+            examId: 'exam-9',
+            draft: const QuestionDraft(
+              questionType: QuestionType.subjective,
+              questionText:
+                  'Explain the difference between a stack and a queue.',
+            ),
           ),
-        ),
-        throwsA(
-          isA<AuthoringException>().having(
-            (error) => error.message,
-            'message',
-            contains('Only the owner of a paper'),
+          throwsA(
+            isA<AuthoringException>().having(
+              (error) => error.message,
+              'message',
+              contains('Only the owner of a paper'),
+            ),
           ),
-        ),
-      );
-    });
+        );
+      },
+    );
 
     test('a missing grading function names the migration to run', () async {
       transport.statusCode = 404;
@@ -1767,16 +1934,13 @@ void main() {
       expect(sql, contains('set score = v_score'));
     });
 
-    test('the upgrade migration carries the same DDL and the new submit_exam',
-        () {
+    test('the upgrade migration carries the same DDL and the new submit_exam', () {
       final migration = migrationSql();
       if (migration == null) return;
 
       expect(
         migration,
-        contains(
-          'drop constraint if exists questions_question_type_check',
-        ),
+        contains('drop constraint if exists questions_question_type_check'),
       );
       expect(
         migration,
@@ -1806,8 +1970,7 @@ void main() {
   });
 
   group('schema.sql carries the offline-retry contract', () {
-    test('the log table, the RPC and the dedupe index agree with the client',
-        () {
+    test('the log table, the RPC and the dedupe index agree with the client', () {
       final sql = schemaSql();
       if (sql == null) return; // a checkout without ../supabase
 
@@ -1863,7 +2026,10 @@ void main() {
       );
 
       // The window is enforced where an attempt row is created...
-      expect(sql, contains('and (e.starts_at is null or now() >= e.starts_at)'));
+      expect(
+        sql,
+        contains('and (e.starts_at is null or now() >= e.starts_at)'),
+      );
       expect(sql, contains('and (e.ends_at  is null or now() <= e.ends_at)'));
 
       // ...and capped where an attempt is answered and closed, through the one
@@ -1889,10 +2055,7 @@ void main() {
         sql,
         contains('p_started_at + make_interval(mins => p_duration_minutes)'),
       );
-      expect(
-        sql,
-        contains("coalesce(p_ends_at, 'infinity'::timestamptz)"),
-      );
+      expect(sql, contains("coalesce(p_ends_at, 'infinity'::timestamptz)"));
 
       // `ExamSessionController.resolveDeadline` has to answer the *same* instant.
       // It is the only client-side copy of that arithmetic, and it is what the
@@ -2029,7 +2192,8 @@ void main() {
         ..statusCode = 400
         ..responseBody = jsonEncode(<String, dynamic>{
           'code': 'PGRST204',
-          'message': "Could not find the 'starts_at' column of 'exams' in the "
+          'message':
+              "Could not find the 'starts_at' column of 'exams' in the "
               'schema cache',
         });
 

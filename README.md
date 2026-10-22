@@ -119,10 +119,12 @@ rather than left to be mistaken for more than it is.
   sustained-episode rules as the phone build — the detection is the host's, the
   judgement is the app's. Without such a page those signals are simply **absent**
   (never invented), and the supervisor sees that gap. The browser is otherwise a fully
-  supported host: the device check accepts a granted `getUserMedia` as proof of a
-  real camera *and* microphone (with no second capture session of its own — that is
-  what Chromium reports as "another app or tab is already using the camera"), and
-  the session asks `CameraPlatform.instance.supportsImageStreaming()` before
+  supported host: the device check probes the camera and the microphone with two
+  separate `getUserMedia` calls, releasing each stream before the next one opens
+  (one combined call is all-or-nothing, so a laptop with no microphone used to be
+  reported as a blocked camera), and it opens no capture session of its own — that
+  is what Chromium reports as "another app or tab is already using the camera".
+  The session asks `CameraPlatform.instance.supportsImageStreaming()` before
   `startImageStream`, because `camera_web` has no image stream to offer. Raw frames
   and face signals are the only things missing; the preview, the still-frame
   evidence and every browser guard are the same code path as the phone build.
@@ -140,11 +142,11 @@ rather than left to be mistaken for more than it is.
 | --- | --- | --- |
 | Impersonation / a stand-in on camera | Face detection is not face recognition and has no liveness check | Supervisor review of the attempt's evidence; add an identity-match + liveness step where the stakes require it |
 | A helper off-camera or on another device | The camera only sees in front of the lens; audio is level-only | `multiple_faces`, `no_face`, `looking_away`, `idle_afk` and `secondary_display_detected` signals, plus supervisor judgement |
-| Sound that is not plain talking (TV, music, a second speaker) | Loudness cannot be attributed to a person or separated from other sound | Sustained-threshold rules (a median-calibrated room floor, a 1.5s window that tolerates the gaps between words) keep one-offs out; content is deliberately never captured |
+| Sound that is not plain talking (TV, music, a second speaker) | Loudness cannot be attributed to a person or separated from other sound | Sustained-threshold rules (a median-calibrated room floor plus a 4 dB speech margin, a half-second window, and a 0.4 s / 3 dB release that tolerates the gaps between words) keep one-offs out; content is deliberately never captured |
 | A microphone that fails mid-session (unplugged, grant revoked, another app took the input) | Level is the only audio signal, so a dead mic stops speech being detected at all | The chip reports `Mic lost` / `Mic unavailable` / `Mic blocked` — **never a false "quiet"** — with **Reconnect** / **Open settings**. A lost mic is an **unproctored gap, not a strike**: the attempt is deliberately *not* paused, so the gap shows up on the supervisor's timeline as a hole in the audio signal rather than a silent clean run |
 | Escape from the locked exam surface | Screen pinning (no Device Owner) and browser fullscreen can be left | An escape or a fullscreen exit becomes an `app_minimized` strike; the kiosk badge shows whether pinning is enforced or best-effort |
 | Detector evasion (rooted/virtualised device, camera spoof) | Client-side detectors can be defeated by a determined, technically capable student | Treat the client as untrusted: grading and the 3-strike rule are enforced **server-side** (`register_violation`, `submit_exam`) |
-| Evidence retention / privacy | Snapshots in `proctor-snapshots` are personal data with no automatic TTL by default | Set the bucket's visibility and a retention policy for your institution; snapshots are already deleted on an attempt reset, which `session_reset_logs` records (who cleared which attempt, for whom, and how much evidence went with it) |
+| Evidence retention / privacy | Snapshots in `proctor-snapshots` are personal data with no automatic TTL by default | The bucket is **private**: a still is only ever readable through a 10-minute signed URL, and only the owning student or staff can mint one. Set a retention policy for your institution; snapshots are already deleted on an attempt reset, which `session_reset_logs` records (who cleared which attempt, for whom, and how much evidence went with it) |
 
 The client is never the authority: **grading and the strike rule live on the
 server** (see `supabase/schema.sql`), so a modified or compromised client can
@@ -160,6 +162,7 @@ lose proctoring signals but cannot change a result.
    supabase db query --linked -f supabase/migrations/session_reset_logs.sql
    supabase db query --linked -f supabase/migrations/question_types_and_grading.sql
    supabase db query --linked -f supabase/migrations/optional_exam_scheduling.sql
+   supabase db query --linked -f supabase/migrations/private_proctor_snapshots.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -184,6 +187,15 @@ lose proctoring signals but cannot change a result.
    the last of the two. Re-running the older
    `secure_exam_access_and_deadlines.sql` after either would restore a body that
    scores multiple-choice and fill-in-the-blank only, with no window cap.
+   `private_proctor_snapshots.sql` is the evidence-privacy one: it flips an
+   existing `proctor-snapshots` bucket to **private** (a fresh `schema.sql` already
+   creates it that way) and re-asserts its read/upload/purge policies. Until it
+   runs, every stored still is reachable through the permanent public URL the
+   older build wrote into `proctoring_logs.snapshot_url`; afterwards evidence is
+   only served through a short-lived signed URL. It is additive and re-runnable,
+   and it does not move or delete a single object — the app normalises the old URLs
+   back to object paths, so existing evidence stays reviewable and a reset still
+   purges it.
 2. Deploy the account-management functions:
    ```powershell
    supabase functions deploy admin-create-user
@@ -211,13 +223,19 @@ lose proctoring signals but cannot change a result.
   scheduling data — it is additive and re-runnable, and every existing paper stays
   unscheduled). Until then the console's own list reports the missing columns by
   name, and only unscheduled papers can be created.
+- Apply `supabase/migrations/private_proctor_snapshots.sql` on any project whose
+  `proctor-snapshots` bucket was created public (the pre-migration default). It is
+  additive and re-runnable, changes no object, and is what makes the bucket's
+  evidence reachable only through signed URLs.
 - Ensure the `admin-create-user`, `admin-delete-user` and `admin-reset-password`
   functions are deployed.
 - Configure the Flutter app with the Supabase project URL and a publishable
   client key. Never embed a service-role or secret key in the app.
-- Review the `proctor-snapshots` bucket visibility and retention policy in
-  `supabase/schema.sql`; the boundaries of every proctoring signal are catalogued
-  in [Proctoring boundaries and risk register](#proctoring-boundaries-and-risk-register).
+- Review the private `proctor-snapshots` bucket's retention policy in
+  `supabase/schema.sql` §6 (it is created `public = false`, so stills are only
+  readable through a short-lived signed URL); the boundaries of every proctoring
+  signal are catalogued in
+  [Proctoring boundaries and risk register](#proctoring-boundaries-and-risk-register).
 - `.github/workflows/keep_alive.yml` pings the Supabase REST API twice a week;
   configure its repository secrets or remove the workflow on a paid plan.
 - `.github/workflows/sync_release.yml` builds the release APKs on every push to

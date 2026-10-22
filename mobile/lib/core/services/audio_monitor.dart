@@ -320,6 +320,15 @@ class AudioMonitor {
   double? _peakLevel;
   bool _disposed = false;
 
+  /// Counts [start] attempts, so a capture session that opens *after* the attempt
+  /// that opened it gave up can be recognised as belonging to nobody.
+  ///
+  /// A `begin()` that outlives [startTimeout] is not cancelled by the timeout: it
+  /// can still take the microphone seconds later. By then a newer attempt may own
+  /// the device (a reconnect the student tapped), so the late session may only be
+  /// closed when no newer attempt has run since.
+  int _generation = 0;
+
   /// True once a level has been logged for the session that is running.
   ///
   /// "The microphone opened but nothing ever came out of it" is the failure this
@@ -364,6 +373,10 @@ class AudioMonitor {
   /// action in the UI does through `AudioMonitoringNotifier.retry()`.
   Future<AudioMonitorState> start() async {
     if (_disposed) return _state;
+    // Every call is a new attempt, even the ones that return below without opening
+    // anything: a session that opens late is judged against the attempt that is
+    // current when it lands (see [_closeLateSession]).
+    final generation = ++_generation;
     if (!_enabled) {
       return _transition(
         AudioMonitorState.disabled,
@@ -443,9 +456,27 @@ class AudioMonitor {
       );
     }
 
+    // The platform call is captured before the wait is time-boxed: `timeout` stops
+    // the *waiting*, not the `begin()`, which keeps running underneath it and can
+    // still take the microphone afterwards.
+    final opening = _source.begin();
     try {
-      await _source.begin().timeout(startTimeout);
+      await opening.timeout(startTimeout);
     } catch (error) {
+      // A `begin()` that is still on the wire when this attempt gives up opens a
+      // capture session nothing here is left to close: no listener, no level timer,
+      // and a state that already reads `unavailable`. Left alone it holds the
+      // device - and the recording indicator - for the rest of the sitting, so it
+      // is closed as soon as it lands. An *error* means `begin()` finished, so
+      // there is nothing late to close.
+      if (error is TimeoutException) {
+        unawaited(
+          opening.then(
+            (_) => _closeLateSession(generation),
+            onError: (Object _) {},
+          ),
+        );
+      }
       proctorLog('ProctorGuard audio: could not open the microphone: $error');
       if (_disposed) return _state;
       return _transition(
@@ -477,6 +508,29 @@ class AudioMonitor {
     });
 
     return _state;
+  }
+
+  /// Closes a capture session that opened after the [start] attempt had already
+  /// reported it as failed.
+  ///
+  /// [startTimeout] bounds the wait, not the platform call, so the microphone can
+  /// still be taken seconds after the chip said "could not be opened". At that
+  /// point there is no listener, no level timer and no state left for it - just a
+  /// device (and an OS recording indicator) held until the page goes away. This
+  /// releases it.
+  ///
+  /// Skipped when a newer [start] has run since (`generation` is stale - that
+  /// attempt, a reconnect the student tapped, owns whatever is open now) or when
+  /// the monitor is disposed, where the source's own teardown already ran.
+  Future<void> _closeLateSession(int generation) async {
+    if (_disposed || generation != _generation) return;
+    proctorLog(
+      'ProctorGuard audio: the microphone opened after the attempt had given up '
+      'on it - releasing it.',
+    );
+    await _releaseSource();
+    _currentLevel = null;
+    _peakLevel = null;
   }
 
   void _onLevel(double decibels) {

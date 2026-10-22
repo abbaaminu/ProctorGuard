@@ -167,6 +167,9 @@ void main() {
                     'https://mock.supabase.co/storage/v1/object/sign/'
                         'proctor-snapshots/attempt-1/flag%201.jpg?token=secret',
               },
+              // A row written after the bucket went private: the path itself, no
+              // scheme and no bucket segment.
+              {'snapshot_url': 'attempt-1/no_face_1.jpg'},
               {'snapshot_url': 'https://example.invalid/placeholder.jpg'},
             ]);
           }
@@ -188,7 +191,7 @@ void main() {
 
         final result = await repository.resetSubmission('attempt-1');
 
-        expect(result.incidents, 3);
+        expect(result.incidents, 4);
         expect(result.snapshots, 0);
         expect(result.storageWarning, isNull);
         expect(result.auditWarning, isNull);
@@ -206,6 +209,10 @@ void main() {
           contains('attempt-1/flag 1.jpg'),
           reason: 'duplicate URLs resolve to one decoded Storage object path',
         );
+        // The path form resolves too, so a reset purges evidence from both sides
+        // of the private-bucket migration - and the placeholder writes nothing.
+        expect(transport.bodies[2], contains('attempt-1/no_face_1.jpg'));
+        expect(transport.bodies[2], isNot(contains('placeholder')));
 
         // The audit row names the attempt it describes...
         final audit = jsonDecode(transport.bodies.last) as Map<String, dynamic>;
@@ -213,7 +220,7 @@ void main() {
           'submission_id': 'attempt-1',
           'student_id': 'student-1',
           'exam_id': 'exam-1',
-          'incidents': 3,
+          'incidents': 4,
           'snapshots': 0,
           'storage_warning': null,
         });

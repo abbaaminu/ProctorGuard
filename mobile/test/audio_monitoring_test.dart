@@ -52,20 +52,20 @@ void main() {
 
       expect(sensor.isCalibrated, isTrue);
       expect(sensor.roomFloorDb, -60);
-      // Floor -60 plus only 5 dB of speech margin (the median shrugs off the loud
-      // -20 sample): threshold -55, the bottom of the sensitive band rather than
-      // clamped away, so a quiet room stays quiet-sensitive.
+      // Floor -60 plus only 4 dB of speech margin (the median shrugs off the loud
+      // -20 sample): -64 clamped up to -55, the bottom of the sensitive band rather
+      // than clamped away, so a quiet room stays quiet-sensitive.
       expect(sensor.thresholdDb, -55);
     });
 
     test('the threshold follows the room, clamped so neither end is silly', () {
       final quietRoom = detector();
       quietRoom.add(-62);
-      expect(quietRoom.thresholdDb, -55); // -57 clamped up
+      expect(quietRoom.thresholdDb, -55); // -58 clamped up
 
       final hummingRoom = detector();
       hummingRoom.add(-38);
-      expect(hummingRoom.thresholdDb, -33); // -38 + 5, inside the band
+      expect(hummingRoom.thresholdDb, -34); // -38 + 4, inside the band
 
       final loudHall = detector();
       loudHall.add(-15);
@@ -134,17 +134,20 @@ void main() {
     test('the shipped defaults are the documented window and margin', () {
       final sensor = AudioNoiseDetector();
 
-      // 1.5 s is roughly one spoken sentence - the window a talking student has
-      // to fill before it is a strike - and the 400 ms grace carries it across
-      // the gaps between words. Anything shorter than the 250 ms capture
-      // interval would be no allowance at all.
-      expect(sensor.sustain, const Duration(milliseconds: 1500));
+      // 500 ms of speech above the room's own floor is a strike. Short enough that
+      // two words are caught - a student reading a question aloud, or repeating one
+      // to somebody in the room, is exactly what the audit asked for - and long
+      // enough that a cough, a door or a chair is still not: those are one sample
+      // (250 ms) or two, and two consecutive *loud* samples are a raised voice
+      // rather than a noise. The 400 ms grace carries the window across the gaps
+      // between words.
+      expect(sensor.sustain, const Duration(milliseconds: 500));
       expect(sensor.releaseGrace, const Duration(milliseconds: 400));
       expect(sensor.calibrationWindow, const Duration(seconds: 4));
       expect(sensor.cooldown, const Duration(seconds: 5));
       // The margin the threshold sits above the measured room floor: low enough
       // that quiet speech still counts, wide enough that the room itself does not.
-      expect(sensor.speechMarginDb, 5);
+      expect(sensor.speechMarginDb, 4);
     });
 
     test('a short gap between words is bridged, so talking does add up', () {

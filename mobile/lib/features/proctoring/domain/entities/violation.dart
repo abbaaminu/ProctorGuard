@@ -70,6 +70,17 @@ enum ViolationType {
 class Violation extends Equatable {
   final ViolationType type;
   final DateTime timestamp;
+
+  /// Where the evidence still lives: the **bucket-relative object path** inside
+  /// the private `proctor-snapshots` bucket
+  /// (`<submissionId>/<actionType>_<epochMs>.jpg`), written to
+  /// `proctoring_logs.snapshot_url`.
+  ///
+  /// A path rather than a URL because the bucket is private and a signed URL is
+  /// short-lived: the log row outlives any URL minted from it, so the reader
+  /// signs it when it is actually looked at (`SupabaseService.signedSnapshotUrl`).
+  /// Rows written before the bucket went private still hold a public URL; readers
+  /// normalise both (`SupabaseService.snapshotObjectPath`).
   final String? snapshotUrl;
 
   /// Client-minted UUID for this one event, sent as

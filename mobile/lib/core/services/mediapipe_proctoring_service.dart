@@ -35,10 +35,11 @@ enum GazeSignal { centered, lookingAway, noFace, multipleFaces }
 class MediaPipeProctoringService {
   MediaPipeProctoringService({
     this.inferenceInterval = const Duration(milliseconds: 150), // ~6-7 FPS
-    this.offCenterThresholdDegrees = 28.0,
-    this.pitchThresholdDegrees = 30.0,
-    this.immediateAwayThresholdDegrees = 50.0,
-    this.consecutiveFrameThreshold = 3,
+    this.offCenterThresholdDegrees = 15.0,
+    this.pitchThresholdDegrees = 18.0,
+    this.immediateAwayThresholdDegrees = 30.0,
+    this.consecutiveFrameThreshold = 1,
+    this.missingFaceFrameThreshold = 3,
     this.multipleFacesCooldown = const Duration(seconds: 30),
     this.sensorOrientation = 90,
     this.lensDirection = CameraLensDirection.front,
@@ -48,6 +49,10 @@ class MediaPipeProctoringService {
   })  : assert(
           consecutiveFrameThreshold > 0,
           'a zero frame threshold would flag every single frame',
+        ),
+        assert(
+          missingFaceFrameThreshold > 0,
+          'a zero frame threshold would flag every single dropped frame',
         ),
         assert(
           immediateAwayThresholdDegrees >= offCenterThresholdDegrees,
@@ -67,50 +72,71 @@ class MediaPipeProctoringService {
 
   final Duration inferenceInterval;
 
-  /// Yaw (left/right head turn) tolerance in degrees. Relaxed to ~28 so a quick
-  /// glance sideways, or turning toward a second screen, is not an instant
-  /// violation - only a turn that stays past this for [consecutiveFrameThreshold]
-  /// frames in a row is.
+  /// Yaw (left/right head turn) tolerance in degrees.
+  ///
+  /// Tightened to 15 by the audit: an exam screen is the only thing the student is
+  /// meant to be looking at, and at a normal viewing distance a 15 deg turn already
+  /// points the face - and the eyes - off it, which is how a second screen, a phone
+  /// flat on the desk or a person standing beside them gets read. The earlier 28 deg
+  /// tolerance let a student work from a second display at the edge of the camera's
+  /// view for the whole sitting without ever being flagged.
+  ///
+  /// A single frame past this is reported ([consecutiveFrameThreshold] is one), so
+  /// the windows that keep a one-off out are elsewhere: the angle has to be a real
+  /// turn, and `pitchThresholdDegrees` is judged separately because reading and
+  /// typing look down.
   final double offCenterThresholdDegrees;
 
-  /// Pitch (up/down head tilt) tolerance in degrees. Deliberately a little wider
-  /// than [offCenterThresholdDegrees]: looking down at a keyboard or notes while
-  /// reading and typing is normal exam behaviour, not cheating.
+  /// Pitch (up/down head tilt) tolerance in degrees.
+  ///
+  /// A little wider than [offCenterThresholdDegrees] (18 against 15) and no wider:
+  /// a few degrees of droop while reading the question on screen is normal, but a
+  /// head down at a phone in the lap or notes on the desk is 25-40 deg, so the
+  /// earlier 30 deg tolerance was set above the thing it was meant to catch.
   final double pitchThresholdDegrees;
 
-  /// Yaw past which a *single* frame is already unambiguous evidence, instead of
-  /// [consecutiveFrameThreshold] consecutive ones.
+  /// Yaw past which a turn is unambiguous, and the [consecutiveFrameThreshold]
+  /// wait is bypassed.
   ///
-  /// The ordinary tolerance waits for three frames so that a glance sideways, a
-  /// dropped frame, or a hand sweeping past the lens cannot burn a strike. A head
-  /// turned past 50 deg is none of those: it is beyond the point where the
-  /// student could be reading the screen, and making them wait two more frames
-  /// (~0.3 s at the default rate) only delays the warning while the turn keeps
-  /// going. So the count is bypassed - once per episode, like every other
-  /// camera condition - while anything between the tolerance and this line still
-  /// has to hold for the full frame count.
-  ///
-  /// Pitch is deliberately not included. The pitch tolerance is already wider
-  /// because looking down at notes and a keyboard is normal exam behaviour, and
-  /// a single steep tilt is the one case where a detector's Euler estimate is
-  /// worth the extra frames of confirmation.
+  /// It is the line past which a student cannot be reading the screen at all, so
+  /// no amount of extra confirmation is worth delaying the warning for. With the
+  /// one-frame threshold (see [consecutiveFrameThreshold]) every turn past the
+  /// ordinary tolerance is already immediate, so this no longer changes the
+  /// timing; it stays as the documented unambiguous line, and as the rule that
+  /// keeps a near-sideways turn immediate if the frame count is ever raised to
+  /// absorb a noisier detector.
   ///
   /// Must be at least [offCenterThresholdDegrees] (asserted): this may only
   /// shorten the wait for a clearly turned head, never flag a glance.
   final double immediateAwayThresholdDegrees;
 
-  /// How many **consecutive frames** have to show the same condition - a missing
-  /// face, or a head past the yaw/pitch tolerances - before it is reported.
+  /// How many **consecutive frames** have to show a head past the yaw/pitch
+  /// tolerances before [GazeSignal.lookingAway] is reported.
   ///
-  /// Counted in frames rather than seconds on purpose: what is being judged is
-  /// what the detector actually saw, and `inferenceInterval` (so how much wall
-  /// time a frame stands for) is throttling, not evidence. Three in a row is a
-  /// strict threshold - one dropped frame, one hand sweeping past the lens, or
-  /// one frame the detector stumbled on no longer spends a strike - while a
-  /// student who has really left the frame or turned away still reaches it in
-  /// ~0.45 s at the default ~7 FPS. A single frame back in the tolerated pose
-  /// resets the count, so only an *unbroken* run of frames counts.
+  /// One: a single frame past the tolerance is a strike, matching the browser
+  /// monitor's ~300 ms look-away rule (`web_face_presence.dart`). The audit's
+  /// finding was that the old three-frame count (~0.45 s at the default ~7 FPS)
+  /// let a student read a question off a second screen, or glance down at a phone,
+  /// and be back before the camera ever said anything - the detector saw it and
+  /// threw it away.
+  ///
+  /// Kept configurable and frame-counted rather than timed so the strictness is a
+  /// property of the evidence (what the detector saw) and not of the throttle:
+  /// raising it to 2-3 is the knob for a device whose Euler estimates are noisy.
+  /// A frame back inside the tolerances resets the count, and the episode flag is
+  /// what keeps one sustained look-away to one strike.
   final int consecutiveFrameThreshold;
+
+  /// How many **consecutive frames** without a face before [GazeSignal.noFace] is
+  /// reported.
+  ///
+  /// Three, unlike [consecutiveFrameThreshold]: a missing *face* is the one signal
+  /// a working detector also produces by accident - a blink behind glasses, a hand
+  /// passing the lens, one frame of motion blur - so it is worth confirming, and
+  /// three frames is ~0.45 s at the default rate, far short of the time it takes to
+  /// actually leave the camera's view. Any frame with a face in it resets the
+  /// count, so only an unbroken absence is reported.
+  final int missingFaceFrameThreshold;
 
   /// How long the student has to be *alone* in frame before a second person can
   /// be reported again.
@@ -448,17 +474,23 @@ class MediaPipeProctoringService {
   @visibleForTesting
   void handleResult(FaceFrameResult result) => _handleResult(result);
 
-  /// Applies the consecutive-frame threshold to one detection result.
+  /// Applies the consecutive-frame rules to one detection result.
   ///
-  /// A single frame is never enough to flag the student: [GazeSignal.noFace]
-  /// and [GazeSignal.lookingAway] are only emitted once the condition has held
-  /// for [consecutiveFrameThreshold] frames *in a row* (three, by default), and
-  /// each episode emits at most once. The first exception is a head turned past
-  /// [immediateAwayThresholdDegrees]: that cannot be a glance, so it is reported
-  /// from the first frame. Any frame back in the tolerated state - a visible
-  /// face, a centered head - resets that count, so a blink, a dropped frame, a
-  /// hand sweeping past the lens or one glance at the keyboard cannot accumulate
-  /// multiple disqualification flags.
+  /// [GazeSignal.lookingAway] is reported from the **first** frame past the yaw or
+  /// pitch tolerance ([consecutiveFrameThreshold] is one): a head turned that far
+  /// is not something a student does by accident, and waiting for more frames only
+  /// gives a glance at a second screen somewhere to hide. [GazeSignal.noFace]
+  /// still waits for [missingFaceFrameThreshold] frames without a face, because a
+  /// working detector drops a single frame (a blink behind glasses, a hand across
+  /// the lens) on its own. Each episode emits at most once, so a sustained
+  /// look-away or a face that stays out of frame is one strike, not one per
+  /// inference.
+  ///
+  /// The first exception is a head turned past [immediateAwayThresholdDegrees]:
+  /// that cannot be a glance, so it bypasses the frame count even if that count is
+  /// raised for a noisier detector. Any frame back in the tolerated state - a
+  /// visible face, a centered head - resets the counters, so nothing accumulates
+  /// across separate glances.
   ///
   /// [GazeSignal.multipleFaces] is the other condition with no frame threshold
   /// (two people in frame needs no measuring), so it is latched instead: one
@@ -475,14 +507,15 @@ class MediaPipeProctoringService {
     final now = _clock();
 
     if (result.faceCount == 0) {
-      // Face missing: three frames in a row without one becomes noFace. Without a
-      // face the head can no longer be "off centre", so that count starts over.
+      // Face missing: [missingFaceFrameThreshold] frames in a row without one
+      // becomes noFace. Without a face the head can no longer be "off centre", so
+      // those counters start over.
       _offCenterFrames = 0;
       _lookAwayFlagged = false;
 
       _faceMissingFrames++;
       if (!_noFaceFlagged &&
-          _faceMissingFrames >= consecutiveFrameThreshold) {
+          _faceMissingFrames >= missingFaceFrameThreshold) {
         _noFaceFlagged = true;
         _signalController.add(GazeSignal.noFace);
       }
@@ -537,9 +570,10 @@ class MediaPipeProctoringService {
     }
 
     _offCenterFrames++;
-    // A near-sideways turn is not a glance: it is reported from the first frame,
-    // because there is no reading of the screen it could still be. Angles between
-    // the ordinary tolerance and this line keep the strict consecutive-frame rule.
+    // A single frame past the tolerance is a strike ([consecutiveFrameThreshold]),
+    // and a near-sideways turn past [immediateAwayThresholdDegrees] is reported
+    // even if that count is raised for a noisier detector: there is no reading of
+    // the screen either could still be.
     final isUnambiguousTurn = yaw.abs() > immediateAwayThresholdDegrees;
     if (!_lookAwayFlagged &&
         (isUnambiguousTurn ||

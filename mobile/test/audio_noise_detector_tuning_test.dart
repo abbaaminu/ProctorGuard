@@ -21,12 +21,19 @@ void main() {
 
   /// A detector that has already measured the room.
   ///
-  /// One `-60` dBFS sample with a zero-length window gives a `-55` dB threshold
-  /// (floor + 5, the bottom of the clamp), so `-50` is over the line, `-56` is a
-  /// quiet syllable inside the default 3 dB band, and `-65` is a real dip.
+  /// One `-60` dBFS sample with a zero-length window gives the bottom of the
+  /// clamp, a `-55` dB threshold (floor + 4 is `-56`, clamped up), so `-50` is
+  /// over the line, `-56` is a quiet syllable inside the default 3 dB band, and
+  /// `-65` is a real dip.
+  ///
+  /// The window is pinned wide (2 s) on purpose: these tests step a full second
+  /// at a time and are about the *band*, so the measured value is the band's
+  /// effect on the window rather than the shipped 500 ms window firing early and
+  /// hiding it.
   AudioNoiseDetector measured({double hysteresisDb = 3}) {
     final detector = AudioNoiseDetector(
       calibrationWindow: Duration.zero,
+      sustain: const Duration(seconds: 2),
       hysteresisDb: hysteresisDb,
       minCalibrationSamples: 1,
       clock: () => now,
@@ -257,25 +264,42 @@ void main() {
       expect(
         sustainedNoise(sensor, const Duration(seconds: 2)),
         1,
-        reason: 'the window plus the 250 ms sampling offset has to fit inside '
-            'the two to three seconds of noise the rule is meant to catch',
+        reason: 'the cooldown has to keep one burst to one strike even though the '
+            'window closes long before the noise does',
       );
     });
 
-    test('a one-second cough is still not enough', () {
+    test('two words are enough: half a second of speech is a strike', () {
       final sensor = calibrated();
 
-      expect(sustainedNoise(sensor, const Duration(seconds: 1)), 0);
+      // At AudioMonitor's real 250 ms rate the shortest burst that can close the
+      // shipped 500 ms window is three samples - one opens it, the third lands
+      // exactly 500 ms later. That is a couple of words, which is the point of the
+      // tuning: a student reading a question aloud is caught, not only a shout.
+      expect(sustainedNoise(sensor, const Duration(milliseconds: 750)), 1);
+    });
+
+    test('a cough - one or two samples - is still not enough', () {
+      final sensor = calibrated();
+
+      // Loud, but over before the window can add up: a cough, a door, a chair, a
+      // breath. Only the amber indicator reacts, and nothing is logged.
+      expect(sustainedNoise(sensor, const Duration(milliseconds: 500)), 0);
       expect(sensor.isNoisy, isTrue, reason: 'suspicious, not a violation');
     });
 
-    test('the spare half second absorbs the sampling offset', () {
+    test('the sampling offset cannot swallow a short burst', () {
       // A burst that starts just after a sample only contributes its remainder to
-      // the window: 1.75 s of evidence from 2 s of noise. The shipped window is
-      // deliberately below that, so the burst is still logged.
+      // the window: 750 ms of noise yields 500 ms of evidence. The shipped window
+      // is exactly that, so the shortest audible phrase still lands.
       final sensor = calibrated();
-      expect(sensor.sustain, const Duration(milliseconds: 1500));
-      expect(sustainedNoise(sensor, const Duration(milliseconds: 1750)), 1);
+      expect(sensor.sustain, const Duration(milliseconds: 500));
+      expect(sustainedNoise(sensor, const Duration(milliseconds: 750)), 1);
+
+      // One sample less and nothing accrues: the window is not so short that the
+      // 250 ms sampling interval alone closes it.
+      final tooShort = calibrated();
+      expect(sustainedNoise(tooShort, const Duration(milliseconds: 500)), 0);
     });
   });
 }

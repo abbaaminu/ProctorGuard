@@ -47,11 +47,11 @@ import 'dart:math' as math;
 class AudioNoiseDetector {
   AudioNoiseDetector({
     this.calibrationWindow = const Duration(seconds: 4),
-    this.sustain = const Duration(milliseconds: 1500),
+    this.sustain = const Duration(milliseconds: 500),
     this.releaseGrace = const Duration(milliseconds: 400),
     this.hysteresisDb = 3,
     this.cooldown = const Duration(seconds: 5),
-    this.speechMarginDb = 5,
+    this.speechMarginDb = 4,
     this.minThresholdDb = -55,
     this.maxThresholdDb = -32,
     this.defaultThresholdDb = -30,
@@ -83,18 +83,25 @@ class AudioNoiseDetector {
 
   /// How long the level must add up to above the threshold before it is a strike.
   ///
-  /// One and a half seconds is roughly one spoken sentence: long enough that a
-  /// cough, chair creak or door cannot reach it, short enough that a student who
-  /// answers their phone or talks a neighbour through a question is caught while
-  /// they are still doing it.
+  /// Half a second - two or three of `AudioMonitor`'s 250 ms samples in a row - is
+  /// about two spoken syllables, which is the shortest thing that is *speech*
+  /// rather than an accident: "hey you", "stop that", a name called across the
+  /// room. The rule is deliberately hyper-sensitive (an audit finding on the
+  /// earlier 1.5 s window, which needed most of a sentence): with a window that
+  /// long a student could read a question aloud, or answer somebody in the room in
+  /// a few words, and never be warned at all.
   ///
-  /// Deliberately shorter than the two-to-three seconds of sound a supervisor
-  /// would call talking. `AudioMonitor` asks for a level every 250 ms, so a
-  /// burst that starts just after a sample only contributes its remainder to
-  /// the window: with a two-second window a two-second burst could land at
-  /// 1.75 s of evidence and never be logged - exactly the "audio never flags"
-  /// case. The spare half second absorbs that sampling offset; [releaseGrace]
-  /// and [hysteresisDb] are what still keep one-offs out.
+  /// A cough, a chair creak or a door is still shorter than this. At four samples
+  /// a second a 300 ms one-off can contribute at most one over-threshold sample,
+  /// which cannot fill a 500 ms window; the burst has to keep crossing the line
+  /// across two sampling intervals. [releaseGrace] and [hysteresisDb] are what
+  /// keep the gap *between* two words from restarting the window, so two words are
+  /// one episode rather than none.
+  ///
+  /// Kept well below the length of the noise it is meant to catch on purpose: the
+  /// samples are a meter, not a recording, so a burst that starts just after one
+  /// only contributes its remainder. A short window is what makes that offset
+  /// harmless instead of hiding half a sentence.
   final Duration sustain;
 
   /// How much of a dip below the threshold is bridged instead of ending the
@@ -133,10 +140,15 @@ class AudioNoiseDetector {
   final Duration cooldown;
 
   /// How far above the measured room floor counts as human noise rather than the
-  /// room itself. 5 dB is a clear, *sustained* step above the hum it is measured
+  /// room itself. 4 dB is a clear, *sustained* step above the hum it is measured
   /// against, so the room's own level does not trip it - but it is low enough that
   /// quiet speech (often only a few decibels over the floor) and steady background
   /// sound are still caught, not just a raised voice.
+  ///
+  /// Lowered from 5 dB by the sensitivity audit: the margin is what a normal-volume
+  /// conversation has to clear, and a student talking to somebody across the room
+  /// sits barely above a quiet room's floor. The [minThresholdDb] clamp is what
+  /// still keeps a microphone's own self-noise from reading as speech.
   final double speechMarginDb;
 
   /// Sensitivity bounds. Without the clamp a silent room would produce a threshold
