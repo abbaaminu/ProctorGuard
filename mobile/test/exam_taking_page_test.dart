@@ -532,6 +532,31 @@ void main() {
       expect(proctoring.violations.single.type.dbValue, 'multiple_faces');
     });
 
+    testWidgets('a covered camera is a no_face strike once it is held',
+        (tester) async {
+      await openPastGrace(tester);
+
+      // `web/proctor_face_detector.js` re-sends `no_face` on every 350 ms tick it
+      // holds, which is what this is: the first verdict is one dropped frame, the
+      // second - one tick inside the monitor's sustain - is a covered lens.
+      faces.emit('no_face');
+      await tester.pump();
+      await tester.pump();
+      expect(
+        proctoring.violations,
+        isEmpty,
+        reason: 'a single no_face is a camera that blinked, not a student hiding',
+      );
+
+      now = now.add(const Duration(milliseconds: 350));
+      faces.emit('no_face');
+      await tester.pump();
+      await tester.pump();
+
+      expect(proctoring.violations.single.type.dbValue, 'no_face');
+      expect(find.text('Warning 1 / 3'), findsOneWidget);
+    });
+
     testWidgets('nothing is judged while the page has no detector', (tester) async {
       // Android, iOS, desktop, and a browser whose host page ships no detector:
       // the source says so, the page releases it, and the attempt is proctored

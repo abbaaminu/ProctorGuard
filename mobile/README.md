@@ -46,7 +46,9 @@ android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLoc
    and use `estimateHeadPose` when your model emits 3D (x/y/z) landmarks.
    **On the web there is no ML Kit**, so a browser session runs either in mock
    mode (`.\run_app.ps1 -Mock`, or `--dart-define=MOCK_CAMERA=true`) or with a
-   webcam and no face signals *of its own* — a hosting page can supply them
+   webcam and the shipped browser sensor (`web/proctor_face_detector.js`: camera
+   presence, blank/covered-frame detection, and a face count where the browser
+   exposes the Shape Detection API). A hosting page can add its own detections
    through the `proctorGuardFaceSignal` bridge (see
    [Face signals on the web](#face-signals-on-the-web-the-host-page-bridge)); the
    audio hook (`reportAudioLevel`) and the
@@ -857,11 +859,14 @@ Details worth knowing:
   true, `camera_web` answers false — and calling it anyway threw
   `UnimplementedError`, which is the "Proctoring could not start on this device"
   screen a browser student used to get on a perfectly working camera. The preview
-  and the still-frame evidence are unaffected; what the web cannot do is pick a
-  face out of the feed, which the gate says out loud before the paper starts. A
-  camera the browser reports as **still in use** is re-opened once, after
-  `webCameraOpenRetryDelay`, because that one is a timing failure rather than a
-  broken device (`isDeviceBusyCameraCode` names the codes it covers).
+  and the still-frame evidence are unaffected; what the web cannot do is run the
+  app's own face model on the feed — the Shape Detection API, where a browser has
+  it, only counts faces — which is what the gate says before the paper starts.
+  The shipped page-level sensor still watches the preview for a covered, closed
+  or blanked camera (see the web section above), so "nobody in frame" is not
+  blind on the web. A camera the browser reports as **still in use** is re-opened
+  once, after `webCameraOpenRetryDelay`, because that one is a timing failure
+  rather than a broken device (`isDeviceBusyCameraCode` names the codes it covers).
 * **Answers are painted locally and saved through the RPCs.** The tap is durable
   on the device first (`OfflineSyncService`), so the round-trip to Supabase is off
   the critical path and a dropped connection no longer costs the answer — the
@@ -912,7 +917,7 @@ publish the signed, split-per-ABI APKs students install.
 | --- | --- | --- | --- | --- |
 | Android (phone) | `flutter build apk` | ML Kit, on-device | `record` | Lock task / screen pinning + immersive chrome |
 | iOS | `flutter build ios` — needs the Podfile work in `ios/README.md` first | ML Kit, on-device | `record` | Best-effort only (`startLock` reports `granted: false`) |
-| Web (Chrome/Edge) | `flutter build web` | **No ML Kit for browsers.** A host page may supply detections through the `proctorGuardFaceSignal` bridge ([below](#face-signals-on-the-web-the-host-page-bridge)) | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
+| Web (Chrome/Edge) | `flutter build web` | `web/proctor_face_detector.js`, shipped with the app: camera presence, blank/covered-frame and face-count checks ([below](#face-signals-on-the-web-the-host-page-bridge)); a host page may add its own detections through the same `proctorGuardFaceSignal` bridge | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
 | macOS / Windows / Linux | — | — | — | — |
 
 **There is no `macos/`, `windows/` or `linux/` runner here, and that is a scope
@@ -930,10 +935,40 @@ away.
 
 A browser cannot run ML Kit, and `camera_web` cannot hand `CameraImage` frames to
 a model (`supportsImageStreaming()` is false there, so the exam page never calls
-`startImageStream` on the web). What the web build can do is **host** a detector
-someone else runs: `WebFaceSignalSource` (`lib/core/services/web_face_signal_source.dart`,
-DOM half in `web_face_signal_source_web.dart`) installs one global function with
-the attempt, and removes it when the attempt ends.
+`startImageStream` on the web). So the web build ships its own sensor —
+`web/proctor_face_detector.js`, loaded by `web/index.html` — and accepts one from
+a host page as well. `WebFaceSignalSource` (`lib/core/services/web_face_signal_source.dart`,
+DOM half in `web_face_signal_source_web.dart`) installs the one global function
+both use, with the attempt, and removes it when the attempt ends.
+
+**What `proctor_face_detector.js` measures.** It polls about three times a second
+(350 ms — one tick more than the monitor's 300 ms sustain, so the first verdict
+opens an episode and the second is the strike) and samples the preview
+`camera_web` renders, which it finds through Flutter's platform-view host and any
+shadow root above it. Per tick:
+
+* **The camera is gone or not delivering.** The stream's track ended (the camera
+  was closed, unplugged, or the grant was revoked), the track is muted or
+  disabled, the element is paused or still opening, it has no picture size, or it
+  is hidden by CSS → `no_face`. A camera that has never shown a live frame is not
+  accused of anything: a preview that failed to open is a camera problem the
+  attempt reports on its own terms, not a student covering the lens.
+* **The frame holds no picture of anything** — near-black (a hand, a sticker or a
+  closed shutter over the lens), blown out (a camera pointed into a lamp), or one
+  flat colour with no variation (a blanked or stalled stream, a still image in
+  place of the camera) → `no_face`. The frame is sampled into a 48x36 thumbnail,
+  and an unreadable frame is reported as *nothing* rather than as an absence.
+* **Otherwise a live, non-blank frame.** If the browser exposes the Shape
+  Detection API (`window.FaceDetector`, Chromium only) the count decides:
+  `0` → `no_face`, more than one → `multiple_faces`, one → `centered`. Without it
+  the page says `centered`, which is what ends an absence episode — it is never a
+  strike, so a browser that cannot count faces still catches a covered or closed
+  camera and still cannot invent a missing student.
+
+It does **not** report `looking_away`: a head pose is something a model measures,
+and guessing an angle from a bounding box would be inventing evidence. A host
+running a real detector (WASM/WebGPU, or a remote service) keeps using the bridge
+below and can say `looking_away` or `pose:<yaw>,<pitch>` itself.
 
 ```js
 // Once per detection, from any page-level detector (WASM, WebGPU, a remote
@@ -959,10 +994,12 @@ it is one of the shortest intervals a host detector is polled at (~3-10 fps), so
 glance that would be a strike on the phone is a strike here too rather than waiting
 for a second of evidence the host may never send. Three consequences worth knowing:
 
-* **Nothing is invented.** `isSupported` is false everywhere but a web build with
-  the hook installed, so a browser with no detector reports **fewer** signals and
-  the attempt's timeline says so — it never logs a `no_face` for a student it
-  never looked at.
+* **Nothing is invented.** `isSupported` is false on every platform but the web,
+  and on the web the sensor speaks only about evidence it has: a frame it could
+  not read is silence, not an absence, and a camera that never opened a live
+  frame is never accused of having gone dark. A browser where a host removed the
+  script reports **fewer** signals, and the attempt's timeline says so — it never
+  logs a `no_face` for a student it never looked at.
 * **The page cannot log violations**, only detections: unknown or malformed
   strings are passed through and ignored, an empty or non-string argument is
   dropped, and the vocabulary is checked here rather than by the host.
@@ -971,9 +1008,11 @@ for a second of evidence the host may never send. Three consequences worth knowi
   nothing after a submit.
 
 The DOM half is type-checked by `flutter analyze` and compiled by the web build;
-the rules are covered on the VM by `test/web_face_presence_test.dart`, and the
-exam page's use of them by the "the browser face bridge" group in
-`test/exam_taking_page_test.dart`.
+the rules are covered on the VM by `test/web_face_presence_test.dart`, the exam
+page's use of them by the "the browser face bridge" group in
+`test/exam_taking_page_test.dart`, and the shipped sensor's own contract (the hook
+name, the vocabulary, and that a stopped/hidden/blank camera is `no_face`) by
+`test/web_face_detector_contract_test.dart`.
 
 ## Web install surface (icons, manifest, favicon)
 
@@ -1125,13 +1164,14 @@ What `SupabaseService` guarantees on web:
 
 ## Anti-cheating surface (kiosk, lifecycle, strikes)
 
-Five independent detectors feed one escalation path, and every signal ends in
+Six independent detectors feed one escalation path, and every signal ends in
 the same `register_violation` RPC, so the server stays the source of truth for
 the 3-strike rule:
 
 | Detector | Signal | `action_type` |
 | --- | --- | --- |
 | ML Kit face detection | no face (three consecutive frames) / several faces / head pose off-axis (one frame past ~15 deg yaw or ~18 deg pitch) | `no_face`, `multiple_faces`, `looking_away` |
+| `web/proctor_face_detector.js` (Chrome/Edge) | the preview's camera track ended, is muted/disabled, is paused or hidden, or the frame is blank (near-black, blown out, one flat colour) → `no_face`; a face count where the browser has the Shape Detection API ([details above](#face-signals-on-the-web-the-host-page-bridge)) | `no_face`, `multiple_faces` |
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
 | `WebGuards` (Chrome/Edge) | tab hidden, window blurred, or HTML5 fullscreen left | `app_minimized` |
@@ -1154,9 +1194,11 @@ measuring, so it reports immediately and is latched per episode instead. There i
 one other: a head turned past ~30 deg yaw (`immediateAwayThresholdDegrees`) is past
 the point where anything on the screen could still be read, so it is reported even
 if the frame count is raised for a noisier detector. Browsers get the same rule from
-the other side of the stack — `web_face_presence.dart` reports a look-away that
-holds for 300 ms, which is the shortest interval a browser face detector can be
-asked for without depending on its frame rate.
+the other side of the stack — `web_face_presence.dart` reports a `no_face` or a
+look-away that holds for 300 ms, which is the shortest interval a browser face
+detector can be asked for without depending on its frame rate, and the shipped
+`web/proctor_face_detector.js` is polled at 350 ms so a covered camera is a strike
+on the second tick; a second person in frame is still reported at once.
 `ProctoringNotifier.setCameraActive` gates the whole camera set while the feed is not
 streaming.
 

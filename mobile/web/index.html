@@ -49,6 +49,21 @@
 </head>
 <body>
   <!--
+    ProctorGuard's own face sensor for the browser.
+
+    Loaded before Flutter so the detector is polling by the time the exam opens a
+    camera: it watches the preview camera_web renders, and speaks `no_face` /
+    `centered` / `multiple_faces` through `window.proctorGuardFaceSignal`, the hook
+    `WebFaceSignalSource` installs for the length of an attempt. The judgement -
+    how long a verdict has to hold, and what it is worth - stays in Dart
+    (`web_face_presence.dart`), exactly as it does for the on-device engine.
+
+    A classic script, deliberately (never `type="module"`): it has to run without
+    a build step, and Dart looks the hook up by name on `window`.
+  -->
+  <script src="proctor_face_detector.js"></script>
+
+  <!--
     ProctorGuard exam lockdown, first half. The second half is Dart
     (lib/core/services/web_guards_web.dart), which installs the reporter and arms
     the lockdown for the length of one attempt.
