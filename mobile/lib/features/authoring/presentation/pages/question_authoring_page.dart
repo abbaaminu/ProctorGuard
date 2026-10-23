@@ -7,6 +7,7 @@ import '../../domain/entities/attempt_grading.dart' show formatMarks;
 import '../../domain/entities/authored_question.dart';
 import '../../domain/repositories/question_authoring_repository.dart';
 import '../providers/question_authoring_providers.dart';
+import '../widgets/bulk_question_upload_widget.dart';
 import '../widgets/question_editor_dialog.dart';
 
 /// One paper's questions: add, edit, delete, and read the answer keys back.
@@ -16,15 +17,26 @@ import '../widgets/question_editor_dialog.dart';
 /// database (`questions_write_owner` / `questions_update_owner` /
 /// `questions_delete_owner` all key on the exam's `created_by`), so the page does
 /// not re-check ownership — it reports the refusal if there is one.
+///
+/// A batch can also arrive from a file ([BulkQuestionUploadWidget]): the file is
+/// read and validated on the device, then written through the same
+/// `createQuestion` the editor uses, so an uploaded question is stored exactly as
+/// a typed one is and the ownership rules above apply to it unchanged.
 class QuestionAuthoringPage extends ConsumerStatefulWidget {
   const QuestionAuthoringPage({
     super.key,
     required this.examId,
     required this.examTitle,
+    this.pickQuestionFile,
   });
 
   final String examId;
   final String examTitle;
+
+  /// Replaces the platform file picker used by the bulk upload sheet. Tests pass
+  /// a function that answers a [QuestionFile]; the app leaves it null and gets
+  /// the device's own picker.
+  final QuestionFilePicker? pickQuestionFile;
 
   @override
   ConsumerState<QuestionAuthoringPage> createState() =>
@@ -81,6 +93,47 @@ class _QuestionAuthoringPageState extends ConsumerState<QuestionAuthoringPage> {
     } finally {
       if (mounted) setState(() => _saving = false);
     }
+  }
+
+  /// Bulk creation from a file, in a sheet over the list.
+  ///
+  /// The sheet owns the whole flow — pick, preview, add, report — because a
+  /// dialog would have to hand its state back here and the questions would then
+  /// be written twice (once by the sheet's progress, once by this page). What
+  /// this page owes the sheet is the paper's id and the one thing only it can
+  /// do: invalidate `examQuestionsProvider`, so the questions the sheet stored
+  /// appear in the list behind it without a manual refresh.
+  ///
+  /// No question is sent while the file is only being previewed: a lecturer can
+  /// open the sheet, read that row 4 of their spreadsheet will be skipped, and
+  /// close it again with nothing written.
+  Future<void> _openUploadQuestions() async {
+    if (_saving) return;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (sheetContext) => Padding(
+        // The sheet sizes itself to the keyboard as well, so the preview and the
+        // add button stay reachable on a short phone screen.
+        padding: EdgeInsets.fromLTRB(
+          16,
+          0,
+          16,
+          16 + MediaQuery.viewInsetsOf(sheetContext).bottom,
+        ),
+        child: SingleChildScrollView(
+          child: BulkQuestionUploadWidget(
+            examId: widget.examId,
+            pickFile: widget.pickQuestionFile,
+            onImported: () =>
+                ref.invalidate(examQuestionsProvider(widget.examId)),
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _deleteQuestion(AuthoredQuestion question) async {
@@ -163,11 +216,27 @@ class _QuestionAuthoringPageState extends ConsumerState<QuestionAuthoringPage> {
         top: false,
         child: Padding(
           padding: EdgeInsets.fromLTRB(gutter, 8, gutter, 12),
-          child: FilledButton.icon(
-            key: const Key('question-add'),
-            onPressed: _saving ? null : () => _openEditor(),
-            icon: const Icon(Icons.add),
-            label: const Text('Add question'),
+          // Both ways to grow this paper, side by side: one question at a time in
+          // the editor, or a whole file at once. `Wrap` because a narrower phone
+          // runs out of room for both labels and a `Row` would overflow instead
+          // of dropping to a second line.
+          child: Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            children: [
+              OutlinedButton.icon(
+                key: const Key('question-upload'),
+                onPressed: _saving ? null : _openUploadQuestions,
+                icon: const Icon(Icons.upload_file_outlined),
+                label: const Text('Upload questions file'),
+              ),
+              FilledButton.icon(
+                key: const Key('question-add'),
+                onPressed: _saving ? null : () => _openEditor(),
+                icon: const Icon(Icons.add),
+                label: const Text('Add question'),
+              ),
+            ],
           ),
         ),
       ),

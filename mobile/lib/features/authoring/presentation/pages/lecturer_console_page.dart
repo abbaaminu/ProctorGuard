@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart' show SupabaseService;
+import '../../../../core/utils/academic_catalog.dart';
 import '../../../../core/widgets/home_button.dart';
 import '../../../../core/widgets/responsive_layout.dart';
 import '../../../auth/domain/entities/user_profile.dart';
@@ -87,14 +88,23 @@ class _LecturerConsolePageState extends ConsumerState<LecturerConsolePage> {
                 // rather than sending null, so the column keeps its NULL default.
                 startsAt: request.startsAt,
                 endsAt: request.endsAt,
+                // The target cohort, likewise omitted when the author left the
+                // dropdowns alone: NULL there is "not narrowed", and the policy
+                // reads it as "offered to everybody it used to be".
+                faculty: request.faculty,
+                department: request.department,
+                level: request.level,
               );
       if (!mounted) return;
       ref.invalidate(myAuthoredExamsProvider);
+      final target = created.exam.targetLabel;
       _showMessage(
         request.isPublished
-            ? '“${created.exam.title}” is published. Add its questions before '
-                'students sit it.'
-            : '“${created.exam.title}” is saved as a draft. Publish it when its '
+            ? '“${created.exam.title}” is published'
+                '${target == null ? '' : ' to $target'}. Add its questions '
+                'before students sit it.'
+            : '“${created.exam.title}” is saved as a draft'
+                '${target == null ? '' : ' for $target'}. Publish it when its '
                 'questions are ready.',
         isError: false,
       );
@@ -343,6 +353,11 @@ class _LecturerConsolePageState extends ConsumerState<LecturerConsolePage> {
 /// [startsAt] / [endsAt] are local instants, or null for an unscheduled paper:
 /// the dialog's pickers work in the author's own zone and the repository is what
 /// converts to the UTC the column stores.
+///
+/// [faculty] / [department] / [level] are the paper's target cohort, or null for
+/// "not narrowed": the labels the database policy compares against a student's
+/// profile. They are sent as chosen — the repository omits unset ones rather than
+/// sending blanks.
 class _NewExamRequest {
   const _NewExamRequest({
     required this.title,
@@ -350,6 +365,9 @@ class _NewExamRequest {
     required this.isPublished,
     this.startsAt,
     this.endsAt,
+    this.faculty,
+    this.department,
+    this.level,
   });
 
   final String title;
@@ -357,6 +375,9 @@ class _NewExamRequest {
   final bool isPublished;
   final DateTime? startsAt;
   final DateTime? endsAt;
+  final String? faculty;
+  final String? department;
+  final String? level;
 }
 
 /// The "new paper" dialog: a title, how long it runs, an *optional* window, and
@@ -395,6 +416,32 @@ class _NewExamDialogState extends State<_NewExamDialog> {
   /// pair cannot express). Shown inside the dialog rather than as a snack bar:
   /// the author is still editing the paper, so the fix belongs next to it.
   String? _windowError;
+
+  /// The target cohort, or null for "not narrowed" — the state every paper the
+  /// console could create before targeting existed is in, and the state that
+  /// keeps a paper offered to every student the policy lets see it.
+  String? _faculty;
+  String? _department;
+  String? _level;
+
+  /// The department choices for the faculty currently chosen. With no faculty
+  /// picked this is the whole catalogue, so a lecturer who only knows the
+  /// department is not forced to answer a question they do not need to.
+  List<String> get _departmentOptions =>
+      AcademicCatalog.departmentsFor(_faculty);
+
+  /// Picking a faculty narrows the department list, so a department left over
+  /// from the previous faculty is dropped rather than silently re-submitted: the
+  /// pair would then describe no cohort in the institution.
+  void _selectFaculty(String? faculty) {
+    setState(() {
+      _faculty = faculty;
+      if (_department != null &&
+          !_departmentOptions.contains(_department)) {
+        _department = null;
+      }
+    });
+  }
 
   @override
   void dispose() {
@@ -492,9 +539,44 @@ class _NewExamDialogState extends State<_NewExamDialog> {
         isPublished: _published,
         startsAt: start,
         endsAt: end,
+        faculty: _faculty,
+        department: _department,
+        level: _level,
       ),
     );
   }
+
+  /// One optional academic label, as a dropdown whose first entry is "not
+  /// narrowed".
+  ///
+  /// `initialValue`, not the deprecated `value`: the field owns what the author
+  /// tapped and is rebuilt from the state above whenever that changes (picking a
+  /// different faculty, say).
+  Widget _labelField({
+    required Key fieldKey,
+    required String label,
+    required IconData icon,
+    required String anyLabel,
+    required List<String> options,
+    required String? value,
+    required ValueChanged<String?> onChanged,
+  }) =>
+      DropdownButtonFormField<String?>(
+        key: fieldKey,
+        initialValue: value,
+        isExpanded: true,
+        decoration: InputDecoration(
+          labelText: label,
+          prefixIcon: Icon(icon),
+          border: const OutlineInputBorder(),
+        ),
+        items: <DropdownMenuItem<String?>>[
+          DropdownMenuItem<String?>(value: null, child: Text(anyLabel)),
+          for (final option in options)
+            DropdownMenuItem<String?>(value: option, child: Text(option)),
+        ],
+        onChanged: onChanged,
+      );
 
   /// One optional bound, as a tappable field: the label says what the bound
   /// means, the subtitle says either the instant or that this paper has none,
@@ -591,6 +673,46 @@ class _NewExamDialogState extends State<_NewExamDialog> {
                   border: OutlineInputBorder(),
                 ),
                 validator: _validateDuration,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'Who sits it is optional too. Leave these blank and the paper '
+                'is offered to every student it was offered to before; choose a '
+                'cohort to aim it, and add any borrowed student to the paper '
+                'itself.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 8),
+              _labelField(
+                fieldKey: const Key('new-exam-faculty'),
+                label: 'Faculty',
+                icon: Icons.account_balance_outlined,
+                anyLabel: 'Any faculty',
+                options: AcademicCatalog.facultyNames,
+                value: _faculty,
+                onChanged: _selectFaculty,
+              ),
+              const SizedBox(height: 8),
+              _labelField(
+                fieldKey: const Key('new-exam-department'),
+                label: 'Department',
+                icon: Icons.menu_book_outlined,
+                anyLabel: 'Any department',
+                options: _departmentOptions,
+                value: _department,
+                onChanged: (value) => setState(() => _department = value),
+              ),
+              const SizedBox(height: 8),
+              _labelField(
+                fieldKey: const Key('new-exam-level'),
+                label: 'Level',
+                icon: Icons.groups_outlined,
+                anyLabel: 'Any level',
+                options: AcademicCatalog.levels,
+                value: _level,
+                onChanged: (value) => setState(() => _level = value),
               ),
               const SizedBox(height: 16),
               Text(
@@ -747,6 +869,17 @@ class _ExamCard extends StatelessWidget {
               Text(
                 exam.exam.scheduleLabel,
                 key: Key('exam-window-$id'),
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            // The same rule for the cohort: only a targeted paper names one,
+            // because naming "everybody" on a list where that is the norm would
+            // read as a restriction that is not there.
+            if (exam.exam.targetLabel != null)
+              Text(
+                exam.exam.targetLabel!,
+                key: Key('exam-target-$id'),
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),

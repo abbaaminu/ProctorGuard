@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:proctorguard/core/services/supabase_service.dart';
 import 'package:proctorguard/features/admin/data/repositories/admin_user_repository_impl.dart';
 import 'package:proctorguard/features/admin/domain/entities/managed_account.dart';
+import 'package:proctorguard/features/admin/domain/entities/student_roster.dart';
 import 'package:proctorguard/features/admin/domain/repositories/admin_user_repository.dart';
 import 'package:proctorguard/features/admin/presentation/providers/admin_providers.dart';
 import 'package:proctorguard/features/auth/domain/entities/user_profile.dart';
@@ -662,16 +663,34 @@ void main() {
         contains('const MIN_PASSWORD_LENGTH = $adminMinPasswordLength;'),
       );
       // Who may create accounts, and the four keys the 200 answers with — the
-      // body `ManagedAccount.fromMap` reads back.
+      // body `ManagedAccount.fromMap` reads back. The academic labels ride along
+      // in the same object when the profile row carries them, so a client from
+      // before them simply ignores the extra keys.
       expect(
         source,
         contains('const CREATOR_ROLES: readonly Role[] = ["admin"];'),
       );
+      final answeredWith = RegExp(
+        r'account: \{[\s\S]*?id: created\.user\.id,\s*'
+        r'email: input\.email,\s*'
+        r'full_name: input\.fullName,\s*'
+        r'role: input\.role,[\s\S]*?\.\.\.input\.academic,',
+      );
+      expect(
+        answeredWith.hasMatch(source),
+        isTrue,
+        reason: 'the 200 no longer answers the keys ManagedAccount.fromMap reads',
+      );
+      expect(source, contains('return json(outcome.account);'));
+
+      // The bulk branch: the same per-row answer plus the password the
+      // administrator has to hand over, and never a role the body asked for.
+      expect(source, contains('temporary_password: outcome.password,'));
+      expect(source, contains('role: "student",'));
+      // A page the client builds has to be a page this function accepts.
       expect(
         source,
-        contains(
-          'return json({ id: created.user.id, email, full_name: fullName, role });',
-        ),
+        contains('const MAX_BULK_STUDENTS = ${AdminUserRepository.maxStudentPageSize};'),
       );
     });
 
@@ -2215,6 +2234,327 @@ void main() {
             contains('optional_exam_scheduling.sql'),
           ),
         ),
+      );
+    });
+  });
+
+  /// Scoped exposure: the labels a paper carries (what `createExam` sends), the
+  /// columns on both tables, the borrow list, and the rewritten `exams_select`
+  /// that reads them - in the unified schema and in the upgrade migration an
+  /// existing project applies.
+  group('academic targeting contract', () {
+    /// The `using (...)` of `create policy "<policy>" ... for select`, whitespace
+    /// squashed so two files can be compared as sentences rather than layouts.
+    String? selectPredicate(String sql, String policy) {
+      final match = RegExp(
+        'create policy "$policy"'
+        r'[\s\S]*?for select[\s\S]*?using \(([\s\S]*?)\);',
+      ).firstMatch(sql.replaceAll('\r\n', '\n'));
+      return match?.group(1)?.replaceAll(RegExp(r'\s+'), ' ').trim();
+    }
+
+    test('createExam sends the labels, trimmed, and omits the ones it was not '
+        'given', () async {
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'id': 'exam-11',
+        'title': 'CSC301: Databases',
+        'created_by': '11111111-1111-4111-8111-111111111111',
+        'duration_minutes': 45,
+        'is_published': false,
+        'faculty': 'Science',
+        'department': 'Computer Science',
+        'level': '300',
+      });
+
+      final repo = QuestionAuthoringRepositoryImpl(
+        client,
+        currentUserId: () => '11111111-1111-4111-8111-111111111111',
+      );
+      final created = await repo.createExam(
+        title: 'CSC301: Databases',
+        durationMinutes: 45,
+        isPublished: false,
+        // The console's fields are free text, so the column gets it trimmed.
+        faculty: '  Science  ',
+        department: 'Computer Science',
+        level: '300',
+      );
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      expect(body['faculty'], 'Science');
+      expect(body['department'], 'Computer Science');
+      expect(body['level'], '300');
+      // The console shows the target on the tile it has just added.
+      expect(created.exam.isTargeted, isTrue);
+      expect(
+        created.exam.targetLabel,
+        'Computer Science · Science · 300 Level',
+      );
+    });
+
+    test('a paper aimed at nobody sends no label keys at all', () async {
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'id': 'exam-12',
+        'title': 'GST101: Communication Skills',
+        'created_by': '11111111-1111-4111-8111-111111111111',
+        'duration_minutes': 30,
+        'is_published': false,
+      });
+
+      final repo = QuestionAuthoringRepositoryImpl(
+        client,
+        currentUserId: () => '11111111-1111-4111-8111-111111111111',
+      );
+      final created = await repo.createExam(
+        title: 'GST101: Communication Skills',
+        durationMinutes: 30,
+        isPublished: false,
+        // A cleared dropdown arrives as blank text, which means "not narrowed":
+        // the columns store NULL, never the empty string.
+        faculty: '   ',
+        department: '',
+      );
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      for (final key in <String>['faculty', 'department', 'level']) {
+        expect(body.containsKey(key), isFalse, reason: '$key was sent blank');
+      }
+      // A database from before the columns existed answers without them, and
+      // that has to read as "not narrowed" rather than throwing.
+      expect(created.exam.isTargeted, isFalse);
+      expect(created.exam.targetLabel, isNull);
+    });
+
+    test('a roster page goes up as `students`, and its answer is read back',
+        () async {
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'created': <Map<String, dynamic>>[
+          {
+            'id': '22222222-2222-4222-8222-222222222222',
+            'email': 'ada@uni.test',
+            'full_name': 'Ada Nwosu',
+            'role': 'student',
+            'faculty': 'Science',
+            'department': 'Computer Science',
+            'level': '300',
+            'temporary_password': 'Pg-4f9c21',
+          },
+        ],
+        'failed': <Map<String, dynamic>>[
+          {
+            'email': 'taken@uni.test',
+            'error': 'taken@uni.test already has an account.',
+          },
+        ],
+      });
+
+      final repo = AdminUserRepositoryImpl(client);
+      final outcome = await repo.createStudentAccounts(
+        const <NewStudentAccount>[
+          NewStudentAccount(
+            email: 'ada@uni.test',
+            fullName: 'Ada Nwosu',
+            faculty: 'Science',
+            department: 'Computer Science',
+            level: '300',
+          ),
+          // Labels it does not know are absent from the row, not sent as null.
+          NewStudentAccount(email: 'taken@uni.test', fullName: 'Taken Nwosu'),
+        ],
+      );
+
+      final request = transport.requests.single;
+      expect(request.method, 'POST');
+      expect(request.url.path, '/functions/v1/admin-create-user');
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      // One key, and no `role`: the function makes every roster row a student,
+      // so a file cannot mint a lecturer by carrying a column for it.
+      expect(body.keys.toList(), <String>['students']);
+      expect(body['students'], <dynamic>[
+        <String, dynamic>{
+          'email': 'ada@uni.test',
+          'full_name': 'Ada Nwosu',
+          'faculty': 'Science',
+          'department': 'Computer Science',
+          'level': '300',
+        },
+        <String, dynamic>{
+          'email': 'taken@uni.test',
+          'full_name': 'Taken Nwosu',
+        },
+      ]);
+
+      // A refused row is an *answer*, not an exception: the rest of the class
+      // was created and the report has to say both.
+      expect(outcome.createdCount, 1);
+      expect(outcome.created.single.account.faculty, 'Science');
+      expect(outcome.created.single.temporaryPassword, 'Pg-4f9c21');
+      expect(outcome.failedCount, 1);
+      expect(outcome.failed.single.email, 'taken@uni.test');
+      // The one control the administrator actually needs afterwards.
+      expect(outcome.handoverSheet, 'ada@uni.test\tPg-4f9c21');
+    });
+
+    test('a page the server would refuse never leaves the device', () async {
+      final repo = AdminUserRepositoryImpl(client);
+
+      // An empty page is not a request at all.
+      final nothing =
+          await repo.createStudentAccounts(const <NewStudentAccount>[]);
+      expect(nothing.isEmpty, isTrue);
+
+      // One row over the limit is a paging bug, caught here rather than by the
+      // function's 400 - the caller pages by this same number.
+      await expectLater(
+        repo.createStudentAccounts(<NewStudentAccount>[
+          for (var i = 0; i <= AdminUserRepository.maxStudentPageSize; i++)
+            NewStudentAccount(email: 's$i@uni.test', fullName: 'Student $i'),
+        ]),
+        throwsA(
+          isA<AdminAccountException>().having(
+            (error) => error.message,
+            'message',
+            contains('at most ${AdminUserRepository.maxStudentPageSize}'),
+          ),
+        ),
+      );
+      expect(transport.requests, isEmpty);
+    });
+
+    test('the schema declares the labels on both tables and the borrow list',
+        () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      // `create table if not exists` cannot add a column to a table that is
+      // already there, so every label is declared *and* added in place.
+      for (final table in <String>['profiles', 'exams']) {
+        for (final column in <String>['faculty', 'department', 'level']) {
+          expect(
+            RegExp(
+              'alter table public\\.$table add column if not exists '
+              '$column\\s+text;',
+            ).hasMatch(sql),
+            isTrue,
+            reason: '$table.$column has no upgrade path',
+          );
+          expect(
+            RegExp(
+              'create table if not exists public\\.$table \\([\\s\\S]*?'
+              '\\b$column\\s+text',
+            ).hasMatch(sql),
+            isTrue,
+            reason: '$table.$column is missing from a fresh install',
+          );
+        }
+      }
+
+      // The borrow list: one row per (paper, student), cascading from both, and
+      // the reverse index the student's side of `exams_select` walks.
+      expect(
+        sql,
+        contains('create table if not exists public.exam_allowed_students ('),
+      );
+      expect(sql, contains('references public.exams(id) on delete cascade'));
+      expect(sql, contains('references public.profiles(id) on delete cascade'));
+      expect(sql, contains('primary key (exam_id, student_id)'));
+      expect(sql, contains('idx_exam_allowed_students_student'));
+    });
+
+    test('exams_select narrows students by cohort and leaves staff unscoped',
+        () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      final predicate = selectPredicate(sql, 'exams_select');
+      expect(predicate, isNotNull);
+
+      // Staff, and the author of a draft, see every paper: an invigilator opens
+      // sittings in any department.
+      expect(predicate, contains('public.is_staff()'));
+      expect(predicate, contains('created_by = auth.uid()'));
+      // A student only ever sees a *published* paper...
+      expect(predicate, contains('is_published = true'));
+      // ...whose labels match their own row, with NULL on either side read as
+      // "not narrowed" - which is what keeps every untargeted paper visible.
+      for (final column in <String>['faculty', 'department']) {
+        expect(
+          predicate,
+          contains('exams.$column is null or p.$column is null'),
+        );
+        expect(predicate, contains('lower(p.$column) = lower(exams.$column)'));
+      }
+      expect(predicate, contains('exams.level is null or p.level is null'));
+      expect(predicate, contains('p.level = exams.level'));
+      // ...or one they were explicitly allowed to borrow.
+      expect(predicate, contains('from public.exam_allowed_students a'));
+      expect(
+        predicate,
+        contains('a.exam_id = exams.id and a.student_id = auth.uid()'),
+      );
+    });
+
+    test("the borrow list is the student's own row, writable by the author",
+        () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      // A student must not learn who *else* holds an exception.
+      expect(
+        selectPredicate(sql, 'exam_allowed_students_select'),
+        'student_id = auth.uid() or public.is_staff()',
+      );
+      // `owns_exam()` is SECURITY DEFINER, so the write check does not re-enter
+      // `exams_select` - the policy that reads this very table.
+      expect(sql, contains('with check (public.owns_exam(exam_id))'));
+      expect(sql, contains('using (public.owns_exam(exam_id))'));
+    });
+
+    test('the upgrade migration carries the same DDL and the same policy', () {
+      final file = File('../supabase/migrations/academic_targeting.sql');
+      if (!file.existsSync()) return; // a checkout without ../supabase
+      final sql = file.readAsStringSync();
+
+      for (final table in <String>['profiles', 'exams']) {
+        for (final column in <String>['faculty', 'department', 'level']) {
+          expect(
+            RegExp(
+              'alter table public\\.$table add column if not exists '
+              '$column\\s+text;',
+            ).hasMatch(sql),
+            isTrue,
+            reason: '$table.$column is not added by the migration',
+          );
+        }
+      }
+      expect(
+        sql,
+        contains('create table if not exists public.exam_allowed_students ('),
+      );
+      // Recreating a policy on a name the old revision used is a 42710 unless
+      // it is dropped first.
+      for (final policy in <String>[
+        'exams_select',
+        'exam_allowed_students_select',
+        'exam_allowed_students_insert_owner',
+        'exam_allowed_students_delete_owner',
+      ]) {
+        expect(
+          sql,
+          contains('drop policy if exists "$policy"'),
+          reason: '$policy is recreated without being dropped first',
+        );
+      }
+
+      // The sentence itself, not a paraphrase: a paper that is visible to a
+      // class in a fresh project has to be visible to the same class in an
+      // upgraded one.
+      final schema = schemaSql();
+      if (schema == null) return;
+      expect(
+        selectPredicate(sql, 'exams_select'),
+        selectPredicate(schema, 'exams_select'),
       );
     });
   });

@@ -47,7 +47,7 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
           .from('exams')
           .select(
             'id, title, created_by, duration_minutes, is_published, '
-            'starts_at, ends_at, '
+            'starts_at, ends_at, faculty, department, level, '
             'created_at, questions(count), exam_submissions(count)',
           )
           // The *mine* filter, and the same condition the write policies ask:
@@ -75,7 +75,17 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
     required bool isPublished,
     DateTime? startsAt,
     DateTime? endsAt,
+    String? faculty,
+    String? department,
+    String? level,
   }) async {
+    // Trimmed, and an empty answer omitted like an unset one: the columns store
+    // NULL for "not narrowed", never "", so a cleared dropdown cannot narrow a
+    // paper to a cohort whose department is the empty string.
+    final targetFaculty = faculty?.trim() ?? '';
+    final targetDepartment = department?.trim() ?? '';
+    final targetLevel = level?.trim() ?? '';
+
     final row = await _guard(() async {
       final data = await _client
           .from('exams')
@@ -94,10 +104,16 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
             // work in the author's local zone and the instant is what is stored.
             if (startsAt != null) 'starts_at': startsAt.toUtc().toIso8601String(),
             if (endsAt != null) 'ends_at': endsAt.toUtc().toIso8601String(),
+            // The target cohort, omitted when unset for the same reason: NULL is
+            // the "offered to everybody the policy lets in" reading, and sending
+            // it explicitly would say the same thing in a longer way.
+            if (targetFaculty.isNotEmpty) 'faculty': targetFaculty,
+            if (targetDepartment.isNotEmpty) 'department': targetDepartment,
+            if (targetLevel.isNotEmpty) 'level': targetLevel,
           })
           .select(
             'id, title, created_by, duration_minutes, is_published, '
-            'starts_at, ends_at',
+            'starts_at, ends_at, faculty, department, level',
           )
           .single();
       return data;
@@ -465,11 +481,23 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
             'supabase/migrations/question_types_and_grading.sql, then try again.';
       case '42703':
       case 'PGRST204':
-        // A column this app reads or writes does not exist yet. The one that
-        // arrives here is the optional exam window: `exams.starts_at` /
-        // `ends_at` (the grading columns have their own 42P01/42883 above), and
-        // a project that predates scheduling answers a select of them with
-        // 42703 and an insert with PGRST204.
+        // A column this app reads or writes does not exist yet. Two optional
+        // groups arrive here, and naming the wrong file would leave the lecturer
+        // with nothing to run:
+        //  * the academic labels, `exams.faculty / department / level`, from
+        //    academic_targeting.sql (also read on every list of papers);
+        //  * the scheduling window, `exams.starts_at` / `ends_at`, from
+        //    optional_exam_scheduling.sql.
+        // A read of a missing column answers 42703 and an insert PGRST204, and
+        // both name the column, so the answer is read from the refusal rather
+        // than guessed.
+        final missing = error.message.toLowerCase();
+        if (missing.contains('faculty') ||
+            missing.contains('department') ||
+            missing.contains('level')) {
+          return 'This project has no exam targeting columns yet. Run '
+              'supabase/migrations/academic_targeting.sql, then try again.';
+        }
         return 'This project has no exam scheduling columns yet. Run '
             'supabase/migrations/optional_exam_scheduling.sql, then try again.';
       case '42P01':

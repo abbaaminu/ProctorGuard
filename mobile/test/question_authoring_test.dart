@@ -7,6 +7,7 @@ import 'package:proctorguard/features/authoring/presentation/pages/attempt_revie
 import 'package:proctorguard/features/authoring/presentation/pages/lecturer_console_page.dart';
 import 'package:proctorguard/features/authoring/presentation/pages/question_authoring_page.dart';
 import 'package:proctorguard/features/authoring/presentation/providers/question_authoring_providers.dart';
+import 'package:proctorguard/features/authoring/presentation/widgets/bulk_question_upload_widget.dart';
 import 'package:proctorguard/features/exam/domain/entities/exam.dart';
 import 'package:proctorguard/features/exam/domain/entities/question.dart';
 import 'package:proctorguard/features/exam/domain/entities/submission.dart';
@@ -641,6 +642,9 @@ void main() {
         isPublished: false,
         startsAt: null,
         endsAt: null,
+        faculty: null,
+        department: null,
+        level: null,
       ));
       expect(find.textContaining('saved as a draft'), findsOneWidget);
       await letSnackBarExpire(tester);
@@ -674,6 +678,9 @@ void main() {
 
     testWidgets('a window that closes before it opens is refused in the dialog',
         (tester) async {
+      // Tall enough that the whole "New paper" dialog — which also asks for the
+      // cohort — is on screen, so the date and time pickers can be reached.
+      useTallSurface(tester);
       await tester.pumpWidget(consoleUnderTest());
       await tester.pumpAndSettle();
 
@@ -703,6 +710,8 @@ void main() {
 
       // Clearing the closing bound is the fix, and the paper is created with
       // only the opening one — a half-open window is meaningful.
+      await tester.ensureVisible(find.byKey(const Key('new-exam-ends-clear')));
+      await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('new-exam-ends-clear')));
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('new-exam-create')));
@@ -776,12 +785,16 @@ void main() {
 
     setUp(() => repo = _FakeAuthoring());
 
-    Widget authoringUnderTest() => ProviderScope(
+    Widget authoringUnderTest({QuestionFilePicker? pickFile}) => ProviderScope(
           overrides: [
             questionAuthoringRepositoryProvider.overrideWithValue(repo),
           ],
-          child: const MaterialApp(
-            home: QuestionAuthoringPage(examId: examId, examTitle: 'GES301'),
+          child: MaterialApp(
+            home: QuestionAuthoringPage(
+              examId: examId,
+              examTitle: 'GES301',
+              pickQuestionFile: pickFile,
+            ),
           ),
         );
 
@@ -1027,6 +1040,136 @@ void main() {
       expect(repo.deletedQuestions, <String>['q-essay']);
       await letSnackBarExpire(tester);
     });
+
+    testWidgets('a questions file is previewed, then added question by question',
+        (tester) async {
+      useTallSurface(tester);
+      await tester.pumpWidget(authoringUnderTest(
+        // The platform picker is the one thing a test cannot drive, so the file
+        // arrives already read — everything after this point is the real flow.
+        pickFile: () async => const QuestionFile(
+          name: 'ges301-midterm.json',
+          contents: '[\n'
+              '  {"type": "multiple_choice", "question": "Which process model '
+              'delivers a working increment?", "options": ["Waterfall", "Scrum"],'
+              ' "answer": "Scrum", "points": 2},\n'
+              '  {"type": "true_false", "question": "A pull request may be '
+              'merged before its checks pass.", "answer": false},\n'
+              '  {"type": "matching", "question": "Not a shape this app has."}\n'
+              ']',
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      // The upload sits beside the editor: both ways of growing the paper are on
+      // the same bar.
+      expect(find.byKey(const Key('question-upload')), findsOneWidget);
+      await tester.tap(find.byKey(const Key('question-upload')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('question-pack-pick')));
+      await tester.pumpAndSettle();
+
+      // What the file holds, before anything is written: two usable questions and
+      // the entry the parser refused, named by its line.
+      expect(find.text('ges301-midterm.json'), findsOneWidget);
+      expect(find.text('2 questions ready to add.'), findsOneWidget);
+      expect(find.text('1 skipped'), findsOneWidget);
+      expect(find.textContaining('Line 3:'), findsOneWidget);
+      expect(repo.createdQuestions, isEmpty);
+
+      await tester.tap(find.byKey(const Key('question-pack-add')));
+      await tester.pumpAndSettle();
+
+      // One `createQuestion` per question, in file order, against the paper on
+      // screen — the same call the editor makes, so the same trigger and policy
+      // check it.
+      expect(repo.createdQuestions, hasLength(2));
+      expect(
+        repo.createdQuestions.map((call) => call.examId).toSet(),
+        <String>{examId},
+      );
+      final first = repo.createdQuestions[0].draft;
+      expect(first.questionType, QuestionType.multipleChoice);
+      expect(first.options, <String>['Waterfall', 'Scrum']);
+      expect(first.correctOption, 1);
+      expect(first.points, 2);
+      final second = repo.createdQuestions[1].draft;
+      expect(second.questionType, QuestionType.trueFalse);
+      expect(second.correctTextAnswer, 'false');
+
+      // And it says so, on the card and in the toast.
+      expect(find.text('Added 2 questions to this paper.'), findsOneWidget);
+      expect(find.text('Added 2 questions to the paper.'), findsOneWidget);
+      await letSnackBarExpire(tester);
+    });
+
+    testWidgets('a file with nothing usable offers nothing to add',
+        (tester) async {
+      useTallSurface(tester);
+      await tester.pumpWidget(authoringUnderTest(
+        pickFile: () async => const QuestionFile(
+          name: 'broken.csv',
+          // The header is right, so this is a readable file with one unanswerable
+          // question in it — a refused row, not a refused file.
+          contents: 'type,question,options,correct_answer\n'
+              'multiple_choice,Which one is right?,,A\n',
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('question-upload')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('question-pack-pick')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('No questions in this file.'), findsOneWidget);
+      expect(find.textContaining('needs at least 2 options'), findsOneWidget);
+      expect(
+        tester
+            .widget<FilledButton>(find.byKey(const Key('question-pack-add')))
+            .onPressed,
+        isNull,
+      );
+      expect(repo.createdQuestions, isEmpty);
+    });
+
+    testWidgets('a run the server stops part-way says how far it got',
+        (tester) async {
+      useTallSurface(tester);
+      // The first question is stored, the second is refused — a half-added file
+      // is the case where silence would be worst.
+      repo.failCreateAfter = 1;
+      await tester.pumpWidget(authoringUnderTest(
+        pickFile: () async => const QuestionFile(
+          name: 'three.csv',
+          contents: 'type,question,options,correct_answer\n'
+              'true_false,A pull request may be merged untested.,,true\n'
+              'true_false,CI runs on every push.,,true\n'
+              'true_false,Reviews replace tests.,,false\n',
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('question-upload')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('question-pack-pick')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('question-pack-add')));
+      await tester.pumpAndSettle();
+
+      // It stopped at the second question rather than carrying on, and the count
+      // says so — the lecturer needs to know one row landed, not none or three.
+      expect(repo.createdQuestions, hasLength(1));
+      expect(find.byKey(const Key('question-pack-error')), findsOneWidget);
+      expect(
+        find.textContaining('1 of 3 questions were added'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('Check your internet connection'),
+          findsOneWidget);
+      // Not reported as finished, because it is not.
+      expect(find.byKey(const Key('question-pack-added')), findsNothing);
+    });
   });
 
   group('marking an attempt', () {
@@ -1228,6 +1371,11 @@ Future<void> letSnackBarExpire(WidgetTester tester) async {
 /// one, and a test that asserts *ordering* only needs two real picker
 /// round-trips, not a clock the pickers would have to be told about.
 Future<void> pickBound(WidgetTester tester, String field) async {
+  // The dialog is taller than the default 800×600 surface now that it also asks
+  // for the cohort, so the field has to be scrolled into view before it can be
+  // tapped - an off-screen tap lands on nothing and the picker never opens.
+  await tester.ensureVisible(find.byKey(Key(field)));
+  await tester.pumpAndSettle();
   await tester.tap(find.byKey(Key(field)));
   await tester.pumpAndSettle();
   await tester.tap(find.text('OK')); // the date
@@ -1256,7 +1404,7 @@ class _FakeAuthoring implements QuestionAuthoringRepository {
   List<AttemptGrading> attempts = const <AttemptGrading>[];
 
   /// What each `createExam` call asked for, in order — the console's contract
-  /// with the server, including the optional window.
+  /// with the server, including the optional window and the optional cohort.
   final List<
       ({
         String title,
@@ -1264,15 +1412,26 @@ class _FakeAuthoring implements QuestionAuthoringRepository {
         bool isPublished,
         DateTime? startsAt,
         DateTime? endsAt,
+        String? faculty,
+        String? department,
+        String? level,
       })> created = <({
     String title,
     int durationMinutes,
     bool isPublished,
     DateTime? startsAt,
     DateTime? endsAt,
+    String? faculty,
+    String? department,
+    String? level,
   })>[];
   final List<({String examId, QuestionDraft draft})> createdQuestions =
       <({String examId, QuestionDraft draft})>[];
+
+  /// When set, `createQuestion` stores this many drafts and then refuses the one
+  /// after them — the shape of an import the database stops part-way through.
+  int? failCreateAfter;
+
   final List<String> deletedQuestions = <String>[];
   final List<String> deletedExams = <String>[];
   final List<({String examId, bool isPublished})> publishCalls =
@@ -1298,6 +1457,9 @@ class _FakeAuthoring implements QuestionAuthoringRepository {
     required bool isPublished,
     DateTime? startsAt,
     DateTime? endsAt,
+    String? faculty,
+    String? department,
+    String? level,
   }) async {
     created.add((
       title: title,
@@ -1305,6 +1467,9 @@ class _FakeAuthoring implements QuestionAuthoringRepository {
       isPublished: isPublished,
       startsAt: startsAt,
       endsAt: endsAt,
+      faculty: faculty,
+      department: department,
+      level: level,
     ));
     return AuthoredExam(
       exam: Exam(
@@ -1315,6 +1480,9 @@ class _FakeAuthoring implements QuestionAuthoringRepository {
         isPublished: isPublished,
         startsAt: startsAt,
         endsAt: endsAt,
+        faculty: faculty,
+        department: department,
+        level: level,
       ),
       questionCount: 0,
       attemptCount: 0,
@@ -1343,6 +1511,13 @@ class _FakeAuthoring implements QuestionAuthoringRepository {
     required String examId,
     required QuestionDraft draft,
   }) async {
+    final stopAfter = failCreateAfter;
+    if (stopAfter != null && createdQuestions.length >= stopAfter) {
+      throw const AuthoringException(
+        'The question could not be added. Check your internet connection and '
+        'try again.',
+      );
+    }
     createdQuestions.add((examId: examId, draft: draft));
     return _rowOf('q-new', examId, draft);
   }

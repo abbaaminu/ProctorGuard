@@ -2,6 +2,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../auth/domain/entities/user_profile.dart';
 import '../../domain/entities/managed_account.dart';
+import '../../domain/entities/student_roster.dart';
 import '../../domain/repositories/admin_user_repository.dart';
 
 /// Supabase-backed [AdminUserRepository].
@@ -30,6 +31,9 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
     required String password,
     required String fullName,
     required UserRole role,
+    String? faculty,
+    String? department,
+    String? level,
   }) async {
     final FunctionResponse response;
     try {
@@ -42,6 +46,11 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
           'password': password,
           'full_name': fullName.trim(),
           'role': role.dbValue,
+          ..._academicBody(
+            faculty: faculty,
+            department: department,
+            level: level,
+          ),
         },
       );
     } on FunctionException catch (error) {
@@ -71,6 +80,68 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
           'Refresh the list to check.',
         );
       }
+    }
+    throw const AdminAccountException(
+      'The server returned an unexpected response. Refresh the list to check.',
+    );
+  }
+
+  @override
+  Future<StudentRosterOutcome> createStudentAccounts(
+    List<NewStudentAccount> students,
+  ) async {
+    if (students.isEmpty) return const StudentRosterOutcome();
+    if (students.length > AdminUserRepository.maxStudentPageSize) {
+      // Refused here rather than by the function: the caller pages a file by
+      // this number, and a page that exceeds it means the paging is wrong, not
+      // that the administrator did something.
+      throw AdminAccountException(
+        'Send at most ${AdminUserRepository.maxStudentPageSize} students per '
+        'request.',
+      );
+    }
+
+    final FunctionResponse response;
+    try {
+      response = await _client.functions.invoke(
+        createAccountFunction,
+        // The same endpoint, a `{ students: [...] }` body. No `role` key: the
+        // function hard-codes `student` for a roster row, so a file cannot mint
+        // a lecturer by adding a column.
+        body: {
+          'students': [
+            for (final student in students) student.toJson(),
+          ],
+        },
+      );
+    } on FunctionException catch (error) {
+      // Covers the whole-request failures: not an admin (401/403), the function
+      // is not deployed (404), or the body was refused (400 — too many rows).
+      // A single bad address is *not* one of these; it comes back as a 200 with
+      // that row in `failed`.
+      throw AdminAccountException(_messageFromFunctionError(error));
+    } catch (_) {
+      throw const AdminAccountException(
+        'Could not reach the server. Check your connection and try again.',
+      );
+    }
+
+    final data = response.data;
+    if (data is Map<String, dynamic>) {
+      final error = data['error'];
+      if (error is String && error.isNotEmpty) {
+        throw AdminAccountException(error);
+      }
+      final outcome = StudentRosterOutcome.fromMap(data);
+      if (!outcome.isEmpty) return outcome;
+      // 200 with neither `created` nor `failed`: a deployment from before the
+      // roster branch, which read the body as the single-account shape. Nothing
+      // was created, and saying so is better than an empty success.
+      throw AdminAccountException(
+        'The server did not report per-student results, so nothing was '
+        'uploaded. Deploy the latest $createAccountFunction function and try '
+        'again.',
+      );
     }
     throw const AdminAccountException(
       'The server returned an unexpected response. Refresh the list to check.',
@@ -207,6 +278,30 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
         'Could not reach the server. Check your connection and try again.',
       );
     }
+  }
+
+  /// The academic keys of a create request that are actually stated.
+  ///
+  /// A blank cell in a spreadsheet and an untouched dropdown both mean "not
+  /// stated", and the function writes NULL for a key it does not receive — so
+  /// omitting the key is the honest request, and an unlabelled account's body
+  /// stays byte-identical to the one from before academic targeting existed.
+  static Map<String, String> _academicBody({
+    String? faculty,
+    String? department,
+    String? level,
+  }) {
+    final labels = <String, String?>{
+      'faculty': faculty,
+      'department': department,
+      'level': level,
+    };
+    final body = <String, String>{};
+    for (final entry in labels.entries) {
+      final value = entry.value?.trim() ?? '';
+      if (value.isNotEmpty) body[entry.key] = value;
+    }
+    return body;
   }
 
   /// Reads the `{ error }` body the Edge Function answers with.

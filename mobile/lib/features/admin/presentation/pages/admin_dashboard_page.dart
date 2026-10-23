@@ -10,6 +10,7 @@ import '../../../auth/domain/entities/user_profile.dart';
 import '../../domain/entities/managed_account.dart';
 import '../../domain/repositories/admin_user_repository.dart';
 import '../providers/admin_providers.dart';
+import '../widgets/bulk_student_upload_widget.dart';
 
 /// The admin home: create staff/student accounts and manage the roles of the
 /// ones that already exist.
@@ -328,6 +329,11 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
       onResetPassword: _resetPassword,
     );
 
+    // Below the form on both layouts: one account at a time is still the common
+    // case, and a 40-row class list is the exception that would otherwise push
+    // the form off the screen.
+    const upload = BulkStudentUploadWidget();
+
     return Scaffold(
       appBar: AppBar(
         automaticallyImplyLeading: false,
@@ -403,7 +409,14 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
                       Expanded(
                         child: SingleChildScrollView(
                           padding: EdgeInsets.all(gutter),
-                          child: form,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              form,
+                              const SizedBox(height: 24),
+                              upload,
+                            ],
+                          ),
                         ),
                       ),
                       const VerticalDivider(width: 1),
@@ -420,7 +433,13 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
                   )
                 : ListView(
                     padding: EdgeInsets.all(gutter),
-                    children: [form, const SizedBox(height: 24), roster],
+                    children: [
+                      form,
+                      const SizedBox(height: 24),
+                      upload,
+                      const SizedBox(height: 24),
+                      roster,
+                    ],
                   ),
           ),
         ],

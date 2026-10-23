@@ -46,6 +46,12 @@ dependencies:
   # Utils
   equatable: ^2.0.5
 
+  # Bulk student roster (admin): `file_picker` reads the .csv the administrator
+  # chooses, `csv` parses it. Both are pure Dart/web-safe, so the upload page
+  # works in the browser build as well as on the desktop and mobile apps.
+  csv: ^8.0.0
+  file_picker: ^12.3.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

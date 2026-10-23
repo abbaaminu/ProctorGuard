@@ -36,12 +36,22 @@ abstract class QuestionAuthoringRepository {
   /// produce local ones and the two ends are validated against each other before
   /// this is called (the database's `exams_window_ordered` check is the second
   /// line of defence, not the first).
+  /// [faculty] / [department] / [level] are the paper's target cohort, sent only
+  /// when set. An omitted label is stored NULL, and NULL means *not narrowed
+  /// here*: `exams_select` only restricts the labels a paper actually states, so
+  /// an untargeted paper is offered exactly as it was before targeting existed.
+  /// The strings come from `AcademicCatalog` in the form, but nothing here
+  /// enforces that -- a cohort spelling imported from a roster is still a valid
+  /// label.
   Future<AuthoredExam> createExam({
     required String title,
     required int durationMinutes,
     required bool isPublished,
     DateTime? startsAt,
     DateTime? endsAt,
+    String? faculty,
+    String? department,
+    String? level,
   });
 
   /// Publishes a paper (making it visible to students and startable) or takes it

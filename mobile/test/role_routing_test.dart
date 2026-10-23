@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:proctorguard/core/services/supabase_service.dart';
 import 'package:proctorguard/features/admin/domain/entities/managed_account.dart';
+import 'package:proctorguard/features/admin/domain/entities/student_roster.dart';
 import 'package:proctorguard/features/admin/domain/repositories/admin_user_repository.dart';
 import 'package:proctorguard/features/admin/presentation/providers/admin_providers.dart';
 import 'package:proctorguard/features/auth/domain/entities/user_profile.dart';
@@ -977,13 +978,25 @@ class _FakeAdminUserRepository implements AdminUserRepository {
     required String password,
     required String fullName,
     required UserRole role,
+    String? faculty,
+    String? department,
+    String? level,
   }) async =>
       ManagedAccount(
         id: 'new-${accounts.length}',
         email: email,
         fullName: fullName,
         role: role,
+        faculty: faculty,
+        department: department,
+        level: level,
       );
+
+  @override
+  Future<StudentRosterOutcome> createStudentAccounts(
+    List<NewStudentAccount> students,
+  ) async =>
+      throw UnimplementedError('not reached by the routing tests');
 
   @override
   Future<List<ManagedAccount>> listAccounts() async {
@@ -1132,6 +1145,9 @@ class _FakeQuestionAuthoringRepository implements QuestionAuthoringRepository {
     required bool isPublished,
     DateTime? startsAt,
     DateTime? endsAt,
+    String? faculty,
+    String? department,
+    String? level,
   }) async =>
       throw UnimplementedError('not reached by the routing tests');
 

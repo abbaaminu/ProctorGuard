@@ -1,6 +1,19 @@
 import 'package:equatable/equatable.dart';
 
+import '../../../../core/utils/academic_catalog.dart';
+
 /// One paper as a student (or the supervisor picker) sees it.
+///
+/// [faculty] / [department] / [level] mirror `exams.faculty / department /
+/// level`: the cohort the paper is aimed at. They are presentation here — the
+/// *decision* is `exams_select` in the database, which offers a published paper
+/// to a student whose own profile labels match, or who was added to the paper's
+/// `exam_allowed_students` list (the borrowed-course case). All three are null on
+/// a paper from before targeting existed, and null means "not narrowed": such a
+/// paper is offered exactly as it always was.
+///
+/// The labels are therefore never required, and a screen that has nothing to say
+/// about them shows nothing rather than "Unknown".
 ///
 /// [startsAt] / [endsAt] mirror `exams.starts_at` / `exams.ends_at`, the
 /// *optional* scheduling window:
@@ -28,6 +41,9 @@ class Exam extends Equatable {
     required this.isPublished,
     this.startsAt,
     this.endsAt,
+    this.faculty,
+    this.department,
+    this.level,
   });
 
   factory Exam.fromMap(Map<String, dynamic> map) => Exam(
@@ -38,6 +54,9 @@ class Exam extends Equatable {
         isPublished: map['is_published'] as bool,
         startsAt: _timestamp(map['starts_at']),
         endsAt: _timestamp(map['ends_at']),
+        faculty: _text(map['faculty']),
+        department: _text(map['department']),
+        level: _text(map['level']),
       );
 
   final String id;
@@ -45,6 +64,13 @@ class Exam extends Equatable {
   final String createdBy;
   final int durationMinutes;
   final bool isPublished;
+
+  /// The cohort this paper is aimed at. Null means "any" — the reading the
+  /// database policy gives an unlabelled paper, and the only reading that keeps
+  /// every paper created before targeting existed visible.
+  final String? faculty;
+  final String? department;
+  final String? level;
 
   /// When the paper is first offered, or null when it has no opening bound.
   final DateTime? startsAt;
@@ -62,9 +88,35 @@ class Exam extends Equatable {
   static DateTime? _timestamp(Object? value) =>
       value is String ? DateTime.tryParse(value)?.toLocal() : null;
 
+  /// A nullable text column as the label it means: trimmed, and blank read as
+  /// null (the columns have no "empty string" state, and a database that never
+  /// had the column answers with a missing key).
+  static String? _text(Object? value) {
+    if (value is! String) return null;
+    final trimmed = value.trim();
+    return trimmed.isEmpty ? null : trimmed;
+  }
+
   /// True when the paper names either bound — i.e. it is not a "take it any
   /// time" paper.
   bool get isScheduled => startsAt != null || endsAt != null;
+
+  /// True when the paper is aimed at a cohort rather than offered to everybody
+  /// the policy lets see it (a borrowed student on the allow list always sees
+  /// it, whatever this says).
+  bool get isTargeted =>
+      faculty != null || department != null || level != null;
+
+  /// "Computer Science · 300 Level", "Science", or null for an untargeted paper.
+  ///
+  /// Null rather than "All students" on purpose: the tiles that show this only
+  /// show it when there is something to show, and a target is a *restriction* —
+  /// saying one out loud on an unrestricted paper would be a lie.
+  String? get targetLabel => AcademicCatalog.describe(
+        faculty: faculty,
+        department: department,
+        level: level,
+      );
 
   /// Whether the paper has opened by [now]. A missing opening bound is open.
   bool opensAt(DateTime now) => startsAt == null || !now.isBefore(startsAt!);
@@ -130,6 +182,16 @@ class Exam extends Equatable {
   ];
 
   @override
-  List<Object?> get props =>
-      [id, title, createdBy, durationMinutes, isPublished, startsAt, endsAt];
+  List<Object?> get props => [
+        id,
+        title,
+        createdBy,
+        durationMinutes,
+        isPublished,
+        startsAt,
+        endsAt,
+        faculty,
+        department,
+        level,
+      ];
 }

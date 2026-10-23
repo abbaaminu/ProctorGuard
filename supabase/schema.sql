@@ -184,8 +184,32 @@ create table if not exists public.profiles (
   role        public.user_role not null default 'student',
   full_name   text not null,
   email       text not null unique,
-  created_at  timestamptz not null default now()
+  created_at  timestamptz not null default now(),
+  -- Academic metadata: who this account belongs to inside the institution.
+  --
+  -- Free text rather than a `faculties` / `departments` pair of tables, because
+  -- the values are *labels a policy compares*, not entities with their own
+  -- lifecycle: nothing joins them, nothing cascades from them, and an
+  -- administrator importing a roster writes them straight from a CSV. NULL means
+  -- "not stated", and every scoped policy below reads NULL as *no narrowing* —
+  -- an account whose faculty was never recorded keeps the access it had before
+  -- the columns existed, so adding the metadata can never lock anybody out.
+  --
+  -- `level` is the catalogue's own spelling ('100' … '600'), so an exam aimed at
+  -- '300' matches every profile row that says '300' — the app's
+  -- `AcademicCatalog` is the one place those labels are written down.
+  faculty     text,
+  department  text,
+  level       text
 );
+
+-- The upgrade path for a project created before the academic metadata: the
+-- `create table if not exists` above is a no-op there, so the columns are added
+-- in place instead of being lost. `supabase/migrations/academic_targeting.sql`
+-- carries the same statements, and the two files must be kept in step.
+alter table public.profiles add column if not exists faculty    text;
+alter table public.profiles add column if not exists department text;
+alter table public.profiles add column if not exists level      text;
 
 alter table public.profiles enable row level security;
 
@@ -441,7 +465,16 @@ create table if not exists public.exams (
   is_published     boolean not null default false,
   starts_at        timestamptz,
   ends_at          timestamptz,
-  created_at       timestamptz not null default now()
+  created_at       timestamptz not null default now(),
+  -- Who the paper is *for*. Each column is an optional narrowing and NULL means
+  -- "anybody": a paper with all three NULL is the institution-wide paper every
+  -- publication was before targeting existed. The predicate that reads them is
+  -- `exams_select`, and it compares each column against the reader's own
+  -- `profiles` row — with the same NULL-means-no-narrowing reading, so a student
+  -- whose faculty was never recorded is not excluded by a targeted paper.
+  faculty          text,
+  department       text,
+  level            text
 );
 
 -- The upgrade path for a project created before scheduling: the
@@ -451,6 +484,13 @@ create table if not exists public.exams (
 -- must be kept in step.
 alter table public.exams add column if not exists starts_at timestamptz;
 alter table public.exams add column if not exists ends_at   timestamptz;
+
+-- The same upgrade path for the academic targeting columns added with the
+-- profiles metadata above; `supabase/migrations/academic_targeting.sql` carries
+-- these statements too.
+alter table public.exams add column if not exists faculty    text;
+alter table public.exams add column if not exists department text;
+alter table public.exams add column if not exists level      text;
 
 -- `drop constraint if exists` + `add constraint`, like the shape rules in
 -- section 3: the name may already exist on a live project, and an
@@ -467,18 +507,107 @@ comment on column public.exams.ends_at is
 
 alter table public.exams enable row level security;
 
+-- ---------------------------------------------------------------------
+-- 2b. BORROWED-COURSE ACCESS
+-- ---------------------------------------------------------------------
+-- A paper is aimed at a cohort by the three columns above, but a cohort is not
+-- the whole audience: a student from another department may be taking the
+-- course (a service course, a minor, a carry-over), and the lecturer knows who
+-- before the sitting does. This table is that exception list — one row per
+-- (paper, student) pair, added by the paper's author and read by the student it
+-- names. `exams_select` is the policy that consumes it.
+--
+-- A table rather than an `exams.extra_student_ids uuid[]` column: each row is a
+-- foreign key, so deleting the student's profile or the paper removes the
+-- exception with it (a uuid[] would leave a dangling id behind), and the
+-- author's add/remove is a plain PostgREST write that the policies below scope.
+create table if not exists public.exam_allowed_students (
+  exam_id    uuid not null references public.exams(id) on delete cascade,
+  student_id uuid not null references public.profiles(id) on delete cascade,
+  -- Who granted the exception. Audit only: no policy reads it, and an account
+  -- deleted afterwards must not take the exception with it, so it is
+  -- `on delete set null` rather than a cascade.
+  created_by uuid default auth.uid() references public.profiles(id) on delete set null,
+  created_at timestamptz not null default now(),
+  primary key (exam_id, student_id)
+);
+
+alter table public.exam_allowed_students enable row level security;
+
+drop policy if exists "exam_allowed_students_select" on public.exam_allowed_students;
+drop policy if exists "exam_allowed_students_insert_owner" on public.exam_allowed_students;
+drop policy if exists "exam_allowed_students_delete_owner" on public.exam_allowed_students;
+
+-- Read: the student the row names, or any member of staff (the console lists a
+-- paper's exceptions next to the paper). A student must not be able to see who
+-- else was granted one — that is somebody else's business.
+create policy "exam_allowed_students_select"
+  on public.exam_allowed_students for select
+  to authenticated
+  using (student_id = auth.uid() or public.is_staff());
+
+-- Write: only the paper's author. `owns_exam()` is SECURITY DEFINER, so this
+-- check does not re-enter `exams_select` — which is the policy that reads this
+-- very table, and would otherwise recurse.
+create policy "exam_allowed_students_insert_owner"
+  on public.exam_allowed_students for insert
+  to authenticated
+  with check (public.owns_exam(exam_id));
+
+create policy "exam_allowed_students_delete_owner"
+  on public.exam_allowed_students for delete
+  to authenticated
+  using (public.owns_exam(exam_id));
+
 drop policy if exists "exams_select" on public.exams;
 drop policy if exists "exams_insert_supervisor_only" on public.exams;
 drop policy if exists "exams_update_owner" on public.exams;
 drop policy if exists "exams_delete_owner" on public.exams;
 
+-- Read: staff see every paper, published or not — an invigilator opens a sitting
+-- in any department, and the console's monitor roster depends on it; the author
+-- always sees their own drafts.
+--
+-- Students see a **published** paper only when it is aimed at them:
+--   * every column the paper names must match their own `profiles` row, and a
+--     NULL on either side means "not narrowed" — so an untargeted paper (all
+--     three NULL, every paper that existed before targeting) stays visible to
+--     everybody, and a student whose faculty was never recorded is not excluded
+--     from their own department's papers;
+--   * or they were explicitly allowed to borrow it (`exam_allowed_students`,
+--     section 2b), which is how a service-course student sees a paper aimed at
+--     another department.
+--
+-- The exception list is read through its own policies above, which let the
+-- student see exactly the rows that name them, so this EXISTS needs no definer
+-- helper and cannot recurse.
 create policy "exams_select"
   on public.exams for select
   to authenticated
   using (
-    is_published = true
+    public.is_staff()
     or created_by = auth.uid()
-    or public.is_staff()
+    or (
+      is_published = true
+      and (
+        exists (
+          select 1
+          from public.profiles p
+          where p.id = auth.uid()
+            and (exams.faculty    is null or p.faculty is null
+                 or lower(p.faculty)    = lower(exams.faculty))
+            and (exams.department is null or p.department is null
+                 or lower(p.department) = lower(exams.department))
+            and (exams.level      is null or p.level is null
+                 or p.level = exams.level)
+        )
+        or exists (
+          select 1
+          from public.exam_allowed_students a
+          where a.exam_id = exams.id and a.student_id = auth.uid()
+        )
+      )
+    )
   );
 
 create policy "exams_insert_supervisor_only"
@@ -1225,6 +1354,17 @@ create index if not exists idx_session_reset_logs_exam_id on public.session_rese
 -- above already serves that prefix); this walks the other way, for "which papers
 -- still owe marks on this question" and for the cascade when one is deleted.
 create index if not exists idx_question_grades_question_id on public.question_grades(question_id);
+-- `exam_allowed_students` is keyed (exam_id, student_id), so listing a paper's
+-- exceptions is already covered by the primary key's prefix; this walks the other
+-- way, for the student's side of `exams_select` ("is this paper on my list?") and
+-- for the cascade when a profile is deleted.
+create index if not exists idx_exam_allowed_students_student
+  on public.exam_allowed_students(student_id);
+-- A student's papers are filtered by their own cohort, which is a lookup of
+-- `profiles` by primary key; this serves the other direction, where the console's
+-- roster asks "who is in this department and level?".
+create index if not exists idx_profiles_department_level
+  on public.profiles(department, level);
 
 -- ---------------------------------------------------------------------
 -- Realtime setup
