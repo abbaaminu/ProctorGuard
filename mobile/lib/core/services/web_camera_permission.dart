@@ -26,6 +26,20 @@ abstract class WebCameraPermission {
   /// False on every non-web platform (and in VM widget tests).
   bool get isSupported;
 
+  /// Whether this browser has a camera to ask at all.
+  ///
+  /// False when `navigator.mediaDevices.getUserMedia` is missing: an embedded or
+  /// legacy Android browser (the ones shipped by some phone vendors and
+  /// "lite" browsers), or any page served over plain HTTP, where the API is
+  /// deliberately absent. Nothing the student can change in a settings menu
+  /// produces a camera there, so the gate has to point at the browser rather than
+  /// at a permission - "allow camera access" sends them round a loop that cannot
+  /// end in a working camera.
+  ///
+  /// True (the default for a browser that has the API) says nothing about whether
+  /// permission was *granted*; that is [probe]'s answer.
+  bool get canRequestCapture;
+
   /// Asks the browser for camera access and - by default - microphone access,
   /// as **two independent `getUserMedia` calls**, and reports what the browser
   /// actually handed back.

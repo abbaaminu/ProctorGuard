@@ -479,5 +479,8 @@ class _FakeBrowserProbe implements WebCameraPermission {
   bool get isSupported => true;
 
   @override
+  bool get canRequestCapture => true;
+
+  @override
   Future<WebCameraAccess> probe({bool audio = true}) async => access;
 }

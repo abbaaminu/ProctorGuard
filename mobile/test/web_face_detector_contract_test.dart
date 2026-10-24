@@ -224,9 +224,16 @@ void main() {
       expect(js, contains('getImageData('));
       expect(
         js,
-        contains('frameIsBlank(sampleFrame(element))'),
-        reason: 'a covered lens is a black frame with a working track: the script '
-            'has to measure the picture itself, not just the camera element',
+        contains('var sample = sampleFrame(element)'),
+        reason: 'the picture is not sampled exactly once per tick, so the blank '
+            'test and the "has this frame changed at all" test can disagree',
+      );
+      expect(
+        js,
+        contains('frameIsBlank(sample)'),
+        reason: 'a covered lens is a dim, featureless frame with a working track: '
+            'the script has to measure the picture itself, not just the camera '
+            'element',
       );
       // Mean and spread, not a single pixel: one dark pixel is a shadow, a dark
       // low-variance frame is a hand over the lens.
@@ -234,13 +241,153 @@ void main() {
       expect(js, contains('sample.mean'));
     });
 
-    test('only a camera that has shown a live frame can go dark', () {
+    test('a covered lens is judged by structure, not by near-black', () {
+      final js = detector();
+      final rules = RegExp(r'function frameIsBlank\([\s\S]*?\n  \}').firstMatch(js);
+      expect(rules, isNotNull, reason: 'the blank-frame rules are gone');
+
+      final body = rules!.group(0)!;
+      expect(
+        body,
+        contains('sample.spread <= FEATURELESS_SPREAD'),
+        reason: 'a frame with no structure is not being called blank whatever its '
+            'brightness. This is the rule a hand, a sticker or a closed shutter '
+            'over the lens trips, and it was the bug: auto-exposure lifts a covered '
+            'lens to a grey-brown (a measured mean of ~39, spread ~3.6), so a '
+            '"darker than 18 luma" test reported a covered camera as `centered` '
+            'and the student was never flagged',
+      );
+      expect(
+        body,
+        contains('sample.mean <= DARK_MEAN && sample.spread <= DARK_SPREAD'),
+        reason: 'a dim, near-featureless frame is not judged blank, so a covered '
+            'camera in a dark room passes as a face',
+      );
+      expect(
+        body,
+        contains('sample.mean >= BLOWN_MEAN && sample.spread <= BLOWN_SPREAD'),
+        reason: 'a camera pointed into a lamp is no longer treated as a face',
+      );
+
+      // The calibration itself, held against the measurements it came from.
+      final featureless = RegExp(r'FEATURELESS_SPREAD\s*=\s*(\d+)').firstMatch(js);
+      expect(featureless, isNotNull, reason: 'FEATURELESS_SPREAD is gone');
+      expect(
+        int.parse(featureless!.group(1)!),
+        greaterThanOrEqualTo(4),
+        reason: 'a covered lens measures a spread of 3-4 at this thumbnail size, '
+            'so a lower line would let the exact case this rule exists for through',
+      );
+
+      final darkMean = RegExp(r'DARK_MEAN\s*=\s*(\d+)').firstMatch(js);
+      expect(darkMean, isNotNull, reason: 'DARK_MEAN is gone');
+      expect(
+        int.parse(darkMean!.group(1)!),
+        greaterThanOrEqualTo(60),
+        reason: 'a covered lens in a lit room measures a mean of 35-75 luma; a '
+            'lower ceiling would only catch a lens capped in the dark',
+      );
+      expect(
+        js,
+        isNot(contains('DARK_LUMA')),
+        reason: 'the old near-black-only rule is back: it cannot see a covered '
+            'lens that auto-exposure has lifted off black',
+      );
+    });
+
+    test('a still picture is not a live camera', () {
+      final js = detector();
+      expect(
+        js,
+        contains('trackFrozen(pixels)'),
+        reason: 'nothing compares one frame with the next, so a printed photo, a '
+            'virtual camera looping a screenshot or a stalled decoder is a face '
+            'for as long as it is held up',
+      );
+      expect(
+        js,
+        contains('lastPixels'),
+        reason: 'the previous frame is not kept, so "the same picture again" '
+            'cannot be recognised',
+      );
+      expect(
+        js,
+        contains('sample.frozen'),
+        reason: 'the repeat count never reaches the blank-frame verdict',
+      );
+      final frozenTicks = RegExp(r'FROZEN_TICKS\s*=\s*(\d+)').firstMatch(js);
+      expect(frozenTicks, isNotNull, reason: 'FROZEN_TICKS is gone');
+      expect(
+        int.parse(frozenTicks!.group(1)!),
+        greaterThanOrEqualTo(2),
+        reason: 'one repeated frame is a dropped frame in the capture pipeline, '
+            'not a photograph',
+      );
+    });
+
+    test('a preview that never delivers is reported once it has stalled', () {
+      final js = detector();
+      expect(
+        js,
+        contains('STALL_MS'),
+        reason: 'a camera blocked before the first tick could see it live is never '
+            'reported: `seenLive` is never set, so the page stays silent for the '
+            'whole sitting',
+      );
+      expect(
+        js,
+        contains('seenLive === element || stalled'),
+        reason: 'the stalled preview is not reaching the no_face verdict',
+      );
+      expect(
+        js,
+        contains('Date.now() - inactiveSince'),
+        reason: 'the stall is not measured in time, so it can fire before a camera '
+            'has had a chance to deliver its first frame',
+      );
+    });
+
+    test('a hidden page reports nothing at all', () {
       expect(
         detector(),
-        contains('seenLive === element ? MESSAGES.noFace : null'),
+        contains("document.visibilityState === 'hidden'"),
+        reason: 'a backgrounded tab is `app_minimized` from the web guard, and the '
+            'browser throttles timers there: a no_face as well charges one act twice '
+            'and accuses a student of hiding a preview they could not uncover',
+      );
+    });
+
+    test('it can explain why nothing is being flagged', () {
+      final js = detector();
+      expect(
+        js,
+        contains('diagnostics: function'),
+        reason: 'a browser session that never flags anything has no way to say '
+            'which half is silent: no hook, no preview, or no frame',
+      );
+      expect(js, contains('hook: !!drainHook()'));
+      expect(js, contains("'no-preview'"));
+    });
+
+    test('only a camera that has shown a live frame can go dark', () {
+      final js = detector();
+      expect(
+        js,
+        contains('seenLive === element'),
         reason: 'a preview that never opened (a retry that failed, a refused '
-            'permission) reports no_face, which accuses a student of covering a '
-            'camera that was never on',
+            'permission) is not told apart from one that went dark',
+      );
+      expect(
+        js,
+        contains('seenLive = element'),
+        reason: 'nothing ever records that this camera did show a live frame, so '
+            'a covered lens can go unreported for the whole sitting',
+      );
+      expect(
+        js,
+        contains('function inactiveReason'),
+        reason: 'the single place that decides "is this camera showing anything" '
+            'is gone, so the reasons are being scattered again',
       );
     });
   });
@@ -291,7 +438,7 @@ void main() {
     test('a blank frame is judged before a face is counted in it', () {
       final js = detector();
       expect(
-        js.indexOf('frameIsBlank(sampleFrame(element))'),
+        js.indexOf('frameIsBlank(sample)'),
         lessThan(js.indexOf('var detection = countFaces(element);')),
         reason: 'the face count runs on a frame that has not been checked for '
             'being blank, so a detector can find a face in a black rectangle',

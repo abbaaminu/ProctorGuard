@@ -20,6 +20,12 @@ class UnsupportedWebCameraPermission implements WebCameraPermission {
   @override
   bool get isSupported => false;
 
+  /// False: no browser here to ask, so nothing may claim the capability. Every
+  /// caller reads it only after [isSupported] (see the exam page's "no camera"
+  /// message), where this is the "not applicable" answer.
+  @override
+  bool get canRequestCapture => false;
+
   @override
   Future<WebCameraAccess> probe({bool audio = true}) async =>
       const WebCameraAccess(granted: true);

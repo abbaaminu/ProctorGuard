@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>ProctorGuard face-detector lab</title></head>
+<!--
+  The page the face-sensor lab drives (see lab.js). It reproduces only what the
+  detector actually depends on:
+
+    * the DOM Flutter builds for a platform view - a <flt-platform-view> wrapper
+      appended to <flt-glass-pane>'s light DOM, revealed through an open shadow
+      root's slot - because that is the tree the detector has to find the
+      <video> in;
+    * the Dart hook, `window.proctorGuardFaceSignal`, which records what the page
+      says instead of forwarding it to a monitor;
+    * a synthetic camera: a canvas -> captureStream() track, painted as a lit room
+      with a student-shaped blob, a covered lens (dim and featureless, the way
+      auto-exposure lifts a hand off black), a blown-out frame, a dim room with
+      structure, a frozen picture, or a track that never delivers a frame.
+
+  `?s=<scenario>` picks the camera: scene (canvas), frozen (one still frame),
+  live (getUserMedia behind the browser's fake device), dead (a track that never
+  produces a frame) and novideo (no <video> element at all, i.e. the preview the
+  app never built). window.__paint(mode) changes the canvas camera mid-run, so one
+  page can go from "student present" to "lens covered" the way a student would.
+-->
+<body style="margin:0;background:#101010;color:#ddd;font:12px monospace">
+<pre id="log"></pre>
+<flutter-view style="display:block;position:absolute;left:0;top:0;width:640px;height:480px">
+  <flt-glass-pane id="glass" style="display:block;position:absolute;left:0;top:0;width:640px;height:480px"></flt-glass-pane>
+</flutter-view>
+<script>
+(function () {
+  'use strict';
+  window.__errors = [];
+  window.addEventListener('error', function (e) {
+    window.__errors.push(String(e.message) + ' @' + e.filename + ':' + e.lineno);
+  });
+  var params = new URLSearchParams(location.search);
+  var scenario = params.get('s') || 'live';
+
+  function note(text) {
+    var line = document.createElement('div');
+    line.textContent = text;
+    document.getElementById('log').appendChild(line);
+  }
+  window.__note = note;
+
+  // ---- The DOM Flutter builds for a platform view -------------------------
+  // Exactly what the engine does: the <flt-platform-view> wrapper is appended to
+  // <flt-glass-pane>'s LIGHT DOM, and revealed through an open shadow root slot.
+  var glass = document.getElementById('glass');
+  var shadow = glass.attachShadow({ mode: 'open' });
+  var slotWrapper = document.createElement('flt-platform-view-slot');
+  slotWrapper.style.cssText =
+    'position:absolute;left:0;top:0;width:640px;height:480px;pointer-events:auto;' +
+    'transform:matrix(1,0,0,1,0,0) rotate(0deg)';
+  var slot = document.createElement('slot');
+  slot.name = 'flt-pv-slot-7';
+  slotWrapper.appendChild(slot);
+  shadow.appendChild(slotWrapper);
+
+  var wrapper = document.createElement('flt-platform-view');
+  wrapper.id = 'flt-pv-7';
+  wrapper.setAttribute('slot', 'flt-pv-slot-7');
+  wrapper.setAttribute('aria-hidden', 'true');
+  wrapper.style.cssText = 'position:absolute;left:0;top:0;width:640px;height:480px';
+
+  var holder = document.createElement('div');
+  holder.style.cssText = 'object-fit:cover;height:100%;width:100%';
+  var video = document.createElement('video');
+  video.autoplay = false;
+  video.muted = true;
+  video.setAttribute('playsinline', '');
+  video.style.cssText = 'transform:scaleX(-1);transform-origin:center;pointer-events:none;' +
+    'width:100%;height:100%;object-fit:cover';
+  holder.appendChild(video);
+  wrapper.appendChild(holder);
+
+  window.__video = video;
+  window.__wrapper = wrapper;
+  window.__holder = holder;
+
+  if (scenario !== 'novideo') glass.appendChild(wrapper);
+
+  // ---- The Dart hook ------------------------------------------------------
+  window.__verdicts = [];
+  window.proctorGuardFaceSignal = function (message) {
+    window.__verdicts.push({ t: Math.round(performance.now()), v: String(message) });
+    note('hook <- ' + message);
+  };
+
+  // ---- A synthetic camera -------------------------------------------------
+  var canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 480;
+  var ctx = canvas.getContext('2d');
+
+  // One tile of sensor noise, drawn scaled over every frame: a real camera never
+  // repeats a frame byte for byte, so the "live" modes must flicker too.
+  var noise = document.createElement('canvas');
+  noise.width = 64;
+  noise.height = 48;
+  var noiseCtx = noise.getContext('2d');
+  var noiseData = noiseCtx.createImageData(64, 48);
+
+  // A second tile of dark sensor noise (values 0-26), for the "lens covered"
+  // frames: additive, so it never lifts the base colour into daylight.
+  var darkNoise = document.createElement('canvas');
+  darkNoise.width = 64;
+  darkNoise.height = 48;
+  var darkCtx = darkNoise.getContext('2d');
+  var darkData = darkCtx.createImageData(64, 48);
+  (function seedDark() {
+    for (var i = 0; i < darkData.data.length; i += 4) {
+      var v = Math.random() * 26;
+      darkData.data[i] = v;
+      darkData.data[i + 1] = v;
+      darkData.data[i + 2] = v;
+      darkData.data[i + 3] = 255;
+    }
+    darkCtx.putImageData(darkData, 0, 0);
+  })();
+
+  function repaintDarkNoise() {
+    for (var i = 0; i < darkData.data.length; i += 4) {
+      var v = Math.random() * 26;
+      darkData.data[i] = v;
+      darkData.data[i + 1] = v;
+      darkData.data[i + 2] = v;
+      darkData.data[i + 3] = 255;
+    }
+    darkCtx.putImageData(darkData, 0, 0);
+  }
+
+  function paintNoise(amplitude) {
+    for (var i = 0; i < noiseData.data.length; i += 4) {
+      var v = 128 + (Math.random() * 2 - 1) * amplitude;
+      noiseData.data[i] = v;
+      noiseData.data[i + 1] = v;
+      noiseData.data[i + 2] = v;
+      noiseData.data[i + 3] = 255;
+    }
+    noiseCtx.putImageData(noiseData, 0, 0);
+  }
+
+  var mode = 'scene';
+
+  function draw() {
+    if (mode === 'scene') {
+      // A lit room with a student-shaped blob in it: bright, textured.
+      var g = ctx.createLinearGradient(0, 0, 640, 480);
+      g.addColorStop(0, '#d8cbb0');
+      g.addColorStop(1, '#8f7f66');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 640, 480);
+      ctx.fillStyle = '#6a5a48';
+      ctx.fillRect(0, 320, 640, 160);
+      ctx.fillStyle = '#c9a184';
+      ctx.beginPath();
+      ctx.arc(320, 210, 90, 0, 6.2832);
+      ctx.fill();
+      ctx.fillStyle = '#2b2320';
+      ctx.beginPath();
+      ctx.arc(285, 190, 9, 0, 6.2832);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(355, 190, 9, 0, 6.2832);
+      ctx.fill();
+      paintNoise(6);
+      ctx.globalAlpha = 0.35;
+      ctx.drawImage(noise, 0, 0, 640, 480);
+      ctx.globalAlpha = 1;
+    } else if (mode === 'dimscene') {
+      // The same room with the lights down: dark, but full of structure.
+      var dg = ctx.createLinearGradient(0, 0, 640, 480);
+      dg.addColorStop(0, '#3c3a36');
+      dg.addColorStop(1, '#23211e');
+      ctx.fillStyle = dg;
+      ctx.fillRect(0, 0, 640, 480);
+      ctx.fillStyle = '#15130f';
+      ctx.fillRect(0, 320, 640, 160);
+      ctx.fillStyle = '#544a3e';
+      ctx.beginPath();
+      ctx.arc(320, 210, 90, 0, 6.2832);
+      ctx.fill();
+      ctx.fillStyle = '#0b0a08';
+      ctx.fillRect(240, 150, 160, 40);
+      ctx.fillRect(60, 60, 120, 90);
+      ctx.fillRect(470, 80, 100, 140);
+      paintNoise(6);
+      ctx.globalAlpha = 0.2;
+      ctx.drawImage(noise, 0, 0, 640, 480);
+      ctx.globalAlpha = 1;
+    } else if (mode === 'covered' || mode === 'coveredBright') {
+      // A finger, a sticker or a closed shutter over the lens: dim and, above
+      // all, featureless. `covered` is a phone in a lit room (auto-exposure
+      // still pushes the gain up); `coveredBright` has light bleeding through.
+      var base = mode === 'covered' ? '#221a15' : '#4a3a2e';
+      ctx.fillStyle = base;
+      ctx.fillRect(0, 0, 640, 480);
+      repaintDarkNoise();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.drawImage(darkNoise, 0, 0, 640, 480);
+      ctx.globalCompositeOperation = 'source-over';
+    } else if (mode === 'dark') {
+      ctx.fillStyle = '#050505';
+      ctx.fillRect(0, 0, 640, 480);
+    } else if (mode === 'white') {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, 640, 480);
+    }
+  }
+
+  window.__paint = function (next) {
+    mode = next;
+  };
+
+  function startCanvasCamera() {
+    draw();
+    if (scenario !== 'frozen') setInterval(draw, 66);
+    video.srcObject = canvas.captureStream(15);
+    video.play().then(function () {
+      note('canvas camera playing');
+    }, function (e) {
+      note('canvas play failed: ' + e);
+    });
+  }
+
+  function startDeviceCamera() {
+    navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false })
+      .then(function (stream) {
+        window.__stream = stream;
+        video.srcObject = stream;
+        return video.play();
+      })
+      .then(function () {
+        note('device camera playing');
+      })
+      .catch(function (e) {
+        note('device camera failed: ' + e.name + ' ' + e.message);
+      });
+  }
+
+  if (scenario === 'frozen' || scenario === 'canvas') {
+    startCanvasCamera();
+  } else if (scenario === 'dead') {
+    // A preview whose track is killed before the detector's first tick: the app
+    // opened a camera, and it went dark before anything was ever seen.
+    video.srcObject = canvas.captureStream(15);
+    window.__stream = video.srcObject;
+    video.play().then(function () {
+      setTimeout(function () {
+        window.__stream.getVideoTracks()[0].stop();
+      }, 120);
+    });
+  } else if (scenario !== 'novideo') {
+    startDeviceCamera();
+  }
+
+  // ---- What the detector sees --------------------------------------------
+  window.__stats = function () {
+    if (!video.videoWidth || !video.videoHeight) return null;
+    var probe = document.createElement('canvas');
+    probe.width = 48;
+    probe.height = 36;
+    var pctx = probe.getContext('2d', { willReadFrequently: true });
+    pctx.drawImage(video, 0, 0, 48, 36);
+    var px = pctx.getImageData(0, 0, 48, 36).data;
+    var n = 0;
+    var total = 0;
+    var squares = 0;
+    var dark = 0;
+    var luma = new Array(48 * 36);
+    var idx = 0;
+    for (var i = 0; i < px.length; i += 4) {
+      var value = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
+      luma[idx++] = value;
+      total += value;
+      squares += value * value;
+      if (value < 45) dark++;
+      n++;
+    }
+    // Mean absolute difference between a pixel and its right/below neighbour:
+    // how much structure the frame has (0 for anything featureless).
+    var edges = 0;
+    var pairs = 0;
+    for (var y = 0; y < 36; y++) {
+      for (var x = 0; x < 48; x++) {
+        var here = luma[y * 48 + x];
+        if (x < 47) {
+          edges += Math.abs(here - luma[y * 48 + x + 1]);
+          pairs++;
+        }
+        if (y < 35) {
+          edges += Math.abs(here - luma[(y + 1) * 48 + x]);
+          pairs++;
+        }
+      }
+    }
+    var mean = total / n;
+    var variance = squares / n - mean * mean;
+    return {
+      mean: Math.round(mean * 10) / 10,
+      spread: Math.round(Math.sqrt(variance > 0 ? variance : 0) * 10) / 10,
+      edge: Math.round((edges / pairs) * 100) / 100,
+      darkFraction: Math.round((dark / n) * 100) / 100,
+      w: video.videoWidth,
+      h: video.videoHeight,
+      paused: video.paused,
+      readyState: video.readyState,
+      tracks: video.srcObject
+        ? video.srcObject.getVideoTracks().map(function (t) {
+            return t.readyState + '/enabled:' + t.enabled + '/muted:' + t.muted;
+          })
+        : null
+    };
+  };
+
+  window.__state = function () {
+    var detector = window.ProctorGuardFaceDetector;
+    return {
+      scenario: scenario,
+      installed: !!(detector && detector.installed),
+      running: detector ? detector.isRunning() : null,
+      lastVerdict: detector ? detector.lastVerdict() : null,
+      hasVideo: !!(detector && detector.video && detector.video()),
+      diag: detector && detector.diagnostics ? detector.diagnostics() : null,
+      stats: window.__stats(),
+      verdicts: window.__verdicts.slice()
+    };
+  };
+})();
+</script>
+<script src="detector.js"></script>
+</body>
+</html>

@@ -14,13 +14,20 @@
     * `no_face` when there is no usable picture of the student: the camera was
       closed (its track ended), blanked (the track was muted or disabled), the
       video was paused or is still opening, the picture is hidden, or the frame
-      itself carries nothing - a covered lens (near-black), a blown-out frame, or
-      one flat colour (a fake or stalled stream). A student can produce every one
-      of those at the page's own layer, without touching a pixel of the app.
+      itself carries nothing - a covered lens, a blown-out frame, one flat colour,
+      or the same picture three ticks running (a still image in place of a camera,
+      a stalled decoder). A student can produce every one of those at the page's
+      own layer, without touching a pixel of the app.
     * `no_face` again on each tick it still holds, because Dart's sustain is
       measured in time: one verdict is a dropped frame, two 350 ms apart are a
       covered camera. 350 ms is deliberately one tick more than the monitor's
       300 ms sustain, so the second tick is the strike and the first cannot be.
+    * `no_face` for a preview that never shows a frame either, once it has been
+      silent for [STALL_MS]: a camera that was blocked before this loop could see
+      it live is still a camera nobody is being proctored by.
+    * nothing at all while the page is hidden: a backgrounded tab is
+      `app_minimized` from the web guard, and the browser's own throttling must not
+      become a second strike.
     * `centered` when the frame is live and not blank and the browser has no face
       model: a live frame of the student's desk is the only evidence available,
       and it is what ends an absence episode. It is never a violation.
@@ -73,20 +80,39 @@
   var SAMPLE_WIDTH = 48;
   var SAMPLE_HEIGHT = 36;
 
-  // Mean luma of a frame with the lens covered by a hand, a sticker or a closed
-  // privacy shutter, and how much noise such a frame may carry on top.
-  var DARK_LUMA = 18;
-  var DARK_SPREAD = 10;
+  // A frame with no structure at all - whatever its brightness - is a lens with
+  // something over it: a hand, a sticker, a finger, a printed sheet, a closed
+  // privacy shutter, or a camera pointed at a bare wall.
+  //
+  // Structure, not darkness, is the discriminator, and the numbers come from
+  // measuring both cases at this thumbnail size: a covered lens lands at a
+  // spread of 3-4 (auto-exposure pushes a covered lens to a grey-brown, not to
+  // black - 35 mean luma in a lit room, 70 with light bleeding through), while a
+  // dim room with a student in it keeps a spread of 12-20. The old rule only
+  // fired below 18 mean luma, so a covered camera in a lit room was reported as
+  // `centered` - a student being proctored with a hand over the lens.
+  var FEATURELESS_SPREAD = 6;
 
-  // A frame of one flat colour with almost no variation: a blanked stream, a
-  // stalled decoder, or a page feeding a still image in place of the camera. A
-  // real room never looks like this - a face in frame alone is more contrast
-  // than this - so it costs nothing in false positives.
-  var FLAT_SPREAD = 2;
+  // Dim *and* nearly featureless: a covered lens, or a room with the lights off.
+  // 90 is above every covered frame measured (35-75) and below a lit room.
+  var DARK_MEAN = 90;
+  var DARK_SPREAD = 12;
 
   // A camera pointed into a lamp: the picture exists, but there is no face in it.
-  var BLOWN_LUMA = 250;
+  var BLOWN_MEAN = 250;
   var BLOWN_SPREAD = 6;
+
+  // How many consecutive thumbnails may be byte-for-byte identical before the
+  // "camera" is called a still image. Every real sensor is noisy, so three in a
+  // row (about a second) is a photo held in front of the lens, a frozen decoder,
+  // or a virtual camera looping a screenshot - never a student sitting still.
+  var FROZEN_TICKS = 3;
+
+  // How long a preview that exists but shows nothing is tolerated before it is
+  // reported. It covers the camera that was blocked before the first tick could
+  // see it live (a `seenLive` that never happened), and it is well past the
+  // moment a camera needs to deliver its first frame.
+  var STALL_MS = 5000;
 
   // How deep to walk through shadow roots when looking for the camera. Flutter
   // hosts each platform view under one (`flt-platform-view`), and a host page may
@@ -107,6 +133,21 @@
   var context = null;
   var faceDetector = null;
   var faceDetectorChecked = false;
+
+  // The element this loop is watching, and since when it has shown nothing. A
+  // preview that exists but never delivers a frame is reported after [STALL_MS].
+  var watched = null;
+  var inactiveSince = 0;
+
+  // The previous thumbnail's bytes, and how many ticks in a row repeated them -
+  // the whole of the "is this a live picture" question.
+  var lastPixels = null;
+  var frozenTicks = 0;
+
+  // One warning per page session when a hook is installed but no preview can be
+  // found: a missing <script>, a renamed platform view, or a preview the app never
+  // built is then visible in a phone's remote devtools instead of silent.
+  var warnedNoPreview = false;
 
   // --- Talking to Dart ------------------------------------------------------
 
@@ -203,7 +244,10 @@
   /// camera). A video holding a live camera stream wins over any other `<video>`
   /// a host page happens to have.
   function findVideo() {
-    if (video && video.isConnected) return video;
+    // Fast path: the element the last tick watched is still connected and still
+    // delivering, which is every tick of a working camera.
+    if (video && video.isConnected && hasLiveTrack(video)) return video;
+
     video = null;
 
     var candidates = videosUnder(document, 0);
@@ -267,10 +311,14 @@
   /// Mean brightness of the frame and how much it varies, or null when the frame
   /// cannot be read (a tainted canvas, a decoder that is not ready).
   ///
+  /// `trackRepeat` is false for a diagnostic read: asking the detector what it sees
+  /// must not count as a frame of the loop that decides whether the picture is
+  /// moving.
+  ///
   /// Null is not evidence: an unreadable frame is reported as nothing rather than
   /// as an absent student, or a browser that refuses `getImageData` for its own
   /// reasons would accuse every student running on it.
-  function sampleFrame(element) {
+  function sampleFrame(element, trackRepeat) {
     try {
       if (!canvas) {
         canvas = document.createElement('canvas');
@@ -296,18 +344,61 @@
 
       var mean = total / count;
       var variance = totalSquares / count - mean * mean;
-      return { mean: mean, spread: Math.sqrt(variance > 0 ? variance : 0) };
+      return {
+        mean: mean,
+        spread: Math.sqrt(variance > 0 ? variance : 0),
+        frozen: trackRepeat === false ? false : trackFrozen(pixels)
+      };
     } catch (error) {
       return null;
     }
   }
 
+  /// Whether this thumbnail is the same picture as the last one, counted.
+  ///
+  /// Byte-for-byte on purpose: every real sensor is noisy, so a live camera never
+  /// repeats a frame exactly, while a photo in front of the lens, a stalled
+  /// decoder or a virtual camera looping a screenshot repeats it forever. This is
+  /// the one check that catches a *bright* fake - a still frame of a face has all
+  /// the structure and brightness of the real thing.
+  function trackFrozen(pixels) {
+    var repeat = lastPixels !== null;
+    if (repeat) {
+      for (var i = 0; i < pixels.length; i++) {
+        if (pixels[i] !== lastPixels[i]) {
+          repeat = false;
+          break;
+        }
+      }
+    }
+    if (repeat) {
+      frozenTicks++;
+    } else {
+      frozenTicks = 0;
+      lastPixels = new Uint8ClampedArray(pixels);
+    }
+    return frozenTicks + 1 >= FROZEN_TICKS;
+  }
+
   /// Whether a readable frame holds no picture of anything.
+  ///
+  /// Four ways a camera can be "on" without showing a student, in the order they
+  /// are cheapest to be sure about:
+  ///
+  ///  * `frozen` - the same thumbnail as the last one, three ticks running: a
+  ///    still image or a dead decoder, whatever it is a picture of;
+  ///  * featureless at any brightness - a lens with something over it, or a camera
+  ///    pointed at a blank surface;
+  ///  * dim *and* featureless - a covered lens in a lit room (auto-exposure lifts
+  ///    it to a grey-brown) or a room with the lights off;
+  ///  * blown out - a camera pointed into a lamp.
   function frameIsBlank(sample) {
     if (!sample) return false;
-    if (sample.spread <= FLAT_SPREAD) return true;
-    if (sample.mean >= BLOWN_LUMA && sample.spread <= BLOWN_SPREAD) return true;
-    return sample.mean <= DARK_LUMA && sample.spread <= DARK_SPREAD;
+    if (sample.frozen) return true;
+    if (sample.spread <= FEATURELESS_SPREAD) return true;
+    if (sample.mean <= DARK_MEAN && sample.spread <= DARK_SPREAD) return true;
+    if (sample.mean >= BLOWN_MEAN && sample.spread <= BLOWN_SPREAD) return true;
+    return false;
   }
 
   // --- Counting faces, when the browser can ---------------------------------
@@ -365,6 +456,41 @@
     }, INTERVAL_MS);
   }
 
+  /// Forgets the frame this loop was reading.
+  ///
+  /// Called between attempts and on [stop]: the next attempt must not inherit
+  /// "the last three thumbnails were identical" - or the read time of a stall -
+  /// from the previous one.
+  function resetEpisode() {
+    lastPixels = null;
+    frozenTicks = 0;
+    watched = null;
+    inactiveSince = 0;
+  }
+
+  /// Says, once per page session, that an attempt is running with no preview in
+  /// reach.
+  ///
+  /// It is the one failure with no verdict to speak: a page that forgot the
+  /// `<script>`, a renamed platform view, a preview the app never built, and an
+  /// app that drew its self-view with something other than a `<video>` all look
+  /// identical from here - and all of them leave a browser student unproctored.
+  /// A console line is what a phone's remote devtools can read.
+  function warnNoPreview() {
+    try {
+      if (window.console && window.console.warn) {
+        window.console.warn(
+          'ProctorGuard: an attempt is open and no camera preview can be found ' +
+            '(no <video> element with a live track). Web face detection is inactive ' +
+            'for this sitting. Check that proctor_face_detector.js is loaded and that ' +
+            'the camera preview is on screen.'
+        );
+      }
+    } catch (error) {
+      // A host page without a console is still proctored by the rest of the app.
+    }
+  }
+
   /// Ends one tick: releases the guard, speaks the verdict (if any), and queues
   /// the next tick. Every path out of [tick] goes through here, so no early
   /// return can stall the loop.
@@ -388,6 +514,18 @@
     // pixels read. The timer stays, so the next attempt in this page session is
     // covered without a reload.
     if (!drainHook()) {
+      resetEpisode();
+      lastVerdict = null;
+      schedule();
+      return;
+    }
+
+    // A page that is not on screen is not being watched by this loop: the browser
+    // throttles its timers and a suspended preview keeps its last frame, while
+    // leaving the exam surface is already `app_minimized` from the web guard. One
+    // act, one strike - and never a `no_face` for a camera the student was not
+    // there to uncover.
+    if (document.visibilityState === 'hidden') {
       lastVerdict = null;
       schedule();
       return;
@@ -402,25 +540,41 @@
         // session, a host that replaced the preview. There is nothing to judge,
         // and no absence to accuse anyone of.
         seenLive = null;
+        watched = null;
+        inactiveSince = 0;
         lastVerdict = null;
+        if (!warnedNoPreview) {
+          warnedNoPreview = true;
+          warnNoPreview();
+        }
         finished(null, session);
         return;
       }
 
       if (inactiveReason(element)) {
-        // Only a camera this page has actually shown a live frame of can be
-        // accused of having gone dark. A preview that never opened (a retry that
-        // did not take, a permission that was never granted) is a camera problem
-        // the attempt already reports on its own terms, not a student covering
-        // the lens.
-        finished(seenLive === element ? MESSAGES.noFace : null, session);
+        // A camera this page has shown a live frame of is evidence the moment it
+        // goes dark. A preview that has never shown a frame gets [STALL_MS] first:
+        // a camera the app opened and could not feed is a camera problem the
+        // attempt reports on its own terms, but a preview that stays black for five
+        // seconds mid-exam is a camera that was taken away - the one case `seenLive`
+        // on its own would never report, because it was blocked before the first
+        // tick could see it live.
+        if (watched !== element || !inactiveSince) {
+          watched = element;
+          inactiveSince = Date.now();
+        }
+        var stalled = Date.now() - inactiveSince >= STALL_MS;
+        finished(seenLive === element || stalled ? MESSAGES.noFace : null, session);
         return;
       }
 
       // Seen live: from here on, this element going dark is evidence.
       seenLive = element;
+      watched = element;
+      inactiveSince = 0;
 
-      if (frameIsBlank(sampleFrame(element))) {
+      var sample = sampleFrame(element);
+      if (frameIsBlank(sample)) {
         finished(MESSAGES.noFace, session);
         return;
       }
@@ -469,6 +623,7 @@
     running = false;
     busy = false;
     generation++;
+    resetEpisode();
     if (timer !== null) {
       window.clearTimeout(timer);
       timer = null;
@@ -502,6 +657,46 @@
     /// The element currently being watched, for diagnostics.
     video: function () {
       return findVideo();
+    },
+
+    /// Everything this loop knows, for a host or a proctor wiring up a browser
+    /// build: why the last tick said what it said, in plain words.
+    ///
+    /// `ProctorGuardFaceDetector.diagnostics()` in a phone's remote devtools is the
+    /// quickest way to answer "why is nothing being flagged": no `hook` means the
+    /// attempt's Dart side is not listening, `video: null` means no preview was
+    /// found, `reason` names the state the preview is in, and `lastVerdict` says
+    /// what the page last told the app.
+    diagnostics: function () {
+      var element = findVideo();
+      var sample = element && !inactiveReason(element) ? sampleFrame(element, false) : null;
+      return {
+        installed: true,
+        running: running,
+        intervalMs: INTERVAL_MS,
+        hook: !!drainHook(),
+        lastVerdict: lastVerdict,
+        video: element
+          ? {
+              id: element.id || null,
+              width: element.videoWidth,
+              height: element.videoHeight,
+              paused: element.paused,
+              readyState: element.readyState,
+              source: element.srcObject ? 'srcObject' : element.currentSrc || null,
+              tracks: streamTracks(element)
+                ? streamTracks(element).map(function (track) {
+                    return track.readyState + (track.muted ? '/muted' : '') + (track.enabled ? '' : '/disabled');
+                  })
+                : []
+            }
+          : null,
+        reason: element ? inactiveReason(element) : 'no-preview',
+        sample: sample
+          ? { mean: Math.round(sample.mean), spread: Math.round(sample.spread), frozen: sample.frozen }
+          : null,
+        visible: document.visibilityState
+      };
     }
   };
 

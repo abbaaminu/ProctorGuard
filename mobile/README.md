@@ -852,7 +852,16 @@ Details worth knowing:
   screen opens is the one that records). Fewer opens also means the checklist's
   microphone row is its own answer rather than being inferred from a session that
   may never have started — a granted-but-trackless result is reported as such, not
-  as "fine".
+  as "fine". The other half of that answer is the browser itself:
+  `WebCameraPermission.canRequestCapture` is false when the page has no
+  `navigator.mediaDevices.getUserMedia` at all — a vendor "lite" or legacy Android
+  browser, an old WebView, or any page served over plain HTTP, where the API is
+  absent by design — and the exam screen then says **"This browser cannot share a
+  camera with a website. Open this exam in Chrome, Firefox or Edge"** instead of
+  sending the student round a permission menu that cannot exist. A browser that
+  *has* the API and refuses is the ordinary path: NotAllowedError is "camera access
+  was refused", NotFoundError is "no camera was found", and the gate's Try again
+  re-asks.
 * **Raw camera frames only exist where the platform offers them.** The exam
   screen asks `CameraPlatform.instance.supportsImageStreaming()` before calling
   `startImageStream`: `camera_android_camerax` and `camera_avfoundation` answer
@@ -951,19 +960,38 @@ shadow root above it. Per tick:
   was closed, unplugged, or the grant was revoked), the track is muted or
   disabled, the element is paused or still opening, it has no picture size, or it
   is hidden by CSS → `no_face`. A camera that has never shown a live frame is not
-  accused of anything: a preview that failed to open is a camera problem the
-  attempt reports on its own terms, not a student covering the lens.
-* **The frame holds no picture of anything** — near-black (a hand, a sticker or a
-  closed shutter over the lens), blown out (a camera pointed into a lamp), or one
-  flat colour with no variation (a blanked or stalled stream, a still image in
-  place of the camera) → `no_face`. The frame is sampled into a 48x36 thumbnail,
-  and an unreadable frame is reported as *nothing* rather than as an absence.
+  accused of anything for the first five seconds: a preview that failed to open is
+  a camera problem the attempt reports on its own terms, not a student covering the
+  lens — but a preview that stays black past that is a camera nobody is being
+  proctored by, and it is reported too.
+* **The frame holds no picture of anything** → `no_face`. The frame is sampled into
+  a 48x36 thumbnail on every tick and judged on two numbers: its mean luma and its
+  spread. A frame with **no structure** (`spread` ≤ 6, whatever its brightness) is a
+  lens with something over it — a hand, a finger, a sticker, a closed shutter, a
+  printed sheet; auto-exposure lifts a covered lens to a grey-brown (a measured mean
+  of ~39, spread ~3.6 in a lit room, ~72 with light bleeding through), so "darker
+  than 18 luma" was the wrong test and let a covered camera pass as `centered`. A
+  **dim and near-featureless** frame (mean ≤ 90, spread ≤ 12) is the same thing with
+  the lights off. A **blown-out** frame (mean ≥ 250, spread ≤ 6) is a camera pointed
+  into a lamp. A **repeated** frame — the same thumbnail byte for byte three ticks
+  running — is a still image in place of a camera, a stalled decoder or a virtual
+  camera looping a screenshot, and it is reported however bright and detailed it is.
+  An unreadable frame is reported as *nothing* rather than as an absence.
+* **A hidden page reports nothing at all.** A backgrounded tab is already
+  `app_minimized` from the web guard, and the browser throttles its timers there;
+  charging the same act twice would flag a preview the student could not uncover.
 * **Otherwise a live, non-blank frame.** If the browser exposes the Shape
   Detection API (`window.FaceDetector`, Chromium only) the count decides:
   `0` → `no_face`, more than one → `multiple_faces`, one → `centered`. Without it
   the page says `centered`, which is what ends an absence episode — it is never a
   strike, so a browser that cannot count faces still catches a covered or closed
   camera and still cannot invent a missing student.
+
+`ProctorGuardFaceDetector.diagnostics()` in the page console answers "why is
+nothing being flagged" for one sitting: `hook` (is the attempt's Dart side
+listening), `video` (was the preview found), `reason` (which state it is in), and
+`lastVerdict` (what the page last said). A page that never finds a preview warns
+once on the console instead of staying silent.
 
 It does **not** report `looking_away`: a head pose is something a model measures,
 and guessing an angle from a bounding box would be inventing evidence. A host
@@ -1013,6 +1041,26 @@ page's use of them by the "the browser face bridge" group in
 `test/exam_taking_page_test.dart`, and the shipped sensor's own contract (the hook
 name, the vocabulary, and that a stopped/hidden/blank camera is `no_face`) by
 `test/web_face_detector_contract_test.dart`.
+
+**Checking the sensor against a picture, without a phone.** The rules above are
+numbers — a spread, a mean, a count of identical ticks — so
+`tool/face_lab/` runs the shipped `web/proctor_face_detector.js` unmodified inside
+a headless Chromium, against the fake platform-view DOM and a synthetic camera it
+can cover, blow out, dim, freeze or fail to deliver, and fails the run if any
+scenario ends in the wrong verdict:
+
+```
+cd mobile && node tool/face_lab/lab.js
+```
+
+`all 14 scenarios behaved` is the pass line; a miss prints the verdict it got and
+the reason (`PASS canvas+covered … after=no_face,no_face,no_face mean=39 spread=4`)
+and writes the full state to `%TEMP%\pg_face_lab_last_run.json`. It needs Node 22+
+(global `WebSocket`) and Edge or Chrome — `PG_LAB_BROWSER` points it at another.
+This is the check that catches the failure this sensor actually had: an
+auto-exposed covered lens measures a mean of ~39 with a spread of ~3.6, so the
+original "darker than 18 luma" rule reported a hand over the lens as `centered`
+and the student was never flagged.
 
 ## Web install surface (icons, manifest, favicon)
 
@@ -1171,7 +1219,7 @@ the 3-strike rule:
 | Detector | Signal | `action_type` |
 | --- | --- | --- |
 | ML Kit face detection | no face (three consecutive frames) / several faces / head pose off-axis (one frame past ~15 deg yaw or ~18 deg pitch) | `no_face`, `multiple_faces`, `looking_away` |
-| `web/proctor_face_detector.js` (Chrome/Edge) | the preview's camera track ended, is muted/disabled, is paused or hidden, or the frame is blank (near-black, blown out, one flat colour) → `no_face`; a face count where the browser has the Shape Detection API ([details above](#face-signals-on-the-web-the-host-page-bridge)) | `no_face`, `multiple_faces` |
+| `web/proctor_face_detector.js` (Chrome/Edge) | the preview's camera track ended, is muted/disabled, is paused or hidden, a preview that has shown nothing for five seconds, or the frame carries no picture (featureless whatever its brightness, dim and near-featureless, blown out, or the same thumbnail for three ticks running) → `no_face`; a face count where the browser has the Shape Detection API ([details above](#face-signals-on-the-web-the-host-page-bridge)) | `no_face`, `multiple_faces` |
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
 | `WebGuards` (Chrome/Edge) | tab hidden, window blurred, or HTML5 fullscreen left | `app_minimized` |

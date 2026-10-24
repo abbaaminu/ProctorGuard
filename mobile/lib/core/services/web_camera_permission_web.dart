@@ -1,4 +1,5 @@
 import 'dart:js_interop';
+import 'dart:js_interop_unsafe';
 
 import 'package:web/web.dart' as web;
 
@@ -16,6 +17,28 @@ class BrowserWebCameraPermission implements WebCameraPermission {
 
   @override
   bool get isSupported => true;
+
+  /// Whether the page has `navigator.mediaDevices.getUserMedia`.
+  ///
+  /// Read through `dart:js_interop_unsafe` rather than `navigator.mediaDevices`
+  /// because `package:web` types that property as non-nullable: on a browser that
+  /// has no `mediaDevices` at all (a vendor "lite" browser, an old WebView, or a
+  /// page served over plain HTTP) the property is `undefined`, and *touching* it
+  /// as an object throws. A capability check must answer "no", not throw.
+  @override
+  bool get canRequestCapture {
+    try {
+      final navigator = web.window.navigator as JSObject;
+      final devices = navigator.getProperty<JSAny?>('mediaDevices'.toJS);
+      if (devices == null || devices.isUndefinedOrNull) return false;
+      final capture = (devices as JSObject).getProperty<JSAny?>(
+        'getUserMedia'.toJS,
+      );
+      return capture != null && !capture.isUndefinedOrNull;
+    } catch (_) {
+      return false;
+    }
+  }
 
   /// Two probes, video then audio, each opening and immediately closing its own
   /// stream.

@@ -415,6 +415,17 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     }
 
     if (cameras.isEmpty) {
+      if (kIsWeb && !WebCameraPermission().canRequestCapture) {
+        // Nothing in a permission menu produces a camera in a browser with no
+        // `getUserMedia` - a vendor "lite" browser, an old WebView, or a page
+        // served over plain HTTP. Point at the browser instead of at a setting the
+        // student cannot find.
+        _failStart(
+          'This browser cannot share a camera with a website. Open this exam in '
+          'Chrome, Firefox or Edge on this device, then tap Try again.',
+        );
+        return;
+      }
       _failStart(
         kIsWeb
             ? 'No camera is available. Allow camera access for this site in your '
