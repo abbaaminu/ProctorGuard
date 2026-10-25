@@ -17,7 +17,10 @@ class ExamRepositoryImpl implements ExamRepository {
         .select()
         .eq('is_published', true)
         .order('created_at', ascending: false);
-    return (rows as List).map((r) => Exam.fromMap(r)).toList();
+    return (rows as List)
+        .cast<Map<String, dynamic>>()
+        .map(Exam.fromMap)
+        .toList();
   }
 
   @override
@@ -27,7 +30,10 @@ class ExamRepositoryImpl implements ExamRepository {
         .from('questions_public')
         .select()
         .eq('exam_id', examId);
-    return (rows as List).map((r) => Question.fromMap(r)).toList();
+    return (rows as List)
+        .cast<Map<String, dynamic>>()
+        .map(Question.fromMap)
+        .toList();
   }
 
   @override

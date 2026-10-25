@@ -1,3 +1,17 @@
 # Lint rules for the Flutter app — `flutter_lints` (declared in pubspec.yaml)
 # is enabled here so `flutter analyze` actually applies it.
 include: package:flutter_lints/flutter.yaml
+
+# The two strict modes `flutter_lints` leaves off. They turn a `dynamic` that
+# escapes a JSON body or a `List` cast into an analyzer error, instead of
+# something that compiles and then fails on a device with a payload the tests
+# never produced. `flutter analyze` is the CI gate, so this config is enforced.
+#
+# `strict-inference` is deliberately *not* enabled: it fires on
+# `client.rpc(...)`, whose result type only exists once the SQL function is
+# deployed, so asking for an explicit type argument there adds noise, not safety.
+analyzer:
+  language:
+    strict-casts: true
+    strict-raw-types: true
+

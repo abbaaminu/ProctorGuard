@@ -113,7 +113,7 @@ class StudentRosterOutcome extends Equatable {
   factory StudentRosterOutcome.fromMap(Map<String, dynamic> map) {
     List<Map<String, dynamic>> rows(Object? value) => value is List
         ? value
-            .whereType<Map>()
+            .whereType<Map<Object?, Object?>>()
             .map((row) => row.cast<String, dynamic>())
             .toList(growable: false)
         : const <Map<String, dynamic>>[];

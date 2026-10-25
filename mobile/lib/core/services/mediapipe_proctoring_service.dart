@@ -378,20 +378,29 @@ class MediaPipeProctoringService {
   /// Picks the ML Kit format for the streamed buffer, or `null` when the frame
   /// is in a format the detector cannot read.
   InputImageFormat? _mlKitFormat(CameraImage image) {
-    final raw = InputImageFormatValue.fromRawValue(image.format.raw);
-
     // ML Kit has no web implementation (`dart:io`'s Platform would throw in a
     // browser anyway), so a web session produces no face signals — run it with
     // MOCK_CAMERA=true or accept camera-only monitoring.
     if (kIsWeb) return null;
 
+    // ML Kit's detector is a mobile-only plugin.
+    if (defaultTargetPlatform != TargetPlatform.android &&
+        defaultTargetPlatform != TargetPlatform.iOS) {
+      return null;
+    }
+
+    // `ImageFormat.raw` is the platform's own constant: an int on both mobile
+    // backends (NV21/YUV420 on the CameraX side, BGRA8888 on AVFoundation).
+    // Anything else is a buffer ML Kit has no format for, so the frame reads as
+    // unreadable rather than being forced into an int.
+    final rawValue = image.format.raw;
+    if (rawValue is! int) return null;
+    final raw = InputImageFormatValue.fromRawValue(rawValue);
+
     if (defaultTargetPlatform == TargetPlatform.iOS) {
       return raw == InputImageFormat.bgra8888
           ? InputImageFormat.bgra8888
           : null;
-    }
-    if (defaultTargetPlatform != TargetPlatform.android) {
-      return null; // ML Kit's detector is a mobile-only plugin
     }
 
     // The exam page requests ImageFormatGroup.nv21 on Android. CameraX

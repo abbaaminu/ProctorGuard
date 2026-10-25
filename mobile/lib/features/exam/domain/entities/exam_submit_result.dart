@@ -37,11 +37,11 @@ class ExamSubmitResult extends Equatable {
   /// it, so an exception here would turn a finished exam into an error screen.
   factory ExamSubmitResult.fromRpc(Object? response) {
     final row = switch (response) {
-      final List list when list.isNotEmpty => list.first,
-      final Map map => map,
+      final List<Object?> list when list.isNotEmpty => list.first,
+      final Map<Object?, Object?> map => map,
       _ => null,
     };
-    if (row is! Map) {
+    if (row is! Map<Object?, Object?>) {
       return const ExamSubmitResult(status: SubmissionStatus.submitted);
     }
 
