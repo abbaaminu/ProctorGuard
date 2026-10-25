@@ -918,27 +918,48 @@ retry/leave actions.
 ## Supported platforms (and what proctoring each one gets)
 
 Only the runner folders that actually exist under `mobile/` are targets:
-`android/`, `ios/` and `web/`. The app compiles for all three, and **Android is
-the shipped one** — `build_apk.ps1` and `.github/workflows/sync_release.yml`
-publish the signed, split-per-ABI APKs students install.
+`android/`, `ios/`, `web/`, `windows/` and `linux/`. **Android is the shipped
+one** — `build_apk.ps1` and `.github/workflows/sync_release.yml` publish the
+signed, split-per-ABI APKs students install. iOS is scaffolded and compiled in CI
+but not signed ([`ios/README.md`](ios/README.md)); the two desktop runners build,
+and refuse to proctor (below).
 
 | Host | Builds | Face signals | Mic level | Screen lockdown |
 | --- | --- | --- | --- | --- |
 | Android (phone) | `flutter build apk` | ML Kit, on-device | `record` | Lock task / screen pinning + immersive chrome |
-| iOS | `flutter build ios` — needs the Podfile work in `ios/README.md` first | ML Kit, on-device | `record` | Best-effort only (`startLock` reports `granted: false`) |
+| iOS | `flutter build ios` — scaffolded, unsigned in CI; what is still owed is in [`ios/README.md`](ios/README.md) | ML Kit, on-device | `record` | Best-effort only (`startLock` reports `granted: false`) |
 | Web (Chrome/Edge) | `flutter build web` | `web/proctor_face_detector.js`, shipped with the app: camera presence, blank/covered-frame and face-count checks ([below](#face-signals-on-the-web-the-host-page-bridge)); a host page may add its own detections through the same `proctorGuardFaceSignal` bridge | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
-| macOS / Windows / Linux | — | — | — | — |
+| Windows / Linux (native) | `flutter build windows` / `flutter build linux` | **none — the exam refuses to start** (see below) | `record`, levels only | none |
+| macOS | — | — | — | — |
 
-**There is no `macos/`, `windows/` or `linux/` runner here, and that is a scope
-decision rather than an unfinished port.** A desktop machine takes part as a
-**browser host** — the `web` target above, sized for a wide window by
-`ResponsiveLayout` — which is why the "no on-device AI on the web" boundary in
-the root README applies to it. A native desktop build would ship a proctoring
-client that (on macOS in particular) cannot enter the lockdown the exam surface
-rests on and cannot reach ML Kit without another plugin, so it would *add* a
-supported platform whose proctoring is weaker than the browser's. Adding one is
-a new target with its own privacy and security review, not a `flutter create`
-away.
+**The `windows/` and `linux/` runners are scaffolding, and the exam surface says
+so.** They exist so the app is a first-class target — a native build that starts,
+a place to run the UI without an emulator — not because desktop proctoring is
+supported: `camera` implements android, ios and the browser only, and ML Kit has no
+desktop implementation at all. That is what
+`lib/core/services/platform_capabilities.dart` answers, via
+`platformHasCamera()` / `platformHasFaceDetector()` — the two questions a single
+`kIsWeb` test used to answer while the browser was the only non-ML-Kit target. On a
+desktop build both are false, so:
+
+* the hardware gate blocks the session with "the camera cannot be opened on this
+  platform — ProctorGuard proctors exams on a phone or tablet" instead of reaching
+  `availableCameras()`, which throws `UnimplementedError` there, and then offering a
+  **Try again** that can never succeed;
+* `ExamTakingPage` refuses at bootstrap with the same reason for the paths that skip
+  the gate;
+* the report is marked `faceDetectionInactive`, the same note the web gets, so
+  nothing claims on-device AI that is not there;
+* `MOCK_CAMERA=true` still runs the entire exam screen, so a desktop build stays a
+  usable development harness — which is the reason to have these targets at all.
+
+A desktop machine *takes part* as a **browser host** — the `web` target above, sized
+for a wide window by `ResponsiveLayout` — and that is the only desktop proctoring
+path that exists: the browser has a real camera and its own face signals, while a
+native desktop build has neither a camera plugin nor a detector. **macOS has no
+runner** for that reason and one more: it is the weakest of the three lockdown
+surfaces, and nothing in this repository needs it yet. Adding one is a new target
+with its own privacy and security review.
 
 ### Face signals on the web (the host-page bridge)
 
@@ -1118,6 +1139,40 @@ corner while the manifest advertised them as the app's. It decodes the first pix
 of each icon (PNG `IHDR` + the first `IDAT`, no image package) and requires the
 artwork's navy `#14284B`, so it fails both on an icon generated from the wrong
 source and on a skipped regeneration.
+
+## Content Security Policy (the browser build)
+
+`web/index.html` carries a `Content-Security-Policy` meta tag, and it is the one
+place a browser build's network surface is written down. A proctoring client
+holds a live camera feed, the student's session and the answer cache; the policy
+exists so that an injected script, a malicious extension's `fetch` or a
+compromised transitive dependency cannot post any of it to a host outside the
+project.
+
+| Directive | What it allows | Why |
+| --- | --- | --- |
+| `default-src` | `'self'` | Anything unlisted below is same-origin only. |
+| `script-src` | `'self' 'unsafe-inline' 'wasm-unsafe-eval' https://www.gstatic.com` | The app's own scripts (the face sensor, the lockdown bootstrap and Flutter's loader) plus CanvasKit's canvas/font payload. `'unsafe-inline'` is what the exam-lockdown script in `index.html` needs; a host serving this as a **response header** can move that script into its own file and drop the keyword. `'wasm-unsafe-eval'` is the narrow WebAssembly allowance — not `'unsafe-eval'`. |
+| `connect-src` | `'self'`, `https://*.supabase.co`, `wss://*.supabase.co`, the `.supabase.in` mirror, Sentry ingest, `https://www.gstatic.com`, localhost | Auth, PostgREST, Storage and the Realtime socket; crash reports only when `SENTRY_DSN` was compiled in; `flutter run -d chrome` and a local Supabase stack. |
+| `img-src` | `'self' data: blob:` + the Supabase hosts | Evidence stills are short-lived signed URLs on the project host. |
+| `object-src` / `base-uri` / `form-action` | `'none'` / `'self'` / `'self'` | No plugins, `<base>` is this document's own `--base-href`, and nothing is posted as a form. |
+
+Two limits are deliberate and documented in the file itself:
+
+* **A self-hosted Supabase** is served from its own domain, and a static
+  `index.html` cannot template `--dart-define=SUPABASE_URL` into a header. The
+  host adds its origin to `connect-src` (and `img-src`); the alternative — `https:`
+  — is the policy with the useful half switched off.
+* **`frame-ancestors` is absent**, because browsers ignore it in a meta tag.
+  Clickjacking protection has to be a response header from whatever serves
+  `build/web` (`Content-Security-Policy: frame-ancestors 'none'` or
+  `X-Frame-Options: DENY`).
+
+`test/web_csp_contract_test.dart` pins the policy: the exhaustive list of allowed
+script and connect sources, the `wss:` realtime host, the `'wasm-unsafe-eval'`
+allowance, and that the meta tag appears **before** the first `<script>` (a
+policy declared after a script does not apply to it). Widening the policy is a
+deliberate edit to that file, not an accident in `index.html`.
 
 ## Responsive layout (Android phone + desktop browser)
 
@@ -1388,6 +1443,65 @@ Dart VM, where no audio plugin is registered, so injecting a source is the only 
 drive a working microphone, a refused one, or one unplugged mid-session, instead of
 asserting on a chip that can only ever say `unavailable`.
 
+## Crash reporting (Sentry — off until configured)
+
+`lib/core/services/crash_reporting.dart` installs Sentry around the whole startup
+and is **inert unless a DSN was compiled in**:
+
+```powershell
+flutter build apk --release --split-per-abi `
+  --dart-define=SUPABASE_URL=... --dart-define=SUPABASE_PUBLISHABLE_KEY=... `
+  --dart-define=SENTRY_DSN=https://<key>@o<org>.ingest.sentry.io/<project> `
+  --dart-define=SENTRY_ENVIRONMENT=production `
+  --dart-define=SENTRY_RELEASE=$(git rev-parse --short HEAD)
+```
+
+| Define | Effect |
+| --- | --- |
+| `SENTRY_DSN` | Unset/empty/invalid = no SDK, no zone, no traffic. A local `flutter run`, `flutter test` and `sync_release.yml` (which does not pass it) are unchanged. |
+| `SENTRY_ENVIRONMENT` | The Sentry environment label. Defaults to `production` in a release build and `debug` otherwise. |
+| `SENTRY_RELEASE` | The release label, normally the git SHA. Left unset, the SDK decides. |
+
+Three deliberate choices:
+
+* **It wraps the boot, not just the widget tree.** `main()` hands the Supabase
+  client, the first permission pass and `runApp` to `CrashReporting.install` as
+  its app runner, because "white screen on that phone" is a boot-time failure and
+  is worth more than a stack from inside a page.
+* **It never costs a student an exam.** A DSN the SDK rejects, a platform channel
+  that is not there or a transport that will not start is caught, logged with
+  `proctorLog` and then the app runs anyway. `main()` calls the runner exactly
+  once either way.
+* **It carries no proctoring data.** `sendDefaultPii` and `attachScreenshot` are
+  off, and the view hierarchy is left at the SDK's own off default: the scope of a
+  running attempt includes the student's name and, on the exam screen, their face.
+  `tracesSampleRate` is `0`, so crash reporting adds no request per camera tick.
+
+The guarded zone itself comes from `SentryFlutter.init` (its own
+`RunZonedGuardedIntegration` on the web, `FlutterError.onError` +
+`PlatformDispatcher.onError` on Android/iOS). `CrashReporting` explains for each
+platform why it does not nest a second one — an inner `runZonedGuarded` would
+shadow those handlers and report a fatal boot error twice.
+`test/crash_reporting_test.dart` pins the DSN validation, the environment
+fallback and that the runner always runs.
+
+The browser half needs the ingest host in the CSP's `connect-src` (see
+[Content Security Policy](#content-security-policy-the-browser-build)): without
+it the SDK is installed and every report is blocked by the browser.
+
+`sentry_flutter` is held at **9.x** on purpose: 10.x's Android plugin declares
+`minSdkVersion 26`, while this app keeps Flutter's floor of 24 so an Android 7
+phone can still sit an exam (9.x declares 21). The constraint and the reason are
+in `pubspec.yaml`; moving to 10.x is a decision to drop those devices.
+
+On Windows and Linux the plugin is a thin CMake target around Sentry's
+`sentry-native` crash handler, which its `CMakeLists.txt` fetches from GitHub the
+first time a desktop build is configured. So a desktop build now needs network
+access on top of MSVC/GTK — and, with no DSN, the plugin is registered but never
+initialised, so the desktop runners still do nothing with it. The scaffolded
+desktop targets are not built in CI, which is why this is written down here
+rather than discovered on a build machine.
+
 ## Release builds (signing, shrinking, ABIs)
 
 The release build type is not the debug one with a different name. Signing material is
@@ -1435,9 +1549,14 @@ written-down opt-out for a throwaway demo build and never for one a student runs
   `mobile/test/android_manifest_contract_test.dart` fails if the merged manifest regains
   `SYSTEM_ALERT_WINDOW`, drops `allowBackup="false"`, loses the `networkSecurityConfig`
   reference, or if that config ever permits cleartext outside loopback.
-- **iOS has no target.** `mobile/ios/README.md` records that decision and the checklist
-  for porting to it; the Dart services degrade to `granted: false` / `unavailable`
-  instead of throwing, so nothing in `lib/` has to change first.
+- **iOS is scaffolded and compiled in CI, not shipped.** `mobile/ios/` is a real
+  Xcode project (`Info.plist` privacy strings, `Podfile` at the ML Kit floor,
+  `Runner.xcodeproj`), and `.github/workflows/ios_release.yml` compiles it
+  unsigned on every push that touches `mobile/**` so an iOS-only break fails a
+  pull request. Distribution — signing material, an App Store Connect record and
+  the TestFlight upload — is the `testflight` job in that same workflow and is
+  inert until its repository secrets exist; `mobile/ios/README.md` lists them and
+  the remaining iOS work (lifecycle violations, artwork, keychain exclusion).
 - **CI publishes these builds.** `.github/workflows/sync_release.yml` runs the same
   `flutter build apk --release --split-per-abi` on every push to `main` (and every
   `vX.Y.Z` tag) and mirrors the APKs, their SHA-256 checksums and a `latest.json`

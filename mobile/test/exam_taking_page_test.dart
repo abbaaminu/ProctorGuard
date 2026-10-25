@@ -13,6 +13,7 @@ import 'package:proctorguard/features/exam/domain/entities/submission.dart';
 import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
 import 'package:proctorguard/features/exam/presentation/pages/exam_taking_page.dart';
 import 'package:proctorguard/features/exam/presentation/widgets/exam_session_widgets.dart';
+import 'package:proctorguard/features/exam/presentation/widgets/mobile_exam_only.dart';
 import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
 import 'package:proctorguard/features/proctoring/domain/repositories/proctoring_repository.dart';
 import 'package:proctorguard/features/proctoring/presentation/providers/audio_monitoring_provider.dart';
@@ -96,6 +97,9 @@ void main() {
     String? examTitle,
     String? candidateEmail,
     void Function(Object? result)? onPopped,
+    /// Overrides `kIsWeb` for the platform rule (see `examRunsOnPlatform`): a VM
+    /// test cannot become a browser, so the refusal is asked for explicitly.
+    bool? isWeb,
   }) =>
       ProviderScope(
         overrides: [
@@ -132,6 +136,7 @@ void main() {
                             candidateName: candidateName,
                             examTitle: examTitle,
                             candidateEmail: candidateEmail,
+                            isWeb: isWeb,
                           ),
                         ));
                     onPopped?.call(popped);
@@ -621,6 +626,140 @@ void main() {
       await pumpBootstrap(tester);
 
       expectBlockingState();
+    });
+  });
+
+  /// What a strike looks like to the student.
+  ///
+  /// Two things used to be wrong here. The warning overlays were built into the
+  /// question branch of `build()` alone, so a strike taken while the screen was
+  /// blocked or loading was logged and counted — three of them disqualify — with
+  /// nothing on screen ever showing one. And the count itself disappeared with the
+  /// overlay, leaving a student one strike from disqualification with no way to
+  /// know it.
+  group('warnings the student can see', () {
+    /// The notifier this page is watching, reached the way the page reaches it.
+    ProctoringNotifier notifierOf(WidgetTester tester) =>
+        ProviderScope.containerOf(tester.element(find.byType(ExamTakingPage)))
+            .read(proctoringProvider('sub-1').notifier);
+
+    /// A strike, and the two pumps its optimistic write needs.
+    Future<void> strike(WidgetTester tester) async {
+      notifierOf(tester).reportAppMinimized();
+      await tester.pump();
+      await tester.pump();
+    }
+
+    testWidgets('a strike taken behind a blocking state is still shown',
+        (tester) async {
+      await tester.pumpWidget(pageUnderTest(mockCamera: false));
+      await tester.tap(find.text('open exam'));
+      await pumpBootstrap(tester);
+      expectBlockingState();
+
+      // The OS reports an app switch whatever is on screen, and the AFK watcher
+      // runs off the same lifecycle, so a strike can land on "Camera unavailable".
+      await strike(tester);
+
+      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      // Still blocked underneath: acknowledging the warning returns the student to
+      // the retry, not to a paper with no camera behind it.
+      expect(find.byKey(const Key('exam-retry')), findsOneWidget);
+
+      await tester.tap(find.text('I understand, continue'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.text('Warning 1 / 3'), findsNothing);
+      expectBlockingState();
+    });
+
+    testWidgets('the count stays on the paper once the warning is acknowledged',
+        (tester) async {
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+      expect(find.text('1 of 3 warnings'), findsNothing);
+
+      await strike(tester);
+      expect(find.text('Warning 1 / 3'), findsOneWidget);
+
+      await tester.tap(find.text('I understand, continue'));
+      await tester.pumpAndSettle();
+
+      // The overlay is gone, the strike is not: the third one ends the attempt, so
+      // the count has to outlive the dialog that announced it.
+      expect(find.text('Warning 1 / 3'), findsNothing);
+      expect(find.text('1 of 3 warnings'), findsOneWidget);
+    });
+
+    testWidgets('back acknowledges the warning instead of abandoning the attempt',
+        (tester) async {
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      await strike(tester);
+      expect(find.text('Warning 1 / 3'), findsOneWidget);
+
+      // A hardware/gesture back on Android reaches the route as `popRoute`, which
+      // is `Navigator.maybePop` — the call that used to pop the session out from
+      // under a warning the student had not read.
+      await tester.state<NavigatorState>(find.byType(Navigator)).maybePop();
+      await tester.pumpAndSettle();
+
+      expect(find.text('Warning 1 / 3'), findsNothing);
+      expect(find.text('Question 1 of 2'), findsOneWidget);
+      // Acknowledged, not undone: the strike stays the attempt's first.
+      expect(proctoring.violations.single.type.dbValue, 'app_minimized');
+    });
+  });
+
+  /// The browser refusal (see `examRunsOnPlatform` in `mobile_exam_only.dart`).
+  ///
+  /// This screen is the backstop: the route can be built without going through the
+  /// exam list at all (a resumed attempt, a restored navigator stack, a shared
+  /// link), so the platform rule has to hold here whatever navigated in.
+  group('mobile-only exams', () {
+    late _FakeWebGuards guards;
+
+    setUp(() => guards = _FakeWebGuards());
+
+    testWidgets('a browser is refused before the session starts anything',
+        (tester) async {
+      await tester.pumpWidget(pageUnderTest(webGuards: guards, isWeb: true));
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('exam-mobile-only')), findsOneWidget);
+      expect(find.text(examMobileOnlyTitle), findsOneWidget);
+      // No paper, no question counter, no camera pane behind it.
+      expect(find.text('Question 1 of 2'), findsNothing);
+
+      // Nothing ran: no DOM lockdown to release, no question read, no strike
+      // recorded against an attempt the student was just told would not run here.
+      expect(guards.lockdownStarts, 0);
+      expect(exams.optionAnswers, isEmpty);
+      expect(exams.textAnswers, isEmpty);
+      expect(proctoring.violations, isEmpty);
+
+      // And the refusal is not a dead end.
+      await tester.tap(find.text('Back to my exams'));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('exam-mobile-only')), findsNothing);
+      expect(find.text('open exam'), findsOneWidget);
+    });
+
+    testWidgets('a phone still gets the paper', (tester) async {
+      await tester.pumpWidget(pageUnderTest(isWeb: false));
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      // The rule refuses the browser, not the platform it cannot see: every other
+      // test in this file is a VM build, and they all sit the exam.
+      expect(find.byKey(const Key('exam-mobile-only')), findsNothing);
+      expect(find.text('Question 1 of 2'), findsOneWidget);
     });
   });
 
@@ -1315,8 +1454,6 @@ Future<void> pumpBootstrap(WidgetTester tester) async {
   }
 }
 
-/// Serves a fixed question list and records every answer write, so a test can
-/// assert what the server was told — and in which order.
 /// Serves a fixed question list and records every answer write, so a test can
 /// assert what the server was told.
 ///

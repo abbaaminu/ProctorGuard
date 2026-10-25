@@ -118,6 +118,58 @@ class ExamKioskBadge extends StatelessWidget {
   }
 }
 
+/// "1 of 3 warnings" chip in the exam chrome.
+///
+/// The full-screen warning is dismissible by design — the student has to get back
+/// to the paper — so without this chip a logged strike left no trace on the screen
+/// they were looking at. On a phone that meant a candidate could be one warning
+/// away from disqualification with nothing on screen saying so, and a roaming
+/// supervisor looking over a shoulder saw a paper that looked untouched.
+///
+/// Rendered only once the server has confirmed a warning (`count > 0`), so an
+/// untouched attempt's header is unchanged.
+class ExamWarningChip extends StatelessWidget {
+  const ExamWarningChip({super.key, required this.count, this.total = 3});
+
+  /// Confirmed warnings on this attempt, counted the way the overlay and the
+  /// supervisor's grid count them (1-based: the first strike is "1 of 3").
+  final int count;
+
+  /// The count that closes the attempt — `register_violation` in `schema.sql`
+  /// disqualifies on the third.
+  final int total;
+
+  @override
+  Widget build(BuildContext context) {
+    // The last warning before disqualification is the one that has to look
+    // different: it is the only one a student can still act on.
+    final lastOne = count >= total - 1;
+    final color = lastOne ? Colors.redAccent : Colors.amber.shade800;
+
+    return Tooltip(
+      message: 'Every failed proctoring check is a warning. '
+          'The attempt closes at $total.',
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.warning_amber_rounded, size: 18, color: color),
+            const SizedBox(width: 4),
+            Text(
+              '$count of $total warnings',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: color,
+                    fontWeight: lastOne ? FontWeight.w700 : null,
+                  ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// Shown in place of the self-view when a **real** session has no live camera.
 ///
 /// Deliberately *not* a neutral camera placeholder: the blocking error above

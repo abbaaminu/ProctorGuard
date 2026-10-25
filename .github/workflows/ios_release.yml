@@ -1,0 +1,466 @@
+name: iOS release build (ProctorGuard)
+
+# The iOS half of the release pipeline, and the only job that runs on macOS.
+#
+# `flutter_ci.yml` analyses and tests the Dart source on Linux and compiles the
+# two targets that can be built there (web release, Android debug), but nothing in
+# it can catch an iOS-only failure: a Podfile that no longer resolves, a plugin
+# whose podspec pins a minimum iOS version above the deployment target, a Swift
+# compile error in the app's own AppDelegate, or `camera_avfoundation` dropping an
+# API the face pipeline calls. Those are found today by opening Xcode, which is
+# the one thing CI cannot do from a pull request.
+on:
+  # Scoped to the app, unlike `flutter_ci.yml`: macOS runner minutes are the most
+  # expensive thing in this repository and a Supabase SQL change cannot break an
+  # .xcworkspace. The workflow file itself is included, so a change to it is
+  # exercised by the next push that touches it.
+  push:
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/ios_release.yml'
+  pull_request:
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/ios_release.yml'
+  # A release build the app is actually shipped from, and a way to run it by hand.
+  workflow_dispatch:
+
+# A newer push to the same ref supersedes a run still in flight: iOS builds are
+# the slowest thing here, and a burst of commits must not queue up stale ones.
+concurrency:
+  group: ios-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (iOS release, unsigned)
+    # Pinned to the newest macOS image rather than a version: Xcode is a system
+    # dependency of the iOS toolchain, and this job's value is proving the project
+    # compiles with a current Xcode. If a toolchain bump ever breaks the build, the
+    # pinned image can be restored here without touching anything else.
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Printed before anything is built, so a red run says which versions it was
+      # red on: a failure that only happens on one Xcode is otherwise a guessing
+      # game played against a runner image that has already been replaced.
+      - name: Show toolchain versions
+        run: |
+          flutter --version
+          xcodebuild -version
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # The runner image ships CocoaPods, but its version moves with the image; the
+      # fallback keeps a podspec that needs a newer one from failing the job with
+      # "Podfile.lock was generated with a newer CocoaPods" and no other clue.
+      - name: Set up CocoaPods
+        run: |
+          ruby --version
+          pod --version || sudo gem install cocoapods --no-document
+
+      # Run explicitly rather than leaving it to `flutter build ios`: when the
+      # resolution fails, this is the step that says so, and it says so about the
+      # pods instead of about "Running Xcode build".
+      - name: Resolve pods
+        working-directory: mobile/ios
+        run: pod install --repo-update
+
+      # `--no-codesign` because no certificate is read here (none is exposed to
+      # pull requests, and never to a fork): this is a compile gate, not a publish
+      # step. Everything else is the release configuration, so the pod graph, the
+      # Swift/ObjC compile, the asset catalogue and the plugin registration are the
+      # ones a signed build uses.
+      - name: Build iOS (release, unsigned)
+        run: >-
+          flutter build ios --release --no-codesign
+          --dart-define=SUPABASE_URL=https://ci.invalid
+          --dart-define=SUPABASE_PUBLISHABLE_KEY=ci-placeholder
+
+  # ---------------------------------------------------------------------
+  # TestFlight
+  # ---------------------------------------------------------------------
+  # The compile gate above proves the project builds *unsigned*. This job is the
+  # one that ships: it signs with a distribution certificate, produces an .ipa
+  # for the App Store and uploads it to TestFlight through App Store Connect.
+  #
+  # It is a separate job, and deliberately gated:
+  #
+  #   * Only on a manual dispatch, a push to `main`, or a `vX.Y.Z` tag. A pull
+  #     request - in particular one from a fork - never reaches the signing
+  #     material (which GitHub does not expose there anyway).
+  #   * With no credentials configured, a push stays green and says so in a
+  #     notice: merging this file must not turn a repository red before its
+  #     owner has created an App Store Connect API key. A *manual* dispatch
+  #     fails instead, because somebody asked for a build and silently skipping
+  #     it is the wrong answer to that.
+  #
+  # Required repository secrets (listed in `mobile/ios/README.md` too):
+  #
+  #   APPLE_TEAM_ID                         10-character Apple team id
+  #   IOS_DISTRIBUTION_CERTIFICATE_BASE64   .p12, base64 (`base64 -i cert.p12`)
+  #   IOS_DISTRIBUTION_CERTIFICATE_PASSWORD the password chosen when exporting it
+  #   APP_STORE_CONNECT_KEY_ID              App Store Connect API key id
+  #   APP_STORE_CONNECT_ISSUER_ID           that key's issuer UUID
+  #   APP_STORE_CONNECT_PRIVATE_KEY         the AuthKey_XXXXXXXXXX.p8 contents
+  #
+  # Recommended, and what makes signing deterministic:
+  #
+  #   IOS_PROVISIONING_PROFILE_BASE64       App Store .mobileprovision, base64
+  #   IOS_PROVISIONING_PROFILE_NAME         its name, as Xcode lists it
+  #
+  # The app's own configuration, compiled in:
+  #
+  #   SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY (or the legacy SUPABASE_ANON_KEY)
+  #   SENTRY_DSN, optional - crash reporting stays off without it
+  #
+  # No Apple ID password and no 2FA code: both the build and the upload
+  # authenticate with the API key.
+  testflight:
+    name: testflight (signed archive + App Store Connect upload)
+    needs: build
+    # A ref that is meant to ship, and nothing else. `workflow_dispatch` is
+    # included so a release can be cut without an empty commit.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: mobile
+    env:
+      # Named one by one, so a step's log names only what it is about to use.
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      CERTIFICATE_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}
+      CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+      PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+      PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}
+      ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      ASC_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+      # Overwritten by the check below (with the key fallback resolved) when it
+      # passes; empty here is what makes the check meaningful.
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show toolchain versions
+        run: |
+          flutter --version
+          xcodebuild -version
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Set up CocoaPods
+        run: |
+          ruby --version
+          pod --version || sudo gem install cocoapods --no-document
+
+      - name: Resolve pods
+        working-directory: ${{ github.workspace }}/mobile/ios
+        run: pod install --repo-update
+
+
+      # One place decides whether this run can sign at all. Everything that
+      # needs a certificate is gated on `available`, so a repository without
+      # these six secrets runs the compile gate and nothing else.
+      - name: Check the TestFlight credentials
+        id: credentials
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          missing=''
+          for name in TEAM_ID CERTIFICATE_BASE64 CERTIFICATE_PASSWORD \
+                      ASC_KEY_ID ASC_ISSUER_ID ASC_PRIVATE_KEY; do
+            [ -n "${!name:-}" ] || missing="$missing $name"
+          done
+
+          if [ -z "$missing" ]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+            echo '::notice::TestFlight credentials are configured; this run will sign and upload.'
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            if [ "$EVENT_NAME" = 'workflow_dispatch' ]; then
+              echo "::error::Missing TestFlight secrets:$missing. See mobile/ios/README.md."
+              exit 1
+            fi
+            echo "::notice::Skipping TestFlight: no signing credentials configured (missing:$missing)."
+          fi
+
+      # A placeholder URL would ship as an app that boots and then cannot reach
+      # any backend, which TestFlight would then hand to testers. Same rules as
+      # `sync_release.yml`, trimmed to what this job compiles in.
+      - name: Check the Supabase secrets before they are compiled in
+        if: steps.credentials.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+
+          url="${SUPABASE_URL:-}"
+          key="${SUPABASE_PUBLISHABLE_KEY:-}"
+          [ -n "$key" ] || key="${SUPABASE_ANON_KEY:-}"
+
+          placeholders='your-url|your_url|yourkey|your-key|your-anon-key|your-publishable-key|your-project|replace-me|replace_me|changeme|change-me'
+          if [ -z "$url" ] || [[ "${url,,}" =~ $placeholders ]]; then
+            echo '::error::SUPABASE_URL secret is unset or still a placeholder.'
+            exit 1
+          fi
+          case "$url" in
+            http://*|https://*) ;;
+            *) echo "::error::SUPABASE_URL must start with http:// or https:// (got '$url')."; exit 1 ;;
+          esac
+          if [ -z "$key" ]; then
+            echo '::error::SUPABASE_PUBLISHABLE_KEY (or SUPABASE_ANON_KEY) is unset.'
+            exit 1
+          fi
+          case "$key" in
+            sb_secret_*)
+              echo '::error::That is a *secret* key. A client build must use the publishable/anon key.'
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "SUPABASE_URL=${url%/}"
+            echo "SUPABASE_PUBLISHABLE_KEY=$key"
+          } >> "$GITHUB_ENV"
+
+      # A temporary keychain, not the runner's login keychain: it is created,
+      # used for this build and deleted in the `always()` step at the end, so
+      # nothing signing-related outlives the job.
+      - name: Import the distribution certificate
+        if: steps.credentials.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+
+          keychain="$RUNNER_TEMP/proctorguard-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/distribution.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/distribution.p12" \
+            -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          # Without this, codesign is denied the private key on a headless
+          # runner: it is a keychain prompt nobody is there to answer.
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -s "$keychain"
+          rm -f "$RUNNER_TEMP/distribution.p12"
+          security find-identity -v -p codesigning "$keychain"
+
+
+      - name: Install the provisioning profile
+        if: >-
+          steps.credentials.outputs.available == 'true' &&
+          env.PROFILE_BASE64 != ''
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PROFILE_NAME:-}" ]; then
+            echo '::error::IOS_PROVISIONING_PROFILE_BASE64 is set but IOS_PROVISIONING_PROFILE_NAME is not, so there is no name to select the profile by.'
+            exit 1
+          fi
+
+          profiles="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$profiles"
+          printf '%s' "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$profiles/$PROFILE_NAME.mobileprovision"
+          rm -f "$RUNNER_TEMP/profile.mobileprovision"
+
+          # Says out loud that the file is the profile it claims to be, and for
+          # which bundle id: a profile for another app signs an archive that
+          # then fails to install with no useful message.
+          security cms -D -i "$profiles/$PROFILE_NAME.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          plutil -extract Name raw -o - "$RUNNER_TEMP/profile.plist" | sed 's/^/profile name: /'
+          plutil -extract Entitlements.application-identifier raw -o - "$RUNNER_TEMP/profile.plist" \
+            | sed 's/^/profile app id: /'
+
+      # Signing settings are set here rather than committed: a team id in the
+      # repository is a team id in every fork, and `PRODUCT_BUNDLE_IDENTIFIER`
+      # stays the one line that names the app.
+      - name: Configure signing for this build
+        if: steps.credentials.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+
+          project='ios/Runner.xcodeproj/project.pbxproj'
+
+          perl -0pi -e "s/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Automatic;\n\t\t\t\tDEVELOPMENT_TEAM = ${TEAM_ID};/g" "$project"
+
+          if [ -n "${PROFILE_NAME:-}" ]; then
+            # Manual, deterministic signing: an App Store profile that is
+            # already on this machine, rather than one Xcode would have to ask
+            # Apple for - which a headless runner cannot authenticate.
+            perl -0pi -e 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' "$project"
+            perl -0pi -e "s/DEVELOPMENT_TEAM = ${TEAM_ID};/DEVELOPMENT_TEAM = ${TEAM_ID};\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = \"${PROFILE_NAME}\";/g" "$project"
+          fi
+
+          grep -c 'DEVELOPMENT_TEAM = ' "$project" | sed 's/^/configurations with a team: /'
+          git --no-pager diff --stat -- "$project"
+
+      # Only when a profile was supplied: without one, `flutter build ipa` can
+      # generate the plist itself from automatic signing (and, on a runner with
+      # no portal credentials, may well fail at that point - which is why the
+      # profile secrets are the recommended path).
+      - name: Write ExportOptions.plist
+        if: >-
+          steps.credentials.outputs.available == 'true' &&
+          env.PROFILE_NAME != ''
+        run: |
+          set -euo pipefail
+
+          bundle_id="$(awk '/PRODUCT_BUNDLE_IDENTIFIER = / && !/RunnerTests/ {
+              sub(/.*PRODUCT_BUNDLE_IDENTIFIER = /, ""); sub(/;.*/, ""); gsub(/"/, "");
+              print; exit
+            }' ios/Runner.xcodeproj/project.pbxproj)"
+          echo "bundle id: $bundle_id"
+          if [ -z "$bundle_id" ]; then
+            echo '::error::Could not read PRODUCT_BUNDLE_IDENTIFIER from ios/Runner.xcodeproj/project.pbxproj.'
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>teamID</key>
+            <string>${TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${bundle_id}</key>
+              <string>${PROFILE_NAME}</string>
+            </dict>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>destination</key>
+            <string>export</string>
+          </dict>
+          </plist>
+          PLIST
+
+          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
+
+
+      # `--build-number` is the workflow run number: TestFlight rejects a second
+      # upload of the same version+build, and the repository's version is a
+      # hand-edited `1.0.0`, so a fixed build number would accept exactly one
+      # upload ever. The marketing version stays in `pubspec.yaml`.
+      - name: Build the signed IPA
+        if: steps.credentials.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+
+          sentry_define=''
+          if [ -n "${SENTRY_DSN:-}" ]; then
+            sentry_define="--dart-define=SENTRY_DSN=${SENTRY_DSN}"
+          fi
+
+          common=(
+            --release
+            --build-number "${GITHUB_RUN_NUMBER}"
+            --dart-define=SUPABASE_URL="${SUPABASE_URL}"
+            --dart-define=SUPABASE_PUBLISHABLE_KEY="${SUPABASE_PUBLISHABLE_KEY}"
+          )
+
+          # `--export-options-plist` and `--export-method` are mutually
+          # exclusive in `flutter build ipa`; the plist is the manual-signing
+          # path, the flag lets Flutter generate one for automatic signing.
+          if [ -n "${PROFILE_NAME:-}" ]; then
+            flutter build ipa "${common[@]}" $sentry_define \
+              --export-options-plist="$RUNNER_TEMP/ExportOptions.plist"
+          else
+            flutter build ipa "${common[@]}" $sentry_define --export-method app-store
+          fi
+
+          ls -l build/ios/ipa
+
+      - name: Upload to TestFlight
+        if: steps.credentials.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+
+          ipa="$(ls build/ios/ipa/*.ipa 2>/dev/null | head -1 || true)"
+          if [ -z "$ipa" ] || [ ! -f "$ipa" ]; then
+            echo '::error::No .ipa in build/ios/ipa - the export step did not produce one.'
+            exit 1
+          fi
+          echo "uploading: $ipa"
+
+          # altool looks the key up by name in this directory; the API key is
+          # the reason no Apple ID password or 2FA code is needed here.
+          key_dir="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$key_dir"
+          printf '%s\n' "$ASC_PRIVATE_KEY" > "$key_dir/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$key_dir/AuthKey_${ASC_KEY_ID}.p8"
+
+          # `altool` is deprecated in favour of the Transporter app, but it is
+          # what a macOS runner image ships, and the App Store Connect API key
+          # path is the one Apple replaced interactive login with.
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$ipa" \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
+
+          rm -f "$key_dir/AuthKey_${ASC_KEY_ID}.p8"
+          echo '::notice::Uploaded to App Store Connect. TestFlight processing usually takes 5-15 minutes.'
+
+      # Always, including after a failure: the certificate and the profile do
+      # not belong to the next job that runs on this (ephemeral) runner, and a
+      # leftover keychain would confuse a re-run in the same workspace.
+      - name: Remove the signing material
+        if: always()
+        run: |
+          set -euo pipefail
+
+          keychain="$RUNNER_TEMP/proctorguard-signing.keychain-db"
+          if [ -f "$keychain" ]; then
+            security delete-keychain "$keychain" || true
+          fi
+
+          rm -f "$RUNNER_TEMP/ExportOptions.plist" "$RUNNER_TEMP/profile.plist"
+          rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8" 2>/dev/null || true
+
+          if [ -n "${PROFILE_NAME:-}" ]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_NAME.mobileprovision" || true
+          fi
+

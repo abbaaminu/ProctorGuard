@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'core/services/crash_reporting.dart';
 import 'core/services/lockdown_bootstrap.dart';
 import 'core/services/permission_service.dart';
 import 'core/services/supabase_service.dart';
@@ -27,9 +28,26 @@ import 'features/proctoring/presentation/providers/proctoring_provider.dart';
 /// **nothing here may throw**, because an exception before `runApp` is exactly
 /// the blank white page this structure avoids. [SupabaseService.init] reports
 /// status instead, and `SetupRequiredPage` explains what is missing.
+///
+/// Crash reporting is installed *first*, and only when `SENTRY_DSN` was
+/// compiled in. The failures worth reporting are precisely the ones that happen
+/// while the rest of this runs — a Supabase client that cannot be built, a
+/// plugin that throws on a device nobody has — so [boot] is handed to
+/// [CrashReporting.install] as its app runner rather than called after it. With
+/// no DSN the runner is called directly and this is the same startup as before.
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  await CrashReporting.install(appRunner: boot);
+}
+
+/// The startup [main] performs: read the backend settings, ask for permissions,
+/// then build the first frame.
+///
+/// Separate from [main] so it can run inside Sentry's error handling when crash
+/// reporting is configured - including on the web, where the SDK runs it in a
+/// `runZonedGuarded` of its own (see [CrashReporting]).
+Future<void> boot() async {
   final supabaseStatus = await SupabaseService.instance.init();
 
   // Request camera/mic/overlay up front so the permission prompts don't

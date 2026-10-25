@@ -17,6 +17,52 @@
   <base href="$FLUTTER_BASE_HREF">
 
   <meta charset="UTF-8">
+  <!--
+    Content Security Policy for the browser build.
+
+    The app is a proctoring client: the page loads exactly one script it ships
+    (the face sensor below) plus Flutter's own bootstrap, and talks to exactly
+    one backend. This pins both, so an injected script element, a malicious
+    browser extension's `fetch`, or a compromised dependency cannot exfiltrate
+    frames, answers or the session token to a host that is not the project.
+
+    What each allowance is for:
+
+      * `script-src 'self'` - the face sensor, the exam-lockdown script further
+        down this file and Flutter's loader, all served from this origin.
+      * `'unsafe-inline'` - the exam-lockdown bootstrap further down this file is
+        an inline script, deliberately (it has to run before Flutter does and
+        without a build step). A host that serves this policy as a response
+        header can move that script to its own file and drop this keyword; the
+        meta tag here cannot, because the file it protects is inline.
+      * `https://www.gstatic.com` + `'wasm-unsafe-eval'` - canvas and font
+        resources for Flutter's CanvasKit renderer. `flutter build web
+        --no-web-resources-cdn` copies those into `build/web/canvaskit/`, after
+        which the host may drop this origin.
+      * `style-src 'unsafe-inline'` - Flutter writes element styles directly.
+      * `connect-src https://*.supabase.co wss://*.supabase.co` (and the `.in`
+        mirror of Supabase's own domains) - Auth, PostgREST, Storage and the
+        Realtime socket. A **self-hosted** Supabase is served from its own
+        domain and must be added here by the host; there is no way to template
+        `--dart-define=SUPABASE_URL` into this static file.
+      * `https://*.ingest.sentry.io` - crash reports, and only when the build was
+        given `--dart-define=SENTRY_DSN` (see `lib/core/services/
+        crash_reporting.dart`). A self-hosted Sentry needs its ingest origin
+        added too.
+      * `http://localhost:*` / `http://127.0.0.1:*` - `flutter run -d chrome`
+        serves the app and a local Supabase from there. Remove them for a
+        production deploy if the app is never run locally.
+      * `object-src 'none'`, `base-uri 'self'`, `form-action 'self'` - there are
+        no plugins, the <base> is this document's own path (the value
+        `--base-href` writes), and the app posts nothing as a form.
+
+    `frame-ancestors` is deliberately absent: browsers ignore it in a meta tag,
+    so clickjacking protection has to be a response header
+    (`Content-Security-Policy: frame-ancestors 'none'`, or `X-Frame-Options:
+    DENY`) on whatever serves `build/web`. `test/web_csp_contract_test.dart`
+    pins the directives above so a relaxed policy fails CI rather than shipping.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://www.gstatic.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.supabase.co https://*.supabase.in; font-src 'self' data:; media-src 'self' blob: data:; worker-src 'self' blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://*.supabase.in wss://*.supabase.in https://*.ingest.sentry.io https://*.ingest.us.sentry.io https://*.ingest.de.sentry.io https://www.gstatic.com http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
   <meta name="description" content="ProctorGuard student client — take AI-proctored exams with on-device face and microphone monitoring.">
   <meta name="theme-color" content="#3F51B5">

@@ -129,11 +129,15 @@ rather than left to be mistaken for more than it is.
   and face signals are the only things missing; the preview, the still-frame
   evidence and every browser guard are the same code path as the phone build.
 - **Android is the only *native* proctoring host.** The repository ships an
-  `android/` runner, an `ios/` scaffold and a `web/` target — and **no desktop
-  runner at all**. A macOS, Windows or Linux machine therefore takes part through
-  the web build in a browser, so the "no on-device AI on the web" boundary above
-  applies there too; there is no native desktop client whose kiosk or face
-  signals could be stronger. See
+  `android/` runner, an `ios/` scaffold, a `web/` target and `windows/` + `linux/`
+  runners. The two desktop runners build and start, but **refuse to proctor**: no
+  `camera` implementation exists for them and no desktop ML Kit does, so the device
+  check blocks the exam and names that as the reason instead of reporting a broken
+  camera it can never fix (`lib/core/services/platform_capabilities.dart`). A
+  macOS, Windows or Linux machine therefore takes part through the web build in a
+  browser, so the "no on-device AI on the web" boundary above applies there too;
+  the native desktop runners exist for UI work and `MOCK_CAMERA` sessions, and add
+  no kiosk or face-signal capability. See
   [mobile/README.md → Supported platforms](./mobile/README.md#supported-platforms-and-what-proctoring-each-one-gets).
 
 **Risk register**
@@ -227,6 +231,26 @@ lose proctoring signals but cannot change a result.
   `proctor-snapshots` bucket was created public (the pre-migration default). It is
   additive and re-runnable, changes no object, and is what makes the bucket's
   evidence reachable only through signed URLs.
+- Apply `supabase/migrations/retention_policy.sql` and enable `pg_cron`
+  (Dashboard → Database → Extensions). `proctoring_logs` is the one table that
+  grows without bound; the migration seeds a 30-day window in
+  `public.retention_policies` and schedules a nightly purge of rows belonging to
+  **closed** attempts. Rows of an attempt still `ongoing` are never deleted, so the
+  3-strike count cannot be eroded. Without `pg_cron` the function is still created
+  and can be called from the SQL editor or an external scheduler:
+  `select public.purge_expired_proctoring_logs(p_dry_run => true);` first. The
+  per-attempt snapshots are **not** deleted by it — see the file's header for why
+  (`storage.objects` deletes through SQL orphan the S3 object) and use a Storage
+  lifecycle rule for the bucket.
+- Set `--dart-define=SENTRY_DSN=...` on a build that should report crashes
+  (`mobile/README.md#crash-reporting-sentry--off-until-configured`). Unset is the
+  default and installs nothing. A self-hosted Sentry also needs its ingest origin
+  added to the web build's CSP `connect-src`.
+- Serve `build/web` with `Content-Security-Policy: frame-ancestors 'none'` (or
+  `X-Frame-Options: DENY`). The meta tag in `web/index.html` pins scripts and
+  network destinations, but browsers ignore `frame-ancestors` in a meta tag; a
+  self-hosted Supabase also needs its API/websocket origin added there
+  (`mobile/README.md#content-security-policy-the-browser-build`).
 - Ensure the `admin-create-user`, `admin-delete-user` and `admin-reset-password`
   functions are deployed.
 - Configure the Flutter app with the Supabase project URL and a publishable
@@ -255,6 +279,13 @@ lose proctoring signals but cannot change a result.
   Functions (`npm run typecheck` in `supabase/functions`) on every push and pull
   request, so a mis-resolved import fails CI rather than `supabase functions
   deploy` on a live project.
+- `.github/workflows/ios_release.yml` compiles the iOS target unsigned on every
+  push that touches `mobile/**` (a compile gate, with no certificate), and its
+  `testflight` job signs and uploads to TestFlight on `workflow_dispatch`, on a
+  push to `main` and on a `v*` tag. That job is inert until its secrets exist —
+  `APPLE_TEAM_ID`, the distribution certificate pair, the App Store Connect API
+  key, and optionally the provisioning profile pair — all listed in
+  [mobile/ios/README.md](./mobile/ios/README.md#testflight-from-ci).
 
 ## Verification
 

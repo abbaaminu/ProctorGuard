@@ -9,6 +9,7 @@ import '../../domain/entities/exam_submit_result.dart';
 import '../../domain/entities/submission.dart';
 import '../providers/exam_providers.dart';
 import '../widgets/exam_instructions_dialog.dart';
+import '../widgets/mobile_exam_only.dart';
 import '../widgets/published_exam_list.dart';
 import 'exam_hardware_gate_page.dart';
 import 'exam_taking_page.dart';
@@ -40,15 +41,6 @@ typedef HardwareGateRequest = Future<bool> Function(
 /// reopened: the server owns that state, and re-sitting a closed attempt would
 /// only produce a rejected write.
 class StudentExamPortalPage extends ConsumerStatefulWidget {
-  const StudentExamPortalPage({
-    super.key,
-    this.studentName,
-    this.examPageBuilder,
-    this.hardwareGate,
-    this.onSignOut,
-    this.clock,
-  });
-
   /// Greeting name; the gate passes `profiles.full_name` ("Aisha Bello").
   final String? studentName;
 
@@ -67,6 +59,26 @@ class StudentExamPortalPage extends ConsumerStatefulWidget {
   /// asserts "this paper has not opened yet" without waiting for a real window.
   final DateTime Function()? clock;
 
+  /// Whether this build thinks it is running in a browser, overriding `kIsWeb`
+  /// for tests (see `examRunsOnPlatform` in `mobile_exam_only.dart`).
+  ///
+  /// A browser is refused *here*, before a submission exists, as well as on the
+  /// session screen itself: this is the call site that runs
+  /// `startOrResumeSubmission`, and an attempt row created for a browser would sit
+  /// on the supervisor's dashboard as `ongoing` for a paper the student was then
+  /// told to sit on their phone.
+  final bool? isWeb;
+
+  const StudentExamPortalPage({
+    super.key,
+    this.studentName,
+    this.examPageBuilder,
+    this.hardwareGate,
+    this.onSignOut,
+    this.clock,
+    this.isWeb,
+  });
+
   @override
   ConsumerState<StudentExamPortalPage> createState() =>
       _StudentExamPortalPageState();
@@ -79,6 +91,18 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
 
   Future<void> _openExam(Exam exam) async {
     if (_openingExamId != null) return;
+
+    // Mobile-only (see `examRunsOnPlatform`): a browser has no on-device face
+    // detector, no kiosk pin and no OS-level integrity probe, so an attempt started
+    // here would be recorded as proctored while being unproctored in fact. Refused
+    // before the hardware gate and before `startOrResumeSubmission`, so nothing is
+    // written: a submission row created for a browser would sit on the supervisor's
+    // dashboard as `ongoing` for a paper the student was then told to sit on their
+    // phone — and the student could not close it from either device.
+    if (!examRunsOnPlatform(isWeb: widget.isWeb)) {
+      await showMobileExamOnlyDialog(context, isWeb: widget.isWeb);
+      return;
+    }
 
     // The window, re-checked here as well as on the tile: the list was rendered
     // from an earlier `now`, so a paper that closed in the meantime would still
@@ -148,6 +172,10 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
                   candidateName: widget.studentName,
                   examTitle: exam.title,
                   candidateEmail: SupabaseService.instance.currentUser?.email,
+                  // The same platform rule this page just applied, carried into
+                  // the session screen so the two cannot disagree in a test (or
+                  // in a build where only one of them was given the override).
+                  isWeb: widget.isWeb,
                 ),
         ),
       );

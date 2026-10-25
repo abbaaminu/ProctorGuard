@@ -52,6 +52,19 @@ dependencies:
   csv: ^8.0.0
   file_picker: ^12.3.0
 
+  # Crash reporting, and **off unless a build passes
+  # `--dart-define=SENTRY_DSN=...`** (`lib/core/services/crash_reporting.dart`).
+  # Nothing else depends on it: without a DSN the SDK is never initialised, and
+  # an init that throws is caught so an observability tool cannot keep a student
+  # out of an exam. Reports carry no screenshot, view hierarchy or PII.
+  #
+  # Pinned to 9.x on purpose. `sentry_flutter` 10.x ships an Android plugin whose
+  # `minSdkVersion` is 26, and this app keeps Flutter's floor of 24
+  # (`android/app/build.gradle.kts`: `minSdk = flutter.minSdkVersion`) so that an
+  # Android 7 phone can still sit an exam. 9.x declares 21, so nothing is lost.
+  # Upgrading to 10.x is a decision to raise that floor, not a version bump.
+  sentry_flutter: ^9.0.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

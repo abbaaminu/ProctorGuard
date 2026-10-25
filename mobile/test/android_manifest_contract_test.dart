@@ -29,8 +29,11 @@ const String mainActivityPath =
 ///  * the package id the app is installed, upgraded and kept alive under, spelled
 ///    the same in Gradle, the manifest, `MainActivity.kt` and the R8 keep rules;
 ///  * one app name across the launcher label, the `MaterialApp` title, the web
-///    metadata and the iOS Info.plist checklist, because the app sends the student
-///    to Settings by that name.
+///    metadata and `ios/Runner/Info.plist`, because the app sends the student
+///    to Settings by that name;
+///  * the iOS project the name lands in: the bundle id, the two privacy strings
+///    without which iOS kills the app on the first camera call, and a deployment
+///    target that agrees with the Podfile (see the last group).
 void main() {
   /// Reads a file relative to the package root (`mobile/`, which is the working
   /// directory `flutter test` uses). Null when a checkout does not have it, so the
@@ -38,6 +41,19 @@ void main() {
   String? read(String path) {
     final file = File(path);
     return file.existsSync() ? file.readAsStringSync() : null;
+  }
+
+  /// The `<string>` that follows `<key>[key]</key>` in a plist, or null.
+  ///
+  /// Whitespace-tolerant rather than line-exact: `flutter create` writes tabs, and
+  /// an editor that reindents the file must not turn a security contract into a
+  /// failing test.
+  String? plistValue(String? plist, String key) {
+    if (plist == null) return null;
+    final match = RegExp(
+      '<key>${RegExp.escape(key)}</key>\\s*<string>([^<]*)</string>',
+    ).firstMatch(plist);
+    return match?.group(1);
   }
 
   group('AndroidManifest.xml', () {
@@ -286,12 +302,14 @@ void main() {
       final main = read('lib/main.dart');
       final web = read('web/index.html');
       final webManifest = read('web/manifest.json');
-      final ios = read('ios/README.md');
+      final plist = read('ios/Runner/Info.plist');
+      final project = read('ios/Runner.xcodeproj/project.pbxproj');
       if (manifest == null ||
           main == null ||
           web == null ||
           webManifest == null ||
-          ios == null) {
+          plist == null ||
+          project == null) {
         return;
       }
 
@@ -303,22 +321,96 @@ void main() {
       expect(manifest, contains('android:label="$name"'));
       expect(main, contains("title: '$name'"));
 
-      // The web build is installed as a home-screen app under the same name, and
-      // the iOS checklist has to carry it into `Info.plist` - including the bundle
-      // id, which is the iOS half of the package rename in the group above.
+      // The web build is installed as a home-screen app under the same name.
       expect(web, contains('apple-mobile-web-app-title" content="$name"'));
       expect(web, contains('<title>$name'));
       expect(webManifest, contains('"short_name": "$name"'));
-      expect(ios, contains('<key>CFBundleDisplayName</key>'));
-      expect(ios, contains('<string>$name</string>'));
-      expect(ios, contains('<key>CFBundleIdentifier</key>'));
-      expect(ios, contains('com.stackbuildco.proctorguard'));
+
+      // iOS reads the name from the project rather than from a checklist now:
+      // `CFBundleDisplayName` is the icon label and the Settings entry, and
+      // `CFBundleName` is what the system falls back to when that is truncated.
+      expect(plistValue(plist, 'CFBundleDisplayName'), name);
+      expect(plistValue(plist, 'CFBundleName'), name);
+
+      // The bundle id is the iOS half of the package rename in the group above, and
+      // it is what an installed app keeps its data and its grants under. The plist
+      // takes it from the build setting rather than repeating the literal, so the
+      // assertion is that the setting exists and is the renamed id.
+      expect(plistValue(plist, 'CFBundleIdentifier'), r'$(PRODUCT_BUNDLE_IDENTIFIER)');
+      expect(
+        project,
+        contains('PRODUCT_BUNDLE_IDENTIFIER = com.stackbuildco.proctorguard;'),
+      );
 
       // And the *declarations* no longer carry the old name: matched as the
       // quoted value, so the comments explaining the rename may still name it.
       expect(manifest, isNot(contains('android:label="Exam Proctor"')));
       expect(main, isNot(contains("title: 'Exam Proctor'")));
-      expect(ios, isNot(contains('<string>Exam Proctor</string>')));
+      expect(plist, isNot(contains('<string>Exam Proctor</string>')));
+    });
+  });
+
+  group('the iOS project', () {
+    // Everything here is a file iOS reads before any Dart runs. A missing privacy
+    // string is not a warning: the OS terminates the process on the first
+    // `AVCaptureDevice.requestAccess`, which the exam screen cannot catch and the
+    // student cannot recover from. A deployment target below the pods' floor fails
+    // at `pod install` instead, on a machine the repository's CI has and a
+    // contributor's may not.
+
+    test('declares both privacy strings, and says what the app does', () {
+      final plist = read('ios/Runner/Info.plist');
+      if (plist == null) return;
+
+      final camera = plistValue(plist, 'NSCameraUsageDescription');
+      final microphone = plistValue(plist, 'NSMicrophoneUsageDescription');
+
+      expect(camera, isNotNull, reason: 'without it iOS kills the app');
+      expect(microphone, isNotNull, reason: 'without it iOS kills the app');
+      // The strings are the words App Review and the student both see, so they name
+      // the proctoring use rather than a generic "this app needs the camera".
+      expect(camera, contains('exam'));
+      expect(microphone, contains('exam'));
+    });
+
+    test('hides the status bar, the way the Android kiosk hides the chrome', () {
+      final plist = read('ios/Runner/Info.plist');
+      if (plist == null) return;
+
+      expect(plist, contains('<key>UIStatusBarHidden</key>'));
+      // Without this the key above does nothing: a view controller that presents
+      // its own status bar wins over the Info.plist value.
+      expect(
+        plist,
+        matches(RegExp(
+          r'<key>UIViewControllerBasedStatusBarAppearance</key>\s*<false/>',
+        )),
+      );
+    });
+
+    test('pins a deployment target the pods can resolve against', () {
+      final project = read('ios/Runner.xcodeproj/project.pbxproj');
+      final podfile = read('ios/Podfile');
+      if (project == null || podfile == null) return;
+
+      // `google_mlkit_face_detection` declares `s.platform = :ios, '15.5'` (and so
+      // does the `google_mlkit_commons` it pulls in), so 15.5 is a floor set by the
+      // face pipeline rather than a preference. Flutter's template default of 13.0
+      // does not merely warn at this floor: `pod install` refuses to resolve.
+      final xcodeTargets = RegExp(
+        r'IPHONEOS_DEPLOYMENT_TARGET = ([\d.]+);',
+      ).allMatches(project).map((m) => m.group(1)).toSet();
+
+      expect(xcodeTargets, isNotEmpty);
+      expect(
+        xcodeTargets,
+        everyElement('15.5'),
+        reason: 'every configuration has to agree, or Xcode links against '
+            'something finer than what CocoaPods resolved',
+      );
+      // The two halves of the same number: CocoaPods resolves from the Podfile,
+      // Xcode links from the project setting.
+      expect(podfile, contains("platform :ios, '15.5'"));
     });
   });
 }

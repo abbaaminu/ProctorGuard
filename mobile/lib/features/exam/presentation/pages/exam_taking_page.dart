@@ -21,6 +21,7 @@ import '../../../../core/services/hardware_verification_service.dart';
 import '../../../../core/services/kiosk_service.dart';
 import '../../../../core/services/mediapipe_proctoring_service.dart';
 import '../../../../core/services/permission_service.dart';
+import '../../../../core/services/platform_capabilities.dart';
 import '../../../../core/services/web_camera_permission.dart';
 import '../../../../core/services/web_exam_guard.dart';
 import '../../../../core/services/web_face_presence.dart';
@@ -39,6 +40,7 @@ import '../exam_strike_mapping.dart';
 import '../providers/exam_session_controller.dart';
 import '../widgets/exam_session_widgets.dart';
 import '../widgets/exam_sync_banner.dart';
+import '../widgets/mobile_exam_only.dart';
 
 /// Route arguments: examId + submissionId (submission is created/resumed
 /// by ExamRepository *before* navigating here — see exam list page) plus the
@@ -116,6 +118,15 @@ class ExamTakingPage extends ConsumerStatefulWidget {
   /// (it carries no matric/registration column).
   final String? candidateEmail;
 
+  /// Whether this build thinks it is running in a browser, overriding [kIsWeb]
+  /// for tests (see `examRunsOnPlatform` in `mobile_exam_only.dart`).
+  ///
+  /// Exams are mobile-only: the browser build is refused by [build] before
+  /// anything is started, and by the exam list before a submission is created.
+  /// A VM widget test cannot become a browser, so this is how the refusal is
+  /// reachable in a test; production passes nothing.
+  final bool? isWeb;
+
   const ExamTakingPage({
     super.key,
     required this.examId,
@@ -130,6 +141,7 @@ class ExamTakingPage extends ConsumerStatefulWidget {
     this.candidateName,
     this.examTitle,
     this.candidateEmail,
+    this.isWeb,
   });
 
   /// True when this session runs without a camera (simulated violations).
@@ -228,6 +240,14 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   @override
   void initState() {
     super.initState();
+
+    // A browser never sits an exam (see `examRunsOnPlatform`), and [build] has
+    // already replaced the exam surface with the refusal notice. Nothing below
+    // this line may run there: the bootstrap would ask for the camera, pin the
+    // kiosk, start the microphone and log `app_minimized`/`fullscreen_exit`
+    // strikes against an attempt the app has just said it will not record.
+    if (!examRunsOnPlatform(isWeb: widget.isWeb)) return;
+
     // Distinct from the notifier's lifecycle observer, which turns *leaving* into
     // a strike: this one only reacts to coming back.
     _appLifecycle = AppLifecycleListener(onResume: _onAppResumed);
@@ -395,6 +415,22 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
           'access — continuing with the camera plugin.',
         );
       }
+    }
+
+    // Windows, Linux and macOS have no `camera` implementation at all — not an
+    // empty device list, but a platform interface whose default throws
+    // `UnimplementedError`. The `catch` below would report that as "the camera
+    // could not be opened on this device", which blames the hardware and offers a
+    // Try again that can never succeed. Say what is true instead.
+    //
+    // Reached only without MOCK_CAMERA: the documented desktop development path
+    // returns above, before any of this.
+    if (!platformHasCamera()) {
+      _failStart(
+        'Proctoring needs a phone or tablet. This build cannot open a camera, so '
+        'the exam cannot start on this computer.',
+      );
+      return;
     }
 
     // Front camera, low resolution is enough for face detection and keeps the
@@ -1131,6 +1167,18 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
 
   @override
   Widget build(BuildContext context) {
+    // Mobile-only, and refused here as well as in the exam list: the route can be
+    // built directly (a resumed attempt, a restored navigator stack, a shared
+    // link), and the guard has to hold wherever the page is built. Nothing is
+    // watched, started or logged in a browser — `initState` returns before the
+    // bootstrap, so there is no camera, no kiosk pin and no strike recorded
+    // against an attempt the student was just told would not run here.
+    if (!examRunsOnPlatform(isWeb: widget.isWeb)) {
+      return MobileExamOnlyPage(
+        onLeave: () => Navigator.of(context).maybePop(),
+      );
+    }
+
     final session = ref.watch(examSessionControllerProvider(_args));
     final proctoringState = ref.watch(proctoringProvider(widget.submissionId));
 
@@ -1169,60 +1217,77 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     // --- Blocking states (each one offers a way out) --------------------
     final blockingError = session.blockingError;
     if (blockingError != null) {
-      return ExamBlockingState(
-        message: blockingError,
-        onRetry: _retryBootstrap,
-        // Only a permission failure can be fixed in the OS settings, so the
-        // extra action appears exactly then.
-        onOpenSettings: session.offerSettings
-            ? () => PermissionService().openSettings()
-            : null,
-        allowExit: true,
+      // Routed through [_proctored] so a strike that lands *while* the screen is
+      // blocked is still shown; see [_proctoringOverlays].
+      return _proctored(
+        proctoringState,
+        ExamBlockingState(
+          message: blockingError,
+          onRetry: _retryBootstrap,
+          // Only a permission failure can be fixed in the OS settings, so the
+          // extra action appears exactly then.
+          onOpenSettings: session.offerSettings
+              ? () => PermissionService().openSettings()
+              : null,
+          allowExit: true,
+        ),
       );
     }
 
     if (session.timeUpPending) {
-      return ExamBlockingState(
-        key: const Key('exam-time-up'),
-        icon: Icons.timer_off_outlined,
-        title: 'Time is up',
-        message: 'Your answers are saved, but the submission has not reached '
-            'the server yet.',
-        onRetry: () => _finalSubmit(timeUp: true),
-        retryLabel: 'Send again',
-        allowExit: true,
+      return _proctored(
+        proctoringState,
+        ExamBlockingState(
+          key: const Key('exam-time-up'),
+          icon: Icons.timer_off_outlined,
+          title: 'Time is up',
+          message: 'Your answers are saved, but the submission has not reached '
+              'the server yet.',
+          onRetry: () => _finalSubmit(timeUp: true),
+          retryLabel: 'Send again',
+          allowExit: true,
+        ),
       );
     }
 
     if (session.offlineSubmitPending) {
-      return ExamBlockingState(
-        key: const Key('exam-offline-submit'),
-        icon: Icons.cloud_off,
-        title: 'Waiting for a connection',
-        message: 'Every answer is saved on this device, so nothing is lost. '
-            'Reconnect to hand the attempt in - it will go through as soon as '
-            'the answers reach the server.',
-        onRetry: _retryOfflineSubmit,
-        retryLabel: 'Submit again',
-        allowExit: true,
+      return _proctored(
+        proctoringState,
+        ExamBlockingState(
+          key: const Key('exam-offline-submit'),
+          icon: Icons.cloud_off,
+          title: 'Waiting for a connection',
+          message: 'Every answer is saved on this device, so nothing is lost. '
+              'Reconnect to hand the attempt in - it will go through as soon as '
+              'the answers reach the server.',
+          onRetry: _retryOfflineSubmit,
+          retryLabel: 'Submit again',
+          allowExit: true,
+        ),
       );
     }
 
     if (session.loading) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return _proctored(
+        proctoringState,
+        const Scaffold(body: Center(child: CircularProgressIndicator())),
+      );
     }
 
     if (session.questions.isEmpty) {
       // No questions is a supervisor's setup mistake, not a used-up attempt:
       // leaving keeps the submission `ongoing` so it can be resumed once the
       // questions are published.
-      return ExamBlockingState(
-        key: const Key('exam-no-questions'),
-        icon: Icons.help_outline,
-        title: 'No questions yet',
-        message: 'This exam has no questions published yet. Tell your '
-            'supervisor — you can come back once they are added.',
-        allowExit: true,
+      return _proctored(
+        proctoringState,
+        ExamBlockingState(
+          key: const Key('exam-no-questions'),
+          icon: Icons.help_outline,
+          title: 'No questions yet',
+          message: 'This exam has no questions published yet. Tell your '
+              'supervisor — you can come back once they are added.',
+          allowExit: true,
+        ),
       );
     }
 
@@ -1257,6 +1322,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                   session,
                   question,
                   audioState,
+                  warningCount: proctoringState.warningCount,
                 );
 
                 return Column(
@@ -1317,44 +1383,77 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
               },
             ),
           ),
-          if (proctoringState.showViolationOverlay)
-            ViolationOverlay(
-              type: proctoringState.lastViolation,
-              warningCount: proctoringState.warningCount,
-              isFinal: proctoringState.disqualified,
-              // The same index the supervisor's grid shows for this attempt: it is
-              // derived from this session's own violation list, not passed in.
-              risk: proctoringState.risk,
-              onDismiss: () {
-                if (proctoringState.disqualified) {
-                  Navigator.of(context).popUntil((r) => r.isFirst);
-                } else {
-                  ref
-                      .read(proctoringProvider(widget.submissionId).notifier)
-                      .dismissOverlay();
-                }
-              },
-            ),
-          // Above the violation overlay: while this countdown is running nothing
-          // has been logged yet, and the only thing the student should be able to
-          // do is come back to fullscreen (which is also the user gesture the
-          // browser needs to grant it).
-          if (_fullscreenDeadline != null)
-            FullscreenLockOverlay(
-              remaining: _fullscreenDeadline!.difference(_now()),
-              onReturnToFullscreen: () => _webGuard?.requestFullscreen(),
-            ),
+          ..._proctoringOverlays(proctoringState),
         ],
       ),
     );
   }
-
-  /// The question and its answer surface.
+  /// [content] with this attempt's proctoring overlays above it.
   ///
-  /// Scrollable by construction. It used to be a `Column` with a `Spacer` inside
-  /// a non-scrollable body, so a five-option question on a phone in landscape (or
-  /// any large accessibility text scale) overflowed — and the overflow banner
-  /// covered the last option.
+  /// Used by every state that is not the question surface — the spinner and each
+  /// blocking state — because a strike does not wait for a readable camera: the OS
+  /// reports an app switch, the AFK watcher fires, and `_bootstrap()` keeps
+  /// retrying behind a blocking screen. Those overlays used to be built into the
+  /// question branch only, so a student sitting on "Camera unavailable" (or the
+  /// offline-submit screen) could collect warnings — and be disqualified on the
+  /// third — without ever having been shown one: the strike was logged, and
+  /// nothing on screen displayed it.
+  Widget _proctored(ProctoringState proctoringState, Widget content) => Stack(
+        fit: StackFit.expand,
+        children: <Widget>[content, ..._proctoringOverlays(proctoringState)],
+      );
+
+  /// The warning overlays and the attempt's back-button rule for one frame.
+  ///
+  /// Returned as a list so the *same* widgets are painted above every state the
+  /// screen can be in (see [_proctored]).
+  List<Widget> _proctoringOverlays(ProctoringState proctoringState) => <Widget>[
+        // `PopScope` registers with the enclosing `ModalRoute` from wherever it
+        // sits in that route's subtree, so it sits beside the warnings it is
+        // about. While a warning is up, hardware back used to pop the attempt
+        // outright: the strike stayed logged against a session the student had
+        // walked away from, and a "this is your last warning" screen could be
+        // left without being read. Back now does what the overlay's own button
+        // does, and on a disqualification — where no dismiss exists — nothing.
+        PopScope(
+          canPop: !proctoringState.showViolationOverlay,
+          onPopInvokedWithResult: (didPop, Object? result) {
+            if (didPop || proctoringState.disqualified) return;
+            ref
+                .read(proctoringProvider(widget.submissionId).notifier)
+                .dismissOverlay();
+          },
+          child: const SizedBox.shrink(),
+        ),
+        if (proctoringState.showViolationOverlay)
+          ViolationOverlay(
+            type: proctoringState.lastViolation,
+            warningCount: proctoringState.warningCount,
+            isFinal: proctoringState.disqualified,
+            // The same index the supervisor's grid shows for this attempt: it is
+            // derived from this session's own violation list, not passed in.
+            risk: proctoringState.risk,
+            onDismiss: () {
+              if (proctoringState.disqualified) {
+                Navigator.of(context).popUntil((r) => r.isFirst);
+              } else {
+                ref
+                    .read(proctoringProvider(widget.submissionId).notifier)
+                    .dismissOverlay();
+              }
+            },
+          ),
+        // Above the violation overlay: while this countdown is running nothing
+        // has been logged yet, and the only thing the student should be able to
+        // do is come back to fullscreen (which is also the user gesture the
+        // browser needs to grant it).
+        if (_fullscreenDeadline != null)
+          FullscreenLockOverlay(
+            remaining: _fullscreenDeadline!.difference(_now()),
+            onReturnToFullscreen: () => _webGuard?.requestFullscreen(),
+          ),
+      ];
+
   /// Whether the answer stored for [question] is the one on screen — what the
   /// three answer widgets mean by "saved".
   ///
@@ -1366,11 +1465,18 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       session.savedText[question.id] ==
           (session.textAnswers[question.id] ?? '');
 
+  /// The question and its answer surface.
+  ///
+  /// Scrollable by construction. It used to be a `Column` with a `Spacer` inside
+  /// a non-scrollable body, so a five-option question on a phone in landscape (or
+  /// any large accessibility text scale) overflowed — and the overflow banner
+  /// covered the last option.
   Widget _buildQuestionPane(
     ExamSessionState session,
     Question question,
-    AudioMonitoringState audioState,
-  ) {
+    AudioMonitoringState audioState, {
+    required int warningCount,
+  }) {
     final theme = Theme.of(context);
     final gutter = ResponsiveSizing.horizontalPadding(context);
     final selectedOption = session.answers[question.id];
@@ -1405,6 +1511,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                   total: session.questions.length,
                 ),
               if (_kioskStatus != null) ExamKioskBadge(status: _kioskStatus!),
+              // Stays on screen after the warning overlay is dismissed, so the
+              // student can see how close the attempt is to closing.
+              if (warningCount > 0) ExamWarningChip(count: warningCount),
               // Always present, in every build: "the microphone is being
               // monitored" is part of the exam's state rather than an optional
               // extra, and its absence is the one silent failure this screen must

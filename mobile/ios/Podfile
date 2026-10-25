@@ -1,0 +1,57 @@
+# Pinned to the ML Kit floor rather than Flutter's template default of 13.0.
+#
+# `google_mlkit_face_detection` (and the `google_mlkit_commons` it depends on)
+# declare `s.platform = :ios, '15.5'`, so at 13.0 `pod install` does not merely
+# warn, it refuses to resolve:
+#
+#   [!] CocoaPods could not find compatible versions for pod
+#       "google_mlkit_face_detection": ... required a higher minimum deployment
+#       target.
+#
+# `IPHONEOS_DEPLOYMENT_TARGET` in Runner.xcodeproj is raised to 15.5 to match:
+# CocoaPods resolves against this file while Xcode links against the project
+# setting, and the two disagreeing is how a pod installs cleanly and then fails to
+# link. `camera_avfoundation` only needs 13.0, so ML Kit is what sets the floor.
+platform :ios, '15.5'
+
+# CocoaPods analytics sends network stats synchronously during `pod install`,
+# which stalls the run (and CI) for no benefit here.
+ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+project 'Runner', {
+  'Debug' => :debug,
+  'Profile' => :release,
+  'Release' => :release,
+}
+
+def flutter_root
+  generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
+  unless File.exist?(generated_xcode_build_settings_path)
+    raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure flutter pub get is executed first"
+  end
+
+  File.foreach(generated_xcode_build_settings_path) do |line|
+    matches = line.match(/FLUTTER_ROOT\=(.*)/)
+    return matches[1].strip if matches
+  end
+  raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Generated.xcconfig, then run flutter pub get"
+end
+
+require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+
+flutter_ios_podfile_setup
+
+target 'Runner' do
+  use_frameworks!
+
+  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+  target 'RunnerTests' do
+    inherit! :search_paths
+  end
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    flutter_additional_ios_build_settings(target)
+  end
+end

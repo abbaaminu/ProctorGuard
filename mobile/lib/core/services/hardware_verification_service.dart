@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart'
 import '../utils/proctor_log.dart';
 import 'mediapipe_proctoring_service.dart';
 import 'permission_service.dart';
+import 'platform_capabilities.dart';
 import 'web_camera_permission.dart';
 
 /// The two devices an exam cannot be proctored without.
@@ -83,9 +84,9 @@ class HardwareReport {
   final bool settingsHint;
 
   /// True when this report comes from a platform whose on-device face detector
-  /// does not exist — the web, because Google ML Kit has no browser
-  /// implementation (the same limitation `PermissionService`'s platform notes
-  /// describe).
+  /// does not exist — the browser and the desktop targets, because Google ML Kit
+  /// ships Android and iOS implementations only (see
+  /// [platformHasFaceDetector]).
   ///
   /// The camera and microphone probes are one code path on every platform, so
   /// this is the only thing that tells the gate apart: on the web [isVerified]
@@ -269,7 +270,11 @@ class DeviceHardwareVerifier implements HardwareVerifier {
     // answered) reaches the gate with it already on. A mock build is skipped —
     // MOCK_CAMERA already says nothing here is proctored, and it is the
     // documented way to run on the web.
-    if (!kIsWeb || report.mock) return report;
+    //
+    // This used to be a `kIsWeb` test, which was the same question only while the
+    // browser was the one target without ML Kit. The Windows and Linux runners
+    // have no detector either, so the test is the capability itself now.
+    if (platformHasFaceDetector() || report.mock) return report;
     return report.withFaceDetectionInactive();
   }
 
@@ -296,6 +301,21 @@ class DeviceHardwareVerifier implements HardwareVerifier {
     // why no capture session is opened behind it here.
     if (_browserProbe.isSupported) {
       return _webReport(await _browserProbe.probe());
+    }
+
+    // Windows, Linux and macOS: there is no camera implementation to call. This is
+    // not the "no device found" case below — `availableCameras()` throws
+    // `UnimplementedError` from the platform interface's default stub, and the
+    // generic catch would report that as "the camera is not available here" with a
+    // Try again button that can never succeed on this machine. Name the actual
+    // limitation instead, and leave `settingsHint` off: no setting conjures a
+    // camera plugin into a build that has none.
+    if (!platformHasCamera()) {
+      return _cameraFailure(
+        null,
+        message: 'the camera cannot be opened on this platform — ProctorGuard '
+            'proctors exams on a phone or tablet',
+      );
     }
 
     final List<CameraDescription> cameras;
