@@ -12,6 +12,16 @@ mobile/android/**/gradle-wrapper.jar
 mobile/ios/Pods/
 mobile/ios/.symlinks/
 mobile/ios/Flutter/Flutter.framework
+# Generated on every `flutter pub get`/build from the *local* Flutter SDK. They
+# carry this machine's absolute paths (and a `FLUTTER_ROOT` that is meaningless
+# anywhere else), so a committed copy is stale on every other checkout: Xcode
+# reads a Windows path, and `git status` is dirty for every developer.
+# `mobile/ios/.gitignore` already lists the same three patterns; they are repeated
+# here so the rule is visible from the repo root, where the tracked copies were
+# removed with `git rm --cached` - no .gitignore rule ever hides a *tracked* file.
+mobile/ios/Flutter/Generated.xcconfig
+mobile/ios/Flutter/flutter_export_environment.sh
+mobile/ios/Flutter/ephemeral/
 mobile/*.iml
 
 # ---- Release signing material (mobile/android/) ----

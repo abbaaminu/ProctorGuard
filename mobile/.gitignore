@@ -43,4 +43,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Command transcripts captured while debugging a run locally
+# (`flutter analyze > analyze_out.txt`): build output, not source.
+/analyze_out.txt
+/test_out.txt
 .vercel

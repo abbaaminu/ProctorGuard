@@ -1,6 +1,0 @@
-﻿Flutter 3.44.6 ΓÇó channel stable ΓÇó https://github.com/flutter/flutter.git
-Framework ΓÇó revision ee80f08bbf (3 months ago) ΓÇó 2026-07-08 15:02:06 -0700
-Engine ΓÇó hash d3a3293399556a85388faf8c6f0723a7a5597aa8 (revision 83675ed276) (3 months ago) ΓÇó 2026-06-30 16:59:03.000Z
-Tools ΓÇó Dart 3.12.2 ΓÇó DevTools 2.57.0
-Analyzing mobile...                                             
-No issues found! (ran in 12.3s)

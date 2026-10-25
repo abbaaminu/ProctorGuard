@@ -20,9 +20,6 @@ dependencies:
   # Offline resilience: the local-first answer cache and the retry queues behind it
   shared_preferences: ^2.5.5
 
-  # Desktop Window & Fullscreen Control
-  window_manager: ^0.5.2
-
   # Camera / on-device AI
   camera: ^0.12.1
   # The camera plugin's platform interface, imported directly for
@@ -45,6 +42,16 @@ dependencies:
 
   # Utils
   equatable: ^2.0.5
+
+  # The font asset behind `CupertinoIcons`. Nothing in `lib/` names a Cupertino
+  # icon directly, but the Flutter framework's own selection/adaptive widgets do,
+  # and without this package a `flutter build` ends on
+  # "Expected to find fonts for (MaterialIcons, packages/cupertino_icons/CupertinoIcons),
+  # but found (MaterialIcons)" — i.e. those glyphs have no font to come from on
+  # iOS and in the web build, and render as blank boxes. It is part of Flutter's
+  # own app template for exactly this reason; the font is tree-shaken to the
+  # glyphs actually referenced.
+  cupertino_icons: ^1.0.8
 
   # Bulk student roster (admin): `file_picker` reads the .csv the administrator
   # chooses, `csv` parses it. Both are pure Dart/web-safe, so the upload page
