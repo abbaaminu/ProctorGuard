@@ -919,9 +919,9 @@ retry/leave actions.
 
 Only the runner folders that actually exist under `mobile/` are targets:
 `android/`, `ios/` and `web/`. **Android is the shipped one** — `build_apk.ps1`
-and `.github/workflows/sync_release.yml` publish the signed, split-per-ABI APKs
-students install. iOS is scaffolded and compiled in CI but not signed
-([`ios/README.md`](ios/README.md)).
+and `build_and_publish` (in `.github/workflows/proctorguard_pipeline.yml`) publish
+the signed, split-per-ABI APKs students install. iOS is scaffolded and compiled in
+CI but not signed ([`ios/README.md`](ios/README.md)).
 
 The native desktop scaffolds (`windows/`, `linux/`, and a `macos/` that was never
 generated) are **gone**. They built and started, but they could never proctor:
@@ -1173,6 +1173,8 @@ project.
 | --- | --- | --- |
 | `default-src` | `'self'` | Anything unlisted below is same-origin only. |
 | `script-src` | `'self' 'unsafe-inline' 'wasm-unsafe-eval' https://www.gstatic.com` | The app's own scripts (the face sensor, the lockdown bootstrap and Flutter's loader) plus CanvasKit's canvas/font payload. `'unsafe-inline'` is what the exam-lockdown script in `index.html` needs; a host serving this as a **response header** can move that script into its own file and drop the keyword. `'wasm-unsafe-eval'` is the narrow WebAssembly allowance — not `'unsafe-eval'`. |
+| `style-src` | `'self' 'unsafe-inline' https://fonts.googleapis.com` | Flutter writes element styles directly (`'unsafe-inline'`), and a Google Fonts stylesheet is the one external stylesheet allowed. The list is exhaustive because injected CSS can call home through `url()` and `@import`. |
+| `font-src` | `'self' data: https://fonts.gstatic.com` | The app's own fonts, the `data:` sources Flutter inlines, and the font files a Google Fonts stylesheet names. The two hosts are a **pair**: without `fonts.googleapis.com` in `style-src` the stylesheet is refused, and without `fonts.gstatic.com` here every `@font-face` inside it fails, so the app quietly renders in the system face. Neither belongs in `connect-src` — a `<link>` fetch is governed by these two — unless a font is fetched from Dart (`google_fonts`' runtime fallback), which *is* an XHR. |
 | `connect-src` | `'self'`, `https://*.supabase.co`, `wss://*.supabase.co`, the `.supabase.in` mirror, Sentry ingest, `https://www.gstatic.com`, localhost | Auth, PostgREST, Storage and the Realtime socket; crash reports only when `SENTRY_DSN` was compiled in; `flutter run -d chrome` and a local Supabase stack. |
 | `img-src` | `'self' data: blob:` + the Supabase hosts | Evidence stills are short-lived signed URLs on the project host. |
 | `object-src` / `base-uri` / `form-action` | `'none'` / `'self'` / `'self'` | No plugins, `<base>` is this document's own `--base-href`, and nothing is posted as a form. |
@@ -1188,11 +1190,11 @@ Two limits are deliberate and documented in the file itself:
   `build/web` (`Content-Security-Policy: frame-ancestors 'none'` or
   `X-Frame-Options: DENY`).
 
-`test/web_csp_contract_test.dart` pins the policy: the exhaustive list of allowed
-script and connect sources, the `wss:` realtime host, the `'wasm-unsafe-eval'`
-allowance, and that the meta tag appears **before** the first `<script>` (a
-policy declared after a script does not apply to it). Widening the policy is a
-deliberate edit to that file, not an accident in `index.html`.
+`test/web_csp_contract_test.dart` pins the policy: the exhaustive lists of allowed
+script, connect, style and font sources, the `wss:` realtime host, the
+`'wasm-unsafe-eval'` allowance, and that the meta tag appears **before** the first
+`<script>` (a policy declared after a script does not apply to it). Widening the
+policy is a deliberate edit to that file, not an accident in `index.html`.
 
 ## Responsive layout (Android phone + desktop browser)
 
@@ -1478,7 +1480,7 @@ flutter build apk --release --split-per-abi `
 
 | Define | Effect |
 | --- | --- |
-| `SENTRY_DSN` | Unset/empty/invalid = no SDK, no zone, no traffic. A local `flutter run`, `flutter test` and `sync_release.yml` (which does not pass it) are unchanged. |
+| `SENTRY_DSN` | Unset/empty/invalid = no SDK, no zone, no traffic. A local `flutter run`, `flutter test` and `build_and_publish` (which does not pass it) are unchanged. |
 | `SENTRY_ENVIRONMENT` | The Sentry environment label. Defaults to `production` in a release build and `debug` otherwise. |
 | `SENTRY_RELEASE` | The release label, normally the git SHA. Left unset, the SDK decides. |
 
@@ -1570,20 +1572,22 @@ written-down opt-out for a throwaway demo build and never for one a student runs
   reference, or if that config ever permits cleartext outside loopback.
 - **iOS is scaffolded and compiled in CI, not shipped.** `mobile/ios/` is a real
   Xcode project (`Info.plist` privacy strings, `Podfile` at the ML Kit floor,
-  `Runner.xcodeproj`), and `.github/workflows/ios_release.yml` compiles it
-  unsigned on every push that touches `mobile/**` so an iOS-only break fails a
-  pull request. Distribution — signing material, an App Store Connect record and
-  the TestFlight upload — is the `testflight` job in that same workflow and is
-  inert until its repository secrets exist; `mobile/ios/README.md` lists them and
-  the remaining iOS work (lifecycle violations, artwork, keychain exclusion).
-- **CI publishes these builds.** `.github/workflows/sync_release.yml` runs the same
+  `Runner.xcodeproj`), and the `build_ios` job in
+  `.github/workflows/proctorguard_pipeline.yml` compiles it unsigned on every
+  push so an iOS-only break fails a pull request. Distribution — signing
+  material, an App Store Connect record and the TestFlight upload — is the
+  `testflight` job in that same workflow and is inert until its repository
+  secrets exist; `mobile/ios/README.md` lists them and the remaining iOS work
+  (lifecycle violations, artwork, keychain exclusion).
+- **CI publishes these builds.** `build_and_publish` in
+  `.github/workflows/proctorguard_pipeline.yml` runs the same
   `flutter build apk --release --split-per-abi` on every push to `main` (and every
   `vX.Y.Z` tag) and mirrors the APKs, their SHA-256 checksums and a `latest.json`
   into the public `abbaaminu/proctorguard-release` repository, which is what a
   student downloads from. It rebuilds `android/key.properties` from repository
   secrets instead of committing one, publishes no source and never keeps R8's
   `mapping.txt` in the public repository; the secrets and the reasoning are listed
-  at the top of that workflow.
+  at the top of that job.
 
 ## Key design decisions worth knowing about
 - **Server-enforced escalation.** The 3-strike disqualify rule lives in

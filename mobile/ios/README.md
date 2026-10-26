@@ -1,12 +1,13 @@
 # iOS: a scaffolded target, and what it still has to be given
 
 `mobile/ios/` is a real Xcode project now — `flutter create . --platforms=ios` was
-run here — but **nothing has been shipped from it yet**. `build_apk.ps1` and
-`.github/workflows/sync_release.yml` still publish Android, and the iOS half is
-*compiled* (unsigned, on a macOS runner) by `.github/workflows/ios_release.yml`, so
-an iOS-only break is caught in a pull request rather than the next time a Mac opens
-Xcode. That workflow also carries the `testflight` job below, which signs and
-uploads — inert until the repository has the secrets it lists.
+run here — but **nothing has been shipped from it yet**. `build_apk.ps1` and the
+`build_and_publish` job in `.github/workflows/proctorguard_pipeline.yml` still
+publish Android, and the iOS half is *compiled* (unsigned, on a macOS runner) by
+that same file's `build_ios` job, so an iOS-only break is caught in a pull request
+rather than the next time a Mac opens Xcode. It also carries the `testflight` job
+below, which signs and uploads — inert until the repository has the secrets it
+lists.
 
 ## What the scaffold already carries
 
@@ -44,13 +45,13 @@ then `flutter build ios --release --no-codesign`.
    entry point Android uses. The pin half cannot work — see the table below — but
    *reporting* that the student left can.
 2. **The signing material.** The `testflight` job in
-   `.github/workflows/ios_release.yml` now builds a signed `.ipa` and uploads it to
-   TestFlight, but it needs an Apple Developer team id, a distribution
-   certificate, an App Store provisioning profile (recommended) and an App Store
-   Connect API key as repository secrets — none of which can live in this
-   repository. What is still missing on the Apple side is the App Store Connect
-   app record for `com.stackbuildco.proctorguard`; the secrets and their sources
-   are in [TestFlight from CI](#testflight-from-ci) below.
+   `.github/workflows/proctorguard_pipeline.yml` now builds a signed `.ipa` and
+   uploads it to TestFlight, but it needs an Apple Developer team id, a
+   distribution certificate, an App Store provisioning profile (recommended) and
+   an App Store Connect API key as repository secrets — none of which can live in
+   this repository. What is still missing on the Apple side is the App Store
+   Connect app record for `com.stackbuildco.proctorguard`; the secrets and their
+   sources are in [TestFlight from CI](#testflight-from-ci) below.
 3. **Artwork.** `Assets.xcassets/AppIcon.appiconset` and the launch image are still
    the Flutter template logo — the same gap the web icons once had.
 4. **The keychain exclusion.** `allowBackup="false"` is Android's answer to a
@@ -62,11 +63,11 @@ then `flutter build ios --release --no-codesign`.
 
 ## TestFlight from CI
 
-`testflight` in `.github/workflows/ios_release.yml` is the shipping half of the iOS
-pipeline. It runs on a manual **Run workflow**, on every push to `main`, and on a
-`vX.Y.Z` tag — never on a pull request, so signing material stays out of reach of a
-fork. With no secrets configured a push stays green and says so in a notice; a
-manual dispatch fails, because somebody asked for a build.
+`testflight` in `.github/workflows/proctorguard_pipeline.yml` is the shipping half
+of the iOS pipeline. It runs on a manual **Run workflow**, on every push to `main`,
+and on a `vX.Y.Z` tag — never on a pull request, so signing material stays out of
+reach of a fork. With no secrets configured a push stays green and says so in a
+notice; a manual dispatch fails, because somebody asked for a build.
 
 What it does, in order: `pod install` (same resolution the compile gate uses),
 import the certificate into a **temporary keychain**, install the provisioning
@@ -86,7 +87,7 @@ Connect API key. The keychain, the profile and the `.p8` are deleted in an
 | `APP_STORE_CONNECT_KEY_ID` | App Store Connect → Users and Access → Integrations → **App Store Connect API** → create a key with **App Manager** access. |
 | `APP_STORE_CONNECT_ISSUER_ID` | Shown above the key list on that same page. |
 | `APP_STORE_CONNECT_PRIVATE_KEY` | The `AuthKey_XXXXXXXXXX.p8` file's contents, pasted as-is (it is only downloadable once). |
-| `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY` | The same values `sync_release.yml` uses. `SUPABASE_ANON_KEY` is still accepted as the older name. |
+| `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY` | The same values `build_and_publish` uses. `SUPABASE_ANON_KEY` is still accepted as the older name. |
 | `SENTRY_DSN` *(optional)* | Crash reporting is off unless this is set (see `mobile/README.md`). |
 
 Two notes that save a failed run:

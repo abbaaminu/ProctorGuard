@@ -40,6 +40,20 @@
         --no-web-resources-cdn` copies those into `build/web/canvaskit/`, after
         which the host may drop this origin.
       * `style-src 'unsafe-inline'` - Flutter writes element styles directly.
+      * `https://fonts.googleapis.com` (`style-src`) and
+        `https://fonts.gstatic.com` (`font-src`) - the Google Fonts stylesheet
+        and the font files it names, for a build whose theme asks for one.
+        Without them the stylesheet is refused ("Refused to load the
+        stylesheet ... because it violates the following Content Security
+        Policy directive: style-src") and the app silently falls back to the
+        system face. The two are a pair: the CSS lives on
+        `fonts.googleapis.com`, and it only ever names `@font-face` sources on
+        `fonts.gstatic.com`. They are *not* in `connect-src`: a `<link>` fetch
+        is governed by `style-src`/`font-src`, and only a fetch made from Dart
+        (the `google_fonts` package's runtime fallback, say) would need them
+        added there as well.
+      * `font-src 'self' data:` - the app's own bundled fonts, plus the
+        `data:` sources Flutter inlines.
       * `connect-src https://*.supabase.co wss://*.supabase.co` (and the `.in`
         mirror of Supabase's own domains) - Auth, PostgREST, Storage and the
         Realtime socket. A **self-hosted** Supabase is served from its own
@@ -62,7 +76,7 @@
     DENY`) on whatever serves `build/web`. `test/web_csp_contract_test.dart`
     pins the directives above so a relaxed policy fails CI rather than shipping.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://www.gstatic.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.supabase.co https://*.supabase.in; font-src 'self' data:; media-src 'self' blob: data:; worker-src 'self' blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://*.supabase.in wss://*.supabase.in https://*.ingest.sentry.io https://*.ingest.us.sentry.io https://*.ingest.de.sentry.io https://www.gstatic.com http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://www.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob: https://*.supabase.co https://*.supabase.in; font-src 'self' data: https://fonts.gstatic.com; media-src 'self' blob: data:; worker-src 'self' blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://*.supabase.in wss://*.supabase.in https://*.ingest.sentry.io https://*.ingest.us.sentry.io https://*.ingest.de.sentry.io https://www.gstatic.com http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
   <meta name="description" content="ProctorGuard student client — take AI-proctored exams with on-device face and microphone monitoring.">
   <meta name="theme-color" content="#3F51B5">

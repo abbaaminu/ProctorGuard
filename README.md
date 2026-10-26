@@ -262,32 +262,35 @@ lose proctoring signals but cannot change a result.
   readable through a short-lived signed URL); the boundaries of every proctoring
   signal are catalogued in
   [Proctoring boundaries and risk register](#proctoring-boundaries-and-risk-register).
-- `.github/workflows/keep_alive.yml` pings the Supabase REST API twice a week;
-  configure its repository secrets or remove the workflow on a paid plan.
-- `.github/workflows/sync_release.yml` builds the release APKs on every push to
+- `.github/workflows/proctorguard_pipeline.yml` is the whole pipeline, in one
+  file, on every push, pull request, `v*` tag and manual dispatch. Its gate jobs
+  are `analyze_and_test` (analysis, the schema/Android manifest contract tests,
+  the full suite), `typecheck_supabase` (`npm run typecheck` in
+  `supabase/functions`, so a mis-resolved Deno import fails CI rather than
+  `supabase functions deploy` on a live project), `build_web`
+  (`flutter build web --release`), `build_android_debug`
+  (`flutter build apk --debug`) and `build_ios` (unsigned, on a macOS runner).
+  The build jobs `needs:` the analyze/test job and are otherwise independent of
+  each other, so a single run reports a broken Gradle file and a broken Podfile
+  together. The APK in `build_android_debug` is deliberately a debug build — a
+  release APK needs the keystore secrets that are unavailable to pull requests.
+- `build_and_publish` in that same file builds the release APKs on every push to
   `main` (and every `v*` tag) and mirrors only those artifacts into the separate
   `abbaaminu/proctorguard-release` repository, so the app can be downloaded
   without publishing this source. Its secrets - `RELEASE_PAT`,
   `SUPABASE_PUBLISHABLE_KEY` and the four `ANDROID_KEYSTORE_*` - are documented at
-  the top of the workflow; a run without the signing ones stops with the keytool
+  the top of the job; a run without the signing ones stops with the keytool
   instructions instead of publishing an APK signed with the public debug key.
-- `.github/workflows/flutter_ci.yml` is the per-push gate: analysis, the
-  schema/Android contract tests, the full suite, and a **build job** that compiles
-  the two shipped targets (`flutter build web --release` and
-  `flutter build apk --debug`). The APK there is deliberately a debug build —
-  a release APK needs the keystore secrets that are unavailable to pull requests,
-  and `sync_release.yml` is what builds and signs the real ones.
-- `.github/workflows/supabase_functions_ci.yml` type-checks the Deno Edge
-  Functions (`npm run typecheck` in `supabase/functions`) on every push and pull
-  request, so a mis-resolved import fails CI rather than `supabase functions
-  deploy` on a live project.
-- `.github/workflows/ios_release.yml` compiles the iOS target unsigned on every
-  push that touches `mobile/**` (a compile gate, with no certificate), and its
-  `testflight` job signs and uploads to TestFlight on `workflow_dispatch`, on a
-  push to `main` and on a `v*` tag. That job is inert until its secrets exist —
-  `APPLE_TEAM_ID`, the distribution certificate pair, the App Store Connect API
-  key, and optionally the provisioning profile pair — all listed in
+- `testflight` in that same file signs and uploads to TestFlight on
+  `workflow_dispatch`, on a push to `main` and on a `v*` tag — never on a pull
+  request. It is inert until its secrets exist — `APPLE_TEAM_ID`, the distribution
+  certificate pair, the App Store Connect API key, and optionally the
+  provisioning profile pair — all listed in
   [mobile/ios/README.md](./mobile/ios/README.md#testflight-from-ci).
+- `.github/workflows/keep_alive.yml` pings the Supabase REST API twice a week;
+  configure its repository secrets or remove the workflow on a paid plan. It
+  stays a file of its own: it is a `schedule`-triggered ping, not part of a
+  push's pipeline.
 
 ## Verification
 

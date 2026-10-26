@@ -510,6 +510,51 @@ void main() {
       expect(find.text('Loading your profile…'), findsNothing);
     });
 
+    testWidgets('a profile that never arrives stops loading after the timeout',
+        (tester) async {
+      // The failure behind a spinner that never stops: not a refused request
+      // (that throws, and the error screen has always handled it) but one that
+      // never answers - a stalled socket, a paused project, or a
+      // `handle_new_user` trigger that raised and will never write the row. The
+      // repository's retries are bounded, but a pending future is not, so the
+      // gate used to spin on "Loading your profile…" with no retry and no way
+      // out but killing the app.
+      final pending = Completer<UserProfile>();
+      profiles.behaviour = () => pending.future;
+
+      await tester.pumpWidget(gateUnderTest());
+      await tester.pump();
+
+      expect(find.text('Loading your profile…'), findsOneWidget);
+
+      // Still inside the bound: the spinner stays, because a slow-but-alive
+      // lookup is not an error yet.
+      await tester.pump(profileLoadTimeout - const Duration(milliseconds: 500));
+      expect(find.text('Loading your profile…'), findsOneWidget);
+
+      // Past it, the future is abandoned and the gate renders the ordinary
+      // retryable error instead of waiting forever.
+      await tester.pump(const Duration(milliseconds: 600));
+      await tester.pump();
+
+      expect(find.text('Loading your profile…'), findsNothing);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      expect(find.text('We could not load your profile'), findsOneWidget);
+      expect(
+        find.text(profileTimeoutMessage),
+        findsOneWidget,
+        reason: 'the timeout has to say what to do, not just that it gave up',
+      );
+
+      // Try again is a real retry: it re-reads the row rather than replaying
+      // the timed-out future.
+      profiles.behaviour = () => Future<UserProfile>.value(aisha);
+      await tester.tap(find.byKey(const Key('profile-retry')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Student Exam Portal'), findsOneWidget);
+    });
+
     testWidgets('a failed role lookup is retryable', (tester) async {
       profiles.behaviour = () => Future<UserProfile>.error(
             const ProfileLookupException(

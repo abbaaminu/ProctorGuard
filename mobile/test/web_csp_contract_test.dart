@@ -152,6 +152,34 @@ void main() {
       );
     });
 
+    test('lets Google Fonts provide the stylesheet and the font files', () {
+      final style = csp['style-src'] ?? const <String>[];
+      final font = csp['font-src'] ?? const <String>[];
+
+      // Exhaustive, like the other two: injected CSS can call home through
+      // `url()` and `@import`, so `style-src` is not a directive to leave open.
+      for (final source in style) {
+        expect(
+          _styleSources.contains(source),
+          isTrue,
+          reason: 'style-src "$source" is not one of $_styleSources',
+        );
+      }
+      for (final source in font) {
+        expect(
+          _fontSources.contains(source),
+          isTrue,
+          reason: 'font-src "$source" is not one of $_fontSources',
+        );
+      }
+
+      // The pair a Google Fonts build needs: without the first the stylesheet
+      // is refused, and without the second every @font-face inside it fails and
+      // the app silently renders in the system face.
+      expect(style, contains('https://fonts.googleapis.com'));
+      expect(font, contains('https://fonts.gstatic.com'));
+    });
+
     test('blocks plugins, pins <base> to this origin and forbids form posts',
         () {
       expect(csp['object-src'], <String>["'none'"]);
@@ -167,6 +195,29 @@ const Set<String> _scriptSources = <String>{
   "'unsafe-inline'",
   "'wasm-unsafe-eval'",
   'https://www.gstatic.com',
+};
+
+/// The complete set `style-src` may name.
+///
+/// `'unsafe-inline'` is Flutter writing element styles directly;
+/// `fonts.googleapis.com` is a Google Fonts stylesheet. Nothing else: a
+/// `style-src` that reaches `https:` lets injected CSS exfiltrate through
+/// `url()` and `@import`.
+const Set<String> _styleSources = <String>{
+  "'self'",
+  "'unsafe-inline'",
+  'https://fonts.googleapis.com',
+};
+
+/// The complete set `font-src` may name.
+///
+/// `data:` covers the fonts Flutter inlines, and `fonts.gstatic.com` is where
+/// the Google Fonts stylesheet's `@font-face` sources live - the second half of
+/// the pair `style-src` starts.
+const Set<String> _fontSources = <String>{
+  "'self'",
+  'data:',
+  'https://fonts.gstatic.com',
 };
 
 /// The complete set `connect-src` may name.

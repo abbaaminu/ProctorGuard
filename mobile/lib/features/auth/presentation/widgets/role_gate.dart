@@ -152,7 +152,10 @@ class RoleGate extends ConsumerWidget {
 /// before the `handle_new_user` trigger's row is visible to that query. So the
 /// screen can legitimately be up for a second or two, and after [hintDelay] it
 /// says so rather than looking frozen. It never turns into the error screen by
-/// itself — only a real [ProfileLookupException] does that.
+/// itself — only a real [ProfileLookupException] does that, and the last one on
+/// that way is [profileLoadTimeout]: a lookup that never answers at all becomes
+/// one after ten seconds, so the spinner cannot outlive the sign-in it belongs
+/// to.
 class _ProfileLoading extends StatefulWidget {
   const _ProfileLoading();
 
