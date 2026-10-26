@@ -95,10 +95,10 @@ jobs:
         working-directory: mobile
     steps:
       - name: Check out the private source repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           # `android/app/build.gradle.kts` pins source/target compatibility and
@@ -110,7 +110,7 @@ jobs:
           cache: gradle
 
       - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@v2.23.0
         with:
           channel: stable
           cache: true
@@ -496,7 +496,7 @@ jobs:
       # simultaneously a full class-name listing of a proctoring client - does not get
       # to publish a build at all.
       - name: Keep the APKs and the R8 mapping in this private run
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: proctorguard-apks-${{ github.run_number }}
           path: |

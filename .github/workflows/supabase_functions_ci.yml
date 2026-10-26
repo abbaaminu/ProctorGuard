@@ -13,16 +13,17 @@ name: Supabase Functions CI (ProctorGuard)
 # checker (TS2307), so a checkout failed `npm run typecheck` while `deploy` was
 # happy. `npm-imports.d.ts` declares the `npm:` form for exactly this reason.
 #
-# No `paths:` filter, deliberately: it runs on every push and pull request like
-# `flutter_ci.yml`, so it behaves predictably if it is ever made a required
-# check - a path-filtered workflow never reports on a PR that does not touch its
-# paths, and a required check that never reports blocks the merge.
+# No `paths:` filter, deliberately: it runs on every branch push and pull
+# request like `flutter_ci.yml`, so it behaves predictably if it is ever made a
+# required check - a path-filtered workflow never reports on a PR that does not
+# touch its paths, and a required check that never reports blocks the merge.
 on:
   push:
+    branches: ['**']
   pull_request:
 
 concurrency:
-  group: supabase-functions-ci-${{ github.ref }}
+  group: supabase-functions-ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -34,10 +35,10 @@ jobs:
         working-directory: supabase/functions
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm

@@ -15,6 +15,7 @@ on:
   # .xcworkspace. The workflow file itself is included, so a change to it is
   # exercised by the next push that touches it.
   push:
+    branches: ['**']
     paths:
       - 'mobile/**'
       - '.github/workflows/ios_release.yml'
@@ -28,7 +29,7 @@ on:
 # A newer push to the same ref supersedes a run still in flight: iOS builds are
 # the slowest thing here, and a burst of commits must not queue up stale ones.
 concurrency:
-  group: ios-release-${{ github.ref }}
+  group: ios-release-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -45,10 +46,10 @@ jobs:
         working-directory: mobile
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@v2.23.0
         with:
           channel: stable
           cache: true
@@ -163,10 +164,10 @@ jobs:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@v2.23.0
         with:
           channel: stable
           cache: true
@@ -463,4 +464,3 @@ jobs:
           if [ -n "${PROFILE_NAME:-}" ]; then
             rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_NAME.mobileprovision" || true
           fi
-
