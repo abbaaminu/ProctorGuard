@@ -70,7 +70,36 @@ dependencies:
   # (`android/app/build.gradle.kts`: `minSdk = flutter.minSdkVersion`) so that an
   # Android 7 phone can still sit an exam. 9.x declares 21, so nothing is lost.
   # Upgrading to 10.x is a decision to raise that floor, not a version bump.
-  sentry_flutter: ^9.0.0
+  #
+  # The floor is 9.30.1, not 9.0.0, because 9.0.0 cannot be built by the current
+  # toolchain (Flutter 3.44, AGP 9.0.1, Kotlin 2.3.20, Xcode 26):
+  #
+  #   * Android: 9.0.0's `android/build.gradle` pins
+  #     `kotlinOptions.languageVersion = "1.6"`. Kotlin 2.x dropped 1.6 support, so
+  #     the plugin fails with "Language version 1.6 is no longer supported". 9.3.0
+  #     moved it to 1.8 and 9.28.0 removed the pin altogether, also skipping the
+  #     `kotlin-android` plugin when AGP 9 applies Kotlin itself (it reads
+  #     `android.builtInKotlin`, which this project sets to `false` in
+  #     `android/gradle.properties`, so the standalone plugin is still applied).
+  #   * iOS: 9.0.0's podspec pins `Sentry/HybridSDK 8.51.0`, which does not compile
+  #     with Xcode 26 (`SentryBinaryImageCache`). The Xcode 26 build fix landed in
+  #     sentry-cocoa 8.53.0; 9.30.1 pins 8.58.4.
+  #
+  # One Flutter warning is still printed on an Android build, and it is expected:
+  #
+  #   WARNING: Your app uses the following plugins that apply Kotlin Gradle
+  #   Plugin (KGP): sentry_flutter
+  #
+  # That is `android.builtInKotlin=false` doing exactly what it says: the template
+  # keeps the standalone Kotlin plugin, and 9.30.1 is written for that path. It
+  # warns about a *future* Flutter release, not this one - `flutter build apk`
+  # succeeds with it, and so does a from-scratch `:sentry_flutter:compileDebugKotlin`
+  # under AGP 9.0.1 + Kotlin 2.3.20. Dropping the warning is the same decision as
+  # moving to 10.x (authored for built-in Kotlin, and minSdk 26), not a flag flip.
+  #
+  # `^9.30.1` stays inside 9.x, so `pub upgrade` cannot silently cross onto the
+  # 10.x minSdk floor above.
+  sentry_flutter: ^9.30.1
 
 dev_dependencies:
   flutter_test:

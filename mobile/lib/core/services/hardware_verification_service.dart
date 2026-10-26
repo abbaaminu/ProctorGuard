@@ -74,7 +74,7 @@ class HardwareReport {
   final DeviceProbe microphone;
 
   /// True only on the explicit `--dart-define=MOCK_CAMERA=true` path, where no
-  /// real hardware is expected (emulators, desktop targets, CI). The gate says
+  /// real hardware is expected (emulators, browsers, CI). The gate says
   /// so out loud and the exam screen shows its own MOCK tile — this is never
   /// reached silently.
   final bool mock;
@@ -84,9 +84,9 @@ class HardwareReport {
   final bool settingsHint;
 
   /// True when this report comes from a platform whose on-device face detector
-  /// does not exist — the browser and the desktop targets, because Google ML Kit
-  /// ships Android and iOS implementations only (see
-  /// [platformHasFaceDetector]).
+  /// does not exist — the browser, and any native desktop target (they have no
+  /// runner any more), because Google ML Kit ships Android and iOS
+  /// implementations only (see [platformHasFaceDetector]).
   ///
   /// The camera and microphone probes are one code path on every platform, so
   /// this is the only thing that tells the gate apart: on the web [isVerified]

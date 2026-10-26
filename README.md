@@ -129,15 +129,17 @@ rather than left to be mistaken for more than it is.
   and face signals are the only things missing; the preview, the still-frame
   evidence and every browser guard are the same code path as the phone build.
 - **Android is the only *native* proctoring host.** The repository ships an
-  `android/` runner, an `ios/` scaffold, a `web/` target and `windows/` + `linux/`
-  runners. The two desktop runners build and start, but **refuse to proctor**: no
-  `camera` implementation exists for them and no desktop ML Kit does, so the device
-  check blocks the exam and names that as the reason instead of reporting a broken
-  camera it can never fix (`lib/core/services/platform_capabilities.dart`). A
-  macOS, Windows or Linux machine therefore takes part through the web build in a
-  browser, so the "no on-device AI on the web" boundary above applies there too;
-  the native desktop runners exist for UI work and `MOCK_CAMERA` sessions, and add
-  no kiosk or face-signal capability. See
+  `android/` runner, an `ios/` scaffold and a `web/` target. The `windows/` and
+  `linux/` runners have been removed: they built and started, but could **never
+  proctor** — no `camera` implementation exists for a desktop target and no
+  desktop ML Kit does, so the device check blocked the exam and named that as the
+  reason instead of reporting a broken camera it could never fix
+  (`lib/core/services/platform_capabilities.dart`). A macOS, Windows or Linux
+  machine therefore takes part through the web build in a browser, so the "no
+  on-device AI on the web" boundary above applies there too. That web console is
+  **desktop-only**: `lib/core/widgets/desktop_only_web_guard.dart` shows a
+  "desktop browser required" notice on a phone browser, and students on a phone
+  use the app. See
   [mobile/README.md → Supported platforms](./mobile/README.md#supported-platforms-and-what-proctoring-each-one-gets).
 
 **Risk register**

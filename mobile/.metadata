@@ -21,16 +21,10 @@ migration:
     - platform: ios
       create_revision: ee80f08bbf97172ec030b8751ceab557177a34a6
       base_revision: ee80f08bbf97172ec030b8751ceab557177a34a6
-    - platform: linux
-      create_revision: ee80f08bbf97172ec030b8751ceab557177a34a6
-      base_revision: ee80f08bbf97172ec030b8751ceab557177a34a6
-    - platform: macos
-      create_revision: ee80f08bbf97172ec030b8751ceab557177a34a6
-      base_revision: ee80f08bbf97172ec030b8751ceab557177a34a6
+    # The linux, macos and windows entries are gone with their runner folders:
+    # `flutter migrate` upgrades the platforms listed here, and there is no
+    # scaffolding left for it to upgrade.
     - platform: web
-      create_revision: ee80f08bbf97172ec030b8751ceab557177a34a6
-      base_revision: ee80f08bbf97172ec030b8751ceab557177a34a6
-    - platform: windows
       create_revision: ee80f08bbf97172ec030b8751ceab557177a34a6
       base_revision: ee80f08bbf97172ec030b8751ceab557177a34a6
 

@@ -5,15 +5,14 @@ import 'package:proctorguard/core/services/hardware_verification_service.dart';
 import 'package:proctorguard/core/services/permission_service.dart';
 import 'package:proctorguard/core/services/platform_capabilities.dart';
 
-/// The two questions the Windows, Linux and iOS runners turned from `kIsWeb`
-/// checks into facts about the platform.
+/// The two questions a single `kIsWeb` check used to answer in one breath.
 ///
-/// Before the desktop targets existed, "not the web" was the same answer as "has
-/// a camera and a face detector", so a single `kIsWeb` test was correct wherever
-/// it appeared. It is not any more: `camera` implements android, ios and the
-/// browser, ML Kit implements android and ios, and the desktop runners have
-/// neither. These tests pin the two apart so a future `!kIsWeb` shortcut cannot
-/// quietly come back.
+/// "Not the web" was the same answer as "has a camera and a face detector", so a
+/// `kIsWeb` test was correct wherever it appeared. It is not any more: `camera`
+/// implements android, ios and the browser, ML Kit implements android and ios
+/// only, and the desktop `TargetPlatform`s have neither (their runners are gone
+/// from the workspace, but the answer still has to be right for them). These
+/// tests pin the two apart so a `!kIsWeb` shortcut cannot quietly come back.
 void main() {
   group('the camera plugin exists on mobile and in the browser', () {
     test('android and ios can open a camera', () {

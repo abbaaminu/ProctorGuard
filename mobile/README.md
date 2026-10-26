@@ -175,7 +175,7 @@ all — the chip then reads `Audio off`, and the exam is otherwise unaffected.
 simulated `no_face` → `looking_away` → `no_face` … gaze deviation every 12
 seconds (`-Mock` is the flag; `-MockCamera` is kept as an alias).
 That walks the **real** escalation ladder (3 strikes → auto-disqualification →
-forced exit) against your Supabase project, so emulators, desktop targets and CI
+forced exit) against your Supabase project, so emulators, browsers and CI
 runners can exercise the overlay, the log rows and the supervisor's live feed
 without a physical camera. Simulated violations carry no snapshot (there is
 nothing to capture). Tune the cadence with the service's `mockInterval`.
@@ -196,7 +196,7 @@ flush — without a camera.
 `WebGuards` (`lib/core/services/web_guards.dart`) is the browser counterpart of
 the Android lock task, created through a **conditional import**: the DOM code
 (`web_guards_web.dart`, `package:web` + `dart:js_interop`, Wasm-safe) only exists
-in a web build, while Android/iOS/desktop and the Dart VM that runs `flutter test`
+in a web build, while Android/iOS and the Dart VM that runs `flutter test`
 get `UnsupportedWebGuards` — `isSupported == false`, silent.
 
 What it listens to, and what each event becomes:
@@ -918,48 +918,68 @@ retry/leave actions.
 ## Supported platforms (and what proctoring each one gets)
 
 Only the runner folders that actually exist under `mobile/` are targets:
-`android/`, `ios/`, `web/`, `windows/` and `linux/`. **Android is the shipped
-one** — `build_apk.ps1` and `.github/workflows/sync_release.yml` publish the
-signed, split-per-ABI APKs students install. iOS is scaffolded and compiled in CI
-but not signed ([`ios/README.md`](ios/README.md)); the two desktop runners build,
-and refuse to proctor (below).
+`android/`, `ios/` and `web/`. **Android is the shipped one** — `build_apk.ps1`
+and `.github/workflows/sync_release.yml` publish the signed, split-per-ABI APKs
+students install. iOS is scaffolded and compiled in CI but not signed
+([`ios/README.md`](ios/README.md)).
+
+The native desktop scaffolds (`windows/`, `linux/`, and a `macos/` that was never
+generated) are **gone**. They built and started, but they could never proctor:
+`camera` implements android, ios and the browser only, and ML Kit has no desktop
+implementation at all, so they were a second, unshippable copy of the UI to keep
+compiling. A desktop machine takes part the way every non-Android host does —
+through the web build, in a browser.
 
 | Host | Builds | Face signals | Mic level | Screen lockdown |
 | --- | --- | --- | --- | --- |
 | Android (phone) | `flutter build apk` | ML Kit, on-device | `record` | Lock task / screen pinning + immersive chrome |
 | iOS | `flutter build ios` — scaffolded, unsigned in CI; what is still owed is in [`ios/README.md`](ios/README.md) | ML Kit, on-device | `record` | Best-effort only (`startLock` reports `granted: false`) |
 | Web (Chrome/Edge) | `flutter build web` | `web/proctor_face_detector.js`, shipped with the app: camera presence, blank/covered-frame and face-count checks ([below](#face-signals-on-the-web-the-host-page-bridge)); a host page may add its own detections through the same `proctorGuardFaceSignal` bridge | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
-| Windows / Linux (native) | `flutter build windows` / `flutter build linux` | **none — the exam refuses to start** (see below) | `record`, levels only | none |
-| macOS | — | — | — | — |
+| Web (phone/tablet) | the same `flutter build web`, but the app does not render — see [below](#the-web-build-is-desktop-only) | — | — | — |
 
-**The `windows/` and `linux/` runners are scaffolding, and the exam surface says
-so.** They exist so the app is a first-class target — a native build that starts,
-a place to run the UI without an emulator — not because desktop proctoring is
-supported: `camera` implements android, ios and the browser only, and ML Kit has no
-desktop implementation at all. That is what
-`lib/core/services/platform_capabilities.dart` answers, via
-`platformHasCamera()` / `platformHasFaceDetector()` — the two questions a single
-`kIsWeb` test used to answer while the browser was the only non-ML-Kit target. On a
-desktop build both are false, so:
+### The web build is desktop-only
 
-* the hardware gate blocks the session with "the camera cannot be opened on this
-  platform — ProctorGuard proctors exams on a phone or tablet" instead of reaching
-  `availableCameras()`, which throws `UnimplementedError` there, and then offering a
-  **Try again** that can never succeed;
-* `ExamTakingPage` refuses at bootstrap with the same reason for the paths that skip
-  the gate;
-* the report is marked `faceDetectionInactive`, the same note the web gets, so
-  nothing claims on-device AI that is not there;
-* `MOCK_CAMERA=true` still runs the entire exam screen, so a desktop build stays a
-  usable development harness — which is the reason to have these targets at all.
+`lib/core/widgets/desktop_only_web_guard.dart` wraps the whole app in
+`main.dart`. On a phone browser it renders a **"desktop browser required"**
+notice instead of the app: the web build is the administrative console — the
+screens a lecturer or an administrator uses on a laptop — and a phone cannot use
+it. Either of two signals blocks the visit:
 
-A desktop machine *takes part* as a **browser host** — the `web` target above, sized
-for a wide window by `ResponsiveLayout` — and that is the only desktop proctoring
-path that exists: the browser has a real camera and its own face signals, while a
-native desktop build has neither a camera plugin nor a detector. **macOS has no
-runner** for that reason and one more: it is the weakest of the three lockdown
-surfaces, and nothing in this repository needs it yet. Adding one is a new target
-with its own privacy and security review.
+* `navigator.userAgent` contains `iphone`, `ipad`, `android` or `mobile`, read
+  through a **conditional import** — `package:web` and `dart:js_interop` do not
+  exist off the web, and importing them directly would break the Android and iOS
+  builds;
+* the viewport is narrower than **768 px**, which catches what the agent hides:
+  an iPad in "desktop" mode (it reports a Macintosh UA) and a desktop window
+  dragged narrow. The width is re-read on resize (`MediaQuery.fromView`), so the
+  notice comes and goes with the window.
+
+Android and iOS pass straight through — they *are* the student app — at the cost
+of one `kIsWeb` check. The notice itself names the way forward: open the console
+on a computer, or sit the exam in the app.
+
+### What a platform can actually do
+
+`lib/core/services/platform_capabilities.dart` answers the two questions a
+single `kIsWeb` test used to answer in one breath, via `platformHasCamera()` /
+`platformHasFaceDetector()`. The browser is why they are separate: a browser
+camera is real (`camera_web`) while nothing there can pick a face out of the
+frames, because ML Kit is Android and iOS only. So on the web:
+
+* the report is marked `faceDetectionInactive`, and the exam screen says so
+  before the exam starts rather than a proctoring report admitting it afterwards
+  — the camera keeps recording, and the review is a person's, in full;
+* the host page's own detector can still add face signals through the
+  `proctorGuardFaceSignal` bridge
+  ([below](#face-signals-on-the-web-the-host-page-bridge)), which is how a
+  browser session gets automated face evidence at all;
+* `MOCK_CAMERA=true` still runs the entire exam screen, so the web build is a
+  complete development harness without a webcam.
+
+The two functions keep answering for the desktop `TargetPlatform`s — `false` for
+both — and the hardware gate keeps its "the camera cannot be opened on this
+platform — ProctorGuard proctors exams on a phone or tablet" branch for them, so
+a target added later starts from the truth instead of discovering it on a device.
 
 ### Face signals on the web (the host-page bridge)
 
@@ -1494,13 +1514,12 @@ it the SDK is installed and every report is blocked by the browser.
 phone can still sit an exam (9.x declares 21). The constraint and the reason are
 in `pubspec.yaml`; moving to 10.x is a decision to drop those devices.
 
-On Windows and Linux the plugin is a thin CMake target around Sentry's
-`sentry-native` crash handler, which its `CMakeLists.txt` fetches from GitHub the
-first time a desktop build is configured. So a desktop build now needs network
-access on top of MSVC/GTK — and, with no DSN, the plugin is registered but never
-initialised, so the desktop runners still do nothing with it. The scaffolded
-desktop targets are not built in CI, which is why this is written down here
-rather than discovered on a build machine.
+The plugin also ships Windows and Linux CMake targets around Sentry's
+`sentry-native` crash handler. They no longer matter here: the native desktop
+runners were removed
+([above](#supported-platforms-and-what-proctoring-each-one-gets)), so only the
+Android, iOS and web halves of the plugin are ever built — no build machine needs
+MSVC, GTK or a GitHub fetch of `sentry-native`.
 
 ## Release builds (signing, shrinking, ABIs)
 

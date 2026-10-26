@@ -2,13 +2,14 @@
 /// the platform it is running on.
 ///
 /// These are facts about the *plugin ecosystem*, not about the device, and they
-/// are deliberately not `kIsWeb` checks. The app now has runners for Android,
-/// iOS, the browser, Windows and Linux, so "not the web" stopped meaning "has a
+/// are deliberately not `kIsWeb` checks. "Not the web" does not mean "has a
 /// camera and a face detector": `camera` ships federated implementations for
 /// android, ios and the browser only, and `google_mlkit_face_detection` ships
 /// none for the browser or any desktop. Asking the two questions separately is
-/// what lets a Windows or Linux build say the true thing instead of reporting a
-/// device fault it can never fix.
+/// what lets the browser report the true thing — a real camera, no on-device
+/// detector — instead of a device fault it can never fix, and it is why the
+/// desktop rows below still have an answer even though those runners have been
+/// removed from the workspace.
 ///
 /// | target                    | [platformHasCamera] | [platformHasFaceDetector] |
 /// |---------------------------|---------------------|---------------------------|

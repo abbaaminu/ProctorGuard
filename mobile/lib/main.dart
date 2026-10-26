@@ -8,6 +8,7 @@ import 'core/services/lockdown_bootstrap.dart';
 import 'core/services/permission_service.dart';
 import 'core/services/supabase_service.dart';
 import 'core/utils/proctor_log.dart';
+import 'core/widgets/desktop_only_web_guard.dart';
 import 'core/widgets/refresh_on_resume.dart';
 import 'core/widgets/setup_required_page.dart';
 import 'features/admin/data/repositories/admin_user_repository_impl.dart';
@@ -78,30 +79,35 @@ Future<void> boot() async {
   LockdownBootstrap().markAppBooted();
 
   runApp(
-    ProviderScope(
-      overrides: [
-        // Only bind the repositories when there is a backend. Otherwise the
-        // providers keep their explicit "override me" throw and the setup
-        // screen explains why, instead of some page crashing later.
-        if (client != null)
-          examRepositoryProvider.overrideWithValue(ExamRepositoryImpl(client)),
-        if (client != null)
-          profileRepositoryProvider
-              .overrideWithValue(ProfileRepositoryImpl(client)),
-        if (client != null)
-          proctoringRepositoryProvider
-              .overrideWithValue(ProctoringRepositoryImpl(client)),
-        if (client != null)
-          adminUserRepositoryProvider
-              .overrideWithValue(AdminUserRepositoryImpl(client)),
-        if (client != null)
-          dashboardRepositoryProvider
-              .overrideWithValue(DashboardRepositoryImpl(client)),
-        if (client != null)
-          questionAuthoringRepositoryProvider
-              .overrideWithValue(QuestionAuthoringRepositoryImpl(client)),
-      ],
-      child: ExamProctorApp(supabaseStatus: supabaseStatus),
+    // Outermost widget in the tree: a phone browser gets the "desktop browser
+    // required" notice instead of the app, while Android and iOS pass straight
+    // through to the `ProviderScope` below (see [DesktopOnlyWebGuard]).
+    DesktopOnlyWebGuard(
+      child: ProviderScope(
+        overrides: [
+          // Only bind the repositories when there is a backend. Otherwise the
+          // providers keep their explicit "override me" throw and the setup
+          // screen explains why, instead of some page crashing later.
+          if (client != null)
+            examRepositoryProvider.overrideWithValue(ExamRepositoryImpl(client)),
+          if (client != null)
+            profileRepositoryProvider
+                .overrideWithValue(ProfileRepositoryImpl(client)),
+          if (client != null)
+            proctoringRepositoryProvider
+                .overrideWithValue(ProctoringRepositoryImpl(client)),
+          if (client != null)
+            adminUserRepositoryProvider
+                .overrideWithValue(AdminUserRepositoryImpl(client)),
+          if (client != null)
+            dashboardRepositoryProvider
+                .overrideWithValue(DashboardRepositoryImpl(client)),
+          if (client != null)
+            questionAuthoringRepositoryProvider
+                .overrideWithValue(QuestionAuthoringRepositoryImpl(client)),
+        ],
+        child: ExamProctorApp(supabaseStatus: supabaseStatus),
+      ),
     ),
   );
 }
