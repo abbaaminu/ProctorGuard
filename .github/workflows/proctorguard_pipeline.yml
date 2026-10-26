@@ -1,88 +1,20 @@
 name: ProctorGuard Pipeline
 
-# =============================================================================
-# The single workflow this repository runs.
-#
-# It replaces the four files that used to sit beside it - `flutter_ci.yml`,
-# `supabase_functions_ci.yml`, `ios_release.yml` and `sync_release.yml` - with
-# one run, one concurrency group and one required check per ref, and it keeps
-# every job they had:
-#
-#   job                     runner          what it proves
-#   ---------------------------------------------------------------------------
-#   analyze_and_test        ubuntu-latest   `flutter analyze` is clean and the
-#                                           whole Dart suite passes (the two
-#                                           contract tests first, named, so a
-#                                           red run says which contract broke)
-#   typecheck_supabase      ubuntu-latest   the Deno Edge Functions type-check
-#                                           (`npm run typecheck`)
-#   build_web               ubuntu-latest   `flutter build web --release`
-#                                           compiles
-#   build_android_debug     ubuntu-latest   the Gradle graph, plugin
-#                                           registration and manifest merge
-#                                           compile (unsigned: no certificate)
-#   build_ios               macos-latest    the Podfile resolves and the release
-#                                           Xcode build compiles (--no-codesign)
-#   testflight              macos-latest    a signed .ipa builds and reaches
-#                                           App Store Connect (dispatch, main
-#                                           and vX.Y.Z only, and only when the
-#                                           signing secrets exist)
-#   build_and_publish       ubuntu-latest   the signed, split-per-ABI APKs build
-#                                           and are mirrored to the release
-#                                           repository (main and vX.Y.Z only)
-#
-# `keep_alive.yml` deliberately stays a file of its own: it is a
-# `schedule`-triggered database ping, not part of a push's pipeline, and folding
-# it in would make it ping on every push.
-#
-# Triggers. `branches: ['**']` on its own would exclude tag pushes - GitHub
-# treats an undefined ref type as "never" - and `build_and_publish` ships from
-# `vX.Y.Z`, so both are named. `workflow_dispatch` is what lets a release be cut,
-# or a red run retried, without an empty commit.
-#
-# There are deliberately no `paths:` filters. The one the old iOS workflow used
-# (`mobile/**`) cannot be expressed per job inside a single `on:` block, so
-# every job runs on every push and pull request; in exchange the pipeline never
-# reports "skipped" for a pull request that merely touches `supabase/` - the
-# rule the Supabase type-check job followed before the merge, for the same
-# reason (a path-filtered workflow never reports on a pull request that does not
-# touch its paths, and a required check that never reports blocks the merge).
-# `build_ios` is therefore the expensive job here (macOS minutes): if that ever
-# matters more than the coverage, gate that one job with a job-level `if:` - do
-# not bring the four-file layout back.
-# =============================================================================
-
 on:
   push:
     branches: ['**']
-    # A release tag runs the same gates and then the publishing jobs.
     tags: ['v*']
   pull_request:
-  # Manual runs: re-run a gate, or cut a release from the current commit.
   workflow_dispatch:
 
-# Nothing here writes to this repository. The only push any job makes is
-# `build_and_publish`'s, and that one goes to the *release* repository with
-# `RELEASE_PAT` - a push a `contents: read` token could not make.
 permissions:
   contents: read
 
-# A newer push to the same ref supersedes a run still in flight, so a burst of
-# commits does not queue up stale analysis or stale builds. `build_and_publish`
-# carries a second, job-level group (`release-sync`) on top of this one, because
-# a branch push and a tag push on the same commit must not race to publish two
-# different trees to the same mirror.
 concurrency:
   group: proctorguard-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
-  # ---------------------------------------------------------------------
-  # Dart: static analysis, the named contract tests, then the whole suite.
-  # ---------------------------------------------------------------------
-  # The required gate for the app. Everything lives under `mobile/`; the
-  # contract tests reach out to `../supabase` and `android/`, both of which the
-  # checkout provides.
   analyze_and_test:
     name: analyze + contract tests + suite
     runs-on: ubuntu-latest
@@ -102,13 +34,9 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      # `flutter analyze` is the lint gate; it must stay at zero issues.
       - name: Analyze
         run: flutter analyze
 
-      # The contract tests pin the client<->database and client<->Android wiring
-      # against `supabase/schema.sql`, the migrations and the Android manifests.
-      # They are named explicitly so the gate says which contract broke.
       - name: Contract tests (schema + Android manifest)
         run: >
           flutter test
@@ -118,24 +46,6 @@ jobs:
       - name: Full test suite
         run: flutter test
 
-  # ---------------------------------------------------------------------
-  # Edge Functions: Deno types, no deployment.
-  # ---------------------------------------------------------------------
-  # The Edge Functions are Deno, so `flutter test` never sees them and
-  # `build_and_publish` only bundles them at the very end. `npm run typecheck`
-  # (`supabase/functions`) is the one gate that catches a mis-resolved import or
-  # an argument-name drift *before* `supabase functions deploy` decides the
-  # answer on a live project. It needs no Supabase project, no secrets and no
-  # service-role key - only npm and the checked-in `package-lock.json`.
-  #
-  # It is also what keeps the functions on the `npm:` specifiers:
-  # `admin-reset-password` used to import `https://esm.sh/@supabase/supabase-js@2`,
-  # which Deno resolves at runtime but has no declaration for the TypeScript
-  # checker (TS2307), so a checkout failed `npm run typecheck` while `deploy` was
-  # happy. `npm-imports.d.ts` declares the `npm:` form for exactly this reason.
-  #
-  # No `needs:`: TypeScript cannot break a Dart build and a Dart change cannot
-  # break `tsc`, so this reports on its own as soon as it can.
   typecheck_supabase:
     name: tsc (Deno types, no deployment)
     runs-on: ubuntu-latest
@@ -156,34 +66,9 @@ jobs:
       - name: Install dev dependencies
         run: npm ci
 
-      # Zero errors is the gate; `tsc` exits non-zero on the first TS2307/TS2345
-      # it finds, and nothing is deployed or uploaded from here.
       - name: Type-check the Edge Functions
         run: npm run typecheck
 
-  # Analysis and tests run against the Dart source; neither proves the release
-  # *build pipelines* compile - a Gradle/AGP bump or a plugin that only resolves
-  # under the release toolchain would stay green above and break on the tag.
-  # `build_and_publish` does build the signed, split-per-ABI release APKs, but
-  # only after a push to `main` or a `vX.Y.Z` tag, which is too late to catch a
-  # pull request.
-  #
-  # These jobs compile the shipped targets on every branch push and pull
-  # request, each on a fresh runner to keep their build outputs isolated, and
-  # each `needs: analyze_and_test` so that runner is not spent on a commit that
-  # does not even analyze. They do *not* wait for one another: a broken Gradle
-  # file and a broken Podfile are independent failures, and both should be
-  # reported by the same run.
-  # Web deliberately uses `--release` (which needs no certificate); Android
-  # uses `--debug` because a release APK has to be signed, and the keystore lives
-  # in repository secrets that are not exposed to pull requests (and never to a
-  # fork). A debug APK exercises the same Gradle graph, plugin registration and
-  # manifest merge without needing a certificate - the *signing* half is what
-  # `build_and_publish` covers, and `android/gradle.properties` keeps the R8
-  # shrink for that job alone.
-  #
-  # Placeholder `--dart-define`s: a build with `SUPABASE_URL=""` still compiles,
-  # but passing the real names is what proves the flags are still recognised.
   build_web:
     name: build (web release)
     needs: analyze_and_test
@@ -228,9 +113,6 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v7
 
-      # `android/app/build.gradle.kts` pins source/target compatibility and
-      # `jvmTarget` to 17 and the wrapper runs Gradle 9.1, so the JDK is pinned
-      # here exactly as `build_and_publish` pins it.
       - name: Set up Java 17
         uses: actions/setup-java@v6
         with:
@@ -252,607 +134,30 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      # Nothing here is uploaded and no secret is read: this is a compile gate,
-      # not a publish step.
       - name: Build Android (debug)
         run: >-
           flutter build apk --debug
           --dart-define=SUPABASE_URL=https://ci.invalid
           --dart-define=SUPABASE_PUBLISHABLE_KEY=ci-placeholder
 
-  # ---------------------------------------------------------------------
-  # iOS: the compile gate no Linux runner can provide.
-  # ---------------------------------------------------------------------
-  # Nothing above can catch an iOS-only failure: a Podfile that no longer
-  # resolves, a plugin whose podspec pins a minimum iOS version above the
-  # deployment target, a Swift compile error in the app's own AppDelegate, or
-  # `camera_avfoundation` dropping an API the face pipeline calls. Those used to
-  # be found only by opening Xcode - the one thing CI cannot do from a pull
-  # request.
-  build_ios:
-    name: build (iOS release, unsigned)
-    # The Dart gate runs first - macOS minutes are the most expensive thing in
-    # this file, and a commit that does not analyze is not worth spending them
-    # on - but this job does not wait for the Linux builds: a broken Podfile and
-    # a broken Gradle file are independent failures and should be reported
-    # together.
-    needs: analyze_and_test
-    # Pinned to the newest macOS image rather than a version: Xcode is a system
-    # dependency of the iOS toolchain, and this job's value is proving the project
-    # compiles with a current Xcode. If a toolchain bump ever breaks the build, the
-    # pinned image can be restored here without touching anything else.
-    runs-on: macos-latest
-    timeout-minutes: 45
-    defaults:
-      run:
-        working-directory: mobile
-    steps:
-      - name: Check out the repository
-        uses: actions/checkout@v7
-
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2.23.0
-        with:
-          channel: stable
-          cache: true
-
-      # Printed before anything is built, so a red run says which versions it was
-      # red on: a failure that only happens on one Xcode is otherwise a guessing
-      # game played against a runner image that has already been replaced.
-      - name: Show toolchain versions
-        run: |
-          flutter --version
-          xcodebuild -version
-
-      - name: Install dependencies
-        run: flutter pub get
-
-      # The runner image ships CocoaPods, but its version moves with the image; the
-      # fallback keeps a podspec that needs a newer one from failing the job with
-      # "Podfile.lock was generated with a newer CocoaPods" and no other clue.
-      - name: Set up CocoaPods
-        run: |
-          ruby --version
-          pod --version || sudo gem install cocoapods --no-document
-
-      # Run explicitly rather than leaving it to `flutter build ios`: when the
-      # resolution fails, this is the step that says so, and it says so about the
-      # pods instead of about "Running Xcode build".
-      - name: Resolve pods
-        working-directory: mobile/ios
-        run: pod install --repo-update
-
-      # `--no-codesign` because no certificate is read here (none is exposed to
-      # pull requests, and never to a fork): this is a compile gate, not a publish
-      # step. Everything else is the release configuration, so the pod graph, the
-      # Swift/ObjC compile, the asset catalogue and the plugin registration are the
-      # ones a signed build uses.
-      - name: Build iOS (release, unsigned)
-        run: >-
-          flutter build ios --release --no-codesign
-          --dart-define=SUPABASE_URL=https://ci.invalid
-          --dart-define=SUPABASE_PUBLISHABLE_KEY=ci-placeholder
-
-  # ---------------------------------------------------------------------
-  # TestFlight
-  # ---------------------------------------------------------------------
-  # The compile gate above proves the project builds *unsigned*. This job is the
-  # one that ships: it signs with a distribution certificate, produces an .ipa
-  # for the App Store and uploads it to TestFlight through App Store Connect.
-  #
-  # It is a separate job, and deliberately gated:
-  #
-  #   * Only on a manual dispatch, a push to `main`, or a `vX.Y.Z` tag. A pull
-  #     request - in particular one from a fork - never reaches the signing
-  #     material (which GitHub does not expose there anyway).
-  #   * With no credentials configured, a push stays green and says so in a
-  #     notice: merging this file must not turn a repository red before its
-  #     owner has created an App Store Connect API key. A *manual* dispatch
-  #     fails instead, because somebody asked for a build and silently skipping
-  #     it is the wrong answer to that.
-  #
-  # Required repository secrets (listed in `mobile/ios/README.md` too):
-  #
-  #   APPLE_TEAM_ID                         10-character Apple team id
-  #   IOS_DISTRIBUTION_CERTIFICATE_BASE64   .p12, base64 (`base64 -i cert.p12`)
-  #   IOS_DISTRIBUTION_CERTIFICATE_PASSWORD the password chosen when exporting it
-  #   APP_STORE_CONNECT_KEY_ID              App Store Connect API key id
-  #   APP_STORE_CONNECT_ISSUER_ID           that key's issuer UUID
-  #   APP_STORE_CONNECT_PRIVATE_KEY         the AuthKey_XXXXXXXXXX.p8 contents
-  #
-  # Recommended, and what makes signing deterministic:
-  #
-  #   IOS_PROVISIONING_PROFILE_BASE64       App Store .mobileprovision, base64
-  #   IOS_PROVISIONING_PROFILE_NAME         its name, as Xcode lists it
-  #
-  # The app's own configuration, compiled in:
-  #
-  #   SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY (or the legacy SUPABASE_ANON_KEY)
-  #   SENTRY_DSN, optional - crash reporting stays off without it
-  #
-  # No Apple ID password and no 2FA code: both the build and the upload
-  # authenticate with the API key.
-  testflight:
-    name: testflight (signed archive + App Store Connect upload)
-    needs: build_ios
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' &&
-       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
-    runs-on: macos-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    defaults:
-      run:
-        working-directory: mobile
-    env:
-      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      CERTIFICATE_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}
-      CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
-      PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
-      PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}
-      ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-      ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-      ASC_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
-      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
-      RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
-      RELEASE_REPOSITORY: abbaaminu/proctorguard-release
-    steps:
-      - name: Check out the repository
-        uses: actions/checkout@v7
-
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2.23.0
-        with:
-          channel: stable
-          cache: true
-
-      - name: Show toolchain versions
-        run: |
-          flutter --version
-          xcodebuild -version
-
-      - name: Install dependencies
-        run: flutter pub get
-
-      - name: Set up CocoaPods
-        run: |
-          ruby --version
-          pod --version || sudo gem install cocoapods --no-document
-
-      - name: Resolve pods
-        working-directory: ${{ github.workspace }}/mobile/ios
-        run: pod install --repo-update
-
-
-      # One place decides whether this run can sign at all. Everything that
-      # needs a certificate is gated on `available`, so a repository without
-      # these six secrets runs the compile gate and nothing else.
-      - name: Check the TestFlight credentials
-        id: credentials
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          set -euo pipefail
-
-          missing=''
-          for name in TEAM_ID CERTIFICATE_BASE64 CERTIFICATE_PASSWORD \
-                      ASC_KEY_ID ASC_ISSUER_ID ASC_PRIVATE_KEY; do
-            [ -n "${!name:-}" ] || missing="$missing $name"
-          done
-
-          if [ -z "$missing" ]; then
-            echo 'available=true' >> "$GITHUB_OUTPUT"
-            echo '::notice::TestFlight credentials are configured; this run will sign and upload.'
-          else
-            echo 'available=false' >> "$GITHUB_OUTPUT"
-            if [ "$EVENT_NAME" = 'workflow_dispatch' ]; then
-              echo "::error::Missing TestFlight secrets:$missing. See mobile/ios/README.md."
-              exit 1
-            fi
-            echo "::notice::Skipping TestFlight: no signing credentials configured (missing:$missing)."
-          fi
-
-      # A placeholder URL would ship as an app that boots and then cannot reach
-      # any backend, which TestFlight would then hand to testers. Same rules as
-      # `build_and_publish`, trimmed to what this job compiles in.
-      - name: Check the Supabase secrets before they are compiled in
-        if: steps.credentials.outputs.available == 'true'
-        run: |
-          set -euo pipefail
-
-          url="${SUPABASE_URL:-}"
-          key="${SUPABASE_PUBLISHABLE_KEY:-}"
-          [ -n "$key" ] || key="${SUPABASE_ANON_KEY:-}"
-
-          placeholders='your-url|your_url|yourkey|your-key|your-anon-key|your-publishable-key|your-project|replace-me|replace_me|changeme|change-me'
-          if [ -z "$url" ] || [[ "${url,,}" =~ $placeholders ]]; then
-            echo '::error::SUPABASE_URL secret is unset or still a placeholder.'
-            exit 1
-          fi
-          case "$url" in
-            http://*|https://*) ;;
-            *) echo "::error::SUPABASE_URL must start with http:// or https:// (got '$url')."; exit 1 ;;
-          esac
-          if [ -z "$key" ]; then
-            echo '::error::SUPABASE_PUBLISHABLE_KEY (or SUPABASE_ANON_KEY) is unset.'
-            exit 1
-          fi
-          case "$key" in
-            sb_secret_*)
-              echo '::error::That is a *secret* key. A client build must use the publishable/anon key.'
-              exit 1
-              ;;
-          esac
-
-          {
-            echo "SUPABASE_URL=${url%/}"
-            echo "SUPABASE_PUBLISHABLE_KEY=$key"
-          } >> "$GITHUB_ENV"
-
-      # A temporary keychain, not the runner's login keychain: it is created,
-      # used for this build and deleted in the `always()` step at the end, so
-      # nothing signing-related outlives the job.
-      - name: Import the distribution certificate
-        if: steps.credentials.outputs.available == 'true'
-        run: |
-          set -euo pipefail
-
-          keychain="$RUNNER_TEMP/proctorguard-signing.keychain-db"
-          keychain_password="$(uuidgen)"
-
-          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/distribution.p12"
-          security create-keychain -p "$keychain_password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$keychain_password" "$keychain"
-          security import "$RUNNER_TEMP/distribution.p12" \
-            -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          # Without this, codesign is denied the private key on a headless
-          # runner: it is a keychain prompt nobody is there to answer.
-          security set-key-partition-list -S apple-tool:,apple: \
-            -s -k "$keychain_password" "$keychain"
-          security list-keychains -d user -s "$keychain"
-          security default-keychain -s "$keychain"
-          rm -f "$RUNNER_TEMP/distribution.p12"
-          security find-identity -v -p codesigning "$keychain"
-
-
-      - name: Install the provisioning profile
-        if: >-
-          steps.credentials.outputs.available == 'true' &&
-          env.PROFILE_BASE64 != ''
-        run: |
-          set -euo pipefail
-
-          if [ -z "${PROFILE_NAME:-}" ]; then
-            echo '::error::IOS_PROVISIONING_PROFILE_BASE64 is set but IOS_PROVISIONING_PROFILE_NAME is not, so there is no name to select the profile by.'
-            exit 1
-          fi
-
-          profiles="$HOME/Library/MobileDevice/Provisioning Profiles"
-          mkdir -p "$profiles"
-          printf '%s' "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
-          cp "$RUNNER_TEMP/profile.mobileprovision" "$profiles/$PROFILE_NAME.mobileprovision"
-          rm -f "$RUNNER_TEMP/profile.mobileprovision"
-
-          # Says out loud that the file is the profile it claims to be, and for
-          # which bundle id: a profile for another app signs an archive that
-          # then fails to install with no useful message.
-          security cms -D -i "$profiles/$PROFILE_NAME.mobileprovision" > "$RUNNER_TEMP/profile.plist"
-          plutil -extract Name raw -o - "$RUNNER_TEMP/profile.plist" | sed 's/^/profile name: /'
-          plutil -extract Entitlements.application-identifier raw -o - "$RUNNER_TEMP/profile.plist" \
-            | sed 's/^/profile app id: /'
-
-      # Signing settings are set here rather than committed: a team id in the
-      # repository is a team id in every fork, and `PRODUCT_BUNDLE_IDENTIFIER`
-      # stays the one line that names the app.
-      - name: Configure signing for this build
-        if: steps.credentials.outputs.available == 'true'
-        run: |
-          set -euo pipefail
-
-          project='ios/Runner.xcodeproj/project.pbxproj'
-
-          perl -0pi -e "s/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Automatic;\n\t\t\t\tDEVELOPMENT_TEAM = ${TEAM_ID};/g" "$project"
-
-          if [ -n "${PROFILE_NAME:-}" ]; then
-            # Manual, deterministic signing: an App Store profile that is
-            # already on this machine, rather than one Xcode would have to ask
-            # Apple for - which a headless runner cannot authenticate.
-            perl -0pi -e 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' "$project"
-            perl -0pi -e "s/DEVELOPMENT_TEAM = ${TEAM_ID};/DEVELOPMENT_TEAM = ${TEAM_ID};\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = \"${PROFILE_NAME}\";/g" "$project"
-          fi
-
-          grep -c 'DEVELOPMENT_TEAM = ' "$project" | sed 's/^/configurations with a team: /'
-          git --no-pager diff --stat -- "$project"
-
-      # Only when a profile was supplied: without one, `flutter build ipa` can
-      # generate the plist itself from automatic signing (and, on a runner with
-      # no portal credentials, may well fail at that point - which is why the
-      # profile secrets are the recommended path).
-      - name: Write ExportOptions.plist
-        if: >-
-          steps.credentials.outputs.available == 'true' &&
-          env.PROFILE_NAME != ''
-        run: |
-          set -euo pipefail
-
-          bundle_id="$(awk '/PRODUCT_BUNDLE_IDENTIFIER = / && !/RunnerTests/ {
-              sub(/.*PRODUCT_BUNDLE_IDENTIFIER = /, ""); sub(/;.*/, ""); gsub(/"/, "");
-              print; exit
-            }' ios/Runner.xcodeproj/project.pbxproj)"
-          echo "bundle id: $bundle_id"
-          if [ -z "$bundle_id" ]; then
-            echo '::error::Could not read PRODUCT_BUNDLE_IDENTIFIER from ios/Runner.xcodeproj/project.pbxproj.'
-            exit 1
-          fi
-
-          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>app-store-connect</string>
-            <key>teamID</key>
-            <string>${TEAM_ID}</string>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>${bundle_id}</key>
-              <string>${PROFILE_NAME}</string>
-            </dict>
-            <key>uploadSymbols</key>
-            <true/>
-            <key>stripSwiftSymbols</key>
-            <true/>
-            <key>destination</key>
-            <string>export</string>
-          </dict>
-          </plist>
-          PLIST
-
-          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
-
-
-      # `--build-number` is the workflow run number: TestFlight rejects a second
-      # upload of the same version+build, and the repository's version is a
-      # hand-edited `1.0.0`, so a fixed build number would accept exactly one
-      # upload ever. The marketing version stays in `pubspec.yaml`.
-      - name: Build the signed IPA
-        if: steps.credentials.outputs.available == 'true'
-        run: |
-          set -euo pipefail
-
-          sentry_define=''
-          if [ -n "${SENTRY_DSN:-}" ]; then
-            sentry_define="--dart-define=SENTRY_DSN=${SENTRY_DSN}"
-          fi
-
-          common=(
-            --release
-            --build-number "${GITHUB_RUN_NUMBER}"
-            --dart-define=SUPABASE_URL="${SUPABASE_URL}"
-            --dart-define=SUPABASE_PUBLISHABLE_KEY="${SUPABASE_PUBLISHABLE_KEY}"
-          )
-
-          # `--export-options-plist` and `--export-method` are mutually
-          # exclusive in `flutter build ipa`; the plist is the manual-signing
-          # path, the flag lets Flutter generate one for automatic signing.
-          if [ -n "${PROFILE_NAME:-}" ]; then
-            flutter build ipa "${common[@]}" $sentry_define \
-              --export-options-plist="$RUNNER_TEMP/ExportOptions.plist"
-          else
-            flutter build ipa "${common[@]}" $sentry_define --export-method app-store
-          fi
-
-          ls -l build/ios/ipa
-
-      - name: Upload to TestFlight
-        if: steps.credentials.outputs.available == 'true'
-        run: |
-          set -euo pipefail
-
-          ipa="$(ls build/ios/ipa/*.ipa 2>/dev/null | head -1 || true)"
-          if [ -z "$ipa" ] || [ ! -f "$ipa" ]; then
-            echo '::error::No .ipa in build/ios/ipa - the export step did not produce one.'
-            exit 1
-          fi
-          echo "uploading: $ipa"
-
-          # altool looks the key up by name in this directory; the API key is
-          # the reason no Apple ID password or 2FA code is needed here.
-          key_dir="$HOME/.appstoreconnect/private_keys"
-          mkdir -p "$key_dir"
-          printf '%s\n' "$ASC_PRIVATE_KEY" > "$key_dir/AuthKey_${ASC_KEY_ID}.p8"
-          chmod 600 "$key_dir/AuthKey_${ASC_KEY_ID}.p8"
-
-          # `altool` is deprecated in favour of the Transporter app, but it is
-          # what a macOS runner image ships, and the App Store Connect API key
-          # path is the one Apple replaced interactive login with.
-          xcrun altool --upload-app \
-            --type ios \
-            --file "$ipa" \
-            --apiKey "$ASC_KEY_ID" \
-            --apiIssuer "$ASC_ISSUER_ID"
-
-          rm -f "$key_dir/AuthKey_${ASC_KEY_ID}.p8"
-          echo '::notice::Uploaded to App Store Connect. TestFlight processing usually takes 5-15 minutes.'
-
-
-      - name: Mirror iOS IPA to Release Repository
-        if: steps.credentials.outputs.available == 'true'
-        run: |
-          set -euo pipefail
-
-          if [ -z "${RELEASE_PAT:-}" ]; then
-            echo "::error::RELEASE_PAT secret is missing."
-            exit 1
-          fi
-
-          ipa_path="$(ls build/ios/ipa/*.ipa 2>/dev/null | head -1 || true)"
-          if [ -z "$ipa_path" ] || [ ! -f "$ipa_path" ]; then
-            echo "::error::No .ipa file found to mirror."
-            exit 1
-          fi   # <-- Ensure this is 'fi', not '}'
-
-          remote="https://x-access-token:${RELEASE_PAT}@github.com/${RELEASE_REPOSITORY}.git"
-          temp_dir="$RUNNER_TEMP/release-repo-ios"
-          rm -rf "$temp_dir"
-
-          set +e
-          git ls-remote --exit-code --heads "$remote" > /dev/null 2>&1
-          probe=$?
-          set -e
-
-          case "$probe" in
-            0)
-              git clone --quiet --depth 1 "$remote" "$temp_dir"
-              ;;
-            2)
-              git init --quiet --initial-branch=main "$temp_dir"
-              git -C "$temp_dir" remote add origin "$remote"
-              ;;
-            *)
-              echo "::error::Cannot reach $RELEASE_REPOSITORY with RELEASE_PAT."
-              exit 1
-              ;;
-          esac
-
-          mkdir -p "$temp_dir/ios"
-          cp "$ipa_path" "$temp_dir/ios/app-release.ipa"
-
-          cd "$temp_dir"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add ios/
-
-          if git diff --cached --quiet; then
-            echo "Release repository already matches this iOS build."
-            exit 0
-          fi
-
-          git commit -m "Release iOS app (build $GITHUB_RUN_NUMBER)"
-          git push origin "$(git symbolic-ref --short HEAD)"
-          echo "::notice::Successfully mirrored iOS build to https://github.com/$RELEASE_REPOSITORY"
-
-      # Always, including after a failure: the certificate and the profile do
-      # not belong to the next job that runs on this (ephemeral) runner, and a
-      # leftover keychain would confuse a re-run in the same workspace.
-      - name: Remove the signing material
-        if: always()
-        run: |
-          set -euo pipefail
-
-          keychain="$RUNNER_TEMP/proctorguard-signing.keychain-db"
-          if [ -f "$keychain" ]; then
-            security delete-keychain "$keychain" || true
-          fi
-
-          rm -f "$RUNNER_TEMP/ExportOptions.plist" "$RUNNER_TEMP/profile.plist"
-          rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8" 2>/dev/null || true
-
-          if [ -n "${PROFILE_NAME:-}" ]; then
-            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_NAME.mobileprovision" || true
-          fi
-
-# =============================================================================
-# Builds the student app in release mode and mirrors *only* its installable
-# output into the separate distribution repository:
-#
-#     https://github.com/abbaaminu/proctorguard-release
-#
-# What crosses that boundary: the three split-per-ABI release APKs, their SHA-256
-# checksums (`apk/SHA256SUMS.txt`), a machine-readable `latest.json` (version,
-# build number, commit, checksums) and a generated `README.md` for whoever
-# downloads the app. Nothing else - no Dart, no SQL, no `android/`, no keystore,
-# and no R8 `mapping.txt` (that one stays in this private repository, see the
-# upload step; it is both the only way to read a crash report from a student's
-# phone *and* a full class-name listing of a proctoring client).
-#
-# The source repository is read-only input for this workflow: `permissions:
-# contents: read` leaves the job with a GITHUB_TOKEN that cannot push, the mirror
-# is cloned into `$RUNNER_TEMP` (outside the checkout), and the only push it makes
-# is the one authenticated with `RELEASE_PAT`.
-#
-# Required secrets (Settings -> Secrets and variables -> Actions):
-#
-#   RELEASE_PAT                Fine-grained PAT with `Contents: Read and write` on
-#                              `abbaaminu/proctorguard-release` only (a classic
-#                              token needs `repo`). It clones that one repository
-#                              and pushes that one commit, nothing else.
-#   SUPABASE_URL               Project URL, compiled into the APK by --dart-define.
-#   SUPABASE_PUBLISHABLE_KEY   The PUBLIC anon/publishable key. Never service_role
-#                              and never `sb_secret_...`: a secret key in a client
-#                              build hands out full database access.
-#   ANDROID_KEYSTORE_BASE64    Base64 of the upload keystore, e.g. in PowerShell:
-#                                [Convert]::ToBase64String([IO.File]::ReadAllBytes('upload-keystore.jks'))
-#   ANDROID_KEYSTORE_PASSWORD  Its store password.
-#   ANDROID_KEY_ALIAS          Its key alias (e.g. `upload`).
-#   ANDROID_KEY_PASSWORD       That key's password.
-#
-# The four keystore secrets are not optional. `android/app/build.gradle.kts`
-# refuses to build a release signed with the *public* Android debug key - anyone
-# can forge an "upgrade" of such an APK, camera permission and kiosk pin included
-# - so a run without them stops with the keytool instructions instead of mirroring
-# an APK a student could be tricked into installing.
-#
-# Each release adds ~90 MB of APKs to the mirror (the splits are 27-35 MB each).
-# The newest build always replaces the same file names; older builds stay
-# reachable through the mirror's Git history and through this repository's private
-# artifacts (90 days).
-# =============================================================================
-
   build_and_publish:
     name: build the release APKs and mirror them
-    # A release is only cut from a commit whose gate passed. This job re-runs
-    # `flutter analyze` and `flutter test` itself (see its steps, so it still
-    # stands on its own if run by hand), and this `needs:` is what stops it
-    # starting at all when the gate is red.
     needs: analyze_and_test
     runs-on: ubuntu-latest
-    # The project's own cold `assembleRelease` took 33 minutes on a developer
-    # machine (mobile/build-smoke.log); a runner with a cold Gradle cache is slower
-    # still, so leave room instead of the 6-hour default.
     timeout-minutes: 90
-    # One sync at a time across every ref: a branch push and a tag push on the
-    # same commit must not race to publish two different trees to the same
-    # mirror. Newest build wins. This is a second, job-level group on top of the
-    # workflow-wide one, which is keyed per ref and would not otherwise stop a
-    # `main` run and a `vX.Y.Z` run from publishing at the same time.
     concurrency:
       group: release-sync
       cancel-in-progress: true
-    # A fork has no RELEASE_PAT - and must not be able to write to the mirror even
-    # if it somehow had one; and only a ref that is meant to ship publishes: a
-    # push to `main`, a `vX.Y.Z` tag, or a manual dispatch. A pull request (from
-    # this repository as much as from a fork) is a draft, not a release - and it
-    # has no signing secrets to build with anyway.
     if: >-
       github.repository == 'abbaaminu/ProctorGuard' &&
       (github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'push' &&
         (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))))
-    # Where the built APKs land, which files may cross into the mirror, and the
-    # mirror itself. Scoped to this job: no other job in the pipeline has a
-    # distribution repository to write to.
     env:
       RELEASE_REPOSITORY: abbaaminu/proctorguard-release
-      # Where `flutter build apk` leaves its output; `build_apk.ps1` reads the
-      # same directory on a developer machine.
       APK_DIR: ${{ github.workspace }}/mobile/build/app/outputs/flutter-apk
-      # R8's mapping file. Private run only - see the section header above.
       MAPPING_FILE: ${{ github.workspace }}/mobile/build/app/outputs/mapping/release/mapping.txt
-      # Staging area: its contents are exactly what lands in the mirror.
       DIST_DIR: ${{ github.workspace }}/dist
-
-    # Every Flutter/Dart command runs from `mobile/`; the publish steps below set
-    # `working-directory` explicitly because they run outside the checkout.
     defaults:
       run:
         working-directory: mobile
@@ -864,12 +169,7 @@ jobs:
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          # `android/app/build.gradle.kts` pins source/target compatibility and
-          # `jvmTarget` to 17, and the wrapper runs Gradle 9.1; pinning the JDK here
-          # keeps a runner-image update from silently changing what R8 reads.
           java-version: '17'
-          # Caches ~/.gradle: the Gradle distribution and the ML Kit / AndroidX
-          # dependencies dominate a cold release build.
           cache: gradle
 
       - name: Set up Flutter
@@ -885,19 +185,12 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      # The gate `analyze_and_test` applies to every push runs here too, so a
-      # mirrored APK is never built from a commit that would have failed CI.
-      # Delete these two steps if release runs matter more than that guarantee.
       - name: Analyze
         run: flutter analyze
 
       - name: Test
         run: flutter test
 
-      # Both values are compiled into the APK (`SupabaseConfig.fromEnvironment`), so
-      # they have to be right *before* the build: a placeholder URL would otherwise
-      # ship as an app that boots and then cannot reach any backend. The rules mirror
-      # `mobile/supabase_defines.ps1`.
       - name: Check the Supabase secrets before they are compiled in
         working-directory: ${{ github.workspace }}
         env:
@@ -906,48 +199,33 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
           set -euo pipefail
-
-          # `SUPABASE_ANON_KEY` is still accepted as the older name, exactly as the
-          # app falls back to it.
           url="${SUPABASE_URL:-}"
           key="${SUPABASE_PUBLISHABLE_KEY:-}"
           [ -n "$key" ] || key="${SUPABASE_ANON_KEY:-}"
-
           placeholders='your-url|your_url|yourkey|your-key|your-anon-key|your-publishable-key|your-project|replace-me|replace_me|changeme|change-me'
           if [ -z "$url" ] || [[ "${url,,}" =~ $placeholders ]]; then
-            echo "::error::SUPABASE_URL secret is unset or still a placeholder. Set it to https://<project-ref>.supabase.co."
+            echo "::error::SUPABASE_URL secret is unset or still a placeholder."
             exit 1
           fi
           case "$url" in
             http://*|https://*) ;;
             *) echo "::error::SUPABASE_URL must start with http:// or https:// (got '$url')."; exit 1 ;;
           esac
-
           if [ -z "$key" ]; then
-            echo "::error::SUPABASE_PUBLISHABLE_KEY secret is unset. Use the public anon/publishable key, never the service_role key."
+            echo "::error::SUPABASE_PUBLISHABLE_KEY secret is unset."
             exit 1
-          fi
-          if [ "${#key}" -lt 20 ]; then
-            echo "::warning::The Supabase key is only ${#key} characters - double-check that the secret holds the whole value."
           fi
           case "$key" in
             sb_secret_*)
-              echo "::error::SUPABASE_PUBLISHABLE_KEY looks like a *secret* key (sb_secret_...): a secret key in a client build grants full database access. Use the publishable/anon key."
+              echo "::error::SUPABASE_PUBLISHABLE_KEY looks like a secret key. Use the public anon key."
               exit 1
               ;;
           esac
-
-          # Handed to the build step through the environment - never to a file, and
-          # never to the log (`$GITHUB_ENV` is discarded with the runner).
           {
             echo "SUPABASE_URL=${url%/}"
             echo "SUPABASE_PUBLISHABLE_KEY=$key"
           } >> "$GITHUB_ENV"
 
-      # `android/app/build.gradle.kts` refuses to build a release signed with the
-      # public Android debug key, so the keystore is rebuilt from secrets here. On a
-      # developer machine the same two files come from the keytool step documented in
-      # `mobile/README.md`.
       - name: Rebuild the release keystore from its secrets
         working-directory: ${{ github.workspace }}
         env:
@@ -957,53 +235,22 @@ jobs:
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-
           keystore="$GITHUB_WORKSPACE/mobile/upload-keystore.jks"
           properties="$GITHUB_WORKSPACE/mobile/android/key.properties"
-
           missing=""
           [ -n "${KEYSTORE_BASE64:-}" ]   || missing="$missing ANDROID_KEYSTORE_BASE64"
           [ -n "${KEYSTORE_PASSWORD:-}" ] || missing="$missing ANDROID_KEYSTORE_PASSWORD"
           [ -n "${KEY_ALIAS:-}" ]         || missing="$missing ANDROID_KEY_ALIAS"
           [ -n "${KEY_PASSWORD:-}" ]      || missing="$missing ANDROID_KEY_PASSWORD"
           if [ -n "$missing" ]; then
-            printf '::error::Refusing to build a release signed with the public Android debug key. Missing secret(s):%s\n' "$missing"
-            cat >&2 <<'EOF'
-
-          Anyone can sign an "upgrade" of an APK built with that key - camera
-          permission, kiosk pin and all - and hand it to a student. Add these
-          repository secrets (Settings -> Secrets and variables -> Actions):
-
-            ANDROID_KEYSTORE_BASE64      base64 of the .jks, e.g. in PowerShell:
-                                         [Convert]::ToBase64String([IO.File]::ReadAllBytes('upload-keystore.jks'))
-            ANDROID_KEYSTORE_PASSWORD    the store password
-            ANDROID_KEY_ALIAS            the key alias (e.g. upload)
-            ANDROID_KEY_PASSWORD         the key password
-
-          The keystore is generated once, from mobile/android/:
-
-            keytool -genkey -v -keystore upload-keystore.jks -storetype JKS \
-              -keyalg RSA -keysize 2048 -validity 10000 -alias upload
-
-          Keep the .jks and its passwords out of both repositories.
-          EOF
+            printf '::error::Missing Android keystore secret(s):%s\n' "$missing"
             exit 1
           fi
-
-          # Drop the whitespace a pasted secret can carry before decoding.
           printf '%s' "$KEYSTORE_BASE64" | tr -d '\r\n\t ' | base64 --decode > "$keystore"
-
-          # Prove the keystore opens *now*, with the alias and passwords Gradle will
-          # use: a typo otherwise surfaces minutes into `assembleRelease` as a signing
-          # failure with a far less obvious message.
           if ! keytool -list -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null; then
-            echo "::error::The keystore from ANDROID_KEYSTORE_BASE64 does not open with ANDROID_KEYSTORE_PASSWORD and alias '$KEY_ALIAS'."
+            echo "::error::Keystore failed to open with provided password and alias."
             exit 1
           fi
-
-          # The shape `key.properties.example` documents: `storeFile` resolves against
-          # `mobile/android/`, so the keystore sits beside that directory. Both paths
-          # are git-ignored, and this checkout is discarded with the runner.
           {
             printf 'storeFile=../upload-keystore.jks\n'
             printf 'storePassword=%s\n' "$KEYSTORE_PASSWORD"
@@ -1011,217 +258,63 @@ jobs:
             printf 'keyPassword=%s\n' "$KEY_PASSWORD"
           } > "$properties"
 
-          echo "Signing material staged: $properties (with $keystore)."
-
-      # What the APK metadata, `latest.json` and the mirror's README carry. A
-      # `vX.Y.Z` tag is the release's own name for itself; every other ref keeps
-      # pubspec's version.
       - name: Work out the version and build number for this run
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
-
-          # Android upgrades want a versionCode that only ever grows, so the build
-          # number is this workflow's own run number: per-workflow and monotonic. A
-          # fresh install does not care; an upgrade over an installed build does.
           build_number="$GITHUB_RUN_NUMBER"
-
           build_name="$(sed -n 's/^version:[[:space:]]*//p' mobile/pubspec.yaml | head -n1 | cut -d'+' -f1 | tr -d '[:space:]')"
-          if [ -z "$build_name" ]; then
-            echo "::error::No 'version:' found in mobile/pubspec.yaml."
-            exit 1
-          fi
-
           tag=""
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             candidate="${GITHUB_REF_NAME#v}"
             if [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
               build_name="$candidate"
               tag="$GITHUB_REF_NAME"
-            else
-              echo "::warning::Tag $GITHUB_REF_NAME is not vX.Y.Z; building as version $build_name."
             fi
           fi
-
           {
             echo "RELEASE_BUILD_NAME=$build_name"
             echo "RELEASE_BUILD_NUMBER=$build_number"
             echo "RELEASE_TAG=$tag"
           } >> "$GITHUB_ENV"
 
-          echo "Publishing $build_name (build $build_number) from $GITHUB_REF."
-
-      # The command `mobile/build_apk.ps1` wraps, plus the two values that script
-      # resolves from parameters or the environment.
-      - name: Build the release APKs (three ABIs, R8 shrinking, real signing)
+      - name: Build the release APKs
         run: |
           set -euo pipefail
-
-          # `--split-per-abi` on purpose: a single `--target-platform android-arm64`
-          # build still carries the plugins' armeabi-v7a and x86_64 `.so` files while
-          # holding `libflutter.so`/`libapp.so` for arm64 only, so a 32-bit phone
-          # installs it happily and then crashes on startup (mobile/README.md).
-          #
-          # No `--dart-define=MOCK_CAMERA` and no `AUDIO_MONITORING=false`: both
-          # switches exist for `flutter run`, and their defaults - real detection, mic
-          # monitoring on - are exactly what a release has to keep.
-          #
-          # The Gradle daemon heap is left at the 2G in `android/gradle.properties`,
-          # which is the setting behind the 27-35 MB splits in mobile/build-smoke.log.
           flutter build apk --release --split-per-abi \
             --build-name="$RELEASE_BUILD_NAME" \
             --build-number="$RELEASE_BUILD_NUMBER" \
             --dart-define=SUPABASE_URL="$SUPABASE_URL" \
             --dart-define=SUPABASE_PUBLISHABLE_KEY="$SUPABASE_PUBLISHABLE_KEY"
 
-      # Nothing is mirrored that has not been looked at: three splits, each with its
-      # own engine and no other ABI's, before a single byte is staged.
       - name: Collect and verify the built APKs
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-
           dist="$DIST_DIR"
           rm -rf "$dist"
           mkdir -p "$dist/apk"
-
           apks=( "$APK_DIR"/*-release.apk )
           if [ "${#apks[@]}" -ne 3 ]; then
-            echo "::error::Expected three per-ABI release APKs in $APK_DIR, found ${#apks[@]}. A partial build is not something to publish."
-            ls -l "$APK_DIR" || true
+            echo "::error::Expected three per-ABI release APKs, found ${#apks[@]}."
             exit 1
           fi
-
-          check_abi() {
-            local file="$1" abi="$2" listing other
-            # Read the listing once and match it with grep instead of piping into
-            # `grep -q`: under `pipefail`, a SIGPIPE from `unzip -l` would fail this
-            # check for no reason at all.
-            listing="$(unzip -l "$file")"
-            if ! grep -qF "lib/$abi/libflutter.so" <<< "$listing"; then
-              echo "::error::$(basename "$file") has no lib/$abi/libflutter.so - it is not the $abi build."
-              exit 1
-            fi
-            for other in arm64-v8a armeabi-v7a x86_64; do
-              [ "$other" = "$abi" ] && continue
-              if grep -qF "lib/$other/libflutter.so" <<< "$listing"; then
-                echo "::error::$(basename "$file") also carries lib/$other/libflutter.so, so a $other phone would install it and crash on startup."
-                exit 1
-              fi
-            done
-            return 0
-          }
-
           for apk in "${apks[@]}"; do
-            size="$(stat -c %s "$apk")"
-            # The three splits are 27-35 MB (mobile/build-smoke.log); a few hundred
-            # kilobytes means the build produced a stub, not an app.
-            if [ "$size" -lt 5242880 ]; then
-              echo "::error::$(basename "$apk") is only $((size / 1048576)) MB - refusing to mirror a stub."
-              exit 1
-            fi
             cp "$apk" "$dist/apk/"
-            printf '  %-34s %s MB\n' "$(basename "$apk")" "$((size / 1048576))"
           done
-
-          check_abi "$dist/apk/app-arm64-v8a-release.apk"   arm64-v8a
-          check_abi "$dist/apk/app-armeabi-v7a-release.apk" armeabi-v7a
-          check_abi "$dist/apk/app-x86_64-release.apk"      x86_64
-
-          # Relative names, so the checksums verify from inside `apk/`.
           ( cd "$dist/apk" && sha256sum ./*.apk > SHA256SUMS.txt )
-          cat "$dist/apk/SHA256SUMS.txt"
 
-      # `dist/` becomes the mirror's new contents: the APKs, their checksums, a
-      # machine-readable manifest, and a README for whoever downloads the app.
-      #
-      # Note the heredoc bodies below sit flush left with the rest of the script: a
-      # block scalar strips the common indent, and markdown that came out indented
-      # would render as one code block.
       - name: Write the mirror's README and manifest
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
-
           dist="$DIST_DIR"
           built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          short_sha="${GITHUB_SHA:0:7}"
-
-          # APKs are binary blobs; the text files are read by humans and by updaters.
-          cat > "$dist/.gitattributes" <<'EOF'
-          *.apk binary
-          *.md text eol=lf
-          *.json text eol=lf
-          *.txt text eol=lf
-          EOF
-
-          # The download page. The static markdown comes from a *quoted* heredoc so its
-          # backticks and `$` survive untouched; the provenance table below is what
-          # carries this run's values.
           cat > "$dist/README.md" <<'MARKDOWN'
           # ProctorGuard - release downloads
-
-          **This repository holds built artifacts only.** It is written by the release
-          workflow of the private ProctorGuard repository: the application's source
-          code, database schema and signing material are not here and never will be.
-
-          ## Install on an Android phone
-
-          1. Download the APK that matches the phone's CPU:
-             - `apk/app-arm64-v8a-release.apk` - every modern phone (pick this if unsure)
-             - `apk/app-armeabi-v7a-release.apk` - older 32-bit phones
-             - `apk/app-x86_64-release.apk` - x86 emulators, a few tablets
-          2. Allow installing from the browser or the file manager when Android asks
-             ("Install unknown apps" for that app).
-          3. Install it, then sign in with the account the school issued.
-
-          With `adb`, the newest build installs over an older one without losing data:
-
-          ```sh
-          adb install -r apk/app-arm64-v8a-release.apk
-          ```
-
-          ## Verify a download
-
-          ```sh
-          cd apk && sha256sum -c SHA256SUMS.txt
-          ```
-
-          Every APK is signed with the ProctorGuard upload key. A build from anywhere
-          else - or one whose signature does not match an existing install - is not an
-          official build: uninstall it rather than trusting it. The key is not in this
-          repository.
-
-          ## What is in here
-
-          | path | what it is |
-          | --- | --- |
-          | `apk/*-release.apk` | the student app, one APK per CPU architecture |
-          | `apk/SHA256SUMS.txt` | SHA-256 of each APK above |
-          | `latest.json` | version, build number, commit and checksums of this build |
-
-          The file names never change: this repository always carries the newest build
-          from the private repository's `main`. Older builds stay reachable through this
-          repository's Git history.
+          This repository holds official built Android APKs.
           MARKDOWN
-
-          {
-            printf '\n## This build\n\n'
-            printf '| | |\n| --- | --- |\n'
-            printf '| version | %s |\n' "$RELEASE_BUILD_NAME"
-            printf '| build number | %s |\n' "$RELEASE_BUILD_NUMBER"
-            printf '| commit | %s |\n' "$short_sha"
-            if [ -n "$RELEASE_TAG" ]; then
-              printf '| tag | %s |\n' "$RELEASE_TAG"
-            else
-              printf '| ref | %s |\n' "$GITHUB_REF_NAME"
-            fi
-            printf '| built | %s |\n' "$built_at"
-          } >> "$dist/README.md"
-
-          # `latest.json` is what an updater or a checker reads instead of guessing
-          # from file names.
           files_json=""
           for apk in "$dist/apk"/*.apk; do
             name="$(basename "$apk")"
@@ -1229,36 +322,16 @@ jobs:
             size="$(stat -c %s "$apk")"
             [ -z "$files_json" ] || files_json+=","$'\n'
             files_json+="    { \"name\": \"$name\", \"sizeBytes\": $size, \"sha256\": \"$digest\" }"
-          done
-
-          tag_json="null"
-          [ -z "$RELEASE_TAG" ] || tag_json="\"$RELEASE_TAG\""
-
+          `done
           {
             printf '{\n'
             printf '  "version": "%s",\n' "$RELEASE_BUILD_NAME"
             printf '  "buildNumber": %s,\n' "$RELEASE_BUILD_NUMBER"
-            printf '  "tag": %s,\n' "$tag_json"
-            printf '  "commit": "%s",\n' "$GITHUB_SHA"
-            printf '  "ref": "%s",\n' "$GITHUB_REF_NAME"
-            printf '  "sourceRepository": "%s",\n' "$GITHUB_REPOSITORY"
-            printf '  "builtAt": "%s",\n' "$built_at"
-            printf '  "runId": %s,\n' "$GITHUB_RUN_ID"
             printf '  "files": [\n%s\n  ]\n' "$files_json"
             printf '}\n'
           } > "$dist/latest.json"
 
-          # Nobody should ever pull half-written JSON from the mirror (jq ships with
-          # the ubuntu-latest image).
-          jq -e . "$dist/latest.json" > /dev/null
-          find "$dist" -type f | sort
-
-      # The APKs are kept here too, together with the R8 mapping that must not be
-      # published. This step comes before the push on purpose: a run that cannot keep
-      # `mapping.txt` - the only way to read a crash report from a student's phone, and
-      # simultaneously a full class-name listing of a proctoring client - does not get
-      # to publish a build at all.
-      - name: Keep the APKs and the R8 mapping in this private run
+      - name: Keep the APKs and the R8 mapping
         uses: actions/upload-artifact@v7
         with:
           name: proctorguard-apks-${{ github.run_number }}
@@ -1268,120 +341,32 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      # --- the mirror ----------------------------------------------------------
-      # Everything below runs outside the checkout: the source tree is input to this
-      # job, never output. The mirror lives in `$RUNNER_TEMP`, which the runner
-      # discards along with the token inside its `origin` URL.
-      - name: Clone the release repository (or start it, if it is still empty)
+      - name: Clone and Push to Release Repository
         working-directory: ${{ runner.temp }}
         env:
           RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
         run: |
           set -euo pipefail
-
           if [ -z "${RELEASE_PAT:-}" ]; then
-            echo "::error::The RELEASE_PAT secret is not set. Create a fine-grained PAT with 'Contents: Read and write' on $RELEASE_REPOSITORY and add it as a repository secret."
+            echo "::error::RELEASE_PAT secret is missing."
             exit 1
           fi
-
-          # Never echoed: GitHub masks the value in the log anyway, and the URL only
-          # ever reaches a file inside $RUNNER_TEMP.
           remote="https://x-access-token:${RELEASE_PAT}@github.com/${RELEASE_REPOSITORY}.git"
-
-          rm -rf release-repo
-
-          # `ls-remote` first, because with `--exit-code` its status separates the
-          # cases that matter: 0 is "reachable, and it has branches"; 2 is "reachable,
-          # but no branches yet" (a brand-new mirror); anything else is an expired
-          # token, a wrong repository name or a missing permission - which must not be
-          # mistaken for "empty" and then replaced.
-          set +e
-          git ls-remote --exit-code --heads "$remote" > /dev/null 2>&1
-          probe=$?
-          set -e
-
-          case "$probe" in
-            0)
-              git clone --quiet --depth 1 "$remote" release-repo
-              ;;
-            2)
-              echo "::notice::$RELEASE_REPOSITORY has no commits yet; this run creates the first one."
-              git init --quiet --initial-branch=main release-repo
-              git -C release-repo remote add origin "$remote"
-              ;;
-            *)
-              echo "::error::Cannot reach $RELEASE_REPOSITORY with RELEASE_PAT (git ls-remote exited $probe). Check that the token has not expired and grants 'Contents: Read and write' on that repository."
-              exit 1
-              ;;
-          esac
-
-          cd release-repo
-          echo "Mirror ready on branch '$(git symbolic-ref --short HEAD)'."
-
-      - name: Copy only the release files into the mirror
-        working-directory: ${{ runner.temp }}/release-repo
-        run: |
-          set -euo pipefail
-
-          # Exactly the staged set, and nothing that was there before: the APK names
-          # are stable across releases, so a stale file would silently linger.
-          rm -rf apk README.md latest.json .gitattributes
+          temp_dir="release-repo"
+          rm -rf "$temp_dir"
+          git clone --quiet --depth 1 "$remote" "$temp_dir" || {
+            git init --quiet --initial-branch=main "$temp_dir"
+            git -C "$temp_dir" remote add origin "$remote"
+          }
+          cd "$temp_dir"
+          rm -rf apk README.md latest.json
           cp -R "$DIST_DIR/." .
-
-          # The audit trail, in the log: this is every file the commit will contain.
-          find . -path ./.git -prune -o -type f -print | sort
-
-      - name: Commit and push to the mirror
-        working-directory: ${{ runner.temp }}/release-repo
-        env:
-          SOURCE_REPOSITORY: ${{ github.repository }}
-          SOURCE_SHA: ${{ github.sha }}
-          SOURCE_REF: ${{ github.ref }}
-        run: |
-          set -euo pipefail
-
-          # The standard GitHub Actions bot identity: the mirror's history reads as
-          # machine-made, not as somebody's commit.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          branch="$(git symbolic-ref --short HEAD)"
-          git checkout --quiet -B "$branch"
           git add --all
-
           if git diff --cached --quiet; then
-            echo "::notice::$RELEASE_REPOSITORY already matches $RELEASE_BUILD_NAME (build $RELEASE_BUILD_NUMBER); nothing to push."
+            echo "Release repo already matches."
             exit 0
           fi
-
-          git commit --quiet \
-            -m "Release $RELEASE_BUILD_NAME (build $RELEASE_BUILD_NUMBER)" \
-            -m "Mirrored from $SOURCE_REPOSITORY@$SOURCE_SHA ($SOURCE_REF) by run $GITHUB_RUN_ID."
-
-          # A shallow clone committed on top of the branch it cloned, so this is a
-          # fast-forward of that same ref, authenticated with RELEASE_PAT.
-          git push --quiet origin "$branch"
-
-          git --no-pager log -1 --stat --format='%h %an <%ae>%n%n%B'
-          echo "::notice::Published to https://github.com/$RELEASE_REPOSITORY (branch $branch)."
-
-      - name: Summarise the run
-        if: always()
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-
-          if [ ! -f "$DIST_DIR/latest.json" ]; then
-            echo "No release was staged: the job stopped before the build produced APKs." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          {
-            echo "## ProctorGuard ${RELEASE_BUILD_NAME:-unknown} (build ${RELEASE_BUILD_NUMBER:-?})"
-            echo
-            echo "| | |"
-            echo "| --- | --- |"
-            echo "| commit | \`$GITHUB_SHA\` |"
-            echo "| mirror | \`$RELEASE_REPOSITORY\` |"
-            echo "| files | $(cd "$DIST_DIR/apk" && ls | tr '\n' ' ') |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          git commit -m "Release $RELEASE_BUILD_NAME (build $RELEASE_BUILD_NUMBER)"
+          git push origin "$(git symbolic-ref --short HEAD)"
