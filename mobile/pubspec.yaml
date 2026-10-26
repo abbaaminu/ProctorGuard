@@ -101,6 +101,21 @@ dependencies:
   # 10.x minSdk floor above.
   sentry_flutter: ^9.30.1
 
+  # Google Fonts, **with runtime fetching switched off in `main()`**
+  # (`GoogleFonts.config.allowRuntimeFetching = false`). The package is the only
+  # way the app can name a Google Font, and that flag is what keeps it from
+  # resolving one over the network at runtime: with it off a face must be
+  # declared as an asset in this file (see
+  # https://pub.dev/packages/google_fonts#bundling-of-font-assets), and asking
+  # for one that is not bundled throws instead of downloading it. That is the
+  # whole point for the browser build: the CSP in `web/index.html` allows the
+  # Google Fonts *stylesheet* (`style-src`) and its *font files* (`font-src`),
+  # but deliberately not in `connect-src` - and a runtime fetch from Dart *is*
+  # an XHR, so it would have needed that directive widened. Nothing in `lib/`
+  # calls `GoogleFonts` today; `test/web_csp_contract_test.dart` pins the policy
+  # so the directive cannot quietly grow back.
+  google_fonts: ^8.2.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -178,6 +178,28 @@ void main() {
       // the app silently renders in the system face.
       expect(style, contains('https://fonts.googleapis.com'));
       expect(font, contains('https://fonts.gstatic.com'));
+
+      // ...and the pair belongs to *these* directives only. A `<link>` or an
+      // `@font-face` load is governed by `style-src` / `font-src`; the only
+      // font traffic `connect-src` would govern is a fetch made from Dart, and
+      // `main()` disables that (`GoogleFonts.config.allowRuntimeFetching =
+      // false`), so the hosts are a widening of the network surface with
+      // nothing behind it. `_connectSources` does not name them either; this
+      // assertion is the one that says so out loud.
+      final connect = csp['connect-src'] ?? const <String>[];
+      expect(
+        connect,
+        isNot(contains('https://fonts.gstatic.com')),
+        reason: 'fonts.gstatic.com belongs to font-src: with runtime fetching '
+            'off, nothing in the app fetches a font from Dart, so a '
+            'connect-src entry only widens what an injected script can reach',
+      );
+      expect(
+        connect,
+        isNot(contains('https://fonts.googleapis.com')),
+        reason: 'fonts.googleapis.com belongs to style-src, where the '
+            'stylesheet is already allowed',
+      );
     });
 
     test('blocks plugins, pins <base> to this origin and forbids form posts',
@@ -225,9 +247,16 @@ const Set<String> _fontSources = <String>{
 /// `*.supabase.co` / `*.supabase.in` are Supabase's hosted domains (a project
 /// is `<ref>.supabase.co`; Auth, Storage, PostgREST and Realtime share the
 /// host). `*.ingest.*.sentry.io` is where crash reports go, and only when the
-/// build was given a DSN. The localhost entries are `flutter run -d chrome` and
-/// a local Supabase stack: a production deployment can drop them, and this test
+/// build was given a DSN. `www.gstatic.com` is CanvasKit, which the engine
+/// fetches itself. The localhost entries are `flutter run -d chrome` and a
+/// local Supabase stack: a production deployment can drop them, and this test
 /// then fails until it is updated deliberately.
+///
+/// The Google Fonts hosts are deliberately *not* here. They are `style-src` /
+/// `font-src` sources, and `main()` turns `google_fonts`' runtime fetching off
+/// (`GoogleFonts.config.allowRuntimeFetching = false`), so no font is ever
+/// fetched from Dart - which is the only font traffic `connect-src` would
+/// govern.
 const Set<String> _connectSources = <String>{
   "'self'",
   'https://*.supabase.co',
