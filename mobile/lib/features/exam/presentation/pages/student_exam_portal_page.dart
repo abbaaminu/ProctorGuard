@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../../core/services/crash_reporting.dart';
 import '../../../../core/services/supabase_service.dart' show SupabaseService;
 import '../../../../core/widgets/responsive_layout.dart';
 import '../../../proctoring/presentation/providers/proctoring_provider.dart';
@@ -187,7 +188,12 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
       ref.invalidate(publishedExamsProvider);
       if (result == null) return; // backed out without closing the attempt
       _showResult(exam, result);
-    } catch (_) {
+    } catch (error, stackTrace) {
+      await CrashReporting.captureException(
+        error,
+        stackTrace,
+        context: 'StudentExamPortal failed to open exam',
+      );
       if (mounted) {
         _showMessage(
           'Could not start "${exam.title}". Check your connection and try again.',

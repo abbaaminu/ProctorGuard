@@ -11,3 +11,11 @@ import 'package:web/web.dart' as web;
 /// `desktop_only_web_guard.dart` decides), so there is no non-web fallback to
 /// keep in step here.
 String browserUserAgent() => web.window.navigator.userAgent;
+
+/// `iPadOS` can report a desktop-style `Macintosh` user agent. Its platform
+/// identifies the compatibility mode while multiple touch points distinguish
+/// the tablet from a Mac desktop.
+String browserPlatform() => web.window.navigator.platform;
+
+/// `iPadOS` in desktop mode reports its multi-touch display here.
+int browserMaxTouchPoints() => web.window.navigator.maxTouchPoints;

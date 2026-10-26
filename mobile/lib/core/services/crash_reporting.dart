@@ -128,6 +128,28 @@ class CrashReportingConfig {
 class CrashReporting {
   const CrashReporting._();
 
+  static bool _sentryReady = false;
+
+  /// Reports a caught, unexpected error when Sentry is running.
+  ///
+  /// Expected service failures should be translated into their normal result or
+  /// user-facing state instead. This boundary is for errors caught only to keep
+  /// an async UI flow alive; the reporting transport itself must never escape.
+  static Future<void> captureException(
+    Object error,
+    StackTrace stackTrace, {
+    required String context,
+  }) async {
+    proctorLog('$context: $error');
+    if (!_sentryReady) return;
+
+    try {
+      await Sentry.captureException(error, stackTrace: stackTrace);
+    } catch (reportingError) {
+      proctorLog('Crash reporting could not send a caught error: $reportingError');
+    }
+  }
+
   /// Initialises crash reporting (unless [config] is disabled) and calls
   /// [appRunner] once the SDK is ready.
   ///
@@ -145,6 +167,13 @@ class CrashReporting {
       // No DSN: the pre-Sentry code path, unchanged.
       await appRunner();
       return;
+    }
+
+    var appRunnerStarted = false;
+    FutureOr<void> runAppOnce() {
+      appRunnerStarted = true;
+      _sentryReady = true;
+      return appRunner();
     }
 
     try {
@@ -167,9 +196,14 @@ class CrashReporting {
             ..sendDefaultPii = false
             ..attachScreenshot = false;
         },
-        appRunner: appRunner,
+        appRunner: runAppOnce,
       );
     } catch (error) {
+      // Do not mistake an exception from boot itself for an Sentry
+      // initialisation failure: rerunning boot could initialize services twice
+      // or call runApp twice. Only fall back when Sentry failed before startup.
+      if (appRunnerStarted) rethrow;
+
       // A DSN the SDK rejects, a platform channel that is not there, a
       // transport that cannot start: all of them land here, and all of them
       // end in the app running anyway.

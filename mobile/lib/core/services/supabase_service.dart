@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart'
     show kIsWeb, visibleForTesting;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'crash_reporting.dart';
 import '../utils/proctor_log.dart';
 
 /// Contract for the evidence uploader that the proctoring notifier depends on.
@@ -389,7 +390,11 @@ class SupabaseService {
       _client = null;
       _status = SupabaseInitStatus.failed;
       _initError = error.toString();
-      proctorLog('SupabaseService: initialisation failed: $error\n$stackTrace');
+      await CrashReporting.captureException(
+        error,
+        stackTrace,
+        context: 'SupabaseService initialization failed',
+      );
     }
     return _status;
   }
@@ -478,7 +483,11 @@ class SupabaseService {
     } on AuthException catch (error) {
       return AuthOutcome.failure(error.message); // expected, user-actionable
     } catch (error, stackTrace) {
-      proctorLog('SupabaseService: $what failed: $error\n$stackTrace');
+      await CrashReporting.captureException(
+        error,
+        stackTrace,
+        context: 'SupabaseService $what failed unexpectedly',
+      );
       return AuthOutcome.failure(
         '$what failed. Check your connection and try again.',
       );
@@ -701,4 +710,3 @@ class _MemoryAsyncStorage implements GotrueAsyncStorage {
     _values.remove(key);
   }
 }
-

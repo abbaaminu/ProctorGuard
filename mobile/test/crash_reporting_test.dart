@@ -128,5 +128,23 @@ void main() {
         throwsStateError,
       );
     });
+
+    test('does not rerun the app when boot throws after Sentry starts',
+        () async {
+      var runs = 0;
+
+      await expectLater(
+        CrashReporting.install(
+          config: const CrashReportingConfig(dsn: valid, environment: 'test'),
+          appRunner: () {
+            runs++;
+            throw StateError('boot failed');
+          },
+        ),
+        throwsStateError,
+      );
+
+      expect(runs, 1);
+    });
   });
 }

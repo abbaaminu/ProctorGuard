@@ -46,10 +46,16 @@ bool blocksWebVisit({
   required bool isWeb,
   required String? userAgent,
   required double viewportWidth,
+  String? platform,
+  int maxTouchPoints = 0,
 }) {
   // Android and iOS are the product: no notice, and not even a viewport read.
   if (!isWeb) return false;
   if (viewportWidth < kDesktopWebMinimumWidth) return true;
+  // Safari on iPadOS can opt into a desktop-style Macintosh user agent and use
+  // a full-width landscape viewport. The UA and width checks alone would then
+  // let the tablet through. A Mac desktop does not report multi-touch points.
+  if (platform == 'MacIntel' && maxTouchPoints > 1) return true;
   return looksLikeMobileBrowser(userAgent);
 }
 
@@ -93,6 +99,8 @@ class DesktopOnlyWebGuard extends StatelessWidget {
     required this.child,
     this.userAgent,
     this.isWeb,
+    this.platform,
+    this.maxTouchPoints,
   });
 
   /// The app, shown unchanged unless this is a blocked browser visit.
@@ -107,6 +115,12 @@ class DesktopOnlyWebGuard extends StatelessWidget {
   /// Overrides [kIsWeb], for tests only — on a Dart VM the browser half of this
   /// widget is otherwise unreachable.
   final bool? isWeb;
+
+  /// Browser platform override for tests, such as iPadOS desktop mode.
+  final String? platform;
+
+  /// Browser touch-point override for tests.
+  final int? maxTouchPoints;
 
   @override
   Widget build(BuildContext context) {
@@ -124,6 +138,8 @@ class DesktopOnlyWebGuard extends StatelessWidget {
             isWeb: true,
             userAgent: userAgent ?? user_agent.browserUserAgent(),
             viewportWidth: MediaQuery.sizeOf(context).width,
+            platform: platform ?? user_agent.browserPlatform(),
+            maxTouchPoints: maxTouchPoints ?? user_agent.browserMaxTouchPoints(),
           );
 
           return blocked ? const DesktopOnlyBrowserNotice() : child;

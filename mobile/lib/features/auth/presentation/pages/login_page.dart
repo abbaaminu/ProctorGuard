@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../../../core/services/crash_reporting.dart';
 import '../../../../core/services/supabase_service.dart';
 import '../../../../core/widgets/responsive_layout.dart';
 
@@ -77,6 +78,17 @@ class _LoginPageState extends State<LoginPage> {
         return;
       }
       _showMessage('Signed in as $email', isError: false);
+    } catch (error, stackTrace) {
+      await CrashReporting.captureException(
+        error,
+        stackTrace,
+        context: 'LoginPage sign-in request failed unexpectedly',
+      );
+      if (mounted) {
+        _showMessage(
+          'Sign-in failed unexpectedly. Check your connection and try again.',
+        );
+      }
     } finally {
       if (mounted) setState(() => _submitting = false);
     }

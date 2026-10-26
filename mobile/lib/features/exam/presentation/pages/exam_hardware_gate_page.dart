@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../../../core/services/crash_reporting.dart';
 import '../../../../core/services/hardware_verification_service.dart';
 import '../../../../core/widgets/responsive_layout.dart';
 import '../../domain/entities/exam.dart';
@@ -51,7 +52,31 @@ class _ExamHardwareGatePageState extends State<ExamHardwareGatePage> {
       _report = HardwareReport.checking();
     });
 
-    final report = await _verifier.verify();
+    final HardwareReport report;
+    try {
+      report = await _verifier.verify();
+    } catch (error, stackTrace) {
+      await CrashReporting.captureException(
+        error,
+        stackTrace,
+        context: 'ExamHardwareGatePage device check failed unexpectedly',
+      );
+      if (!mounted) return;
+      setState(() {
+        _checking = false;
+        _report = const HardwareReport(
+          camera: DeviceProbe.failed(
+            ProbeDevice.camera,
+            'The device check failed. Try again.',
+          ),
+          microphone: DeviceProbe.failed(
+            ProbeDevice.microphone,
+            'The device check failed. Try again.',
+          ),
+        );
+      });
+      return;
+    }
     if (!mounted) return;
 
     setState(() {

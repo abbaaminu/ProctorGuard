@@ -16,6 +16,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/di/providers.dart';
 import '../../../../core/services/afk_watcher.dart';
 import '../../../../core/services/audio_monitor.dart';
+import '../../../../core/services/crash_reporting.dart';
 import '../../../../core/services/hardware_integrity_service.dart';
 import '../../../../core/services/hardware_verification_service.dart';
 import '../../../../core/services/kiosk_service.dart';
@@ -226,13 +227,13 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// Identity of this session's controller. Rebuilt every frame, but `==` makes
   /// Riverpod hand back the same instance (see [ExamSessionArgs]).
   ExamSessionArgs get _args => ExamSessionArgs(
-        examId: widget.examId,
-        submissionId: widget.submissionId,
-        durationMinutes: widget.durationMinutes,
-        startedAt: widget.startedAt,
-        endsAt: widget.endsAt,
-        clock: widget.clock,
-      );
+    examId: widget.examId,
+    submissionId: widget.submissionId,
+    durationMinutes: widget.durationMinutes,
+    startedAt: widget.startedAt,
+    endsAt: widget.endsAt,
+    clock: widget.clock,
+  );
 
   ExamSessionController get _session =>
       ref.read(examSessionControllerProvider(_args).notifier);
@@ -270,7 +271,19 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   void _onAppResumed() {
     if (!mounted) return;
     _webGuard?.reassertFullscreen();
-    unawaited(_session.retrySyncNow());
+    unawaited(_retrySyncAfterResume());
+  }
+
+  Future<void> _retrySyncAfterResume() async {
+    try {
+      await _session.retrySyncNow();
+    } catch (error, stackTrace) {
+      await CrashReporting.captureException(
+        error,
+        stackTrace,
+        context: 'ExamTakingPage resume sync failed unexpectedly',
+      );
+    }
   }
 
   /// Runs the session setup for this attempt, at most once at a time.
@@ -283,6 +296,17 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     _bootstrapping = true;
     try {
       await _runBootstrap();
+    } catch (error, stackTrace) {
+      await CrashReporting.captureException(
+        error,
+        stackTrace,
+        context: 'ExamTakingPage session setup failed unexpectedly',
+      );
+      if (mounted) {
+        _failStart(
+          'Proctoring could not be prepared. Check your device and try again.',
+        );
+      }
     } finally {
       _bootstrapping = false;
     }
@@ -465,9 +489,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       _failStart(
         kIsWeb
             ? 'No camera is available. Allow camera access for this site in your '
-                'browser (and check the device has one), then tap Try again.'
+                  'browser (and check the device has one), then tap Try again.'
             : 'No camera is available on this device. Proctoring needs a working '
-                'front camera.',
+                  'front camera.',
       );
       return;
     }
@@ -596,11 +620,11 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     // to open and audio proctoring sits in "Mic unavailable" for the whole
     // attempt. The mic is opened by the session, not by the lens.
     CameraController build() => CameraController(
-          lens,
-          ResolutionPreset.low,
-          enableAudio: false,
-          imageFormatGroup: proctorImageFormatGroup(),
-        );
+      lens,
+      ResolutionPreset.low,
+      enableAudio: false,
+      imageFormatGroup: proctorImageFormatGroup(),
+    );
 
     final first = build();
     try {
@@ -702,9 +726,22 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// without stacking a second session.
   Future<void> _startAudioMonitoring() async {
     if (!mounted) return;
-    await ref
-        .read(audioMonitoringProvider(widget.submissionId).notifier)
-        .start();
+    try {
+      await ref
+          .read(audioMonitoringProvider(widget.submissionId).notifier)
+          .start();
+    } catch (error, stackTrace) {
+      await CrashReporting.captureException(
+        error,
+        stackTrace,
+        context: 'ExamTakingPage microphone startup failed unexpectedly',
+      );
+      if (mounted) {
+        _showMessage(
+          'Audio proctoring could not start. Check microphone access and retry.',
+        );
+      }
+    }
   }
 
   /// Re-opens the microphone: the student tapped the indicator, or came back from
@@ -714,9 +751,22 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// plugged back in - or a student who moved rooms - is a new noise floor.
   Future<void> _retryAudioMonitoring() async {
     if (!mounted) return;
-    await ref
-        .read(audioMonitoringProvider(widget.submissionId).notifier)
-        .retry();
+    try {
+      await ref
+          .read(audioMonitoringProvider(widget.submissionId).notifier)
+          .retry();
+    } catch (error, stackTrace) {
+      await CrashReporting.captureException(
+        error,
+        stackTrace,
+        context: 'ExamTakingPage microphone retry failed unexpectedly',
+      );
+      if (mounted) {
+        _showMessage(
+          'Audio proctoring could not reconnect. Check microphone access and retry.',
+        );
+      }
+    }
   }
 
   /// Tells the student that audio proctoring needs them, with the one action that
@@ -996,43 +1046,46 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     final session = _session;
     if (session.isSubmitting || !mounted) return;
 
-    if (!timeUp) {
-      final confirmed = await _confirmSubmit();
-      if (confirmed != true || !mounted) return;
-
-      // Only close the attempt once the last typed answer is durable: grading
-      // reads the server copy, so submitting without it would drop it silently.
-      if (!await session.flushTextAnswer()) return;
-    } else {
-      // The clock decides, so submission wins over a failed save - but still try
-      // once, because a fill-in-the-blank field is normally the only unsaved
-      // thing on screen.
-      await session.flushTextAnswer();
-    }
-
-    // Everything the student typed is on the device by now; make sure it is on
-    // the server before the attempt closes. A queue that cannot drain means the
-    // network is gone, and nothing typed is lost by *not* submitting yet.
-    var outcome = await session.prepareSubmit(timeUp: timeUp);
-    if (!mounted) return;
-
-    if (outcome.gate == SubmitGate.rejectedAnswers) {
-      final accepted = await _confirmRejectedAnswers(outcome.rejectedCount);
-      if (!mounted) return;
-      if (accepted != true) {
-        session.abortSubmit(timeUp: timeUp);
-        return;
-      }
-      outcome = await session.prepareSubmit(timeUp: timeUp, acknowledged: true);
-      if (!mounted) return;
-    }
-
-    // Still owed the server an answer: the controller has put the page on its
-    // "waiting for a connection" screen.
-    if (outcome.gate == SubmitGate.pendingAnswers) return;
-
-    session.markSubmitting();
     try {
+      if (!timeUp) {
+        final confirmed = await _confirmSubmit();
+        if (confirmed != true || !mounted) return;
+
+        // Only close the attempt once the last typed answer is durable: grading
+        // reads the server copy, so submitting without it would drop it silently.
+        if (!await session.flushTextAnswer()) return;
+      } else {
+        // The clock decides, so submission wins over a failed save - but still
+        // try once, because a fill-in-the-blank field is normally the only
+        // unsaved thing on screen.
+        await session.flushTextAnswer();
+      }
+
+      // Everything the student typed is on the device by now; make sure it is on
+      // the server before the attempt closes. A queue that cannot drain means
+      // the network is gone, and nothing typed is lost by not submitting yet.
+      var outcome = await session.prepareSubmit(timeUp: timeUp);
+      if (!mounted) return;
+
+      if (outcome.gate == SubmitGate.rejectedAnswers) {
+        final accepted = await _confirmRejectedAnswers(outcome.rejectedCount);
+        if (!mounted) return;
+        if (accepted != true) {
+          session.abortSubmit(timeUp: timeUp);
+          return;
+        }
+        outcome = await session.prepareSubmit(
+          timeUp: timeUp,
+          acknowledged: true,
+        );
+        if (!mounted) return;
+      }
+
+      // Still owed the server an answer: the controller has put the page on its
+      // "waiting for a connection" screen.
+      if (outcome.gate == SubmitGate.pendingAnswers) return;
+
+      session.markSubmitting();
       // `submit_exam` grades on the server and is idempotent, so a retry after a
       // dropped connection is safe. It also *answers* with the mark it computed,
       // which is what lets the portal show an instant result for a paper with no
@@ -1042,13 +1095,27 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       session.onSubmitted();
       // The server owns the answers now, so the drafts for this attempt are only
       // clutter. Queued violations are deliberately kept (see clearSession).
-      await session.clearSession();
+      try {
+        await session.clearSession();
+      } catch (error, stackTrace) {
+        // The submit has already succeeded on the server. A local cleanup
+        // failure must not turn it into a retryable submission.
+        await CrashReporting.captureException(
+          error,
+          stackTrace,
+          context: 'ExamTakingPage submitted-answer cleanup failed',
+        );
+      }
       if (!mounted) return;
       // Handed back to the portal, which decides what the student is told: it is
       // the screen the student returns to, and the attempt is on its list.
       Navigator.of(context).pop(_submitResult(result));
-    } catch (error) {
-      proctorLog('ProctorGuard: submit failed: $error');
+    } catch (error, stackTrace) {
+      await CrashReporting.captureException(
+        error,
+        stackTrace,
+        context: 'ExamTakingPage submit flow failed unexpectedly',
+      );
       if (!mounted) return;
       session.onSubmitFailed(timeUp: timeUp);
       if (!timeUp) {
@@ -1084,18 +1151,32 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// is empty, go straight back to submitting (no second confirmation dialog -
   /// the student already asked).
   Future<void> _retryOfflineSubmit() async {
-    final ready = await _session.retryOfflineSubmit();
-    if (!mounted) return;
+    try {
+      final ready = await _session.retryOfflineSubmit();
+      if (!mounted) return;
 
-    if (!ready) {
-      _showMessage(
-        'Still offline - your answers are safe on this device. Reconnect and '
-        'tap Submit again.',
+      if (!ready) {
+        _showMessage(
+          'Still offline - your answers are safe on this device. Reconnect and '
+          'tap Submit again.',
+        );
+        return;
+      }
+
+      await _finalSubmit();
+    } catch (error, stackTrace) {
+      await CrashReporting.captureException(
+        error,
+        stackTrace,
+        context: 'ExamTakingPage offline submit retry failed unexpectedly',
       );
-      return;
+      if (mounted) {
+        _showMessage(
+          'Could not sync your answers yet. They remain saved on this device; '
+          'check your connection and try again.',
+        );
+      }
     }
-
-    await _finalSubmit();
   }
 
   Future<bool?> _confirmSubmit() {
@@ -1107,8 +1188,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     final markedNote = marked == 0
         ? ''
         : '\n\n$marked '
-            '${marked == 1 ? 'question is' : 'questions are'} still marked '
-            'for review.';
+              '${marked == 1 ? 'question is' : 'questions are'} still marked '
+              'for review.';
     return showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -1137,24 +1218,24 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// deadline) before the student closes the attempt for good.
   Future<bool?> _confirmRejectedAnswers(int rejectedAnswers) =>
       showDialog<bool>(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => AlertDialog(
-          title: const Text('Some answers were not saved'),
-          content: Text(
-            '$rejectedAnswers '
-            '${rejectedAnswers == 1 ? 'answer could' : 'answers could'} '
-            'not be saved because the attempt was closed or its deadline passed. '
-            'The server will grade only answers it accepted.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Submit saved answers'),
-            ),
-          ],
+    context: context,
+    barrierDismissible: false,
+    builder: (context) => AlertDialog(
+      title: const Text('Some answers were not saved'),
+      content: Text(
+        '$rejectedAnswers '
+        '${rejectedAnswers == 1 ? 'answer could' : 'answers could'} '
+        'not be saved because the attempt was closed or its deadline passed. '
+        'The server will grade only answers it accepted.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('Submit saved answers'),
         ),
-      );
+      ],
+    ),
+  );
 
   void _showMessage(String message) {
     if (!mounted) return;
@@ -1388,6 +1469,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       ),
     );
   }
+
   /// [content] with this attempt's proctoring overlays above it.
   ///
   /// Used by every state that is not the question surface — the spinner and each
@@ -1399,60 +1481,60 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// third — without ever having been shown one: the strike was logged, and
   /// nothing on screen displayed it.
   Widget _proctored(ProctoringState proctoringState, Widget content) => Stack(
-        fit: StackFit.expand,
-        children: <Widget>[content, ..._proctoringOverlays(proctoringState)],
-      );
+    fit: StackFit.expand,
+    children: <Widget>[content, ..._proctoringOverlays(proctoringState)],
+  );
 
   /// The warning overlays and the attempt's back-button rule for one frame.
   ///
   /// Returned as a list so the *same* widgets are painted above every state the
   /// screen can be in (see [_proctored]).
   List<Widget> _proctoringOverlays(ProctoringState proctoringState) => <Widget>[
-        // `PopScope` registers with the enclosing `ModalRoute` from wherever it
-        // sits in that route's subtree, so it sits beside the warnings it is
-        // about. While a warning is up, hardware back used to pop the attempt
-        // outright: the strike stayed logged against a session the student had
-        // walked away from, and a "this is your last warning" screen could be
-        // left without being read. Back now does what the overlay's own button
-        // does, and on a disqualification — where no dismiss exists — nothing.
-        PopScope(
-          canPop: !proctoringState.showViolationOverlay,
-          onPopInvokedWithResult: (didPop, Object? result) {
-            if (didPop || proctoringState.disqualified) return;
+    // `PopScope` registers with the enclosing `ModalRoute` from wherever it
+    // sits in that route's subtree, so it sits beside the warnings it is
+    // about. While a warning is up, hardware back used to pop the attempt
+    // outright: the strike stayed logged against a session the student had
+    // walked away from, and a "this is your last warning" screen could be
+    // left without being read. Back now does what the overlay's own button
+    // does, and on a disqualification — where no dismiss exists — nothing.
+    PopScope(
+      canPop: !proctoringState.showViolationOverlay,
+      onPopInvokedWithResult: (didPop, Object? result) {
+        if (didPop || proctoringState.disqualified) return;
+        ref
+            .read(proctoringProvider(widget.submissionId).notifier)
+            .dismissOverlay();
+      },
+      child: const SizedBox.shrink(),
+    ),
+    if (proctoringState.showViolationOverlay)
+      ViolationOverlay(
+        type: proctoringState.lastViolation,
+        warningCount: proctoringState.warningCount,
+        isFinal: proctoringState.disqualified,
+        // The same index the supervisor's grid shows for this attempt: it is
+        // derived from this session's own violation list, not passed in.
+        risk: proctoringState.risk,
+        onDismiss: () {
+          if (proctoringState.disqualified) {
+            Navigator.of(context).popUntil((r) => r.isFirst);
+          } else {
             ref
                 .read(proctoringProvider(widget.submissionId).notifier)
                 .dismissOverlay();
-          },
-          child: const SizedBox.shrink(),
-        ),
-        if (proctoringState.showViolationOverlay)
-          ViolationOverlay(
-            type: proctoringState.lastViolation,
-            warningCount: proctoringState.warningCount,
-            isFinal: proctoringState.disqualified,
-            // The same index the supervisor's grid shows for this attempt: it is
-            // derived from this session's own violation list, not passed in.
-            risk: proctoringState.risk,
-            onDismiss: () {
-              if (proctoringState.disqualified) {
-                Navigator.of(context).popUntil((r) => r.isFirst);
-              } else {
-                ref
-                    .read(proctoringProvider(widget.submissionId).notifier)
-                    .dismissOverlay();
-              }
-            },
-          ),
-        // Above the violation overlay: while this countdown is running nothing
-        // has been logged yet, and the only thing the student should be able to
-        // do is come back to fullscreen (which is also the user gesture the
-        // browser needs to grant it).
-        if (_fullscreenDeadline != null)
-          FullscreenLockOverlay(
-            remaining: _fullscreenDeadline!.difference(_now()),
-            onReturnToFullscreen: () => _webGuard?.requestFullscreen(),
-          ),
-      ];
+          }
+        },
+      ),
+    // Above the violation overlay: while this countdown is running nothing
+    // has been logged yet, and the only thing the student should be able to
+    // do is come back to fullscreen (which is also the user gesture the
+    // browser needs to grant it).
+    if (_fullscreenDeadline != null)
+      FullscreenLockOverlay(
+        remaining: _fullscreenDeadline!.difference(_now()),
+        onReturnToFullscreen: () => _webGuard?.requestFullscreen(),
+      ),
+  ];
 
   /// Whether the answer stored for [question] is the one on screen — what the
   /// three answer widgets mean by "saved".
@@ -1526,8 +1608,8 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                 onRetry: () => unawaited(_retryAudioMonitoring()),
                 onOpenSettings:
                     audioState.monitor == AudioMonitorState.permissionDenied
-                        ? () => unawaited(PermissionService().openSettings())
-                        : null,
+                    ? () => unawaited(PermissionService().openSettings())
+                    : null,
               ),
             ],
           ),
@@ -1646,17 +1728,17 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         child: widget.mockMode
             ? const ExamMockCameraTile()
             : controller != null &&
-                    controller.value.isInitialized &&
-                    !controller.value.hasError
-                ? FittedBox(
-                    fit: BoxFit.cover,
-                    child: SizedBox(
-                      width: controller.value.previewSize?.height ?? 480,
-                      height: controller.value.previewSize?.width ?? 640,
-                      child: CameraPreview(controller),
-                    ),
-                  )
-                : const ExamCameraOfflineNotice(),
+                  controller.value.isInitialized &&
+                  !controller.value.hasError
+            ? FittedBox(
+                fit: BoxFit.cover,
+                child: SizedBox(
+                  width: controller.value.previewSize?.height ?? 480,
+                  height: controller.value.previewSize?.width ?? 640,
+                  child: CameraPreview(controller),
+                ),
+              )
+            : const ExamCameraOfflineNotice(),
       ),
     );
   }
@@ -1738,9 +1820,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                           onPressed: blocked || session.savingText
                               ? null
                               : () => _session.saveTextAnswer(
-                                    question.id,
-                                    advance: true,
-                                  ),
+                                  question.id,
+                                  advance: true,
+                                ),
                           icon: const Icon(Icons.check),
                           label: _ShrinkableLabel(
                             session.savingText ? 'Saving…' : 'Save & next',

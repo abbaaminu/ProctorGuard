@@ -13,3 +13,9 @@ library;
 /// Empty rather than null so callers have one shape to handle; the guard reads
 /// an empty agent as "nothing says this is a phone".
 String browserUserAgent() => '';
+
+/// There is no browser platform in a native build.
+String browserPlatform() => '';
+
+/// There is no browser touch capability in a native build.
+int browserMaxTouchPoints() => 0;

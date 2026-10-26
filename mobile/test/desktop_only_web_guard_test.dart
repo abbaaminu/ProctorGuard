@@ -16,6 +16,9 @@ const String ipadSafari =
 const String desktopChrome =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like '
     'Gecko) Chrome/126.0.0.0 Safari/537.36';
+const String ipadDesktopSafari =
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 '
+    '(KHTML, like Gecko) Version/17.5 Safari/605.1.15';
 
 /// The guard is the only thing between a phone browser and the administrative
 /// console, and its interesting half (`kIsWeb` being true) cannot happen in a
@@ -39,6 +42,31 @@ void main() {
       expect(
         blocksWebVisit(isWeb: true, userAgent: ipadSafari, viewportWidth: 834),
         isTrue,
+      );
+    });
+
+    test('iPadOS desktop mode is blocked at a full-width viewport', () {
+      expect(
+        blocksWebVisit(
+          isWeb: true,
+          userAgent: ipadDesktopSafari,
+          viewportWidth: 1024,
+          platform: 'MacIntel',
+          maxTouchPoints: 5,
+        ),
+        isTrue,
+      );
+    });
+
+    test('a Mac desktop is not blocked for having its platform name', () {
+      expect(
+        blocksWebVisit(
+          isWeb: true,
+          userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5)',
+          viewportWidth: 1440,
+          platform: 'MacIntel',
+        ),
+        isFalse,
       );
     });
 
@@ -119,6 +147,8 @@ void main() {
       WidgetTester tester, {
       required bool isWeb,
       String? userAgent,
+      String? platform,
+      int maxTouchPoints = 0,
       Size size = const Size(1400, 900),
     }) async {
       tester.view.physicalSize = size;
@@ -129,6 +159,8 @@ void main() {
         DesktopOnlyWebGuard(
           isWeb: isWeb,
           userAgent: userAgent,
+          platform: platform,
+          maxTouchPoints: maxTouchPoints,
           child: console(),
         ),
       );
@@ -152,6 +184,21 @@ void main() {
         isWeb: true,
         userAgent: iphoneSafari,
         size: const Size(390, 844),
+      );
+
+      expect(find.byType(DesktopOnlyBrowserNotice), findsOneWidget);
+      expect(find.text('the administrative console'), findsNothing);
+    });
+
+    testWidgets('iPadOS desktop mode gets the notice at tablet width',
+        (tester) async {
+      await pumpGuard(
+        tester,
+        isWeb: true,
+        userAgent: ipadDesktopSafari,
+        platform: 'MacIntel',
+        maxTouchPoints: 5,
+        size: const Size(1024, 768),
       );
 
       expect(find.byType(DesktopOnlyBrowserNotice), findsOneWidget);
