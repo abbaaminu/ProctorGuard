@@ -32,12 +32,12 @@ const List<String> kMobileUserAgentMarkers = <String>[
 ///
 /// Two independent signals, because either alone misses a real case:
 ///
-/// * the **user agent** says phone/tablet — an iPhone is never going to get a
-///   usable console out of a 390 px column, whatever its window reports;
+/// * the **device** is a phone or a tablet ([isMobileBrowser]) — an iPhone is
+///   never going to get a usable console out of a 390 px column, whatever its
+///   window reports;
 /// * the **viewport** is narrower than [kDesktopWebMinimumWidth] — this is what
-///   catches the cases the agent hides, chiefly an iPad in "desktop" mode
-///   (which reports a Macintosh UA) and a desktop browser window resized to
-///   phone width.
+///   catches the cases the agent hides, chiefly a desktop browser window resized
+///   to phone width.
 ///
 /// [isWeb] is a parameter rather than a direct `kIsWeb` read so a Dart VM test
 /// can ask about the browser — the same seam, and for the same reason, as
@@ -52,12 +52,48 @@ bool blocksWebVisit({
   // Android and iOS are the product: no notice, and not even a viewport read.
   if (!isWeb) return false;
   if (viewportWidth < kDesktopWebMinimumWidth) return true;
+  return isMobileBrowser(
+    userAgent: userAgent,
+    platform: platform,
+    maxTouchPoints: maxTouchPoints,
+  );
+}
+
+/// Whether the browser is running on a phone or a tablet, whatever its window
+/// is sized like.
+///
+/// This is the device half of [blocksWebVisit], and it is split out because the
+/// same question is now asked in two places: here, to keep the administrative
+/// console off a phone, and in `examRunsOnPlatform`
+/// (`features/exam/presentation/widgets/mobile_exam_only.dart`), which refuses
+/// the exam in that browser and points the student at the Android app. The
+/// **window width is deliberately not part of it**: that is the console's layout
+/// rule, and a desktop browser dragged narrow is still a desktop — the exam gate
+/// must not refuse one for the size of its window.
+bool isMobileBrowser({
+  required String? userAgent,
+  String? platform,
+  int maxTouchPoints = 0,
+}) {
   // Safari on iPadOS can opt into a desktop-style Macintosh user agent and use
-  // a full-width landscape viewport. The UA and width checks alone would then
-  // let the tablet through. A Mac desktop does not report multi-touch points.
+  // a full-width landscape viewport. The UA check alone would then let the
+  // tablet through. A Mac desktop does not report multi-touch points.
   if (platform == 'MacIntel' && maxTouchPoints > 1) return true;
   return looksLikeMobileBrowser(userAgent);
 }
+
+/// What this browser reports about itself, read from the real `navigator`.
+///
+/// The conditional import that makes this possible exists once, here, and both
+/// the guard and the exam gate read it — the exam rule in `mobile_exam_only.dart`
+/// asks exactly the question [blocksWebVisit] asks. Off the web the stub answers
+/// empty/zero, and no caller on a native build reads it: those are allowed before
+/// the browser is ever consulted.
+({String userAgent, String platform, int maxTouchPoints}) browserIdentity() => (
+      userAgent: user_agent.browserUserAgent(),
+      platform: user_agent.browserPlatform(),
+      maxTouchPoints: user_agent.browserMaxTouchPoints(),
+    );
 
 /// Whether [userAgent] names a phone or a tablet.
 ///

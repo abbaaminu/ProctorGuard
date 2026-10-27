@@ -136,10 +136,17 @@ rather than left to be mistaken for more than it is.
   reason instead of reporting a broken camera it could never fix
   (`lib/core/services/platform_capabilities.dart`). A macOS, Windows or Linux
   machine therefore takes part through the web build in a browser, so the "no
-  on-device AI on the web" boundary above applies there too. That web console is
+  on-device AI on the web" boundary above applies there too. The web build is
   **desktop-only**: `lib/core/widgets/desktop_only_web_guard.dart` shows a
-  "desktop browser required" notice on a phone browser, and students on a phone
-  use the app. See
+  "desktop browser required" notice on a phone or tablet browser, so the console is
+  reached from a computer or from the Android app. The **exam** inside it has its
+  own, narrower rule
+  (`lib/features/exam/presentation/widgets/mobile_exam_only.dart`): the Android
+  app and **any desktop browser** (Windows, macOS, Linux) may sit a paper, while a
+  phone or tablet browser is refused and told to install the app — so a student
+  with no Android phone is not locked out of the exam. That rule deliberately does
+  not read the viewport: 768 px is the console's layout limit, and a desktop window
+  dragged narrow is still a desktop. See
   [mobile/README.md → Supported platforms](./mobile/README.md#supported-platforms-and-what-proctoring-each-one-gets).
 
 **Risk register**

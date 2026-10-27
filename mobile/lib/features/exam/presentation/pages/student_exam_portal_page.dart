@@ -63,12 +63,27 @@ class StudentExamPortalPage extends ConsumerStatefulWidget {
   /// Whether this build thinks it is running in a browser, overriding `kIsWeb`
   /// for tests (see `examRunsOnPlatform` in `mobile_exam_only.dart`).
   ///
-  /// A browser is refused *here*, before a submission exists, as well as on the
-  /// session screen itself: this is the call site that runs
-  /// `startOrResumeSubmission`, and an attempt row created for a browser would sit
-  /// on the supervisor's dashboard as `ongoing` for a paper the student was then
-  /// told to sit on their phone.
+  /// A **phone or tablet** browser is refused *here*, before a submission exists,
+  /// as well as on the session screen itself: this is the call site that runs
+  /// `startOrResumeSubmission`, and an attempt row created for that browser would
+  /// sit on the supervisor's dashboard as `ongoing` for a paper the student was
+  /// then told to sit in the app. A desktop browser is a supported host and starts
+  /// the attempt as usual.
+  ///
+  /// [browserUserAgent], [browserPlatform] and [maxTouchPoints] are the rest of
+  /// the browser's answer, forwarded unchanged to the same rule.
   final bool? isWeb;
+
+  /// `navigator.userAgent`, when a caller wants to state it rather than have the
+  /// rule read it. See [isWeb].
+  final String? browserUserAgent;
+
+  /// `navigator.platform`, the iPadOS-desktop-mode half of the device rule.
+  /// See [isWeb].
+  final String? browserPlatform;
+
+  /// `navigator.maxTouchPoints`, the other half of that rule. See [isWeb].
+  final int? maxTouchPoints;
 
   const StudentExamPortalPage({
     super.key,
@@ -78,7 +93,18 @@ class StudentExamPortalPage extends ConsumerStatefulWidget {
     this.onSignOut,
     this.clock,
     this.isWeb,
+    this.browserUserAgent,
+    this.browserPlatform,
+    this.maxTouchPoints,
   });
+
+  /// True when the platform rule refuses an exam in this browser.
+  bool get platformRefused => !examRunsOnPlatform(
+        isWeb: isWeb,
+        userAgent: browserUserAgent,
+        browserPlatform: browserPlatform,
+        maxTouchPoints: maxTouchPoints,
+      );
 
   @override
   ConsumerState<StudentExamPortalPage> createState() =>
@@ -93,15 +119,24 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
   Future<void> _openExam(Exam exam) async {
     if (_openingExamId != null) return;
 
-    // Mobile-only (see `examRunsOnPlatform`): a browser has no on-device face
-    // detector, no kiosk pin and no OS-level integrity probe, so an attempt started
-    // here would be recorded as proctored while being unproctored in fact. Refused
-    // before the hardware gate and before `startOrResumeSubmission`, so nothing is
-    // written: a submission row created for a browser would sit on the supervisor's
-    // dashboard as `ongoing` for a paper the student was then told to sit on their
-    // phone — and the student could not close it from either device.
-    if (!examRunsOnPlatform(isWeb: widget.isWeb)) {
-      await showMobileExamOnlyDialog(context, isWeb: widget.isWeb);
+    // Refused for a phone or tablet browser only (see `examRunsOnPlatform`): there
+    // is no kiosk pin, no OS-level integrity probe and a screen the student can
+    // leave with a gesture, so an attempt started there would be recorded as
+    // proctored while being unproctored in fact. A desktop browser has the camera,
+    // the browser guards and the shipped face detector, and sits the paper as
+    // usual. The refusal is before the hardware gate and before
+    // `startOrResumeSubmission`, so nothing is written: a submission row created
+    // for that browser would sit on the supervisor's dashboard as `ongoing` for a
+    // paper the student was then told to sit in the app — and the student could not
+    // close it from either device.
+    if (widget.platformRefused) {
+      await showMobileExamOnlyDialog(
+        context,
+        isWeb: widget.isWeb,
+        userAgent: widget.browserUserAgent,
+        browserPlatform: widget.browserPlatform,
+        maxTouchPoints: widget.maxTouchPoints,
+      );
       return;
     }
 
@@ -177,6 +212,9 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
                   // the session screen so the two cannot disagree in a test (or
                   // in a build where only one of them was given the override).
                   isWeb: widget.isWeb,
+                  browserUserAgent: widget.browserUserAgent,
+                  browserPlatform: widget.browserPlatform,
+                  maxTouchPoints: widget.maxTouchPoints,
                 ),
         ),
       );

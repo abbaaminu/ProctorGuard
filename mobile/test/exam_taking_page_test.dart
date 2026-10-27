@@ -47,6 +47,16 @@ import 'package:flutter_test/flutter_test.dart';
 /// the test. The microphone is always injected ([_FakeAudioSource]) for the same
 /// reason: a Dart VM test has no audio plugin, and this screen opens a capture
 /// session as part of its bootstrap.
+/// The user agents the platform rule reads, as the browsers actually send them
+/// (see `examRunsOnPlatform` in `mobile_exam_only.dart`).
+const String iphoneSafari =
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) '
+    'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 '
+    'Safari/604.1';
+const String windowsChrome =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like '
+    'Gecko) Chrome/126.0.0.0 Safari/537.36';
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -98,8 +108,12 @@ void main() {
     String? candidateEmail,
     void Function(Object? result)? onPopped,
     /// Overrides `kIsWeb` for the platform rule (see `examRunsOnPlatform`): a VM
-    /// test cannot become a browser, so the refusal is asked for explicitly.
+    /// test cannot become a browser, so the browser's answer — the refusal and
+    /// the desktop allowance alike — is asked for explicitly.
     bool? isWeb,
+    String? userAgent,
+    String? browserPlatform,
+    int? maxTouchPoints,
   }) =>
       ProviderScope(
         overrides: [
@@ -137,6 +151,9 @@ void main() {
                             examTitle: examTitle,
                             candidateEmail: candidateEmail,
                             isWeb: isWeb,
+                            browserUserAgent: userAgent,
+                            browserPlatform: browserPlatform,
+                            maxTouchPoints: maxTouchPoints,
                           ),
                         ));
                     onPopped?.call(popped);
@@ -715,19 +732,23 @@ void main() {
     });
   });
 
-  /// The browser refusal (see `examRunsOnPlatform` in `mobile_exam_only.dart`).
+  /// The platform rule (see `examRunsOnPlatform` in `mobile_exam_only.dart`).
   ///
   /// This screen is the backstop: the route can be built without going through the
   /// exam list at all (a resumed attempt, a restored navigator stack, a shared
-  /// link), so the platform rule has to hold here whatever navigated in.
-  group('mobile-only exams', () {
+  /// link), so the rule has to hold here whatever navigated in — the refusal for a
+  /// phone or tablet browser, and the paper itself in the app and in a desktop
+  /// browser.
+  group('where the exam may be sat', () {
     late _FakeWebGuards guards;
 
     setUp(() => guards = _FakeWebGuards());
 
-    testWidgets('a browser is refused before the session starts anything',
+    testWidgets('a phone browser is refused before the session starts anything',
         (tester) async {
-      await tester.pumpWidget(pageUnderTest(webGuards: guards, isWeb: true));
+      await tester.pumpWidget(
+        pageUnderTest(webGuards: guards, isWeb: true, userAgent: iphoneSafari),
+      );
       await tester.tap(find.text('open exam'));
       await tester.pumpAndSettle();
 
@@ -751,13 +772,28 @@ void main() {
       expect(find.text('open exam'), findsOneWidget);
     });
 
+    testWidgets('a desktop browser gets the paper', (tester) async {
+      // A computer is a supported exam host: the rule refuses the *device* that
+      // cannot be proctored, not the web build. The guards here are the VM stubs
+      // (`kIsWeb` is compile-time false in a Dart VM test), which is exactly what
+      // the page falls back to when a caller injects none.
+      await tester.pumpWidget(
+        pageUnderTest(isWeb: true, userAgent: windowsChrome),
+      );
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('exam-mobile-only')), findsNothing);
+      expect(find.text('Question 1 of 2'), findsOneWidget);
+    });
+
     testWidgets('a phone still gets the paper', (tester) async {
       await tester.pumpWidget(pageUnderTest(isWeb: false));
       await tester.tap(find.text('open exam'));
       await tester.pumpAndSettle();
 
-      // The rule refuses the browser, not the platform it cannot see: every other
-      // test in this file is a VM build, and they all sit the exam.
+      // The rule refuses a phone *browser*, not the platform it cannot see: every
+      // other test in this file is a VM build, and they all sit the exam.
       expect(find.byKey(const Key('exam-mobile-only')), findsNothing);
       expect(find.text('Question 1 of 2'), findsOneWidget);
     });

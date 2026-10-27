@@ -122,11 +122,24 @@ class ExamTakingPage extends ConsumerStatefulWidget {
   /// Whether this build thinks it is running in a browser, overriding [kIsWeb]
   /// for tests (see `examRunsOnPlatform` in `mobile_exam_only.dart`).
   ///
-  /// Exams are mobile-only: the browser build is refused by [build] before
-  /// anything is started, and by the exam list before a submission is created.
-  /// A VM widget test cannot become a browser, so this is how the refusal is
-  /// reachable in a test; production passes nothing.
+  /// An exam runs in the Android app **and** in a desktop browser; it is refused
+  /// in a phone or tablet browser, by [build] before anything is started and by
+  /// the exam list before a submission is created. [browserUserAgent],
+  /// [browserPlatform] and [maxTouchPoints] are the rest of the browser's answer:
+  /// a VM widget test cannot become a browser, so they are how both the refusal
+  /// and the desktop allowance are reachable in one. Production passes nothing.
   final bool? isWeb;
+
+  /// `navigator.userAgent`, when a caller wants to state it rather than have the
+  /// page read it. See [isWeb].
+  final String? browserUserAgent;
+
+  /// `navigator.platform`, the iPadOS-desktop-mode half of the device rule.
+  /// See [isWeb].
+  final String? browserPlatform;
+
+  /// `navigator.maxTouchPoints`, the other half of that rule. See [isWeb].
+  final int? maxTouchPoints;
 
   const ExamTakingPage({
     super.key,
@@ -143,7 +156,18 @@ class ExamTakingPage extends ConsumerStatefulWidget {
     this.examTitle,
     this.candidateEmail,
     this.isWeb,
+    this.browserUserAgent,
+    this.browserPlatform,
+    this.maxTouchPoints,
   });
+
+  /// True when the platform rule refuses this page (a phone or tablet browser).
+  bool get platformRefused => !examRunsOnPlatform(
+        isWeb: isWeb,
+        userAgent: browserUserAgent,
+        browserPlatform: browserPlatform,
+        maxTouchPoints: maxTouchPoints,
+      );
 
   /// True when this session runs without a camera (simulated violations).
   bool get mockMode =>
@@ -242,12 +266,13 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   void initState() {
     super.initState();
 
-    // A browser never sits an exam (see `examRunsOnPlatform`), and [build] has
-    // already replaced the exam surface with the refusal notice. Nothing below
-    // this line may run there: the bootstrap would ask for the camera, pin the
-    // kiosk, start the microphone and log `app_minimized`/`fullscreen_exit`
-    // strikes against an attempt the app has just said it will not record.
-    if (!examRunsOnPlatform(isWeb: widget.isWeb)) return;
+    // A phone or tablet browser never sits an exam (see `examRunsOnPlatform` —
+    // a desktop browser does), and [build] has already replaced the exam surface
+    // with the refusal notice. Nothing below this line may run there: the
+    // bootstrap would ask for the camera, pin the kiosk, start the microphone and
+    // log `app_minimized`/`fullscreen_exit` strikes against an attempt the app has
+    // just said it will not record.
+    if (widget.platformRefused) return;
 
     // Distinct from the notifier's lifecycle observer, which turns *leaving* into
     // a strike: this one only reacts to coming back.
@@ -1248,13 +1273,14 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
 
   @override
   Widget build(BuildContext context) {
-    // Mobile-only, and refused here as well as in the exam list: the route can be
-    // built directly (a resumed attempt, a restored navigator stack, a shared
-    // link), and the guard has to hold wherever the page is built. Nothing is
-    // watched, started or logged in a browser — `initState` returns before the
-    // bootstrap, so there is no camera, no kiosk pin and no strike recorded
-    // against an attempt the student was just told would not run here.
-    if (!examRunsOnPlatform(isWeb: widget.isWeb)) {
+    // Refused here as well as in the exam list, for the phone and tablet browsers
+    // only (a desktop browser is a supported host): the route can be built
+    // directly (a resumed attempt, a restored navigator stack, a shared link), and
+    // the guard has to hold wherever the page is built. Nothing is watched,
+    // started or logged there — `initState` returns before the bootstrap, so there
+    // is no camera, no kiosk pin and no strike recorded against an attempt the
+    // student was just told would not run in that browser.
+    if (widget.platformRefused) {
       return MobileExamOnlyPage(
         onLeave: () => Navigator.of(context).maybePop(),
       );

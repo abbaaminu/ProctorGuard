@@ -132,6 +132,73 @@ void main() {
     });
   });
 
+  /// The device half, split out because the exam gate asks it too
+  /// (`examRunsOnPlatform` in
+  /// `features/exam/presentation/widgets/mobile_exam_only.dart`): a phone or
+  /// tablet browser cannot be proctored, while a desktop browser can.
+  ///
+  /// The split is the point: the exam reads this function and **not**
+  /// [blocksWebVisit], because the width limit is the console's layout rule and a
+  /// desktop window dragged narrow is still a desktop.
+  group('isMobileBrowser', () {
+    test('reads the user agent the way the visit check does', () {
+      for (final agent in <String>[iphoneSafari, androidChrome, ipadSafari]) {
+        expect(
+          isMobileBrowser(userAgent: agent),
+          isTrue,
+          reason: 'a phone or tablet announces itself',
+        );
+      }
+      for (final agent in <String>[desktopChrome, ipadDesktopSafari]) {
+        expect(
+          isMobileBrowser(userAgent: agent),
+          isFalse,
+          reason: 'a Macintosh agent with no touch screen is a computer — the '
+              'iPad in desktop mode is caught by the pair below, not by the UA',
+        );
+      }
+    });
+
+    test('iPadOS desktop mode is a tablet, a Macintosh is not', () {
+      expect(
+        isMobileBrowser(
+          userAgent: ipadDesktopSafari,
+          platform: 'MacIntel',
+          maxTouchPoints: 5,
+        ),
+        isTrue,
+      );
+      expect(
+        isMobileBrowser(
+          userAgent: desktopChrome,
+          platform: 'MacIntel',
+          maxTouchPoints: 0,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a missing user agent is not evidence of a phone', () {
+      expect(isMobileBrowser(userAgent: null), isFalse);
+      expect(isMobileBrowser(userAgent: ''), isFalse);
+    });
+
+    test('the window is not part of the device rule', () {
+      // Nothing about a narrow viewport can be asked here, which is exactly why
+      // the exam gate cannot refuse a desktop browser for the size of its window.
+      expect(isMobileBrowser(userAgent: desktopChrome), isFalse);
+      expect(
+        blocksWebVisit(
+          isWeb: true,
+          userAgent: desktopChrome,
+          viewportWidth: 390,
+        ),
+        isTrue,
+        reason: 'the console still refuses a narrow window; the exam does not',
+      );
+    });
+  });
+
   group('DesktopOnlyWebGuard', () {
     /// The app under the guard. A real one carries its own `MaterialApp`, which
     /// is also what lets "passes straight through" be asserted by its text.

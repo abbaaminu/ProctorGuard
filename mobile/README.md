@@ -704,6 +704,16 @@ lecturer's GES301 in `seed.sql`) through `PublishedExamList`, and on tap:
   where the server disqualified her after three strikes;
 * a failed start shows "Could not start …" instead of a silent no-op.
 
+**A phone or tablet browser is refused before any of that can happen.**
+`examRunsOnPlatform` (`lib/features/exam/presentation/widgets/mobile_exam_only.dart`)
+is checked first in `_openExam`, before the device check and before
+`startOrResumeSubmission`: the browser gets the "sit this exam in the app" dialog
+and **no attempt row is created**, because an `ongoing` submission for a browser
+would sit on the supervisor's dashboard for a paper the student was then told to
+sit elsewhere. A desktop browser (Windows, macOS, Linux) passes and sits the paper
+as usual, and the session screen re-applies the same rule for the route that never
+went through this list — a resumed attempt, a restored stack, a shared link.
+
 **The window, when the paper has one.** A tile prints its window
 (`5 Jan 2026, 09:00 – 17:00`), and a paper that has not opened yet — or has already
 closed — is **inert**: `PublishedExamList(lockWhenNotOpen: true)`, which is the
@@ -935,7 +945,7 @@ through the web build, in a browser.
 | Android (phone) | `flutter build apk` | ML Kit, on-device | `record` | Lock task / screen pinning + immersive chrome |
 | iOS | `flutter build ios` — scaffolded, unsigned in CI; what is still owed is in [`ios/README.md`](ios/README.md) | ML Kit, on-device | `record` | Best-effort only (`startLock` reports `granted: false`) |
 | Web (Chrome/Edge) | `flutter build web` | `web/proctor_face_detector.js`, shipped with the app: camera presence, blank/covered-frame and face-count checks ([below](#face-signals-on-the-web-the-host-page-bridge)); a host page may add its own detections through the same `proctorGuardFaceSignal` bridge | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
-| Web (phone/tablet) | the same `flutter build web`, but the app does not render — see [below](#the-web-build-is-desktop-only) | — | — | — |
+| Web (phone/tablet) | the same `flutter build web`, but the app does not render and an exam cannot be sat — see [below](#the-web-build-is-desktop-only) | — | — | — |
 
 ### The web build is desktop-only
 
@@ -957,6 +967,25 @@ it. Either of two signals blocks the visit:
 Android and iOS pass straight through — they *are* the student app — at the cost
 of one `kIsWeb` check. The notice itself names the way forward: open the console
 on a computer, or sit the exam in the app.
+
+**The exam applies the device half of that rule, not the width.**
+`examRunsOnPlatform` (`lib/features/exam/presentation/widgets/mobile_exam_only.dart`)
+is the rule the exam list and the session screen share, and it answers for three
+hosts:
+
+| Host | Exam |
+| --- | --- |
+| Android app | sits it: ML Kit on-device, `startLockTask()` pinning, the display-manager probe |
+| Desktop browser (Windows, macOS, Linux) | sits it: `camera_web`, the browser guards, the shipped face detector, the microphone level and the still-frame evidence. The gate marks the report `faceDetectionInactive` **before** the paper starts, so the smaller surface is named rather than discovered in review |
+| Phone/tablet browser | refused — `MobileExamOnlyPage` on the session route and the same notice as a dialog from the exam list, both *before* `startOrResumeSubmission`, and both naming the Android app (or a computer) as the way in |
+
+`isMobileBrowser` is what both read: the user-agent markers, plus the
+iPadOS-desktop-mode pair (`platform == 'MacIntel'` with `maxTouchPoints > 1`), so
+the console and the exam cannot disagree about what a phone is. The viewport is
+deliberately **not** part of it — 768 px is the console's layout rule, and refusing
+a desktop window dragged narrow would lock a student out of the only host they
+have. A student with no Android phone therefore sits the paper in a browser, and
+the dashboard says which host it was.
 
 ### What a platform can actually do
 

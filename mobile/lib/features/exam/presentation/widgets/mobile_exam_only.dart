@@ -1,50 +1,77 @@
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
+import '../../../../core/widgets/desktop_only_web_guard.dart'
+    show browserIdentity, isMobileBrowser;
+
 /// Whether an exam attempt may be sat on the platform this build is running on.
 ///
-/// The exam surface is only a *proctored* attempt where the app itself can do
-/// the proctoring, and a browser cannot do any of it:
+/// Three answers, because there are three kinds of host:
 ///
-///  * **presence** — `google_mlkit_face_detection` has no web implementation and
-///    the web camera plugin cannot hand over frames for one either, so a browser
-///    attempt has no face check at all unless the page that embeds it happens to
-///    run its own detector (`WebFaceSignalSource`).
-///  * **the pin** — `startLockTask()` is an Android API and screen pinning does
-///    not exist inside a tab; `WebExamGuard` can only *witness* a tab switch and
-///    log `app_minimized`, never prevent it.
-///  * **the device** — `HardwareIntegrityService` reads the Android display
-///    manager. In a browser there is nothing to read, and the second display a
-///    student was moved off is their own monitor.
+///  * **the Android app** — yes. It is the host an attempt is designed around:
+///    ML Kit's on-device face detector, `startLockTask()` screen pinning, and
+///    `HardwareIntegrityService` reading the display manager.
+///  * **a desktop browser** (Windows, macOS, Linux) — yes. It is how a student
+///    without an Android phone sits the paper: the browser has a real camera
+///    (`camera_web`), the browser guards (`WebExamGuard`: fullscreen, tab/blur,
+///    clipboard, developer tools), audio level metering, and the shipped
+///    `web/proctor_face_detector.js` plus the host-page `proctorGuardFaceSignal`
+///    bridge for face signals. The hardware gate names the smaller surface
+///    before the exam (`faceDetectionInactive`), so nothing here is passed off as
+///    a phone attempt.
+///  * **a phone or tablet browser** — no. A touch-sized browser is a second-class
+///    host for the proctoring surface: no kiosk pin, no OS-level integrity probe,
+///    and a screen the student can leave with a gesture. That is the case the
+///    [MobileExamOnlyPage] and the dialog below speak to, and they name the
+///    Android app as the way to sit the exam.
 ///
-/// An attempt opened in a browser would therefore be recorded as a proctored one
-/// while being unproctored in fact, which is the one outcome the dashboard must
-/// never show a school. The exam is sat on the phone, where the camera, the
-/// microphone, the kiosk pin and the integrity probe are all real.
+/// The browser answer is about the **device**, not the window: it is the same
+/// rule the app-wide `DesktopOnlyWebGuard` applies to the whole web build
+/// (`isMobileBrowser` in `core/widgets/desktop_only_web_guard.dart`), so a
+/// desktop browser resized narrow is still allowed to sit the exam — the width
+/// limit is the administrative console's, not the exam's.
 ///
-/// [isWeb] mirrors `PermissionService({bool? isWeb})`: a Dart VM widget test
-/// cannot become a browser, so the rule has to be reachable without compiling
-/// for web. Production passes nothing and gets [kIsWeb].
-bool examRunsOnPlatform({bool? isWeb}) => !(isWeb ?? kIsWeb);
+/// [isWeb], [userAgent], [browserPlatform] and [maxTouchPoints] mirror the
+/// guard's overrides: a Dart VM widget test cannot become a browser, so the rule
+/// has to be reachable without compiling for web. Production passes nothing and
+/// gets [kIsWeb] and the real `navigator` values.
+bool examRunsOnPlatform({
+  bool? isWeb,
+  String? userAgent,
+  String? browserPlatform,
+  int? maxTouchPoints,
+}) {
+  // Native builds — the Android app above all — are the product, and nothing
+  // here has an opinion about them.
+  if (!(isWeb ?? kIsWeb)) return true;
+
+  final browser = browserIdentity();
+  return !isMobileBrowser(
+    userAgent: userAgent ?? browser.userAgent,
+    platform: browserPlatform ?? browser.platform,
+    maxTouchPoints: maxTouchPoints ?? browser.maxTouchPoints,
+  );
+}
 
 /// What the student is told instead of an exam, kept beside the rule so the exam
 /// screen and the exam list cannot drift apart on it.
-const String examMobileOnlyTitle = 'Open this exam in the ProctorGuard app';
+const String examMobileOnlyTitle = 'Sit this exam in the ProctorGuard app';
 
 const String examMobileOnlyBody =
-    'Exams are proctored from the ProctorGuard mobile app: the phone\'s own '
-    'camera, microphone and screen pin are what record the attempt, and a '
-    'browser cannot provide them. No attempt has been started here.';
+    'This browser is on a phone or a tablet, where an exam cannot be proctored: '
+    'the ProctorGuard Android app records the attempt with its own camera, its '
+    'microphone and its screen pin. No attempt has been started here.';
 
 const String examMobileOnlyHint =
-    'Install ProctorGuard on your phone, sign in with the same account and open '
-    'the exam there.';
+    'Install ProctorGuard on your Android phone, sign in with the same account '
+    'and open the exam there. If you have a computer, open the exam in Chrome or '
+    'Edge — a desktop browser can sit it.';
 
-/// The whole screen a browser gets instead of an exam attempt.
+/// The whole screen a phone or tablet browser gets instead of an exam attempt.
 ///
 /// A page rather than a dialog because the route can be reached without the exam
 /// list (a resumed attempt, a restored navigator stack, a shared link): whichever
-/// way it is built, the browser gets this instead of a paper it cannot be
+/// way it is built, that browser gets this instead of a paper it cannot be
 /// proctored on.
 class MobileExamOnlyPage extends StatelessWidget {
   const MobileExamOnlyPage({super.key, this.onLeave});
@@ -112,13 +139,27 @@ class MobileExamOnlyPage extends StatelessWidget {
 ///
 /// The refusal has to happen here rather than only on the exam screen: this is the
 /// call site that runs `startOrResumeSubmission`, and an attempt row created for a
-/// browser would sit on the supervisor's dashboard as `ongoing` for a sitting the
-/// student was then told to finish on a phone they never opened it on.
+/// phone or tablet browser would sit on the supervisor's dashboard as `ongoing`
+/// for a sitting the student was then told to finish in the app they never opened
+/// it on.
+///
+/// The browser facts are forwarded to [examRunsOnPlatform] unchanged; see its own
+/// doc for why a desktop browser is not refused.
 Future<void> showMobileExamOnlyDialog(
   BuildContext context, {
   bool? isWeb,
+  String? userAgent,
+  String? browserPlatform,
+  int? maxTouchPoints,
 }) {
-  if (examRunsOnPlatform(isWeb: isWeb)) return Future<void>.value();
+  if (examRunsOnPlatform(
+    isWeb: isWeb,
+    userAgent: userAgent,
+    browserPlatform: browserPlatform,
+    maxTouchPoints: maxTouchPoints,
+  )) {
+    return Future<void>.value();
+  }
 
   return showDialog<void>(
     context: context,
