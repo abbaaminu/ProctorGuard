@@ -44,10 +44,12 @@ Future<void> main() async {
   // with runtime fetching on, `google_fonts` resolves a family it cannot find
   // in the assets by fetching it from `fonts.gstatic.com` with an HTTP request
   // the first time the theme is built. On the web that request is an XHR, so it
-  // is `connect-src` - not `font-src` - that governs it, and the policy in
-  // `web/index.html` deliberately does not name the Google Fonts hosts there:
-  // the stylesheet (`style-src`) and the font files (`font-src`) are the only
-  // allowance, because neither is a fetch made from Dart.
+  // is `connect-src` - not `font-src` - that would govern it, and the policy in
+  // `web/index.html` only carries `fonts.gstatic.com` in `connect-src` for the
+  // *engine's* own fallback downloader (the Noto subsets a CanvasKit build
+  // fetches for code points no bundled face covers). Turning the package's
+  // fetching off means no face this app asks for is resolved over the network
+  // at all - the package cannot lean on that same entry.
   //
   // Off means the font has to be bundled: declared under `assets:` in
   // `pubspec.yaml`, which is what a proctoring client wants anyway - an exam

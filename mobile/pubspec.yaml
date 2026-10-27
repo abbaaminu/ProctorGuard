@@ -108,12 +108,14 @@ dependencies:
   # declared as an asset in this file (see
   # https://pub.dev/packages/google_fonts#bundling-of-font-assets), and asking
   # for one that is not bundled throws instead of downloading it. That is the
-  # whole point for the browser build: the CSP in `web/index.html` allows the
-  # Google Fonts *stylesheet* (`style-src`) and its *font files* (`font-src`),
-  # but deliberately not in `connect-src` - and a runtime fetch from Dart *is*
-  # an XHR, so it would have needed that directive widened. Nothing in `lib/`
-  # calls `GoogleFonts` today; `test/web_csp_contract_test.dart` pins the policy
-  # so the directive cannot quietly grow back.
+  # whole point for the browser build: a face fetched from Dart *is* an XHR, so
+  # it is `connect-src` that would govern it, and the policy in `web/index.html`
+  # carries `fonts.gstatic.com` there for the *engine's* fallback downloader
+  # only - not for this package. `fonts.googleapis.com` is `style-src`
+  # (stylesheet) and `fonts.gstatic.com` is also `font-src` (the `@font-face`
+  # files that stylesheet names). Nothing in `lib/` calls `GoogleFonts` today;
+  # `test/web_csp_contract_test.dart` pins the policy so the directive cannot
+  # quietly grow back.
   google_fonts: ^8.2.1
 
 dev_dependencies:

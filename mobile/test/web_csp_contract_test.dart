@@ -125,8 +125,8 @@ void main() {
       expect(csp['script-src'], contains("'wasm-unsafe-eval'"));
     });
 
-    test('connects only to Supabase, Sentry ingest and the local dev server',
-        () {
+    test('connects only to Supabase, Sentry ingest, CanvasKit and font '
+        'fallbacks', () {
       final connect = csp['connect-src'] ?? const <String>[];
 
       for (final source in connect) {
@@ -134,8 +134,9 @@ void main() {
           _connectSources.contains(source),
           isTrue,
           reason: 'connect-src "$source" is not a Supabase project, Sentry '
-              'ingest or localhost; a proctoring client must not be able to '
-              'post frames or answers anywhere else',
+              'ingest, CanvasKit\'s CDN, the engine\'s font fallback origin '
+              'or localhost; a proctoring client must not be able to post '
+              'frames or answers anywhere else',
         );
       }
     });
@@ -179,21 +180,33 @@ void main() {
       expect(style, contains('https://fonts.googleapis.com'));
       expect(font, contains('https://fonts.gstatic.com'));
 
-      // ...and the pair belongs to *these* directives only. A `<link>` or an
-      // `@font-face` load is governed by `style-src` / `font-src`; the only
-      // font traffic `connect-src` would govern is a fetch made from Dart, and
-      // `main()` disables that (`GoogleFonts.config.allowRuntimeFetching =
-      // false`), so the hosts are a widening of the network surface with
-      // nothing behind it. `_connectSources` does not name them either; this
-      // assertion is the one that says so out loud.
+      // `fonts.gstatic.com` is also a `connect-src` source, and not as a
+      // widening of the Dart-side surface: the web engine's *own* fallback
+      // font downloader fetches a Noto subset from
+      // `https://fonts.gstatic.com/s/<family>/<version>/<hash>.woff2` with
+      // `fetch()` whenever a rendered code point has no face behind it, and a
+      // `fetch` is governed by `connect-src`. Drop it and the browser refuses
+      // every one of those downloads ("Fetch API cannot load ... Refused to
+      // connect because it violates the document's Content Security Policy"),
+      // the engine retries and then reports the family as permanently
+      // unavailable - which is what a login page whose icons and symbols came
+      // from Noto Sans Symbols 2 looked like in the console before this entry
+      // was put back. `GoogleFonts.config.allowRuntimeFetching = false` does
+      // not affect it: that flag is the *package*, this is the engine.
       final connect = csp['connect-src'] ?? const <String>[];
       expect(
         connect,
-        isNot(contains('https://fonts.gstatic.com')),
-        reason: 'fonts.gstatic.com belongs to font-src: with runtime fetching '
-            'off, nothing in the app fetches a font from Dart, so a '
-            'connect-src entry only widens what an injected script can reach',
+        contains('https://fonts.gstatic.com'),
+        reason: 'the engine downloads its Noto fallback faces through '
+            'connect-src; without this entry every symbol outside the bundled '
+            'fonts fails to load and logs a CSP violation',
       );
+
+      // The stylesheet host, by contrast, stays out of `connect-src`: the CSS
+      // is loaded by a `<link>`/`@import` (`style-src`) and the faces it names
+      // by `font-src`, so nothing legitimately fetches from
+      // `fonts.googleapis.com` from Dart, and an entry there would only widen
+      // what an injected script can reach.
       expect(
         connect,
         isNot(contains('https://fonts.googleapis.com')),
@@ -252,11 +265,16 @@ const Set<String> _fontSources = <String>{
 /// local Supabase stack: a production deployment can drop them, and this test
 /// then fails until it is updated deliberately.
 ///
-/// The Google Fonts hosts are deliberately *not* here. They are `style-src` /
-/// `font-src` sources, and `main()` turns `google_fonts`' runtime fetching off
-/// (`GoogleFonts.config.allowRuntimeFetching = false`), so no font is ever
-/// fetched from Dart - which is the only font traffic `connect-src` would
-/// govern.
+/// `fonts.gstatic.com` is here for the *engine*, not for `google_fonts`: the
+/// web engine's fallback font downloader resolves a code point no bundled face
+/// covers by fetching `https://fonts.gstatic.com/s/<family>/<version>/<hash>.woff2`
+/// with `fetch()`, which `connect-src` governs (a `font-src` entry does not
+/// cover it). `GoogleFonts.config.allowRuntimeFetching = false` in `main()`
+/// stops the package from doing the same, so the entry cannot be used by
+/// Dart-side code; removing it does not make the build font-free, it only
+/// breaks the fallback glyphs and fills the console with CSP violations.
+/// `fonts.googleapis.com` is deliberately absent: the stylesheet is a
+/// `style-src` load and its faces are `font-src` loads.
 const Set<String> _connectSources = <String>{
   "'self'",
   'https://*.supabase.co',
@@ -267,6 +285,7 @@ const Set<String> _connectSources = <String>{
   'https://*.ingest.us.sentry.io',
   'https://*.ingest.de.sentry.io',
   'https://www.gstatic.com',
+  'https://fonts.gstatic.com',
   'http://localhost:*',
   'http://127.0.0.1:*',
   'ws://localhost:*',

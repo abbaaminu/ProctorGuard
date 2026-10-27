@@ -41,19 +41,39 @@
         which the host may drop this origin.
       * `style-src 'unsafe-inline'` - Flutter writes element styles directly.
       * `https://fonts.googleapis.com` (`style-src`) and
-        `https://fonts.gstatic.com` (`font-src`) - the Google Fonts stylesheet
-        and the font files it names, for a build whose theme asks for one.
-        Without them the stylesheet is refused ("Refused to load the
-        stylesheet ... because it violates the following Content Security
-        Policy directive: style-src") and the app silently falls back to the
-        system face. The two are a pair: the CSS lives on
-        `fonts.googleapis.com`, and it only ever names `@font-face` sources on
-        `fonts.gstatic.com`. They are *not* in `connect-src`: a `<link>` fetch
-        is governed by `style-src`/`font-src`, and only a fetch made from Dart
-        (the `google_fonts` package's runtime fallback, say) would need them
-        added there as well - which cannot happen, because `main()` sets
-        `GoogleFonts.config.allowRuntimeFetching = false` and a face it cannot
-        find in the bundled assets throws instead of being downloaded.
+        `https://fonts.gstatic.com` (`font-src` **and** `connect-src`) - the
+        Google Fonts hosts, for two independent reasons:
+        1. *Stylesheets.* `style-src` lets the app load
+           `fonts.googleapis.com/css2`, and `font-src` lets it load the
+           `@font-face` files that stylesheet names. Without them the sheet is
+           refused ("Refused to load the stylesheet ... because it violates the
+           following Content Security Policy directive: style-src") and the app
+           silently falls back to the system face.
+        2. *The engine's fallback font downloader.* When the CanvasKit build
+           meets a code point no bundled face covers it fetches a Noto subset
+           from `https://fonts.gstatic.com/s/...` with `fetch()` (the web
+           engine's `FontFallbackManager`, whose base URL defaults to that
+           origin and is overridable only by `fontFallbackBaseUrl`), and a
+           `fetch` is governed by `connect-src`, not `font-src`. Leaving the
+           host out of `connect-src` therefore does not make the app
+           font-free: the browser refuses every download - "Fetch API cannot
+           load https://fonts.gstatic.com/s/notosanssymbols2/... Refused to
+           connect because it violates the document's Content Security
+           Policy" - the engine retries twice, logs "Font Noto Sans Symbols 2
+           is permanently unavailable", and each such glyph comes out as tofu.
+        Neither host is reached by the `google_fonts` package at runtime:
+        `main()` sets `GoogleFonts.config.allowRuntimeFetching = false`, so a
+        face it cannot find in the bundled assets throws instead of being
+        downloaded. That flag cannot switch off the *engine's* downloader,
+        though - only self-hosting the same paths under `web/` and pointing
+        `fontFallbackBaseUrl` at them would, which means vendoring the whole
+        Noto fallback family list. `fonts.googleapis.com` stays out of
+        `connect-src`: nothing fetches CSS from there from Dart.
+        The grant is the bare host on purpose. Every URL both consumers use
+        lives under `https://fonts.gstatic.com/s/`, so scoping the source to
+        that prefix would be narrower - but it would also mean a path Flutter
+        changes later fails closed with exactly the error above, and this entry
+        exists to stop that error rather than to make it quieter.
       * `font-src 'self' data:` - the app's own bundled fonts, plus the
         `data:` sources Flutter inlines.
       * `connect-src https://*.supabase.co wss://*.supabase.co` (and the `.in`
@@ -78,7 +98,7 @@
     DENY`) on whatever serves `build/web`. `test/web_csp_contract_test.dart`
     pins the directives above so a relaxed policy fails CI rather than shipping.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://www.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob: https://*.supabase.co https://*.supabase.in; font-src 'self' data: https://fonts.gstatic.com; media-src 'self' blob: data:; worker-src 'self' blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://*.supabase.in wss://*.supabase.in https://*.ingest.sentry.io https://*.ingest.us.sentry.io https://*.ingest.de.sentry.io https://www.gstatic.com http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://www.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob: https://*.supabase.co https://*.supabase.in; font-src 'self' data: https://fonts.gstatic.com; media-src 'self' blob: data:; worker-src 'self' blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://*.supabase.in wss://*.supabase.in https://*.ingest.sentry.io https://*.ingest.us.sentry.io https://*.ingest.de.sentry.io https://www.gstatic.com https://fonts.gstatic.com http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
   <meta name="description" content="ProctorGuard student client — take AI-proctored exams with on-device face and microphone monitoring.">
   <meta name="theme-color" content="#3F51B5">

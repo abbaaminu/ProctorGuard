@@ -322,7 +322,7 @@ jobs:
             size="$(stat -c %s "$apk")"
             [ -z "$files_json" ] || files_json+=","$'\n'
             files_json+="    { \"name\": \"$name\", \"sizeBytes\": $size, \"sha256\": \"$digest\" }"
-          `done
+          done
           {
             printf '{\n'
             printf '  "version": "%s",\n' "$RELEASE_BUILD_NAME"
