@@ -200,16 +200,29 @@ create table if not exists public.profiles (
   -- `AcademicCatalog` is the one place those labels are written down.
   faculty     text,
   department  text,
-  level       text
+  level       text,
+  -- Identification numbers: the institution's own name for the person, as it is
+  -- printed on the student ID card (`matric_number`) or the staff badge
+  -- (`staff_id`). Optional in every sense — nullable, not unique, never compared
+  -- by a policy — because they are *labels a human reads* and a roster import
+  -- may not have the number for every row. A student's row carries
+  -- `matric_number` and a staff row `staff_id`; either may be NULL, and neither
+  -- is a key, so a repeated or missing cell can never fail an import wholesale.
+  matric_number text,
+  staff_id      text
 );
 
 -- The upgrade path for a project created before the academic metadata: the
 -- `create table if not exists` above is a no-op there, so the columns are added
 -- in place instead of being lost. `supabase/migrations/academic_targeting.sql`
--- carries the same statements, and the two files must be kept in step.
+-- carries the three label statements and
+-- `supabase/migrations/profile_identity_numbers.sql` the two identity ones, and
+-- the files must be kept in step.
 alter table public.profiles add column if not exists faculty    text;
 alter table public.profiles add column if not exists department text;
 alter table public.profiles add column if not exists level      text;
+alter table public.profiles add column if not exists matric_number text;
+alter table public.profiles add column if not exists staff_id      text;
 
 alter table public.profiles enable row level security;
 

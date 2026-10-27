@@ -1,0 +1,53 @@
+-- =====================================================================
+-- PROCTORGUARD - PROFILE IDENTIFICATION NUMBERS
+-- Gives a profile the institution's own name for the person: the matriculation
+-- number a student is examined under, and the staff ID on the badge a lecturer or
+-- supervisor carries. Both are optional: an account created without them is
+-- exactly the account it was before this file, and a UI that never asks for them
+-- keeps working.
+--
+-- WHY THIS FILE EXISTS
+--   `create table if not exists public.profiles (...)` in `schema.sql` cannot add
+--   a column to a table that already exists, so a live project would keep its
+--   current columns while the admin console started sending `matric_number` and
+--   `staff_id`. The two `add column if not exists` statements below are the
+--   upgrade path; `schema.sql` section 1 carries the same DDL for fresh installs
+--   (the create-table body plus the guarded alters), and the two files must be
+--   kept in step - `mobile/test/schema_contract_test.dart` reads both.
+--
+-- WHAT IT DOES
+--   1. `public.profiles.matric_number` - the student's matriculation number.
+--      Free text, nullable.
+--   2. `public.profiles.staff_id` - the staff member's ID. Free text, nullable.
+--
+-- WHAT IT DELIBERATELY DOES NOT DO
+--   * No uniqueness. These are labels an administrator reads, not keys: a roster
+--     import that repeats a cell, or leaves one blank, must still create the
+--     class rather than fail on a constraint. A unique index would admit any
+--     number of NULLs (NULLs are distinct), but it would still refuse the second
+--     row that repeats a number — a data-entry problem to correct in the roster,
+--     not a reason to refuse creating an account.
+--   * No policy change. Nothing in `schema.sql` compares these columns, so no
+--     read or write narrows or widens: `profiles_select_own_or_staff` and
+--     `profiles_admin_all` already cover the row, and RLS is per row, not per
+--     column, so an owner and staff read the number along with the rest.
+--
+-- SAFETY
+--   * Safe to re-run: both statements are `add column if not exists`.
+--   * Additive for data: no row is rewritten - every existing profile has NULL
+--     in both columns, which is "not recorded".
+--   * Order: independent of every other migration (it touches no policy and no
+--     function). On a project that also runs `academic_targeting.sql`, either
+--     order works.
+--   * Applied through the Supabase CLI:
+--       supabase db query --linked -f supabase/migrations/profile_identity_numbers.sql
+--   * Verify:
+--       select column_name, is_nullable, data_type
+--         from information_schema.columns
+--        where table_schema = 'public'
+--          and table_name = 'profiles'
+--          and column_name in ('matric_number', 'staff_id');
+-- =====================================================================
+
+alter table public.profiles add column if not exists matric_number text;
+alter table public.profiles add column if not exists staff_id      text;

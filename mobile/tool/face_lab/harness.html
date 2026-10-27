@@ -18,9 +18,41 @@
 
   `?s=<scenario>` picks the camera: scene (canvas), frozen (one still frame),
   live (getUserMedia behind the browser's fake device), dead (a track that never
-  produces a frame) and novideo (no <video> element at all, i.e. the preview the
-  app never built). window.__paint(mode) changes the canvas camera mid-run, so one
-  page can go from "student present" to "lens covered" the way a student would.
+  produces a frame), novideo (no <video> element at all, i.e. the preview the app
+  never built), capture (a real device camera whose preview is never in the
+  document - the app drew its self-view somewhere the detector cannot reach) and
+  pose (a stand-in for the Shape Detection API, so the head-pose path runs at all
+  on a browser that ships no face model). window.__paint(mode) changes the canvas
+  camera mid-run, so one page can go from "student present" to "lens covered" the
+  way a student would; window.__look(degrees) turns the stub's head.
+
+  `?s=mediapipe*` are the shipped-model scenarios, and the only ones that let the
+  detector load a model at all: every other scenario stands for the browser this
+  app ran on before the model existed (no Shape Detection API, no model), where a
+  live picture is `centered` and a real 13 MB model - which finds no face in a
+  synthetic camera - would change what the scenario is testing. They are:
+
+    mediapipe               the real vendored assets, i.e. MediaPipe's own
+                            WebAssembly and model (the lab serves web/mediapipe/
+                            at /mediapipe/, so the production paths are used)
+    mediapipe+csp            the same files under the Content-Security-Policy
+                            web/index.html ships, sent as a header and read out of
+                            that page: the only scenario that proves a locked-down
+                            page can load the model at all
+    mediapipe+absent         a module URL that 404s: the model must give up, and
+                            the page must keep saying `centered` as if it had no
+                            model - with no page error and no unhandled rejection
+    mediapipe+turn           a stand-in module (stub_vision.mjs) reporting a head
+                            turned 40 degrees and tipped 10, through the pose
+                            matrix: `pose:40.0,10.0`
+    mediapipe+landmarks      the same, with the matrix withheld, so the landmark
+                            fallback has to measure the turn itself
+    mediapipe+gpuFallback    the same, with the first (GPU) delegate refused,
+                            as on a machine with no usable WebGL
+    mediapipe+two / +none    the stand-in counting two faces and none
+
+  window.__look(yaw, pitch) and window.__faces(count) drive the stand-in, which is
+  why the model scenarios need no face in front of the camera.
 -->
 <body style="margin:0;background:#101010;color:#ddd;font:12px monospace">
 <pre id="log"></pre>
@@ -34,8 +66,26 @@
   window.addEventListener('error', function (e) {
     window.__errors.push(String(e.message) + ' @' + e.filename + ':' + e.lineno);
   });
+  // An unhandled rejection is the failure mode a model loader is most likely to
+  // produce (a rejected `import()`, a `createFromOptions` that never settles into
+  // a catch): the browser does not raise it as an `error` event, so it is counted
+  // here and the model scenarios assert on it.
+  window.addEventListener('unhandledrejection', function (e) {
+    var reason = e && e.reason;
+    window.__errors.push('unhandledrejection: ' + String(reason && reason.message ? reason.message : reason));
+  });
+  // A policy refusal is not a model that failed to find a face - it is a model the
+  // page was never allowed to run - and it is silent in every other way. The
+  // `mediapipe+csp` scenario runs the lab under the policy index.html ships, so any
+  // violation there has to fail the run instead of reading as a quiet `centered`.
+  document.addEventListener('securitypolicyviolation', function (e) {
+    window.__errors.push('csp: ' + (e.violatedDirective || '?') + ' blocked ' + (e.blockedURI || '?'));
+  });
   var params = new URLSearchParams(location.search);
-  var scenario = params.get('s') || 'live';
+  // A `+` in a query string decodes to a space, and the variants of a scenario are
+  // named `canvas+covered`, `mediapipe+turn` and so on, so a space is put back: the
+  // URL a lab run builds is the URL a person can paste.
+  var scenario = (params.get('s') || 'live').replace(/ /g, '+');
 
   function note(text) {
     var line = document.createElement('div');
@@ -79,7 +129,7 @@
   window.__wrapper = wrapper;
   window.__holder = holder;
 
-  if (scenario !== 'novideo') glass.appendChild(wrapper);
+  if (scenario !== 'novideo' && scenario !== 'capture') glass.appendChild(wrapper);
 
   // ---- The Dart hook ------------------------------------------------------
   window.__verdicts = [];
@@ -87,6 +137,46 @@
     window.__verdicts.push({ t: Math.round(performance.now()), v: String(message) });
     note('hook <- ' + message);
   };
+
+  // ---- Which model may load (see the header) ------------------------------
+  //
+  // The detector reads this before it loads anything, exactly like a host page
+  // that serves the assets from another path would. `off` is the important part:
+  // every scenario but `mediapipe*` reproduces a browser with no face model, so
+  // `centered` there means what it always meant.
+  if (scenario.indexOf('mediapipe') === 0) {
+    if (scenario === 'mediapipe+absent') {
+      // A model that is not on the server: the import rejects, and the page has
+      // to carry on without one.
+      window.proctorGuardMediaPipe = { module: 'mediapipe/absent.mjs' };
+    } else if (scenario !== 'mediapipe' && scenario !== 'mediapipe+csp') {
+      // The stand-in module, with the same three config keys the real one uses.
+      window.proctorGuardMediaPipe = {
+        module: 'stub_vision.mjs',
+        wasm: 'stub-wasm',
+        model: 'stub-model.task'
+      };
+      window.__model = {
+        faces: 1,
+        yaw: 0,
+        pitch: 0,
+        matrix: scenario !== 'mediapipe+landmarks',
+        failGpu: scenario === 'mediapipe+gpuFallback'
+      };
+      window.__look = function (yaw, pitch) {
+        window.__model.yaw = Number(yaw || 0);
+        window.__model.pitch = Number(pitch || 0);
+      };
+      window.__faces = function (count) {
+        window.__model.faces = Number(count || 0);
+      };
+    }
+    // `mediapipe` itself sets nothing: the detector's own relative paths
+    // (`mediapipe/...`) are what the lab serves from web/mediapipe/. So does
+    // `mediapipe+csp`, which additionally runs the page under the real policy.
+  } else {
+    window.proctorGuardMediaPipe = 'off';
+  }
 
   // ---- A synthetic camera -------------------------------------------------
   var canvas = document.createElement('canvas');
@@ -240,8 +330,56 @@
       });
   }
 
-  if (scenario === 'frozen' || scenario === 'canvas') {
+  // ---- A stand-in for the Shape Detection API -----------------------------
+  // Chromium on Windows has no FaceDetector (it is a ChromeOS/Android feature),
+  // so the head-pose path is unreachable in a lab run without one. The stub
+  // answers with the landmarks a real model returns for a face at 640x480: two
+  // eyes 140 px apart, and a nose that swings with __look(degrees) the way the
+  // nose of a head turned by that angle would move.
+  var faceCount = 1;
+  var lookDegrees = 0;
+
+  function stubFace() {
+    var left = { x: 250, y: 200 };
+    var right = { x: 390, y: 200 };
+    var span = right.x - left.x;
+    var midX = (left.x + right.x) / 2;
+    var midY = (left.y + right.y) / 2;
+    var swing = Math.sin((lookDegrees * Math.PI) / 180) * (span / 2);
+    return {
+      boundingBox: { x: 240, y: 130, width: 160, height: 220 },
+      landmarks: [
+        { type: 'eye', locations: [left, right] },
+        { type: 'nose', locations: [{ x: midX + swing, y: midY + span * 0.6 }] },
+        { type: 'mouth', locations: [{ x: midX, y: midY + span * 1.1 }] }
+      ]
+    };
+  }
+
+  if (scenario === 'pose') {
+    window.__look = function (degrees) {
+      lookDegrees = degrees;
+    };
+    window.__faces = function (count) {
+      faceCount = count;
+    };
+    window.FaceDetector = function () {
+      this.detect = function () {
+        var faces = [];
+        for (var i = 0; i < faceCount; i++) faces.push(stubFace());
+        return Promise.resolve(faces);
+      };
+    };
+  }
+
+  if (scenario.indexOf('mediapipe') === 0 || scenario === 'frozen' || scenario === 'canvas' || scenario === 'pose') {
     startCanvasCamera();
+  } else if (scenario === 'capture') {
+    // A real camera whose <video> is never in the document: the app opened the
+    // lens and drew the self-view somewhere this script cannot see. Delayed until
+    // detector.js has run, because a getUserMedia call is only visible to a page
+    // that wrapped it before the call was made.
+    setTimeout(startDeviceCamera, 400);
   } else if (scenario === 'dead') {
     // A preview whose track is killed before the detector's first tick: the app
     // opened a camera, and it went dark before anything was ever seen.
@@ -325,6 +463,11 @@
       hasVideo: !!(detector && detector.video && detector.video()),
       diag: detector && detector.diagnostics ? detector.diagnostics() : null,
       stats: window.__stats(),
+      // What the stand-in model was asked for (mode, delegate, how many faces) and
+      // how many frames it was shown: the proof that the model path ran at all.
+      stub: window.__stubOptions || null,
+      stubFrames: window.__stubFrames || 0,
+      errors: window.__errors.slice(),
       verdicts: window.__verdicts.slice()
     };
   };

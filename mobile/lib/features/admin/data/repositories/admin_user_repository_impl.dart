@@ -34,6 +34,8 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
     String? faculty,
     String? department,
     String? level,
+    String? matricNumber,
+    String? staffId,
   }) async {
     final FunctionResponse response;
     try {
@@ -50,6 +52,8 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
             faculty: faculty,
             department: department,
             level: level,
+            matricNumber: matricNumber,
+            staffId: staffId,
           ),
         },
       );
@@ -280,21 +284,27 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
     }
   }
 
-  /// The academic keys of a create request that are actually stated.
+  /// The profile metadata keys of a create request that are actually stated.
   ///
   /// A blank cell in a spreadsheet and an untouched dropdown both mean "not
   /// stated", and the function writes NULL for a key it does not receive — so
   /// omitting the key is the honest request, and an unlabelled account's body
   /// stays byte-identical to the one from before academic targeting existed.
+  /// The identity numbers follow the same rule and travel under the column's own
+  /// name (`matric_number` / `staff_id`), which is what the function reads.
   static Map<String, String> _academicBody({
     String? faculty,
     String? department,
     String? level,
+    String? matricNumber,
+    String? staffId,
   }) {
     final labels = <String, String?>{
       'faculty': faculty,
       'department': department,
       'level': level,
+      'matric_number': matricNumber,
+      'staff_id': staffId,
     };
     final body = <String, String>{};
     for (final entry in labels.entries) {

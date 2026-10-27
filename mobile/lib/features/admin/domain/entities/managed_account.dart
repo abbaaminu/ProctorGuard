@@ -19,6 +19,8 @@ class ManagedAccount extends Equatable {
     this.faculty,
     this.department,
     this.level,
+    this.matricNumber,
+    this.staffId,
   });
 
   /// Tolerates a missing name/email/created_at (older rows, or a trimmed
@@ -26,9 +28,9 @@ class ManagedAccount extends Equatable {
   /// throws on the latter, which is the right failure: a role the app does not
   /// understand must not be rendered as if it were a familiar one.
   ///
-  /// The academic labels are read leniently too: they arrive as null from a
-  /// database that has not run `academic_targeting.sql` yet, which is exactly
-  /// what "not narrowed" looks like.
+  /// The academic labels and identity numbers are read leniently too: they
+  /// arrive as null from a database that has not run the academic/identity
+  /// migrations yet, which is exactly what "not recorded" looks like.
   factory ManagedAccount.fromMap(Map<String, dynamic> map) {
     String? text(Object? value) {
       final raw = value is String ? value.trim() : '';
@@ -44,6 +46,8 @@ class ManagedAccount extends Equatable {
       faculty: text(map['faculty']),
       department: text(map['department']),
       level: text(map['level']),
+      matricNumber: text(map['matric_number']),
+      staffId: text(map['staff_id']),
     );
   }
 
@@ -62,10 +66,21 @@ class ManagedAccount extends Equatable {
   final String? department;
   final String? level;
 
+  /// `profiles.matric_number / staff_id` — the institution's own name for the
+  /// person, as printed on the student ID card or the staff badge. Null means
+  /// "not recorded": no policy reads them, so an account without one behaves
+  /// exactly like every account that predates the columns.
+  final String? matricNumber;
+  final String? staffId;
+
   bool get isAdmin => role == UserRole.admin;
 
   /// "Dr. Ada Nwosu", falling back to the address when the row has no name.
   String get displayName => fullName.trim().isEmpty ? email : fullName;
+
+  /// "CSC/2021/041" or "STF-0142", whichever the row carries — null when neither
+  /// was recorded, so a tile can omit the line instead of printing a dash.
+  String? get identityNumber => matricNumber ?? staffId;
 
   /// "Computer Science · Science · 300 Level", or null for an unlabelled row —
   /// null rather than "All", because a blank column narrows nothing.
@@ -73,7 +88,17 @@ class ManagedAccount extends Equatable {
       AcademicCatalog.describe(faculty: faculty, department: department, level: level);
 
   @override
-  List<Object?> get props =>
-      [id, email, fullName, role, createdAt, faculty, department, level];
+  List<Object?> get props => [
+        id,
+        email,
+        fullName,
+        role,
+        createdAt,
+        faculty,
+        department,
+        level,
+        matricNumber,
+        staffId,
+      ];
 }
 

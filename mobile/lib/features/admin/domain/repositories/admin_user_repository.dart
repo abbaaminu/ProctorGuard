@@ -43,6 +43,14 @@ abstract class AdminUserRepository {
   /// written to the profile row so `exams_select` can offer that account papers
   /// targeted at its cohort. A blank value is *not* sent at all, which reads as
   /// "not stated" — the same thing a blank exam column means.
+  ///
+  /// [matricNumber] and [staffId] are the optional identity numbers the
+  /// institution already knows the person by — the student's matriculation
+  /// number, the staff member's badge number. They are recorded beside the
+  /// labels and read by nobody in the schema: no policy compares them, so an
+  /// account created without one (an administrator who does not have the number
+  /// to hand, or a caller that predates them) behaves exactly like every account
+  /// that already existed.
   Future<ManagedAccount> createAccount({
     required String email,
     required String password,
@@ -51,6 +59,8 @@ abstract class AdminUserRepository {
     String? faculty,
     String? department,
     String? level,
+    String? matricNumber,
+    String? staffId,
   });
 
   /// Creates one page of a roster import through the same Edge Function, with

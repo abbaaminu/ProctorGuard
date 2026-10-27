@@ -164,6 +164,37 @@ void main() {
       );
     });
 
+    test('reads the exact shape the page sends', () async {
+      // `proctor_face_detector.js` formats a measured pose as `pose:<yaw>,<pitch>`
+      // with exactly one decimal on each number - `pose:0.0,0.0` for a face
+      // square to the screen. A detector and a monitor that disagree on the
+      // spelling would leave every turned head unjudged: the page measuring
+      // honestly and the monitor silently ignoring it, which is the failure that
+      // is hardest to see from either side alone.
+      report('pose:0.0,0.0');
+      await flush();
+      expect(signals.last, GazeSignal.centered);
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        isEmpty,
+        reason: 'a decimal point is not an accusation',
+      );
+
+      sustain('pose:40.0,0.0');
+      await flush();
+      expect(
+        signals.last,
+        GazeSignal.lookingAway,
+        reason: 'the turn the page actually reports, in the page\'s spelling',
+      );
+
+      // Smoothing can land on either side of zero; a fraction of a degree is
+      // still a head facing the screen.
+      report('pose:-0.0,-0.0');
+      await flush();
+      expect(signals.last, GazeSignal.centered);
+    });
+
     test('an angle the detector cannot mean is clamped, not discarded',
         () async {
       // A detector reporting 400° is describing a head that is definitely not

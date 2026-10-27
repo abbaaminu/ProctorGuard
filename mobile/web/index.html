@@ -38,7 +38,14 @@
       * `https://www.gstatic.com` + `'wasm-unsafe-eval'` - canvas and font
         resources for Flutter's CanvasKit renderer. `flutter build web
         --no-web-resources-cdn` copies those into `build/web/canvaskit/`, after
-        which the host may drop this origin.
+        which the host may drop this origin. `'wasm-unsafe-eval'` is also what
+        the face sensor's head-pose model needs to compile its own WebAssembly;
+        that model is served from this origin (`mediapipe/`, under
+        `script-src 'self'` for its module and `connect-src 'self'` for its
+        `.wasm` and `.task` files), which is why no CDN host appears here for it.
+        A deployment that ships without `mediapipe/` loses head-pose measurement
+        on desktop browsers and nothing else: the sensor says `centered` for a
+        live picture, exactly as it did before the model existed.
       * `style-src 'unsafe-inline'` - Flutter writes element styles directly.
       * `https://fonts.googleapis.com` (`style-src`) and
         `https://fonts.gstatic.com` (`font-src` **and** `connect-src`) - the
@@ -139,6 +146,13 @@
     `WebFaceSignalSource` installs for the length of an attempt. The judgement -
     how long a verdict has to hold, and what it is worth - stays in Dart
     (`web_face_presence.dart`), exactly as it does for the on-device engine.
+
+    The head-pose model it uses on desktop browsers is the `mediapipe/` directory
+    next to this file (MediaPipe's FaceLandmarker: a WebAssembly module and a
+    `.task` model, see `mediapipe/README.md`). It is served from this origin, so
+    the policy above covers it as it is, and the sensor loads it lazily - only
+    once an exam has a live camera, and never on a browser whose own
+    `window.FaceDetector` already works.
 
     A classic script, deliberately (never `type="module"`): it has to run without
     a build step, and Dart looks the hook up by name on `window`.

@@ -340,6 +340,8 @@ class _FakeAdminUsers implements AdminUserRepository {
     String? faculty,
     String? department,
     String? level,
+    String? matricNumber,
+    String? staffId,
   }) =>
       throw UnimplementedError('the card only uses createStudentAccounts');
 

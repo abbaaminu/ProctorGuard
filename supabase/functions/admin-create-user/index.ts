@@ -11,20 +11,25 @@
 // Request  (POST, `Authorization: Bearer <the caller's access token>`):
 //   { "email": "ada@uni.test", "password": "Temp123!", "full_name": "Dr. Ada
 //     Nwosu", "role": "lecturer", "faculty": "Science", "department": "Computer
-//     Science", "level": null }
-//   `fullName` is accepted as a spelling of `full_name` — see `stringField`. The
-//   three academic keys are optional and simply become that profile's columns.
+//     Science", "level": "300", "staff_id": "STF-0142" }
+//   `fullName` is accepted as a spelling of `full_name`, and `matricNumber` /
+//   `staffId` of the two identity keys — see `stringField`. All five pieces of
+//   profile metadata are optional: a key that is absent, null or blank is simply
+//   not written, so the column stays NULL ("not recorded") and a request that
+//   predates this feature is still valid.
 //
 //   Bulk roster import — the same endpoint, one POST per page of a CSV:
 //   { "students": [ { "email": ..., "full_name": ..., "faculty": ...,
-//                     "department": ..., "level": ... }, ... ] }
+//                     "department": ..., "level": ..., "matric_number": ... },
+//                   ... ] }
 //   Every row becomes a `role='student'` account with a generated temporary
 //   password; the body cannot ask for another role. At most
 //   `MAX_BULK_STUDENTS` rows per call.
 //
 // Response 200: { "id": "<uuid>", "email": ..., "full_name": ..., "role": ...,
-//                 "faculty"?: ..., "department"?: ..., "level"?: ... }
-//   The academic keys are present only when the profile row carries them; a
+//                 "faculty"?: ..., "department"?: ..., "level"?: ...,
+//                 "matric_number"?: ..., "staff_id"?: ... }
+//   The metadata keys are present only when the profile row carries them; a
 //   Flutter client from before them ignores the extra keys.
 //   Bulk: { "created": [ { ...row, "temporary_password": ... } ],
 //           "failed":  [ { "email": ..., "error": ... } ] }
@@ -111,6 +116,8 @@ function fail(message: string, status = 400): Response {
  * `full_name`, while a hand-written request or a JavaScript client reaching for
  * camelCase spells it `fullName`. Both name the same field, so both are accepted
  * rather than answering 400 over a spelling this function could have understood.
+ * `IDENTITY_FIELDS` is the other user: `matric_number` / `matricNumber` and
+ * `staff_id` / `staffId` are the same disagreement over two more columns.
  * (The password is read directly, never through here: its spaces are its own.)
  */
 function stringField(
@@ -137,6 +144,39 @@ function stringField(
 const ACADEMIC_FIELDS = ["faculty", "department", "level"] as const;
 
 /**
+ * The identification numbers a `profiles` row may carry: the matriculation
+ * number a student is examined under, and the staff ID on the badge a lecturer,
+ * supervisor or admin carries.
+ *
+ * A student's form fills the first and a staff form the second, but nothing here
+ * enforces that pairing. Both are nullable free-text columns that a human reads
+ * — no policy compares them — so an account named by either one is worth more
+ * than an account refused over which box was used, and a body that predates this
+ * feature simply does not send them.
+ *
+ * Each entry is `[column, ...accepted spellings]`: `matricNumber` / `staffId`
+ * are what a hand-written JavaScript client reaches for, and `stringField`
+ * already accepts both spellings of `full_name` for the same reason.
+ */
+const IDENTITY_FIELDS: ReadonlyArray<readonly [string, ...string[]]> = [
+  ["matric_number", "matricNumber"],
+  ["staff_id", "staffId"],
+];
+
+/**
+ * Every optional `profiles` column this function writes.
+ *
+ * Used to recognise the one insert failure that is not the administrator's
+ * fault: a project that has not applied the migrations yet answers
+ * `column "matric_number" of relation "profiles" does not exist`, and naming
+ * that column (and the file that adds it) is more use than the raw sentence.
+ */
+const PROFILE_METADATA_COLUMNS: readonly string[] = [
+  ...ACADEMIC_FIELDS,
+  ...IDENTITY_FIELDS.map(([column]) => column),
+];
+
+/**
  * The rows of one bulk request. Pinned to the Flutter client's
  * `AdminUserRepository.maxStudentPageSize` by
  * `mobile/test/schema_contract_test.dart`: a page the client builds has to be a
@@ -144,7 +184,7 @@ const ACADEMIC_FIELDS = ["faculty", "department", "level"] as const;
  */
 const MAX_BULK_STUDENTS = 50;
 
-/** The academic keys of `payload` that are present and non-empty. */
+/** The profile metadata keys of `payload` that are present and non-empty. */
 function academicFields(
   payload: Record<string, unknown>,
 ): Record<string, string> {
@@ -154,6 +194,12 @@ function academicFields(
     // Omitted rather than sent as `null`: the columns are nullable and an empty
     // cell in a CSV means "not stated", which is what NULL already says.
     if (value.length > 0) academic[field] = value;
+  }
+  // The identity numbers follow the same rule, and are stored under the column's
+  // own name whatever spelling the body used (`matricNumber` -> `matric_number`).
+  for (const [column, ...aliases] of IDENTITY_FIELDS) {
+    const value = stringField(payload, column, ...aliases);
+    if (value.length > 0) academic[column] = value;
   }
   return academic;
 }
@@ -257,8 +303,21 @@ Deno.serve(async (request: Request): Promise<Response> => {
     return fail("Expected a JSON body.");
   }
 
-  /** The academic columns of one request, as the profile row stores them. */
-  type Academic = { faculty?: string; department?: string; level?: string };
+  /**
+   * The academic and identification columns of one request, as the profile row
+   * stores them.
+   *
+   * Every key is optional: a body that names none of them produces the empty
+   * object, and the columns stay NULL — which is what an account created before
+   * these columns existed looks like too.
+   */
+  type Academic = {
+    faculty?: string;
+    department?: string;
+    level?: string;
+    matric_number?: string;
+    staff_id?: string;
+  };
 
   /** A profile row as this function answers it. */
   type AccountRow = {
@@ -269,6 +328,8 @@ Deno.serve(async (request: Request): Promise<Response> => {
     faculty?: string;
     department?: string;
     level?: string;
+    matric_number?: string;
+    staff_id?: string;
   };
 
   type Created = { account: AccountRow; password: string };
@@ -321,9 +382,11 @@ Deno.serve(async (request: Request): Promise<Response> => {
       role: input.role,
       full_name: input.fullName,
       email: input.email,
-      // Absent keys stay absent: the columns are nullable, and NULL is exactly
-      // "no academic metadata stated", which is also what the scoped policies in
-      // schema.sql read as "no narrowing".
+      // Absent keys stay absent: every one of these columns is nullable, and
+      // NULL is exactly "no academic metadata / no identity number recorded",
+      // which is also what the scoped policies in schema.sql read as "no
+      // narrowing". The names in `input.academic` are already the column names
+      // (`faculty`, `department`, `level`, `matric_number`, `staff_id`).
       ...input.academic,
     });
 
@@ -338,10 +401,23 @@ Deno.serve(async (request: Request): Promise<Response> => {
       const suffix = rollbackError
         ? ` The half-created account could not be removed either (${rollbackError.message}) — delete it under Authentication → Users.`
         : " The account was rolled back, so nothing was created.";
+      // A project that has not applied the migrations yet rejects the whole row
+      // over one missing column. Naming the file is what turns "column does not
+      // exist" into something the administrator can pass on to whoever runs the
+      // database — the same convention `optional_exam_scheduling.sql` set.
+      const missingColumn = PROFILE_METADATA_COLUMNS.find(
+        (column) =>
+          insertError.message.includes(`"${column}"`) &&
+          /does not exist/i.test(insertError.message),
+      );
+      const advice = missingColumn
+        ? ` This project has no "${missingColumn}" column on profiles yet — apply supabase/migrations/profile_identity_numbers.sql (and academic_targeting.sql for the academic labels), then create the account again.`
+        : "";
       return {
         refused: true,
         status: 500,
-        error: `Could not write the profile row: ${insertError.message}${suffix}`,
+        error:
+          `Could not write the profile row: ${insertError.message}${suffix}${advice}`,
       };
     }
 
@@ -464,7 +540,8 @@ Deno.serve(async (request: Request): Promise<Response> => {
   }
 
   // 200, with the created account — the same four keys the Flutter
-  // `ManagedAccount.fromMap` reads back, followed by the academic ones when the
-  // profile row carries them (a client from before them ignores the extra keys).
+  // `ManagedAccount.fromMap` reads back, followed by the profile metadata
+  // (academic labels, then the identity numbers) when the row carries them; a
+  // client from before them ignores the extra keys.
   return json(outcome.account);
 });

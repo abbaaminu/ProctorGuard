@@ -704,6 +704,24 @@ void main() {
       });
     }
 
+    /// Picks [option] from one of the create form's dropdowns.
+    ///
+    /// The form scrolls on desktop, so the field is brought on screen first, and
+    /// `.last` picks the menu's copy of the label rather than the identical text
+    /// the roster behind it may print (a role chip, an account's cohort).
+    Future<void> chooseFromDropdown(
+      WidgetTester tester,
+      Key field,
+      String option,
+    ) async {
+      await tester.ensureVisible(find.byKey(field));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(field));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(option).last);
+      await tester.pumpAndSettle();
+    }
+
     testWidgets('lands on the admin dashboard, not the staff console', (
       tester,
     ) async {
@@ -725,6 +743,44 @@ void main() {
       expect(find.text('Aisha Bello'), findsOneWidget);
       expect(find.text('manager@proctor.test'), findsOneWidget);
       expect(admin.listCalls, 1);
+    });
+
+    testWidgets('a labelled account shows its number and cohort under its name', (
+      tester,
+    ) async {
+      useDesktopSurface(tester);
+      profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
+
+      await tester.pumpWidget(gateUnderTest(userId: rootAdmin.id));
+      await tester.pumpAndSettle();
+
+      admin.accounts = <ManagedAccount>[
+        ...admin.accounts,
+        const ManagedAccount(
+          id: '55555555-5555-4555-8555-555555555555',
+          email: 'musa.ibrahim@proctor.test',
+          fullName: 'Musa Ibrahim',
+          role: UserRole.lecturer,
+          faculty: 'Science',
+          department: 'Computer Science',
+          level: '300',
+          staffId: 'STF-0142',
+        ),
+      ];
+      await tester.tap(find.byKey(const Key('admin-reload-accounts')));
+      await tester.pumpAndSettle();
+
+      // Address on one line, then the number and the cohort together: what was
+      // typed into the form a moment ago is what the roster proves.
+      expect(
+        find.text(
+          'musa.ibrahim@proctor.test\n'
+          'STF-0142 · Computer Science · Science · 300 Level',
+        ),
+        findsOneWidget,
+      );
+      // An account with nothing recorded keeps the plain one-line tile.
+      expect(find.text('manager@proctor.test'), findsOneWidget);
     });
 
     testWidgets('the signed-in admin is listed but cannot re-role themselves', (
@@ -768,6 +824,129 @@ void main() {
       expect(find.textContaining('is now a supervisor'), findsOneWidget);
       await letSnackBarExpire(tester);
     });
+
+    testWidgets(
+      'the create form sends the academic labels and the identity number',
+      (tester) async {
+        useDesktopSurface(tester);
+        profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
+
+        await tester.pumpWidget(gateUnderTest(userId: rootAdmin.id));
+        await tester.pumpAndSettle();
+
+        await tester.enterText(
+          find.byKey(const Key('admin-full-name')),
+          'Ada Nwosu',
+        );
+        await tester.enterText(
+          find.byKey(const Key('admin-email')),
+          'ada.nwosu@proctor.test',
+        );
+        await tester.enterText(
+          find.byKey(const Key('admin-password')),
+          'Proctor123!',
+        );
+
+        // A student is named by a matriculation number, so the identity field
+        // switches its label with the role instead of growing a second box.
+        await chooseFromDropdown(tester, const Key('admin-role'), 'Student');
+        expect(find.text('Matriculation number'), findsOneWidget);
+        expect(find.text('Staff ID'), findsNothing);
+
+        await chooseFromDropdown(tester, const Key('admin-faculty'), 'Science');
+        await chooseFromDropdown(
+          tester,
+          const Key('admin-department'),
+          'Computer Science',
+        );
+        await chooseFromDropdown(tester, const Key('admin-level'), '300');
+
+        await tester.ensureVisible(find.byKey(const Key('admin-identity')));
+        await tester.enterText(
+          find.byKey(const Key('admin-identity')),
+          'CSC/2021/041',
+        );
+
+        await tester.ensureVisible(find.byKey(const Key('admin-submit')));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const Key('admin-submit')));
+        await tester.pumpAndSettle();
+
+        final created = admin.lastCreate;
+        expect(created, isNotNull);
+        expect(created!.email, 'ada.nwosu@proctor.test');
+        expect(created.fullName, 'Ada Nwosu');
+        expect(created.role, UserRole.student);
+        expect(created.faculty, 'Science');
+        expect(created.department, 'Computer Science');
+        expect(created.level, '300');
+        // The student's number belongs in `matric_number`; the staff column stays
+        // NULL because this account is not a staff one.
+        expect(created.matricNumber, 'CSC/2021/041');
+        expect(created.staffId, isNull);
+        // The confirmation repeats the cohort, so a mistyped label is visible
+        // before the account is handed over.
+        expect(
+          find.textContaining('Computer Science · Science · 300 Level'),
+          findsOneWidget,
+        );
+        // The labels stay for the next account in the same department; the
+        // number does not, because it belongs to one person.
+        expect(find.text('Science'), findsOneWidget);
+        expect(find.text('CSC/2021/041'), findsNothing);
+        await letSnackBarExpire(tester);
+      },
+    );
+
+    testWidgets(
+      'a staff account records its number as a staff ID, not a matric number',
+      (tester) async {
+        useDesktopSurface(tester);
+        profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
+
+        await tester.pumpWidget(gateUnderTest(userId: rootAdmin.id));
+        await tester.pumpAndSettle();
+
+        // The form starts on `lecturer`, and the field already asks for the
+        // number a member of staff is known by.
+        expect(find.text('Staff ID'), findsOneWidget);
+        expect(find.text('Matriculation number'), findsNothing);
+
+        await tester.enterText(
+          find.byKey(const Key('admin-full-name')),
+          'Musa Ibrahim',
+        );
+        await tester.enterText(
+          find.byKey(const Key('admin-email')),
+          'musa.ibrahim@proctor.test',
+        );
+        await tester.enterText(
+          find.byKey(const Key('admin-password')),
+          'Proctor123!',
+        );
+        await tester.ensureVisible(find.byKey(const Key('admin-identity')));
+        await tester.enterText(
+          find.byKey(const Key('admin-identity')),
+          'STF-0142',
+        );
+
+        await tester.ensureVisible(find.byKey(const Key('admin-submit')));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const Key('admin-submit')));
+        await tester.pumpAndSettle();
+
+        final created = admin.lastCreate;
+        expect(created?.role, UserRole.lecturer);
+        expect(created?.staffId, 'STF-0142');
+        expect(created?.matricNumber, isNull);
+        // Nothing was stated about a cohort, so no label is invented — the
+        // optional dropdowns stay "not stated" and the row gets NULLs.
+        expect(created?.faculty, isNull);
+        expect(created?.department, isNull);
+        expect(created?.level, isNull);
+        await letSnackBarExpire(tester);
+      },
+    );
 
     testWidgets('a refused roster is reported with a retry', (tester) async {
       useDesktopSurface(tester);
@@ -1017,6 +1196,21 @@ class _FakeAdminUserRepository implements AdminUserRepository {
   final List<(String, String)> passwordResets = <(String, String)>[];
   Object? resetError;
 
+  /// The arguments of the most recent [createAccount], so a test can prove the
+  /// form carried the academic labels and identity number it collected — the
+  /// account it answers with is not added to [accounts], which is the roster the
+  /// page re-reads.
+  ({
+    String email,
+    String fullName,
+    UserRole role,
+    String? faculty,
+    String? department,
+    String? level,
+    String? matricNumber,
+    String? staffId,
+  })? lastCreate;
+
   @override
   Future<ManagedAccount> createAccount({
     required String email,
@@ -1026,16 +1220,31 @@ class _FakeAdminUserRepository implements AdminUserRepository {
     String? faculty,
     String? department,
     String? level,
-  }) async =>
-      ManagedAccount(
-        id: 'new-${accounts.length}',
-        email: email,
-        fullName: fullName,
-        role: role,
-        faculty: faculty,
-        department: department,
-        level: level,
-      );
+    String? matricNumber,
+    String? staffId,
+  }) async {
+    lastCreate = (
+      email: email,
+      fullName: fullName,
+      role: role,
+      faculty: faculty,
+      department: department,
+      level: level,
+      matricNumber: matricNumber,
+      staffId: staffId,
+    );
+    return ManagedAccount(
+      id: 'new-${accounts.length}',
+      email: email,
+      fullName: fullName,
+      role: role,
+      faculty: faculty,
+      department: department,
+      level: level,
+      matricNumber: matricNumber,
+      staffId: staffId,
+    );
+  }
 
   @override
   Future<StudentRosterOutcome> createStudentAccounts(

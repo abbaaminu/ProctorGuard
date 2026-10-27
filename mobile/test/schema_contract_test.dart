@@ -638,6 +638,84 @@ void main() {
         );
       },
     );
+
+    test('the academic labels and the identity number ride in one body', () async {
+      transport.statusCode = 200;
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'id': 'new-2',
+        'email': 'ada.nwosu@proctor.test',
+        'full_name': 'Dr. Ada Nwosu',
+        'role': 'lecturer',
+        'faculty': 'Science',
+        'department': 'Computer Science',
+        'level': '300',
+        'staff_id': 'STF-0142',
+      });
+
+      final account = await AdminUserRepositoryImpl(client).createAccount(
+        email: 'ada.nwosu@proctor.test',
+        password: 'Proctor123!',
+        fullName: 'Dr. Ada Nwosu',
+        role: UserRole.lecturer,
+        // Trimmed like every other free-text field: the column stores the label,
+        // not the padding somebody's spreadsheet left around it.
+        faculty: ' Science ',
+        department: 'Computer Science',
+        level: '300',
+        staffId: ' STF-0142 ',
+      );
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      expect(body, <String, dynamic>{
+        'email': 'ada.nwosu@proctor.test',
+        'password': 'Proctor123!',
+        'full_name': 'Dr. Ada Nwosu',
+        'role': 'lecturer',
+        'faculty': 'Science',
+        'department': 'Computer Science',
+        'level': '300',
+        'staff_id': 'STF-0142',
+        // No `matric_number`: nothing was stated, and an absent key is how the
+        // body says "record nothing" — the column stays NULL either way.
+      });
+      expect(body.containsKey('matric_number'), isFalse);
+
+      // The row the function answers with is read back leniently, so the page can
+      // confirm what was recorded without re-reading the whole roster.
+      expect(account.staffId, 'STF-0142');
+      expect(account.matricNumber, isNull);
+      expect(account.identityNumber, 'STF-0142');
+      expect(
+        account.academicLabel,
+        'Computer Science · Science · 300 Level',
+      );
+    });
+
+    test('an account created without metadata sends none of its keys', () async {
+      transport.statusCode = 200;
+      transport.responseBody = jsonEncode(<String, dynamic>{
+        'id': 'new-3',
+        'email': 'ada.nwosu@proctor.test',
+        'full_name': 'Dr. Ada Nwosu',
+        'role': 'lecturer',
+      });
+
+      // What a programmatic caller from before this feature sends: the same four
+      // keys and nothing else. The body has to stay byte-identical, because a
+      // deployment that has not run the identity migration must still accept it.
+      final account = await createLecturer();
+
+      expect(jsonDecode(transport.bodies.single), <String, dynamic>{
+        'email': 'ada.nwosu@proctor.test',
+        'password': 'Proctor123!',
+        'full_name': 'Dr. Ada Nwosu',
+        'role': 'lecturer',
+      });
+      // A row without the columns reads as "not recorded" rather than throwing.
+      expect(account.matricNumber, isNull);
+      expect(account.staffId, isNull);
+      expect(account.identityNumber, isNull);
+    });
   });
 
   group('role contract', () {
@@ -2556,6 +2634,78 @@ void main() {
         selectPredicate(sql, 'exams_select'),
         selectPredicate(schema, 'exams_select'),
       );
+    });
+
+    test('the identity numbers are declared, optional, and forwarded', () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      // `profiles` only: a paper is aimed at a cohort, never at one person's
+      // matriculation number, so `exams` gets neither column.
+      for (final column in <String>['matric_number', 'staff_id']) {
+        expect(
+          RegExp(
+            'alter table public\\.profiles add column if not exists '
+            '$column\\s+text;',
+          ).hasMatch(sql),
+          isTrue,
+          reason: 'profiles.$column has no upgrade path',
+        );
+        expect(
+          RegExp(
+            'create table if not exists public\\.profiles \\([\\s\\S]*?'
+            '\\b$column\\s+text',
+          ).hasMatch(sql),
+          isTrue,
+          reason: 'profiles.$column is missing from a fresh install',
+        );
+        // Optional, deliberately: an account created without a number is the
+        // account every install already has, and an import must not fail over a
+        // missing cell.
+        expect(
+          RegExp('\\b$column\\s+text not null').hasMatch(sql),
+          isFalse,
+          reason: 'profiles.$column must stay nullable',
+        );
+      }
+
+      // The upgrade file an existing project applies carries the same two
+      // statements: `create table if not exists` is a no-op on a live project.
+      final migration = File(
+        '../supabase/migrations/profile_identity_numbers.sql',
+      );
+      if (!migration.existsSync()) return; // a checkout without ../supabase
+      final upgrade = migration.readAsStringSync();
+      for (final column in <String>['matric_number', 'staff_id']) {
+        expect(
+          RegExp(
+            'alter table public\\.profiles add column if not exists '
+            '$column\\s+text;',
+          ).hasMatch(upgrade),
+          isTrue,
+          reason: '$column is not added by the migration',
+        );
+      }
+
+      // The Edge Function reads both spellings and stores the column's own name,
+      // so a JavaScript client's `matricNumber` lands in `matric_number`.
+      final function = File('../supabase/functions/admin-create-user/index.ts');
+      if (!function.existsSync()) return;
+      final source = function.readAsStringSync();
+      expect(source, contains('const IDENTITY_FIELDS'));
+      for (final column in <String>['matric_number', 'staff_id']) {
+        expect(source, contains('["$column"'), reason: '$column is not read');
+      }
+      expect(source, contains('stringField(payload, column, ...aliases)'));
+      // A project that has not run the migration answers "column ... does not
+      // exist"; the refusal has to name the file that fixes it, exactly as the
+      // scheduling migration's message does.
+      expect(source, contains('const PROFILE_METADATA_COLUMNS'));
+      expect(source, contains('profile_identity_numbers.sql'));
+      // Both branches go through `academicFields`, and the row insert spreads its
+      // answer - one path, so neither can forget a column the other writes.
+      expect(source, contains('academic: academicFields(payload)'));
+      expect(source, contains('academic: academicFields(row)'));
     });
   });
 }

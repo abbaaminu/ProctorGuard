@@ -479,7 +479,7 @@ in as a different account resolves a different profile.
 | --- | --- |
 | List | `select().from('profiles')` ordered oldest-first (`created_at.asc.nullslast`), so a freshly created account appears at the end |
 | Change a role | `update({role}).eq('id', …)` with `.select('*')`; a row count of zero is treated as a failure, not a silent success. Your own row is not editable — it renders a plain `role (you)` chip |
-| Create an account | POSTs email, full name, a temporary password and a role to `/functions/v1/admin-create-user`, which answers `200` with the created row (`full_name`, also accepted as `fullName`) |
+| Create an account | POSTs email, full name, a temporary password and a role to `/functions/v1/admin-create-user`, which answers `200` with the created row (`full_name`, also accepted as `fullName`). The optional faculty/department/level dropdowns and the matriculation-number/staff-ID field travel in the same body (`matric_number` for a student, `staff_id` for anybody else), and a blank one is omitted so the column stays `NULL` |
 | Reset a password | POSTs the account id and the new password to `/functions/v1/admin-reset-password` — `admin` only, and the one action allowed on your own row — then shows the password once |
 
 Every failure surfaces as one `AdminAccountException` whose message is already a

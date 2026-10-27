@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart' show SupabaseService;
+import '../../../../core/utils/academic_catalog.dart';
 import '../../../../core/widgets/home_button.dart';
 import '../../../../core/widgets/responsive_layout.dart';
 import '../../../dashboard/presentation/pages/analytics_page.dart';
@@ -57,10 +58,26 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
 
+  /// The matriculation number (a student) or staff ID (anybody else), in one
+  /// field: an administrator is creating *one* person, and which number that
+  /// person has is answered by the role picker above it. `_createAccount` maps
+  /// what was typed to the column it belongs in, so the two numbers never land in
+  /// each other's column.
+  final _identityController = TextEditingController();
+
   /// Defaults to the role the seeded accounts are mostly made of: creating a
   /// *student* is what the public sign-up form is for, so an admin opening this
   /// page is usually provisioning staff.
   UserRole _role = UserRole.lecturer;
+
+  /// The optional academic labels, or null for "not stated" — the state every
+  /// account created before the columns existed is in. They are written to the
+  /// profile row so `exams_select` can offer that account the papers aimed at its
+  /// cohort, and they are *kept* after a creation: provisioning a department is
+  /// several accounts in a row, and the labels are the same for all of them.
+  String? _faculty;
+  String? _department;
+  String? _level;
 
   bool _submitting = false;
   bool _obscurePassword = true;
@@ -68,11 +85,30 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
   /// The id whose role change is in flight, so exactly one row is disabled.
   String? _busyId;
 
+  /// The department choices for the faculty currently chosen. With no faculty
+  /// picked this is the whole catalogue, so an administrator who only knows the
+  /// department is not forced to answer a question they do not need to.
+  List<String> get _departmentOptions =>
+      AcademicCatalog.departmentsFor(_faculty);
+
+  /// Picking a faculty narrows the department list, so a department left over
+  /// from the previous faculty is dropped rather than silently submitted: the
+  /// pair would then describe no cohort in the institution.
+  void _selectFaculty(String? faculty) {
+    setState(() {
+      _faculty = faculty;
+      if (_department != null && !_departmentOptions.contains(_department)) {
+        _department = null;
+      }
+    });
+  }
+
   @override
   void dispose() {
     _fullNameController.dispose();
     _emailController.dispose();
     _passwordController.dispose();
+    _identityController.dispose();
     super.dispose();
   }
 
@@ -125,6 +161,10 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
     final fullName = _fullNameController.text.trim();
     // Not trimmed: the server hashes the password verbatim.
     final password = _passwordController.text;
+    // One field, two columns: a student is examined under a matriculation number,
+    // everybody else is named by their staff ID. Trimming happens in the
+    // repository, which omits the key when the value is blank.
+    final identity = _identityController.text;
 
     setState(() => _submitting = true);
     try {
@@ -133,6 +173,11 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
             password: password,
             fullName: fullName,
             role: _role,
+            faculty: _faculty,
+            department: _department,
+            level: _level,
+            matricNumber: _role == UserRole.student ? identity : null,
+            staffId: _role == UserRole.student ? null : identity,
           );
       if (!mounted) return;
 
@@ -140,15 +185,19 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
       // than insert a local row that the server might not agree with.
       ref.invalidate(managedAccountsProvider);
 
-      // Clear the credentials, keep the role: several lecturers in a row is the
-      // normal case.
+      // Clear the credentials and the identity number, keep the role *and* the
+      // academic labels: several lecturers in a row, all belonging to the same
+      // department, is the normal case — and the number belongs to one person.
       _formKey.currentState?.reset();
       _fullNameController.clear();
       _emailController.clear();
       _passwordController.clear();
+      _identityController.clear();
 
       _showMessage(
-        'Created ${account.displayName} as a ${account.role.label.toLowerCase()}. '
+        'Created ${account.displayName} as a '
+        '${account.role.label.toLowerCase()}'
+        '${account.academicLabel == null ? '' : ' (${account.academicLabel})'}. '
         'Hand over the temporary password, then have them change it.',
         isError: false,
       );
@@ -308,10 +357,19 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
       fullNameController: _fullNameController,
       emailController: _emailController,
       passwordController: _passwordController,
+      identityController: _identityController,
       role: _role,
+      faculty: _faculty,
+      department: _department,
+      level: _level,
+      departmentOptions: _departmentOptions,
       submitting: _submitting,
       obscurePassword: _obscurePassword,
       onRoleChanged: (role) => setState(() => _role = role),
+      onFacultyChanged: _selectFaculty,
+      onDepartmentChanged: (department) =>
+          setState(() => _department = department),
+      onLevelChanged: (level) => setState(() => _level = level),
       onTogglePassword: () =>
           setState(() => _obscurePassword = !_obscurePassword),
       onSubmit: _createAccount,
@@ -460,10 +518,18 @@ class _CreateAccountCard extends StatelessWidget {
     required this.fullNameController,
     required this.emailController,
     required this.passwordController,
+    required this.identityController,
     required this.role,
+    required this.faculty,
+    required this.department,
+    required this.level,
+    required this.departmentOptions,
     required this.submitting,
     required this.obscurePassword,
     required this.onRoleChanged,
+    required this.onFacultyChanged,
+    required this.onDepartmentChanged,
+    required this.onLevelChanged,
     required this.onTogglePassword,
     required this.onSubmit,
     required this.validateFullName,
@@ -475,10 +541,29 @@ class _CreateAccountCard extends StatelessWidget {
   final TextEditingController fullNameController;
   final TextEditingController emailController;
   final TextEditingController passwordController;
+
+  /// Matriculation number or staff ID, depending on [role] — the page writes it
+  /// to `profiles.matric_number` or `profiles.staff_id` accordingly.
+  final TextEditingController identityController;
+
   final UserRole role;
+
+  /// The optional academic labels: null means "not stated", which is the same
+  /// thing a blank column on the profile row means.
+  final String? faculty;
+  final String? department;
+  final String? level;
+
+  /// The department choices that belong to [faculty] (the whole catalogue while
+  /// no faculty is picked).
+  final List<String> departmentOptions;
+
   final bool submitting;
   final bool obscurePassword;
   final ValueChanged<UserRole> onRoleChanged;
+  final ValueChanged<String?> onFacultyChanged;
+  final ValueChanged<String?> onDepartmentChanged;
+  final ValueChanged<String?> onLevelChanged;
   final VoidCallback onTogglePassword;
   final VoidCallback onSubmit;
   final FormFieldValidator<String> validateFullName;
@@ -597,6 +682,73 @@ class _CreateAccountCard extends StatelessWidget {
                       },
               ),
               const SizedBox(height: 20),
+              Text(
+                'Academic details are optional. They decide which published '
+                'papers a student is offered, and are recorded for staff too.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 8),
+              _OptionalLabelField(
+                fieldKey: const Key('admin-faculty'),
+                label: 'Faculty',
+                icon: Icons.account_balance_outlined,
+                anyLabel: 'Not stated',
+                options: AcademicCatalog.facultyNames,
+                value: faculty,
+                enabled: !submitting,
+                onChanged: onFacultyChanged,
+              ),
+              const SizedBox(height: 8),
+              _OptionalLabelField(
+                fieldKey: const Key('admin-department'),
+                label: 'Department',
+                icon: Icons.menu_book_outlined,
+                anyLabel: 'Not stated',
+                options: departmentOptions,
+                value: department,
+                enabled: !submitting,
+                onChanged: onDepartmentChanged,
+              ),
+              const SizedBox(height: 8),
+              _OptionalLabelField(
+                fieldKey: const Key('admin-level'),
+                label: 'Level',
+                icon: Icons.groups_outlined,
+                anyLabel: 'Not stated',
+                options: AcademicCatalog.levels,
+                value: level,
+                enabled: !submitting,
+                onChanged: onLevelChanged,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                key: const Key('admin-identity'),
+                controller: identityController,
+                enabled: !submitting,
+                textInputAction: TextInputAction.done,
+                textCapitalization: TextCapitalization.characters,
+                // The label follows the role rather than the field being
+                // swapped: one input, and whatever was typed survives a change of
+                // role instead of becoming invisible in a field that is gone.
+                decoration: InputDecoration(
+                  labelText: role == UserRole.student
+                      ? 'Matriculation number'
+                      : 'Staff ID',
+                  helperText: 'Optional.',
+                  hintText: role == UserRole.student
+                      ? 'e.g. CSC/2021/041'
+                      : 'e.g. STF-0142',
+                  prefixIcon: Icon(
+                    role == UserRole.student
+                        ? Icons.school_outlined
+                        : Icons.badge_outlined,
+                  ),
+                  border: const OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 20),
               FilledButton(
                 key: const Key('admin-submit'),
                 // Null while in flight: disabled is the first line of defence
@@ -616,6 +768,56 @@ class _CreateAccountCard extends StatelessWidget {
       ),
     );
   }
+}
+
+/// One optional academic label, as a dropdown whose first entry is "not stated".
+///
+/// The same shape as the lecturer console's `_labelField`, and for the same
+/// reason: these are the institution's own labels (`AcademicCatalog`), and a
+/// free-text box would let "Computer Science" and "computer science" become two
+/// cohorts as far as the exam picker is concerned.
+///
+/// `initialValue`, not the deprecated `value`: the field owns what the
+/// administrator tapped and is rebuilt from the page's state whenever that
+/// changes (picking a different faculty, which can drop the department).
+class _OptionalLabelField extends StatelessWidget {
+  const _OptionalLabelField({
+    required this.fieldKey,
+    required this.label,
+    required this.icon,
+    required this.anyLabel,
+    required this.options,
+    required this.value,
+    required this.enabled,
+    required this.onChanged,
+  });
+
+  final Key fieldKey;
+  final String label;
+  final IconData icon;
+  final String anyLabel;
+  final List<String> options;
+  final String? value;
+  final bool enabled;
+  final ValueChanged<String?> onChanged;
+
+  @override
+  Widget build(BuildContext context) => DropdownButtonFormField<String?>(
+        key: fieldKey,
+        initialValue: value,
+        isExpanded: true,
+        decoration: InputDecoration(
+          labelText: label,
+          prefixIcon: Icon(icon),
+          border: const OutlineInputBorder(),
+        ),
+        items: <DropdownMenuItem<String?>>[
+          DropdownMenuItem<String?>(value: null, child: Text(anyLabel)),
+          for (final option in options)
+            DropdownMenuItem<String?>(value: option, child: Text(option)),
+        ],
+        onChanged: enabled ? onChanged : null,
+      );
 }
 
 /// The account roster: every profile row the caller may read, each with the
@@ -767,9 +969,28 @@ class _AccountTile extends StatelessWidget {
   final VoidCallback onDelete;
   final VoidCallback onResetPassword;
 
+  /// The lines under the account's name: the address (unless the address *is*
+  /// the name), then the identity number and the cohort as one fact.
+  ///
+  /// The last two share a line on purpose: a phone's roster tile is two lines
+  /// tall, and everything an administrator typed is what they need to see — not
+  /// four stacked lines that push the rest of the roster off screen.
+  static List<String> _subtitleLines(ManagedAccount account) {
+    final facts = <String>[
+      if (account.identityNumber != null) account.identityNumber!,
+      if (account.academicLabel != null) account.academicLabel!,
+    ].join(' · ');
+    return <String>[
+      // An unnamed account *is* its e-mail address, so do not print it twice.
+      if (account.displayName != account.email) account.email,
+      if (facts.isNotEmpty) facts,
+    ];
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final subtitleLines = _subtitleLines(account);
 
     return ListTile(
       key: Key('admin-account-${account.id}'),
@@ -779,9 +1000,11 @@ class _AccountTile extends StatelessWidget {
         child: Text(_initials(account.displayName)),
       ),
       title: Text(account.displayName),
-      // An unnamed account *is* its e-mail address, so do not print it twice.
       subtitle:
-          account.displayName == account.email ? null : Text(account.email),
+          subtitleLines.isEmpty ? null : Text(subtitleLines.join('\n')),
+      // Two lines under the name need the taller tile, or the second one is
+      // clipped.
+      isThreeLine: subtitleLines.length > 1,
       trailing: busy
           ? const SizedBox(
               height: 20,

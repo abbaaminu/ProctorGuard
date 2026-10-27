@@ -176,6 +176,8 @@ lose proctoring signals but cannot change a result.
    supabase db query --linked -f supabase/migrations/question_types_and_grading.sql
    supabase db query --linked -f supabase/migrations/optional_exam_scheduling.sql
    supabase db query --linked -f supabase/migrations/private_proctor_snapshots.sql
+   supabase db query --linked -f supabase/migrations/academic_targeting.sql
+   supabase db query --linked -f supabase/migrations/profile_identity_numbers.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -209,6 +211,13 @@ lose proctoring signals but cannot change a result.
    and it does not move or delete a single object — the app normalises the old URLs
    back to object paths, so existing evidence stays reviewable and a reset still
    purges it.
+   `academic_targeting.sql` adds the `faculty` / `department` / `level` columns an
+   account and a paper are labelled with (plus the per-paper borrow list), and
+   `profile_identity_numbers.sql` adds the optional `profiles.matric_number` /
+   `staff_id` that the admin console records beside them. Both are
+   `add column if not exists` and re-runnable: without them the console still
+   creates accounts, it just leaves those columns unset, and every existing
+   account and paper keeps the access it had.
 2. Deploy the account-management functions:
    ```powershell
    supabase functions deploy admin-create-user
@@ -240,6 +249,14 @@ lose proctoring signals but cannot change a result.
   `proctor-snapshots` bucket was created public (the pre-migration default). It is
   additive and re-runnable, changes no object, and is what makes the bucket's
   evidence reachable only through signed URLs.
+- Apply `supabase/migrations/academic_targeting.sql` and
+  `supabase/migrations/profile_identity_numbers.sql` on any project whose
+  `profiles` row predates the academic labels and identity numbers. Both are
+  additive and re-runnable. Without them the admin console still creates
+  accounts — a field left blank is sent as nothing and the column stays `NULL` —
+  but the roster has no faculty, department, level, matriculation number or staff
+  ID to show, no paper can be targeted at a cohort, and a filled-in label is
+  refused with a message naming the file to apply.
 - Apply `supabase/migrations/retention_policy.sql` and enable `pg_cron`
   (Dashboard → Database → Extensions). `proctoring_logs` is the one table that
   grows without bound; the migration seeds a 30-day window in
