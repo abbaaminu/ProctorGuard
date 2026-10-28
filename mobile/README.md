@@ -308,7 +308,9 @@ before the network, drain on recovery, backoff without help, one queued row per
 question, restore after a restart, corrupt-storage tolerance, the same event id on
 retry, a bounded queue, and the probe's events);
 `mobile/test/exam_taking_page_test.dart` covers what the student sees (the banner,
-the answer kept and later synced, the resumed draft) and the fullscreen countdown.
+the answer kept and later synced, the resumed draft, the attempt resumed past its
+deadline that is *not* submitted behind their back, and the one whose clock runs
+out on screen, which is) and the fullscreen countdown.
 
 ## Verifying the native kiosk bridge without a full APK build
 
@@ -773,6 +775,7 @@ mid-exam, so a silent failure would strand them:
 | Question feed unreachable | "Could not load the questions for this exam." + **Try again** / **Leave** |
 | Exam has no questions yet | "No questions yet" + **Leave** (the attempt stays `ongoing`, so it can be resumed after a supervisor adds them) |
 | Clock ran out | auto-submit; if the server cannot be reached, a "Time is up" screen with **Send again** / **Leave** |
+| Clock ran out while the screen was closed (a reload, a crash, a tab restored the next morning) | "Time is up" + **Hand in my answers** / **Leave**, and nothing is submitted until that tap (see the countdown bullet below) |
 
 There is no silent stand-in for a camera that is not working. The self-view shows
 a live preview, the loud **MOCK CAMERA** tile *only* in an explicit `MOCK_CAMERA`
@@ -814,8 +817,17 @@ Details worth knowing:
   flushes an unsaved typed answer first, so navigating never drops one.
 * **`exams.duration_minutes` is enforced.** The countdown is anchored on
   `exam_submissions.started_at` (not on "now"), so a resumed attempt keeps its
-  remaining time and one that is already past its deadline is submitted on the
-  first tick. The chip in the app bar turns amber under 5 minutes and red under 1.
+  remaining time, and the chip in the app bar turns amber under 5 minutes and red
+  under 1. An attempt that is **already** past its deadline when the screen opens
+  is *not* submitted from the clock: the page shows "Time is up", says that
+  nothing more can be added (the RPC refuses anything that arrives after
+  `attempt_deadline()`), and hands the attempt in through the same queue-draining
+  gate as a live expiry once the student taps **Hand in my answers**. Submitting
+  on the first tick is how a reload used to close a resumed attempt before its
+  durable cache and offline queue had been replayed — a zero the student never saw
+  happen. Only a clock that runs out **in front of the student** auto-submits.
+  Leaving that panel keeps the submission `ongoing`, so the same explanation is
+  what they get if they come back.
 * **Camera loss pauses proctoring and prompts the student.** The page listens to
   the `CameraController`; if the feed reports an error mid-session it calls
   `ProctoringNotifier.setCameraActive(false)`, which drops further `GazeSignal`s,

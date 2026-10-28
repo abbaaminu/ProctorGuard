@@ -232,6 +232,15 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// kiosk pin, watcher set and integrity probe that nothing released.
   bool _bootstrapping = false;
 
+  /// In-flight guard for [_finalSubmit], set **before** its first `await`.
+  ///
+  /// [ExamSessionController.isSubmitting] only turns true once the submit gate has
+  /// passed, and everything before that (the confirmation dialog, the text flush,
+  /// the queue drain, the rejected-answers dialog) is asynchronous. So a second
+  /// tap - or a retry screen plus a tap, or the clock firing while the gate is
+  /// flushing - used to start a second submit on top of the first.
+  bool _closing = false;
+
   /// Deadline of the "return to fullscreen" window, or null when fullscreen is
   /// where it should be. The guard owns the deadline; this mirrors it for display.
   DateTime? _fullscreenDeadline;
@@ -1067,10 +1076,29 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// Closes the attempt. `timeUp` is the countdown's path: no confirmation
   /// dialog (the clock already decided) and a retry screen if the server is
   /// unreachable.
+  ///
+  /// Two things enter it with `timeUp: true` and neither is a confirmation
+  /// dialog: the clock reaching zero while the student is on the paper, and the
+  /// expiry panel of a resumed attempt whose time ran out while the screen was
+  /// closed (see [ExamSessionState.expiredOnLoad]). Both go through the same
+  /// gate below, so an answer the queue still owes the server holds the attempt
+  /// open either way.
   Future<void> _finalSubmit({bool timeUp = false}) async {
     final session = _session;
-    if (session.isSubmitting || !mounted) return;
+    if (_closing || session.isSubmitting || !mounted) return;
 
+    _closing = true;
+    try {
+      await _closeAttempt(session: session, timeUp: timeUp);
+    } finally {
+      _closing = false;
+    }
+  }
+
+  Future<void> _closeAttempt({
+    required ExamSessionController session,
+    required bool timeUp,
+  }) async {
     try {
       if (!timeUp) {
         final confirmed = await _confirmSubmit();
@@ -1352,6 +1380,34 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
               'the server yet.',
           onRetry: () => _finalSubmit(timeUp: true),
           retryLabel: 'Send again',
+          allowExit: true,
+        ),
+      );
+    }
+
+    // The attempt's clock had already run out when this screen started: a reload,
+    // a crash, a restored tab, the next morning. Nothing was submitted behind the
+    // student's back. A resumed attempt can still look empty here - the durable
+    // cache and the offline queue are what hold the answers, and anything the RPC
+    // receives after `attempt_deadline()` is refused anyway - so an automatic
+    // submit on the first tick is exactly how a reload closed an attempt with none
+    // of the student's work and told nobody. The panel says what happened and
+    // hands the attempt in through the same gate as a live time-up, rejected
+    // answers dialog included; leaving keeps it `ongoing`, so this screen (and not
+    // a silent zero) is what the student sees if they come back.
+    if (session.expiredOnLoad) {
+      return _proctored(
+        proctoringState,
+        ExamBlockingState(
+          key: const Key('exam-expired-on-load'),
+          icon: Icons.timer_off_outlined,
+          title: 'Time is up',
+          message: 'The clock for this attempt ran out before this screen was '
+              'opened, so no further answers can be added - the exam refuses '
+              'anything that arrives after its deadline. Everything that reached '
+              'the server is still graded. Hand the attempt in to close it.',
+          onRetry: () => _finalSubmit(timeUp: true),
+          retryLabel: 'Hand in my answers',
           allowExit: true,
         ),
       );

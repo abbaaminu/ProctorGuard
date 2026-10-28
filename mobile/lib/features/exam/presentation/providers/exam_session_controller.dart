@@ -111,6 +111,7 @@ class ExamSessionState {
     this.submitting = false,
     this.timeUpPending = false,
     this.offlineSubmitPending = false,
+    this.expiredOnLoad = false,
   });
 
   final List<Question> questions;
@@ -157,6 +158,20 @@ class ExamSessionState {
   /// answers.
   final bool offlineSubmitPending;
 
+  /// True when the attempt's time had *already* run out by the moment this
+  /// screen started its countdown: a reload, a crash, a restored tab, a resumed
+  /// `ongoing` submission (`ExamSessionController.startCountdown`).
+  ///
+  /// Deliberately not [timeUpPending], which means "the clock ran out in front of
+  /// the student and the server has not acknowledged yet". This one means the
+  /// clock ran out while nobody was looking, and the two must not be answered the
+  /// same way: a resumed attempt whose durable cache and offline queue have not
+  /// been replayed yet can still look empty, and any answer that reaches the RPC
+  /// after `attempt_deadline()` is refused anyway. Submitting on the first tick
+  /// is therefore how a reload turned into a zero-answer attempt; instead the
+  /// session screen says what happened and hands the attempt in from there.
+  final bool expiredOnLoad;
+
   /// Question ids the student flagged for another look ("Mark for review").
   ///
   /// Local to the attempt and deliberately not an answer: marking is the student
@@ -184,6 +199,7 @@ class ExamSessionState {
     bool? submitting,
     bool? timeUpPending,
     bool? offlineSubmitPending,
+    bool? expiredOnLoad,
   }) =>
       ExamSessionState(
         questions: questions ?? this.questions,
@@ -202,6 +218,7 @@ class ExamSessionState {
         submitting: submitting ?? this.submitting,
         timeUpPending: timeUpPending ?? this.timeUpPending,
         offlineSubmitPending: offlineSubmitPending ?? this.offlineSubmitPending,
+        expiredOnLoad: expiredOnLoad ?? this.expiredOnLoad,
       );
 }
 
@@ -313,22 +330,47 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
   ///
   /// The deadline is anchored on the submission's `started_at` rather than
   /// "now", so a resumed attempt (crash, refresh, reconnect) keeps counting down
-  /// from where it left off — and one that is already past its deadline is
-  /// submitted on the first tick instead of being given a fresh hour.
+  /// from where it left off instead of being given a fresh hour.
+  ///
+  /// An attempt that is **already** past that deadline when this screen starts is
+  /// reported through [ExamSessionState.expiredOnLoad] and left alone: no ticker,
+  /// no [onTimeUp]. That callback means "the clock ran out in front of the
+  /// student", and the page turns it into a submission without a dialog. Firing
+  /// it here instead is what made a resumed `ongoing` attempt close itself the
+  /// instant the screen mounted — before the cache had been replayed, before the
+  /// offline queue had been drained, and with a dialog (rejected answers) nobody
+  /// had asked for. The page owns that decision now: it says the clock has run out
+  /// and hands the answers in from its own screen, through the same queue-draining
+  /// submit gate as a live time-up.
   void startCountdown() {
+    final now = _clock();
     final deadline = resolveDeadline(
-      now: _clock(),
+      now: now,
       durationMinutes: args.durationMinutes,
       startedAt: args.startedAt,
       endsAt: args.endsAt,
     );
     if (deadline == null) return;
 
+    // Whatever the previous arm of the ticker was, it is not this one.
     _countdown?.cancel();
-    // The ticker is installed *before* the first tick: that tick is what submits
-    // an attempt which resumes past its deadline, and it cancels the ticker it
-    // finds. Creating the ticker afterwards used to re-arm the submission once a
-    // second for as long as the page stayed on screen.
+    _countdown = null;
+
+    // `now >= deadline`: the attempt's time ran out while this screen was not
+    // open (a reload, a crash, a restored tab, the next morning). Nothing is
+    // submitted from here and no ticker is armed - there is nothing left to
+    // count down, and pretending otherwise re-fires the expiry every second.
+    if (!now.isBefore(deadline)) {
+      state = state.copyWith(remaining: Duration.zero, expiredOnLoad: true);
+      return;
+    }
+
+    // A retry re-runs this method on a clock that is still running (see
+    // `_retryBootstrap`), so an earlier expiry reading must not stick.
+    state = state.copyWith(expiredOnLoad: false);
+    // The ticker is installed *before* the first tick, so that tick can cancel
+    // the ticker it finds rather than re-arming the expiry once a second for as
+    // long as the page stays on screen.
     _countdown = Timer.periodic(
       const Duration(seconds: 1),
       (_) => _tickCountdown(deadline),
@@ -372,6 +414,16 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
   }
 
 
+  /// One tick of a clock that is running *in front of the student*.
+  ///
+  /// Every tick re-reads the wall clock rather than subtracting a second: a
+  /// hidden browser tab is throttled (one tick a second at best, a minute at
+  /// worst) and a machine that slept does not tick at all, so a decremented
+  /// counter would drift away from the deadline the server enforces. The tick
+  /// that finds the deadline already passed therefore reports zero and fires
+  /// [onTimeUp] at once, which is what makes a slept-through paper submit
+  /// immediately on the student's next look instead of counting down from a stale
+  /// value.
   void _tickCountdown(DateTime deadline) {
     if (!mounted) return;
 
@@ -569,7 +621,14 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
   Future<bool> flushTextAnswer() async {
     if (!mounted) return true;
 
-    final question = state.questions[state.currentIndex];
+    // The feed may not be loaded yet: a resumed attempt whose clock expired while
+    // the screen was closed now hands itself in from the expiry panel, and this
+    // runs before anything is on screen to have typed into. There is no visible
+    // draft to lose, so there is nothing here to fail.
+    if (state.questions.isEmpty) return true;
+
+    final index = state.currentIndex.clamp(0, state.questions.length - 1);
+    final question = state.questions[index];
     if (!question.usesTextAnswer) return true;
 
     final text = state.textAnswers[question.id] ?? '';

@@ -106,11 +106,18 @@ void main() {
     // `now`: the periodic tick reads the same instant every second.
     final now = DateTime(2026, 1, 5, 16, 55);
 
-    Future<void> expectRemaining({
-      required int durationMinutes,
+    /// A controller for one attempt, driven by a clock the test moves itself.
+    ///
+    /// [timeUps] counts the times the clock asked the page to submit, because the
+    /// distinction this group pins is *which* situation is allowed to get there: a
+    /// clock that runs out in front of the student, never one that ran out while
+    /// the screen was closed.
+    ({ExamSessionController controller, List<bool> timeUps}) countdownFor({
+      required DateTime Function() clock,
+      int? durationMinutes = 60,
+      DateTime? startedAt,
       DateTime? endsAt,
-      required Duration expected,
-    }) async {
+    }) {
       final container = ProviderContainer();
       addTearDown(container.dispose);
 
@@ -118,9 +125,9 @@ void main() {
         examId: 'exam-1',
         submissionId: 'sub-1',
         durationMinutes: durationMinutes,
-        startedAt: DateTime(2026, 1, 5, 16, 50),
+        startedAt: startedAt ?? DateTime(2026, 1, 5, 16, 50),
         endsAt: endsAt,
-        clock: () => now,
+        clock: clock,
       );
       // A listener keeps the `autoDispose` provider alive for the test; a bare
       // `read` would let Riverpod dispose it on the next microtask.
@@ -128,10 +135,25 @@ void main() {
 
       final controller =
           container.read(examSessionControllerProvider(args).notifier);
-      controller.startCountdown();
+      final timeUps = <bool>[];
+      controller.onTimeUp = () => timeUps.add(true);
       addTearDown(controller.stopCountdown);
+      return (controller: controller, timeUps: timeUps);
+    }
 
-      expect(controller.state.remaining, expected);
+    Future<void> expectRemaining({
+      required int durationMinutes,
+      DateTime? endsAt,
+      required Duration expected,
+    }) async {
+      final built = countdownFor(
+        clock: () => now,
+        durationMinutes: durationMinutes,
+        endsAt: endsAt,
+      );
+      built.controller.startCountdown();
+
+      expect(built.controller.state.remaining, expected);
     }
 
     test('shows the full duration when the paper has no window', () async {
@@ -158,6 +180,60 @@ void main() {
         endsAt: DateTime(2026, 1, 5, 16, 54),
         expected: Duration.zero,
       );
+    });
+
+    // A reload, a crashed tab, the machine waking up the next morning: the
+    // deadline went by while nobody was looking at the paper. Submitting from the
+    // first tick here is how a resumed attempt got closed with none of the
+    // student's answers (the cache and the offline queue had not been replayed
+    // yet), so the clock reports the situation and leaves the decision to the
+    // page, which can explain it before handing the attempt in.
+    test('an attempt resumed past its deadline is reported, not submitted', () {
+      final built = countdownFor(
+        // Deadline was 17:50 (16:50 + 60), and the screen comes back at 18:30.
+        clock: () => DateTime(2026, 1, 5, 18, 30),
+      );
+
+      built.controller.startCountdown();
+
+      expect(built.controller.state.expiredOnLoad, isTrue);
+      expect(built.controller.state.remaining, Duration.zero);
+      expect(built.timeUps, isEmpty);
+    });
+
+    test('the deadline landing on the very first tick counts as expired', () {
+      // 16:50 + 60 is 17:50: the exact instant is already too late.
+      final built = countdownFor(clock: () => DateTime(2026, 1, 5, 17, 50));
+
+      built.controller.startCountdown();
+
+      expect(built.controller.state.expiredOnLoad, isTrue);
+      expect(built.timeUps, isEmpty);
+    });
+
+    test('an attempt with time left is not reported as expired', () {
+      final built = countdownFor(clock: () => DateTime(2026, 1, 5, 16, 55));
+
+      built.controller.startCountdown();
+
+      expect(built.controller.state.expiredOnLoad, isFalse);
+      expect(built.controller.state.remaining, const Duration(minutes: 55));
+      expect(built.timeUps, isEmpty);
+    });
+
+    test('a retry on a clock that is running again clears the reading', () {
+      var now = DateTime(2026, 1, 5, 18, 30);
+      final built = countdownFor(clock: () => now);
+      built.controller.startCountdown();
+      expect(built.controller.state.expiredOnLoad, isTrue);
+
+      // The device clock was wrong, or the supervisor moved the deadline: the
+      // next arming must not leave the page stuck on the "time is up" panel.
+      now = DateTime(2026, 1, 5, 16, 55);
+      built.controller.startCountdown();
+
+      expect(built.controller.state.expiredOnLoad, isFalse);
+      expect(built.controller.state.remaining, const Duration(minutes: 55));
     });
   });
 }

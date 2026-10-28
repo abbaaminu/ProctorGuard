@@ -101,6 +101,13 @@ void main() {
     bool mockCamera = true,
     WebGuards? webGuards,
     DateTime Function()? clock,
+    /// The attempt's clock: `exams.duration_minutes`, the submission's
+    /// `started_at` and the paper's `ends_at` (`ExamTakingPage` passes exactly
+    /// these three in production). Null means "no countdown to enforce", which is
+    /// what every test that is not about the clock wants.
+    int? durationMinutes,
+    DateTime? startedAt,
+    DateTime? endsAt,
     AudioLevelSource? audioSource,
     WebFaceSignalSource? webFaceSignals,
     String? candidateName,
@@ -147,6 +154,9 @@ void main() {
                             webGuards: webGuards,
                             webFaceSignals: webFaceSignals,
                             clock: clock,
+                            durationMinutes: durationMinutes,
+                            startedAt: startedAt,
+                            endsAt: endsAt,
                             candidateName: candidateName,
                             examTitle: examTitle,
                             candidateEmail: candidateEmail,
@@ -291,6 +301,117 @@ void main() {
       );
       expect(field.controller?.text, 'HyperText Transfer Protocol');
       expect(find.text('Answer saved'), findsOneWidget);
+    });
+  });
+
+  group('a resumed attempt whose time ran out', () {
+    /// The attempt starts at 09:00 and the paper gives an hour, so the deadline is
+    /// 10:00; this is how far past the start the clock reads.
+    late int minutesPastStart;
+
+    DateTime attemptClock() =>
+        DateTime(2026, 1, 5, 9).add(Duration(minutes: minutesPastStart));
+
+    /// Bounded pumps, for the same reason the offline group uses them: an attempt
+    /// held open by a queue that cannot drain is *supposed* to keep retrying, so
+    /// "settled" is not a state this screen reaches and `pumpAndSettle` would spin.
+    Future<void> pumpAttempt(WidgetTester tester) async {
+      for (var i = 0; i < 20; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+    }
+
+    Widget resumedAt({int minutes = 90}) {
+      minutesPastStart = minutes;
+      return pageUnderTest(
+        clock: attemptClock,
+        durationMinutes: 60,
+        startedAt: DateTime(2026, 1, 5, 9),
+      );
+    }
+
+    testWidgets('is not submitted behind the student\'s back', (tester) async {
+      // A reload at 10:30 of a 09:00-10:00 attempt. The old behaviour was to fire
+      // the clock's time-up on the very first tick, which submitted immediately -
+      // before the cached answers and the offline queue had been replayed - and
+      // closed the attempt with a zero the student never saw happen.
+      await tester.pumpWidget(resumedAt());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      expect(exams.submitted, isEmpty);
+      expect(find.byKey(const Key('exam-expired-on-load')), findsOneWidget);
+      expect(find.text('Time is up'), findsOneWidget);
+      expect(find.text('Hand in my answers'), findsOneWidget);
+      // A blocking screen like any other: no spinner left behind, one action and
+      // one way out.
+      expectBlockingState();
+      // The paper is not put in front of them either: there is nothing to answer.
+      expect(find.text('Question 1 of 2'), findsNothing);
+    });
+
+    testWidgets('hands the saved answers in when the student asks',
+        (tester) async {
+      await tester.pumpWidget(resumedAt());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('exam-retry')));
+      await tester.pumpAndSettle();
+
+      // Exactly one submit, and the session screen has closed itself.
+      expect(exams.submitted, <String>['sub-1']);
+      expect(find.text('open exam'), findsOneWidget);
+    });
+
+    testWidgets('an answer the queue still owes keeps the attempt open',
+        (tester) async {
+      // The device holds an answer the server never received. Closing the attempt
+      // now would have it graded without that answer, so the hand-in has to wait -
+      // the same gate as a live time-up, not a bypass for the expiry panel.
+      exams.online = false;
+      store = InMemoryKeyValueStore(values: <String, String>{
+        'queue.answers': jsonEncode(<Map<String, dynamic>>[
+          <String, dynamic>{
+            'submission_id': 'sub-1',
+            'question_id': 'q-1',
+            'selected_option': 1,
+            'updated_at':
+                DateTime(2026, 1, 5, 9, 5).toUtc().toIso8601String(),
+          },
+        ]),
+      });
+
+      await tester.pumpWidget(resumedAt());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('exam-retry')));
+      await pumpAttempt(tester);
+
+      expect(exams.submitted, isEmpty);
+      expect(find.byKey(const Key('exam-time-up')), findsOneWidget);
+      // Leaving is still possible, and the attempt stays `ongoing` for later.
+      expect(find.byKey(const Key('exam-leave')), findsOneWidget);
+    });
+
+    testWidgets('a clock that runs out on screen still submits on its own',
+        (tester) async {
+      // The other half of the rule this group pins: when the student is sitting the
+      // paper and the clock reaches zero in front of them, the attempt is handed in
+      // without a dialog. Only the *resumed-past-the-deadline* case waits.
+      await tester.pumpWidget(resumedAt(minutes: 59));
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+      expect(find.text('Question 1 of 2'), findsOneWidget);
+      expect(exams.submitted, isEmpty);
+
+      minutesPastStart = 61; // the deadline has gone by
+      await tester.pump(const Duration(seconds: 1)); // the countdown's next tick
+      await tester.pumpAndSettle();
+
+      expect(exams.submitted, <String>['sub-1']);
+      expect(find.text('open exam'), findsOneWidget);
     });
   });
 
