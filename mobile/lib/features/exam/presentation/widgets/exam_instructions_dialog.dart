@@ -170,10 +170,11 @@ const List<_Rule> _proctorRules = <_Rule>[
     icon: Icons.mic_none_outlined,
     heading: 'Your microphone stays on',
     body:
-        'The session listens for noise above the room\'s own level, so a cough '
-        'or a chair does not count against you — but speech, a second voice or '
-        'steady background sound does, even a quiet one at normal volume. It '
-        'takes half a second of it: two words are enough, a single noise is not. '
+        'The session listens for noise above the room\'s own level, so a cough, '
+        'a chair or a keyboard does not count against you — but speech, a second '
+        'voice or steady background sound does, even a quiet one at normal '
+        'volume. It takes about a second of it: a short phrase is enough, a '
+        'single noise is not. '
         'Sustained noise is recorded as "Background noise", '
         'and the '
         'indicator on the exam screen shows the level as it moves. If the '

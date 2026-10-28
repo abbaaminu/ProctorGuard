@@ -14,15 +14,21 @@ final profileRepositoryProvider = Provider<ProfileRepository>((ref) {
 
 /// How long the gate waits for a profile before it stops waiting.
 ///
-/// The repository's own retry window is ~2.5 s (`ProfileRepositoryImpl`'s three
-/// waits) plus the reads and the self-provisioning insert, so a healthy sign-in
-/// never reaches this. Ten seconds is the point where "the `handle_new_user`
-/// trigger is still committing" has become "something is wrong": a socket that
-/// never answers, a paused project, or a trigger that raised and will never
-/// write the row. Without a bound the future simply stays pending - there is no
-/// error to catch because nothing failed - and the gate spins on "Loading your
-/// profile…" with no retry and no way out but killing the app.
-const Duration profileLoadTimeout = Duration(seconds: 10);
+/// The repository's own window is ~25 s at the outside - five attempts, each given
+/// `ProfileRepositoryImpl.defaultAttemptTimeout`, separated by
+/// `ProfileRepositoryImpl.defaultRetryDelays` (0.25 + 0.75 + 1.5 + 3 s) - so this
+/// bound exists only to catch a lookup that gets stuck somewhere the repository
+/// cannot see. It was ten seconds, which was shorter than the repository's own
+/// worst case: a cold start, a laptop waking up or a project coming out of pause
+/// therefore showed "Loading your profile took too long" for a connection that was
+/// still resolving (the false failure seen in live testing), and the retries that
+/// had been added for exactly that case never got to finish. Thirty seconds is
+/// "something is genuinely wrong": a socket that never answers, a paused project,
+/// or a trigger that raised and will never write the row. Without a bound the
+/// future simply stays pending - there is no error to catch because nothing failed
+/// - and the gate spins on "Loading your profile…" with no retry and no way out but
+/// killing the app.
+const Duration profileLoadTimeout = Duration(seconds: 30);
 
 /// The message the timeout produces, kept next to the bound so the two are read
 /// together (and so a test can assert what the student is actually told).

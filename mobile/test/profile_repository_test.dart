@@ -6,9 +6,11 @@ import 'package:http/http.dart' as http;
 import 'package:proctorguard/features/auth/data/repositories/profile_repository_impl.dart';
 import 'package:proctorguard/features/auth/domain/entities/user_profile.dart';
 import 'package:proctorguard/features/auth/domain/repositories/profile_repository.dart';
+import 'package:proctorguard/features/auth/presentation/providers/profile_provider.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
-/// The sign-in race, from the repository's side.
+/// The sign-in race, from the repository's side - and the connection that is
+/// still coming back.
 ///
 /// Signing in emits the session a moment before the `handle_new_user` trigger's
 /// `public.profiles` row is visible to a `select`, so the first answer the role
@@ -18,14 +20,19 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 /// the gate on "Loading your profile…" instead of "We could not load your
 /// profile".
 ///
-/// Nothing else is retried — a refused read, a row with an unknown role, and a row
-/// that is still absent after the whole window are all reported at once. Both
-/// halves of that sentence are pinned here.
+/// A read that *fails* for a reason that may not be true a moment later - a socket
+/// that never answers, a dropped connection, a gateway that could not reach the
+/// database - is retried on the same schedule, because a cold start and a paused
+/// project look exactly like that from here (and reporting them at once is what
+/// showed "Loading your profile took too long" to students whose connection was
+/// still resolving). A refused read, a row with an unknown role, and a row that is
+/// still absent after the whole window are still reported at once. Every one of
+/// those sentences is pinned here.
 ///
-/// Two things make it testable without a backend and without sleeping: the
-/// transport answers each request in turn ("no row yet", then a row), and the
-/// repository's wait is injected (`wait:`), so a test can hold the window open and
-/// assert the schedule rather than race it.
+/// Three things make it testable without a backend and without sleeping: the
+/// transport answers each request in turn ("no row yet", then a row), it can leave
+/// a request hanging, and the repository's wait is injected (`wait:`), so a test
+/// can hold the window open and assert the schedule rather than race it.
 class _ScriptedTransport extends http.BaseClient {
   _ScriptedTransport(this._replies);
 
@@ -46,19 +53,45 @@ class _ScriptedTransport extends http.BaseClient {
   /// Status a [refusedMethods] request carries.
   int refusalStatus = 403;
 
+  /// Status for one request index, when an answer's status matters as well as its
+  /// body: a `PGRST003` pool timeout is a 504, a healthy read is a 200.
+  final Map<int, int> statuses = <int, int>{};
+
+  /// Request indices that never answer until [release]: the shape of a socket a
+  /// cold start, a sleeping laptop or a paused project left open.
+  final Set<int> hanging = <int>{};
+
+  /// Every request the repository made, in order.
   final List<http.BaseRequest> requests = <http.BaseRequest>[];
+
+  final List<Completer<void>> _gates = <Completer<void>>[];
+
+  /// Lets every [hanging] request answer.
+  void release() {
+    for (final gate in _gates) {
+      if (!gate.isCompleted) gate.complete();
+    }
+  }
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     final index = requests.length;
     requests.add(request);
+
+    if (hanging.contains(index)) {
+      final gate = Completer<void>();
+      _gates.add(gate);
+      await gate.future;
+    }
+
     return http.StreamedResponse(
       Stream<List<int>>.value(
         utf8.encode(
           _replies[index < _replies.length ? index : _replies.length - 1],
         ),
       ),
-      refusedMethods.contains(request.method) ? refusalStatus : statusCode,
+      statuses[index] ??
+          (refusedMethods.contains(request.method) ? refusalStatus : statusCode),
       headers: const <String, String>{'content-type': 'application/json'},
       request: request,
     );
@@ -71,6 +104,11 @@ const _userId = '22222222-2222-4222-8222-222222222222';
 /// A PostgREST refusal, the shape the client turns into a `PostgrestException`.
 const _refusal = '{"code":"42501","message":"permission denied for table '
     'profiles","details":null,"hint":null}';
+
+/// PostgREST's "the pool had no connection to give" answer: `PGRST003` with a
+/// 504. It says nothing about the account, which is why it is retried.
+const _poolTimeout = '{"code":"PGRST003","message":"Timed out acquiring '
+    'connection from connection pool.","details":null,"hint":null}';
 
 /// One `public.profiles` row as PostgREST returns it, or `'[]'` for "no row
 /// (yet)".
@@ -97,11 +135,14 @@ void main() {
   /// The repository under test, wired to the current [transport].
   ///
   /// `wait:` is injected by every test that reaches a retry: letting the real
-  /// `Future.delayed` through would spend the whole 2.45 second window in the
+  /// `Future.delayed` through would spend the whole 5.5 second window in the
   /// suite. The default here resolves immediately, so the schedule is still the
-  /// real one and only the waiting is skipped.
+  /// real one and only the waiting is skipped. `attemptTimeout` is left at the
+  /// shipped value except by the tests that need a request to hang, where a few
+  /// milliseconds stand in for four seconds.
   ProfileRepositoryImpl repository({
     List<Duration>? retryDelays,
+    Duration attemptTimeout = ProfileRepositoryImpl.defaultAttemptTimeout,
     Future<void> Function(Duration)? wait,
     ProfileIdentityReader? currentIdentity,
   }) =>
@@ -110,8 +151,15 @@ void main() {
           'https://mock.supabase.co',
           'sb_publishable_mock',
           httpClient: transport,
+          // `supabase` retries a GET three times on its own (`PostgrestClientOptions`,
+          // network errors and 503/520 included). These tests are about the
+          // repository's own window, so that layer is switched off here: otherwise
+          // a single failure would be absorbed by it and neither the schedule nor
+          // the sentence could be asserted.
+          postgrestOptions: const PostgrestClientOptions(retryEnabled: false),
         ),
         retryDelays: retryDelays ?? ProfileRepositoryImpl.defaultRetryDelays,
+        attemptTimeout: attemptTimeout,
         wait: wait ?? (duration) async {},
         currentIdentity: currentIdentity,
       );
@@ -182,7 +230,7 @@ void main() {
       gates.first.complete();
       await pumpEventQueue();
       expect(transport.requests.length, 2);
-      expect(waits.last, const Duration(milliseconds: 700));
+      expect(waits.last, const Duration(milliseconds: 750));
       expect(outcome, isNull);
 
       gates.last.complete();
@@ -195,7 +243,7 @@ void main() {
         waits,
         <Duration>[
           const Duration(milliseconds: 250),
-          const Duration(milliseconds: 700),
+          const Duration(milliseconds: 750),
         ],
         reason: 'the window the gate\'s loading screen covers',
       );
@@ -277,6 +325,113 @@ void main() {
     });
   });
 
+  group('a connection that is still coming back', () {
+    // The live failure behind these tests: a cold start, a laptop back from sleep
+    // or a Supabase project coming out of pause leaves the first read unanswered or
+    // dropped, and the gate used to be shown "We could not load your profile.
+    // Loading your profile took too long..." for a connection that only needed a
+    // moment. A read that fails that way is now retried on the same schedule as a
+    // row that has not arrived yet - and a read that *keeps* failing still ends,
+    // with the sentence about the connection rather than a guess about the row.
+
+    test('a read that never answers is retried, and the row behind it wins',
+        () async {
+      transport = _ScriptedTransport(<String>[profileRow()])..hanging.add(0);
+      final waits = <Duration>[];
+
+      final profile = await repository(
+        attemptTimeout: const Duration(milliseconds: 20),
+        wait: (duration) async => waits.add(duration),
+      ).getProfile(_userId);
+
+      expect(profile.role, UserRole.student);
+      expect(transport.requests.length, 2);
+      expect(waits, <Duration>[const Duration(milliseconds: 250)]);
+
+      // The abandoned request may still land. It must not be able to change
+      // anything, and it must not keep the suite open.
+      transport.release();
+    });
+
+    test('a connection that drops twice still gets a third chance', () async {
+      // A read that fails is not a verdict: two unanswered attempts in a row are
+      // exactly what a cold start looks like, and the third one is the read that
+      // signs the student in.
+      transport = _ScriptedTransport(<String>[profileRow()])
+        ..hanging.addAll(<int>[0, 1]);
+      final waits = <Duration>[];
+
+      final profile = await repository(
+        attemptTimeout: const Duration(milliseconds: 20),
+        wait: (duration) async => waits.add(duration),
+      ).getProfile(_userId);
+
+      expect(profile.role, UserRole.student);
+      expect(transport.requests.length, 3);
+      expect(
+        waits,
+        <Duration>[
+          const Duration(milliseconds: 250),
+          const Duration(milliseconds: 750),
+        ],
+        reason: 'the delays grow, but the whole window is on the student\'s side',
+      );
+      transport.release();
+    });
+
+    test('a gateway that never reached the database is retried', () async {
+      // `PGRST003` / 504 is PostgREST saying its pool had no connection to give,
+      // and a proxy in front of a paused project answers a 5xx with no PostgREST
+      // body at all. Neither is an answer about this account.
+      transport = _ScriptedTransport(<String>[_poolTimeout, profileRow()])
+        ..statuses[0] = 504;
+
+      final profile = await repository(wait: (duration) async {})
+          .getProfile(_userId);
+
+      expect(profile.role, UserRole.student);
+      expect(transport.requests.length, 2);
+    });
+
+    test('a connection that keeps failing ends on the connection sentence',
+        () async {
+      // Every read in the window goes unanswered: the shape of a socket that is
+      // gone rather than slow.
+      transport = _ScriptedTransport(<String>['[]'])
+        ..hanging.addAll(<int>[0, 1, 2, 3, 4]);
+      final waits = <Duration>[];
+
+      await expectLater(
+        repository(
+          attemptTimeout: const Duration(milliseconds: 20),
+          wait: (duration) async => waits.add(duration),
+        ).getProfile(_userId),
+        throwsA(
+          isA<ProfileLookupException>().having(
+            (error) => error.message,
+            'message',
+            contains('Check your connection'),
+          ),
+        ),
+      );
+
+      // Every attempt in the window was used, every one of them a read...
+      expect(
+        transport.requests.length,
+        ProfileRepositoryImpl.defaultRetryDelays.length + 1,
+      );
+      expect(waits, ProfileRepositoryImpl.defaultRetryDelays);
+      // ...and none of them a write: a failed read says nothing about whether the
+      // row exists, so self-provisioning on that guess would be worse than the
+      // message.
+      expect(
+        transport.requests.every((request) => request.method == 'GET'),
+        isTrue,
+      );
+      transport.release();
+    });
+  });
+
   group('the default window', () {
     test('is finite, increasing, and outlasts the gate\'s hint', () {
       final delays = ProfileRepositoryImpl.defaultRetryDelays;
@@ -294,7 +449,7 @@ void main() {
       final total = delays.fold(Duration.zero, (sum, delay) => sum + delay);
       // Short enough that a genuinely absent row still reaches the error screen
       // (with its retry) rather than looking like a hang...
-      expect(total, lessThan(const Duration(seconds: 5)));
+      expect(total, lessThan(const Duration(seconds: 8)));
       // ...and long enough to cover the loading screen's "Still trying" hint,
       // which appears at 1500ms (`_ProfileLoading.hintDelay` in role_gate.dart):
       // a window shorter than that could never be *seen* to be retrying.
@@ -305,6 +460,20 @@ void main() {
       expect(
         repository().retryDelays,
         same(ProfileRepositoryImpl.defaultRetryDelays),
+      );
+
+      // The gate's own bound has to outlast the repository's worst case, or a
+      // connection that is merely slow is reported as a failure while it is still
+      // resolving - which is the false "Loading your profile took too long" that
+      // live testing hit. Five attempts, each free to take `attemptTimeout`, plus
+      // the waits in between.
+      final worstCase = ProfileRepositoryImpl.defaultAttemptTimeout *
+              (delays.length + 1) +
+          total;
+      expect(
+        worstCase,
+        lessThan(profileLoadTimeout),
+        reason: 'the repository must be allowed to finish before the gate gives up',
       );
     });
   });
@@ -336,7 +505,7 @@ void main() {
     /// (PostgREST returns none without `.select()`); the read-back finds the row
     /// the insert created. That is the whole shape of the repair.
     List<String> missingThenCreated() => <String>[
-          '[]', '[]', '[]', '[]', // the look-window
+          for (var i = 0; i < looks; i++) '[]', // the look-window
           '[]', // the insert
           profileRow(),
         ];
@@ -353,7 +522,8 @@ void main() {
       expect(profile.displayName, 'Aisha Bello');
       expect(profile.isStaff, isFalse);
 
-      // Four looks, one insert, one read-back — in that order.
+      // One look per delay, plus the first: then one insert and one read-back -
+      // in that order.
       expect(transport.requests.length, looks + 2);
 
       final insert = transport.requests[looks] as http.Request;
@@ -412,8 +582,8 @@ void main() {
 
     test('a repair with no session behind it is never attempted', () async {
       // No identity: nothing to build a row from, and a row about somebody else
-      // is exactly what must not be written. Four looks and the honest sentence,
-      // unchanged from before this behaviour existed.
+      // is exactly what must not be written. A look per delay and the honest
+      // sentence, unchanged from before this behaviour existed.
       transport = _ScriptedTransport(<String>['[]']);
 
       await expectLater(

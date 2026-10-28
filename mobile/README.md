@@ -373,16 +373,27 @@ router today. Once `SupabaseService.signedInChanges` reports a session it:
    the `profiles_select_own_or_staff` policy, whose `id = auth.uid()` half covers
    your own row even as a student);
 2. shows "Loading your profile…" with a spinner while that read is in flight —
-   **including while a late row is retried.** Signing in can report the session a
-   moment before the `handle_new_user` trigger's row is visible to a read, so
-   `getProfile` looks again on an increasing delay (0.25s, 0.7s, 1.5s: about 2.5s
-   at the outside) and the future simply stays **pending** for the whole window.
-   Nothing is reported in the meantime, so a fresh account never sees "We could
-   not load your profile" for a row that is about to arrive — after 1.5s the
-   loading screen only adds a "Still trying…" hint so it does not look frozen.
-   Only a row that is *still* absent after the window, a refused read, or an
-   unrecognised role becomes the retryable error below — and a row that is still
-   absent is first given back (see "A missing profile row is given back");
+   **including while a late row or a slow connection is retried.** Signing in can
+   report the session a moment before the `handle_new_user` trigger's row is
+   visible to a read, so `getProfile` looks again on an increasing delay (0.25s,
+   0.75s, 1.5s, 3s: about 5.5s of waiting at the outside) and the future simply
+   stays **pending** for the whole window. A read that *fails* rather than
+   answering "no row" is retried on the same schedule when the failure may not be
+   true a moment later — a request that never answers (each attempt is bounded by
+   `attemptTimeout`, 4s), a dropped socket, a gateway that could not reach the
+   database (`PGRST000/001/003`, `53300`, `57P01-03`, or a 5xx with no PostgREST
+   body) — because a cold start, a laptop back from sleep and a project coming out
+   of pause all look exactly like that, and reporting them at once is what showed
+   "Loading your profile took too long" to students whose connection was still
+   resolving. Nothing is reported in the meantime, so a fresh account never sees
+   "We could not load your profile" for a row that is about to arrive — after 1.5s
+   the loading screen only adds a "Still trying…" hint so it does not look frozen.
+   Only a row that is *still* absent after the window, a refused read (an expired
+   session, an RLS refusal, a role the app does not recognise, a 4xx) becomes the
+   retryable error below — and a row that is still absent is first given back (see
+   "A missing profile row is given back"). `profileLoadTimeout` (30s) is the
+   backstop above the repository's own ~25s worst case, so it only fires when a
+   lookup is stuck somewhere the repository cannot see;
 3. routes on the four values of the `public.user_role` enum:
    * `student` → `StudentExamPortalPage`
    * `lecturer` → `LecturerConsolePage` — the authoring and marking console for
@@ -751,7 +762,7 @@ nothing in it is a decision to make. Two tabs:
 
 | Tab | What the student is told |
 | --- | --- |
-| `instructions-tab-proctor` | the camera (on for the whole sitting, faces checked on-device, a snapshot kept with each incident, and that a person reviews every snapshot), the microphone (noise above the room's own floor is what counts — half a second of it, so two words are enough and one cough is not — the indicator shows the level, and a refused or unplugged mic says so instead of passing as fine), staying in the exam (the kiosk pin on a phone, the browser guards — tab/focus/fullscreen, copy/paste, back/reload), and that three confirmed strikes close the attempt as disqualified — including that a wrong one can be reset by the paper's author or a supervisor |
+| `instructions-tab-proctor` | the camera (on for the whole sitting, faces checked on-device, a snapshot kept with each incident, and that a person reviews every snapshot), the microphone (noise above the room's own floor is what counts — about a second of it, so a short phrase is enough and a cough, a chair or a keyboard is not — the indicator shows the level, and a refused or unplugged mic says so instead of passing as fine), staying in the exam (the kiosk pin on a phone, the browser guards — tab/focus/fullscreen, copy/paste, back/reload), and that three confirmed strikes close the attempt as disqualified — including that a wrong one can be reset by the paper's author or a supervisor |
 | `instructions-tab-exam` | the clock (the paper's own duration from the start, a scheduled paper also closing at `ends_at`, answers saved as you go including offline, an unanswered question scoring nothing), when a mark appears (instantly for a paper with no written answers; after the lecturer marks the essays otherwise), one attempt per paper and what a reset clears, what the device check requires (and that a browser flags faces by review, not live), and what to do if something goes wrong |
 
 The wording deliberately matches the screens the student is about to meet — the
@@ -1370,38 +1381,42 @@ streaming.
 
 Audio is judged the same way, and the rules are deliberately pure Dart
 (`core/services/audio_noise_detector.dart`) so they can be tested without a
-microphone: the first 4s (`calibrationWindow`) measure the room's floor, taking the
+microphone: the first 5s (`calibrationWindow`) measure the room's floor, taking the
 **median** rather than the mean so a student who starts talking immediately cannot
-drag the floor up to their own voice; the threshold becomes that floor + 4 dB
-(`speechMarginDb`), clamped to −55…−32 dBFS (`minThresholdDb`/`maxThresholdDb`). The
-margin is deliberately small — 4 dB is a clear, *sustained* step above the hum it is
-measured against — and the band is deliberately low, so the rule flags **little and
-background sound** (quiet speech, a second voice, a television, traffic, a generator)
+drag the floor up to their own voice; the threshold becomes that floor + 6 dB
+(`speechMarginDb`), clamped to −50…−32 dBFS (`minThresholdDb`/`maxThresholdDb`). The
+margin is a clear, *sustained* step above the hum it is measured against, wide enough
+that the room's own flutter — a fan, a fridge, a keyboard, and the peak-reading meter
+a browser hands us — never clears it, and narrow enough that **little and background
+sound** (quiet speech, a second voice, a television, traffic, a generator) still does,
 rather than only a raised voice. The upper clamp does the heavy lifting in a noisy
 room: without it a room that is already loud on its own would raise the bar to
 "shout only" and log nothing,
 whereas pinned below the room's own floor that steady background *is* the finding. The
-lower clamp keeps a dead-silent room's threshold above the microphone's own self-noise,
-which would otherwise read as "talking". The level must then add up to 500 ms above it
-(`sustain`) — two syllables, the shortest thing that is speech rather than an accident
-(the audit found the earlier 1.5 s window needed most of a sentence, so a student could
-read a question aloud or answer someone in the room and never be warned) — and a gap
-below the threshold ends the
+lower clamp is the one that matters on web and desktop: a browser reports exactly no
+sound as `record`'s −160 dBFS sentinel, so a student silent through the calibration
+window would otherwise calibrate at −160 and pin the threshold to the bottom of the
+band, where a mouse click or a chair is a violation. The sentinel is clamped to
+`silenceFloorDb` (−100) before the median sees it, and the clamp floor is −50. The
+level must then add up to 1s above it
+(`sustain`) — a spoken phrase ("hey you", a question read aloud), not two syllables —
+and a gap below the threshold ends the
 episode only once it has lasted longer than 400 ms (`releaseGrace`). That gap allowance
 is what makes the rule catch **talking** rather than only an unbroken shout: at four
 samples a second a real sentence drops below the threshold between words, so a rule
 that reset on any single low sample never filled its window and logged nothing at all.
-Half a second is well below the two to three seconds a supervisor would call talking on
-purpose: the meter is read every 250 ms, so a burst that starts just after a sample
+A second is well below the two to three seconds a supervisor would call talking on
+purpose, and the meter is read every 250 ms, so a burst that starts just after a sample
 contributes only its remainder — which is why the window is kept short instead of
 absorbing the offset with headroom. A one-off shorter than the window (a cough, a chair,
-a door) cannot fill it at all; the grace and the 3 dB hysteresis are what keep the gap
-between two words from restarting it.
+a door, a keystroke) cannot fill it at all; the grace and the 3 dB hysteresis are what
+keep the gap between two words from restarting it.
 A cough, a chair creak or a breath is still far too brief to add up, a room that has
 genuinely gone quiet ends the episode inside the grace, and after a strike the detector
-ignores the level for 5s (`cooldown`), so one long outburst is one strike rather than
-one every sample. Calibration doubles as the start-of-session grace period: nothing can
-be logged before it finishes.
+ignores the level for 10s (`cooldown`), so one long outburst is one strike rather than
+one every sample — and a room staying loud cannot climb the three-strike ladder on its
+own. Calibration doubles as the start-of-session grace period: nothing can be logged
+before it finishes.
 
 Kiosk bridge contract — MethodChannel `lock_task_channel`:
 
@@ -1428,8 +1443,10 @@ own unpin is not an escape" and "a single inactive blip is tolerated" rules);
 `mobile/test/web_exam_guard_test.dart` covers the browser rules;
 `mobile/test/proctoring_notifier_test.dart` covers the strike escalation. The audio
 half adds `mobile/test/audio_monitoring_test.dart` (the detector's rules and the
-monitor's state machine) and the `audio proctoring` group in
-`mobile/test/exam_taking_page_test.dart` (the chip, driven through a fake microphone).
+monitor's state machine), `mobile/test/audio_noise_detector_tuning_test.dart` (the
+hysteresis band, the calibration cap and the shipped sensitivity) and the `audio
+proctoring` group in `mobile/test/exam_taking_page_test.dart` (the chip, driven
+through a fake microphone).
 
 ## Microphone proctoring (levels, not recordings)
 
@@ -1477,7 +1494,12 @@ report" on every platform it ships to (Android's `DEFAULT_AMPLITUDE_DB`, iOS's
 around −60…−20 and the meter's −60…0 window is the useful part of the scale rather than
 an arbitrary one. Anything non-finite, or outside that band, is dropped or clamped
 before it can reach the detector, where one bad sample would shift the calibration
-median the whole room is judged against. Two debug lines make the feature auditable
+median the whole room is judged against. The detector applies the same rule to the
+sentinel from the other side: a reading at −160 dBFS is "nothing to report", not a
+measurement, so it is clamped up to `silenceFloorDb` (−100) before the calibration
+median sees it — otherwise a browser reporting exact silence for a quiet room would
+calibrate the floor at −160 and pin the threshold to the bottom of the clamp, where a
+mouse click is a violation. Two debug lines make the feature auditable
 from a console: `AudioMonitor` logs the first level of a session (`levels are flowing`,
 with the reading) and `AudioMonitoringNotifier` logs each classification (the level, the
 threshold it crossed, the measured floor and the sustain window). Without them, "audio

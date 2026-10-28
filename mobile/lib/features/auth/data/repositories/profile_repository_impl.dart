@@ -37,31 +37,48 @@ class ProfileRepositoryImpl implements ProfileRepository {
   ProfileRepositoryImpl(
     this._client, {
     this.retryDelays = defaultRetryDelays,
+    this.attemptTimeout = defaultAttemptTimeout,
     Future<void> Function(Duration)? wait,
     this.currentIdentity,
   }) : _wait = wait ?? Future<void>.delayed;
 
-  /// The waits between attempts at `public.profiles` while the row is not there
-  /// *yet* — the sign-in race described on [getProfile].
+  /// The waits between attempts at `public.profiles` — the sign-in race described
+  /// on [getProfile], and a connection that is still coming back.
   ///
-  /// Three waits, so four attempts in total (the first is immediate): 0.25s,
-  /// 0.7s and 1.5s, about 2.5 seconds at the outside. Long enough to ride out a
-  /// `handle_new_user` trigger that is still committing or a read that has not
-  /// caught up, and short enough that a genuinely absent row still reaches the
-  /// gate's retryable error screen rather than looking like a hang. Absolute
-  /// durations rather than a multiplier, so the schedule is what it says it is
-  /// however it is edited.
+  /// Four waits, so five attempts in total (the first is immediate): 0.25s, 0.75s,
+  /// 1.5s and 3s, about 5.5 seconds of waiting at the outside. Long enough to ride
+  /// out a `handle_new_user` trigger that is still committing, a read that has not
+  /// caught up, or the first seconds of a network that is still resolving, and
+  /// short enough that a genuinely absent row still reaches the gate's retryable
+  /// error screen rather than looking like a hang. Absolute durations rather than a
+  /// multiplier, so the schedule is what it says it is however it is edited.
   static const List<Duration> defaultRetryDelays = <Duration>[
     Duration(milliseconds: 250),
-    Duration(milliseconds: 700),
+    Duration(milliseconds: 750),
     Duration(milliseconds: 1500),
+    Duration(milliseconds: 3000),
   ];
+
+  /// Upper bound on any single attempt at the row.
+  ///
+  /// A cold start, a laptop that has just woken up or a project coming out of pause
+  /// can leave one request on the wire for a long time. Without a bound here that
+  /// request would consume the role gate's whole timeout, so the student saw
+  /// "Loading your profile took too long" for a connection that only needed a
+  /// second chance. Four seconds is well above a healthy read on a slow mobile
+  /// connection, and it keeps the worst case of the whole window (five attempts
+  /// plus [retryDelays]: about 25 seconds) inside the gate's own bound.
+  static const Duration defaultAttemptTimeout = Duration(seconds: 4);
 
   final SupabaseClient _client;
 
   /// How this class waits between attempts. Injected so a test can assert the
   /// schedule without sleeping through it.
   final Future<void> Function(Duration) _wait;
+
+  /// How long one read is given before it is abandoned and tried again. See
+  /// [defaultAttemptTimeout].
+  final Duration attemptTimeout;
 
   /// Where a missing row's identity comes from — see [_ensureOwnRow]. Null means
   /// "read it from the session", which is [_sessionIdentity].
@@ -87,9 +104,20 @@ class ProfileRepositoryImpl implements ProfileRepository {
   /// and the future stays unresolved for the whole window — which is what keeps
   /// the role gate on its loading screen instead of its error screen.
   ///
-  /// Nothing else is retried. A refused request (no connection, an expired
-  /// session, RLS) has nothing to wait for and is reported at once, as is a row
-  /// that arrived with a role the app does not recognise.
+  /// Nothing else is retried. A refused request (an expired session, RLS) has
+  /// nothing to wait for and is reported at once, as is a row that arrived with a
+  /// role the app does not recognise.
+  ///
+  /// A **failed** read *is* retried, as long as the failure is the kind that might
+  /// not be true a second later: a request that never answered ([attemptTimeout]),
+  /// a dropped connection, a browser's "Failed to fetch", or a gateway 5xx while a
+  /// project wakes up. Those used to be reported at once, which is what put "We
+  /// could not load your profile" in front of a student whose connection only
+  /// needed a moment - a cold start, a laptop back from sleep, a Supabase project
+  /// coming out of pause. A session that is refused (`AuthException`) and a
+  /// PostgREST answer that will be the same every time (a policy refusal, a missing
+  /// column, a bad filter - see [_isTransientPostgrestCode]) are still reported
+  /// immediately.
   ///
   /// A row that is *still* absent after the window is not simply reported: the
   /// account is first given its own row back, through the one insert
@@ -103,7 +131,27 @@ class ProfileRepositoryImpl implements ProfileRepository {
   @override
   Future<UserProfile> getProfile(String userId) async {
     for (var attempt = 0;; attempt++) {
-      final row = await _readRow(userId);
+      final lastAttempt = attempt >= retryDelays.length;
+      Map<String, dynamic>? row;
+      try {
+        row = await _readRow(userId);
+      } on _TransientLookupFailure catch (failure) {
+        // The *connection* failed, not the account: the row may be there and be
+        // readable a moment later. Retried on the same schedule as a late row,
+        // because a cold start, a laptop waking up and a project coming out of
+        // pause all look exactly like this from here.
+        proctorLog(
+          'ProctorGuard profile: read attempt ${attempt + 1} failed: '
+          '${failure.message}',
+        );
+        if (lastAttempt) {
+          throw const ProfileLookupException(
+            'Could not load your profile. Check your connection and try again.',
+          );
+        }
+        await _wait(retryDelays[attempt]);
+        continue;
+      }
       if (row != null) return _profileFrom(row);
 
       // Out of attempts: the row really is absent (an account created outside the
@@ -112,8 +160,18 @@ class ProfileRepositoryImpl implements ProfileRepository {
       // see [_ensureOwnRow]: signing in and being told "this account has no
       // profile row yet" on every single attempt was the one failure a student
       // could neither understand nor act on.
-      if (attempt >= retryDelays.length) {
-        final provisioned = await _ensureOwnRow(userId);
+      if (lastAttempt) {
+        Map<String, dynamic>? provisioned;
+        try {
+          provisioned = await _ensureOwnRow(userId);
+        } on _TransientLookupFailure {
+          // The insert may well have landed; what failed is the read-back. Saying
+          // "this account has no profile row yet" here would be a guess, so the
+          // student is told about the connection instead - and Try again re-reads.
+          throw const ProfileLookupException(
+            'Could not load your profile. Check your connection and try again.',
+          );
+        }
         if (provisioned != null) return _profileFrom(provisioned);
 
         // Still nothing: this is the sentence that reaches the gate only after
@@ -183,6 +241,11 @@ class ProfileRepositoryImpl implements ProfileRepository {
 
     try {
       return await _readRow(userId);
+    } on _TransientLookupFailure {
+      // Not a verdict about the account: the insert may have worked and the read
+      // failed on the way back. `getProfile` turns this into the connection
+      // sentence rather than "no profile row yet".
+      rethrow;
     } catch (error) {
       proctorLog('ProctorGuard profile: re-reading the new row failed: $error');
       return null;
@@ -203,25 +266,85 @@ class ProfileRepositoryImpl implements ProfileRepository {
     );
   }
 
-  /// One read of the caller's own `profiles` row. `null` means "no row (yet)";
-  /// a backend that refused throws the sentence the gate shows.
+  /// One read of the caller's own `profiles` row. `null` means "no row (yet)"; a
+  /// backend that refused throws the sentence the gate shows, and a failure that
+  /// may be temporary throws a [_TransientLookupFailure] so [getProfile] can wait
+  /// it out instead of ending the student's sign-in on it.
+  ///
+  /// Bounded by [attemptTimeout] on purpose: the HTTP client underneath has no
+  /// default timeout, so one socket that never answers would otherwise hold the
+  /// whole lookup - and the student would be told the profile took too long for a
+  /// connection that was about to come back.
   Future<Map<String, dynamic>?> _readRow(String userId) async {
     try {
       return await _client
           .from('profiles')
           .select()
           .eq('id', userId)
-          .maybeSingle();
+          .maybeSingle()
+          .timeout(attemptTimeout);
+    } on TimeoutException {
+      throw const _TransientLookupFailure('the read did not answer in time');
     } on AuthException catch (error) {
       throw ProfileLookupException(
         'Could not verify your session: ${error.message}',
       );
-    } catch (_) {
+    } on PostgrestException catch (error) {
+      // A PostgREST error is the database's answer; only the codes that mean "no
+      // database answered" are worth asking again. See [_isTransientPostgrestCode].
+      if (_isTransientPostgrestCode(error.code)) {
+        throw _TransientLookupFailure(
+          'PostgREST ${error.code ?? '(no code)'}: ${error.message}',
+        );
+      }
       throw const ProfileLookupException(
         'Could not load your profile. Check your connection and try again.',
       );
+    } catch (error) {
+      // A dropped socket, a browser's "Failed to fetch", a TLS hiccup, a DNS
+      // answer that has not arrived: the client cannot say whether the same
+      // request would fail a second later, and that is exactly what the retry
+      // window exists for.
+      throw _TransientLookupFailure('$error');
     }
   }
+
+  /// Whether a PostgREST failure is worth waiting out.
+  ///
+  /// A PostgREST error is normally the database's *answer*: `42501` (permission
+  /// denied), `PGRST116` (no rows / malformed response), a missing column. Asking
+  /// again produces the same answer, so those end the lookup at once. The
+  /// exceptions are the codes that mean "the request never reached a database that
+  /// could answer" - see [_transientPostgrestCodes] and the status branch below.
+  static bool _isTransientPostgrestCode(String? code) {
+    final value = code?.trim() ?? '';
+    // No code at all is what a gateway 502/503 usually produces: there was no
+    // PostgREST answer to read.
+    if (value.isEmpty) return true;
+
+    // `postgrest` falls back to the HTTP status as the code when the body was not
+    // a PostgREST error at all (a proxy's HTML page, an empty 503), so a numeric
+    // code is a status: 5xx, 408 and 429 are the "ask again" answers, and anything
+    // else is a decision about this request.
+    final status = int.tryParse(value);
+    if (status != null) {
+      return status >= 500 || status == 408 || status == 429;
+    }
+
+    return _transientPostgrestCodes.contains(value) || value.startsWith('08');
+  }
+
+  /// The PostgREST and SQLSTATE codes that mean "no answer from the database",
+  /// not "the answer is no".
+  static const Set<String> _transientPostgrestCodes = <String>{
+    'PGRST000', // could not connect to the database
+    'PGRST001', // the database connection was lost
+    'PGRST003', // the request timed out waiting for a connection
+    '53300', // too many connections
+    '57P01', // admin shutdown
+    '57P02', // crash shutdown
+    '57P03', // cannot connect now (a project that is starting up)
+  };
 
   /// Maps a row onto a role, naming the column when the value is wrong.
   UserProfile _profileFrom(Map<String, dynamic> row) {
@@ -238,4 +361,18 @@ class ProfileRepositoryImpl implements ProfileRepository {
       );
     }
   }
+}
+
+/// A read that failed for a reason that may not be true in a moment.
+///
+/// Private on purpose: [ProfileRepositoryImpl.getProfile] is the only thing that
+/// decides what the student is told, and it does that once, after the whole window
+/// has been spent. The [message] is for the log.
+class _TransientLookupFailure implements Exception {
+  const _TransientLookupFailure(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'TransientProfileLookupFailure: $message';
 }

@@ -14,11 +14,14 @@ import 'dart:math' as math;
 ///     room, and the threshold becomes *that room's* floor plus [speechMarginDb]
 ///     (clamped to [minThresholdDb]..[maxThresholdDb]). A quiet exam room therefore
 ///     ends up far more sensitive than one with an air-conditioning hum, with no
-///     per-device configuration. Both the margin and the clamp band are set low on
-///     purpose, so quiet speech and steady background sound - a television, a
-///     second voice, traffic, a generator - are flagged rather than only a raised
-///     voice. Nothing can be logged before calibration finishes, which doubles as
-///     the start-of-session grace period.
+///     per-device configuration. The margin and the clamps sit *between* the room
+///     and a voice rather than at the bottom of the scale: wide enough that the
+///     room's own flutter - a fan, a fridge, a keyboard, the microphone's own
+///     self-noise, and the peak-reading meters a browser hands us - never clears
+///     the line, and low enough that quiet speech and steady background sound (a
+///     television, a second voice, traffic, a generator) still do. Nothing can be
+///     logged before calibration finishes, which doubles as the start-of-session
+///     grace period.
 ///  2. **Sustained, not instantaneous.** The level has to add up to [sustain]
 ///     above the threshold; a dip only ends the episode once it has lasted longer
 ///     than [releaseGrace] *and* gone more than [hysteresisDb] under the
@@ -46,17 +49,18 @@ import 'dart:math' as math;
 /// interruption).
 class AudioNoiseDetector {
   AudioNoiseDetector({
-    this.calibrationWindow = const Duration(seconds: 4),
-    this.sustain = const Duration(milliseconds: 500),
+    this.calibrationWindow = const Duration(seconds: 5),
+    this.sustain = const Duration(seconds: 1),
     this.releaseGrace = const Duration(milliseconds: 400),
     this.hysteresisDb = 3,
-    this.cooldown = const Duration(seconds: 5),
-    this.speechMarginDb = 4,
-    this.minThresholdDb = -55,
+    this.cooldown = const Duration(seconds: 10),
+    this.speechMarginDb = 6,
+    this.minThresholdDb = -50,
     this.maxThresholdDb = -32,
     this.defaultThresholdDb = -30,
     this.minCalibrationSamples = 5,
     this.maxCalibrationSamples = 128,
+    this.silenceFloorDb = -100,
     DateTime Function()? clock,
   })  : assert(sustain > Duration.zero, 'a zero sustain would log every sample'),
         assert(
@@ -75,6 +79,10 @@ class AudioNoiseDetector {
           maxCalibrationSamples > 0,
           'a zero cap would leave calibration with no samples at all',
         ),
+        assert(
+          silenceFloorDb < minThresholdDb,
+          'a silence floor at or above the threshold would make silence a strike',
+        ),
         _now = clock ?? DateTime.now,
         _thresholdDb = defaultThresholdDb;
 
@@ -83,22 +91,26 @@ class AudioNoiseDetector {
 
   /// How long the level must add up to above the threshold before it is a strike.
   ///
-  /// Half a second - two or three of `AudioMonitor`'s 250 ms samples in a row - is
-  /// about two spoken syllables, which is the shortest thing that is *speech*
-  /// rather than an accident: "hey you", "stop that", a name called across the
-  /// room. The rule is deliberately hyper-sensitive (an audit finding on the
-  /// earlier 1.5 s window, which needed most of a sentence): with a window that
-  /// long a student could read a question aloud, or answer somebody in the room in
-  /// a few words, and never be warned at all.
+  /// One second - four or five of `AudioMonitor`'s 250 ms samples in a row - is a
+  /// spoken phrase, which is the shortest thing that is *speech* rather than an
+  /// accident: "hey you", "stop that", a name called across the room, a question
+  /// read aloud. It was 500 ms, on the strength of an audit finding against an
+  /// earlier 1.5 s window that needed most of a sentence; live testing on web and
+  /// desktop showed the other end of that trade - the browsers' peak-reading
+  /// meters make a keyboard, a mouse click, a chair or a single cough land over
+  /// the line for several samples in a row, so a half-second window logged
+  /// `audio_noise` for noise that was not a voice at all. A full second is the
+  /// balance: still a *phrase* rather than a paragraph, but long enough that only
+  /// something which keeps going gets counted.
   ///
-  /// A cough, a chair creak or a door is still shorter than this. At four samples
-  /// a second a 300 ms one-off can contribute at most one over-threshold sample,
-  /// which cannot fill a 500 ms window; the burst has to keep crossing the line
-  /// across two sampling intervals. [releaseGrace] and [hysteresisDb] are what
-  /// keep the gap *between* two words from restarting the window, so two words are
-  /// one episode rather than none.
+  /// A cough, a chair creak, a door or a keystroke is shorter than this. At four
+  /// samples a second a 300 ms one-off can contribute at most one over-threshold
+  /// sample, which cannot fill a one-second window; the burst has to keep crossing
+  /// the line across four sampling intervals. [releaseGrace] and [hysteresisDb]
+  /// are what keep the gap *between* two words from restarting the window, so a
+  /// sentence is one episode rather than none.
   ///
-  /// Kept well below the length of the noise it is meant to catch on purpose: the
+  /// Kept below the length of the noise it is meant to catch on purpose: the
   /// samples are a meter, not a recording, so a burst that starts just after one
   /// only contributes its remainder. A short window is what makes that offset
   /// harmless instead of hiding half a sentence.
@@ -137,40 +149,67 @@ class AudioNoiseDetector {
   final double hysteresisDb;
 
   /// How long after a strike the level is ignored.
+  ///
+  /// Ten seconds, so one continued outburst is one strike. It was five, which was
+  /// long enough to stop one *sample* being one strike but not long enough to stop
+  /// a room that stays loud for half a minute from climbing the strike ladder on
+  /// its own - and the third strike escalates (`ProctoringNotifier`). A student who
+  /// genuinely talks twice, ten seconds apart, still earns two strikes.
   final Duration cooldown;
 
   /// How far above the measured room floor counts as human noise rather than the
-  /// room itself. 4 dB is a clear, *sustained* step above the hum it is measured
-  /// against, so the room's own level does not trip it - but it is low enough that
-  /// quiet speech (often only a few decibels over the floor) and steady background
-  /// sound are still caught, not just a raised voice.
+  /// room itself. 6 dB is a clear, *sustained* step above the hum it is measured
+  /// against, so the room's own level - and the flutter of a peak-reading browser
+  /// meter, a fan, a fridge, a keyboard - does not trip it, while quiet speech and
+  /// steady background sound are still caught, not just a raised voice.
   ///
-  /// Lowered from 5 dB by the sensitivity audit: the margin is what a normal-volume
-  /// conversation has to clear, and a student talking to somebody across the room
-  /// sits barely above a quiet room's floor. The [minThresholdDb] clamp is what
-  /// still keeps a microphone's own self-noise from reading as speech.
+  /// Raised from 4 dB after live testing: at 4 dB a normal-volume conversation and
+  /// a quiet room were only a syllable apart, so ordinary room sound cleared the
+  /// line on web and desktop, where `record` measures the **peak** of a short
+  /// analyser window rather than a smoothed envelope (a peak meter reads several
+  /// decibels hotter and spikier than the same room on a phone). The
+  /// [minThresholdDb] clamp is what still keeps a microphone's own self-noise from
+  /// reading as speech.
   final double speechMarginDb;
 
   /// Sensitivity bounds. Without the clamp a silent room would produce a threshold
   /// so low that the microphone's own noise floor reads as "talking", and a noisy
   /// room one so high that only a shout counts.
   ///
-  /// [minThresholdDb] keeps the threshold above the microphone's own self-noise,
-  /// [maxThresholdDb] stops a noisy room raising the bar out of reach. Both are
-  /// deliberately low so little sound and background sound are flagged, not only a
-  /// raised voice.
+  /// [minThresholdDb] keeps the threshold above the microphone's own self-noise and
+  /// above the room's own flutter; [maxThresholdDb] stops a noisy room raising the
+  /// bar out of reach, so its steady background is itself the finding.
+  ///
+  /// The lower bound is the one that matters on web and desktop. A silent room
+  /// there calibrates to the metering sentinel (`record` reports -160 dBFS for
+  /// "nothing to report"), which clamps the threshold to the bottom of the band -
+  /// and a bottom of -55 dBFS made a mouse click, a chair or the fan in a quiet
+  /// classroom a violation. -50 dBFS is still below a normal speaking level for the
+  /// same room, so speech is caught, but the room's own noise no longer is.
   final double minThresholdDb;
   final double maxThresholdDb;
 
   /// Used until calibration has enough samples (and if it never gets any).
   final double defaultThresholdDb;
 
+  /// The quietest level a reading is allowed to claim.
+  ///
+  /// `record` reports -160 dBFS when it has nothing to report - silence, a capture
+  /// session that has not started, a browser whose analyser buffer is exactly zero
+  /// - and that number is a *sentinel*, not a measurement of the room. Left alone
+  /// it becomes the room's floor through the calibration median, which pins the
+  /// threshold to [minThresholdDb] and makes every tiny sound clear the line: the
+  /// false-positive `audio_noise` strikes seen in live testing. Clamping it to
+  /// -100 dBFS keeps the sentinel far below any threshold (so it still ends an
+  /// episode and still reads as silence) without letting it *be* the room.
+  final double silenceFloorDb;
+
   /// How many samples calibration needs before it will trust its median.
   final int minCalibrationSamples;
 
   /// The most readings the calibration median is built from.
   ///
-  /// The window is four seconds and [AudioMonitor] samples every 250 ms, so the
+  /// The window is five seconds and [AudioMonitor] samples every 250 ms, so the
   /// shipped defaults only ever collect about sixteen - but a source with a
   /// different rate (a test, a host feeding frames) must not be able to turn a
   /// once-per-session calculation into an unbounded buffer. Once the cap is
@@ -246,12 +285,17 @@ class AudioNoiseDetector {
     // A misbehaving source (NaN, ±inf) must not corrupt the calibration median.
     if (decibels.isNaN || decibels.isInfinite) return false;
 
+    // A reading is a measurement of the room; the sentinel is not. Clamping it is
+    // what stops a browser that reports "nothing to report" from calibrating the
+    // room at -160 dBFS - see [silenceFloorDb].
+    final level = math.max(decibels, silenceFloorDb);
+
     _samples++;
     _firstSampleAt ??= now;
-    _peakDb = _peakDb == null ? decibels : math.max(_peakDb!, decibels);
+    _peakDb = _peakDb == null ? level : math.max(_peakDb!, level);
 
     if (!isCalibrated) {
-      _collectCalibration(decibels, now);
+      _collectCalibration(level, now);
       return false;
     }
 
@@ -267,7 +311,7 @@ class AudioNoiseDetector {
     // dip; the band between it and the threshold is a quiet syllable.
     final dipFloor = _thresholdDb - hysteresisDb;
 
-    if (decibels < dipFloor) {
+    if (level < dipFloor) {
       // Genuinely quiet: more than [hysteresisDb] under the line, so this really
       // is a break in the sound rather than a soft syllable. Whether it *ends* the
       // episode is decided by the next sample that comes back over the line: a dip
@@ -288,7 +332,7 @@ class AudioNoiseDetector {
       _belowSince = null;
     }
 
-    if (decibels < _thresholdDb) {
+    if (level < _thresholdDb) {
       // Inside the hysteresis band: no new above-threshold sample to count, but
       // the episode is still open (and the indicator stays amber), so the window
       // keeps running from where it started.
