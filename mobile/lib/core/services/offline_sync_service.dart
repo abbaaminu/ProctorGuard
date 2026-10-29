@@ -153,6 +153,20 @@ class ViolationRuling {
 ///    late, so a strike (or a disqualification) that happened while the network
 ///    was down still reaches the session.
 abstract class ViolationOutbox {
+  /// How long one delivery attempt may take before the row counts as undelivered.
+  ///
+  /// A request that never answers is worse than one that fails: a failure queues
+  /// the row for a retry two seconds later, while a hang leaves the strike in
+  /// neither state — not delivered, not queued — for as long as the socket feels
+  /// like it, and a third strike that has not reached the server is an attempt that
+  /// has not been stopped. Ten seconds is far longer than a healthy
+  /// `register_violation` round trip and well inside a supervisor's patience.
+  ///
+  /// Timing out is safe to replay: the RPC is idempotent per `client_event_id`, so
+  /// a row that *did* land before the timeout expires inserts nothing the second
+  /// time and never becomes two strikes.
+  static const Duration deliveryTimeout = Duration(seconds: 10);
+
   Future<ViolationRuling?> log({
     required String submissionId,
     required Violation violation,
@@ -171,9 +185,18 @@ abstract class ViolationOutbox {
 /// reported as "not delivered" - the local strike count still stands, exactly as
 /// before.
 class DirectViolationOutbox implements ViolationOutbox {
-  DirectViolationOutbox(this._repository);
+  DirectViolationOutbox(
+    this._repository, {
+    this.deliveryTimeout = ViolationOutbox.deliveryTimeout,
+  });
 
   final ProctoringRepository _repository;
+
+  /// See [ViolationOutbox.deliveryTimeout]. A straight-through outbox has no queue
+  /// behind it, so a hang here also means the ruling that would have ended the
+  /// attempt never arrives; the timeout turns that into the "not delivered"
+  /// outcome the caller already knows how to handle.
+  final Duration deliveryTimeout;
 
   @override
   Future<ViolationRuling?> log({
@@ -181,10 +204,9 @@ class DirectViolationOutbox implements ViolationOutbox {
     required Violation violation,
   }) async {
     try {
-      final result = await _repository.logViolation(
-        submissionId: submissionId,
-        violation: violation,
-      );
+      final result = await _repository
+          .logViolation(submissionId: submissionId, violation: violation)
+          .timeout(deliveryTimeout);
       return ViolationRuling(
         submissionId: submissionId,
         violation: violation,
@@ -305,6 +327,7 @@ class OfflineSyncService implements ViolationOutbox {
     this.minRetryDelay = const Duration(seconds: 2),
     this.maxRetryDelay = const Duration(seconds: 60),
     this.maxQueuedViolations = 200,
+    this.deliveryTimeout = ViolationOutbox.deliveryTimeout,
     DateTime Function()? clock,
   }) {
     _exams = exams;
@@ -332,6 +355,13 @@ class OfflineSyncService implements ViolationOutbox {
   /// Upper bound on the violation queue, oldest dropped first: a device that has
   /// been offline for hours must not grow an unbounded row.
   final int maxQueuedViolations;
+
+  /// How long one attempt at delivering a queued or fresh violation may take (see
+  /// [ViolationOutbox.deliveryTimeout]).
+  ///
+  /// Injectable so a test can prove the queue keeps moving past a server that
+  /// accepts the connection and then says nothing.
+  final Duration deliveryTimeout;
 
   /// How many rows may fail inside one delivery pass before the pass gives up on
   /// the rest of the queue.
@@ -574,7 +604,15 @@ class OfflineSyncService implements ViolationOutbox {
     _notify();
   }
 
-  /// One delivery attempt per queued row, oldest first.
+  /// One delivery attempt per queued row: **evidence first**, then answers.
+  ///
+  /// The order is the latency contract. A queued violation is a strike that has
+  /// already happened and whose late arrival can still disqualify the attempt (see
+  /// `ProctoringNotifier`'s deferred-ruling handler), while a queued answer is
+  /// idempotent and can be re-sent at any time. Draining answers first meant the
+  /// evidence waited behind every keystroke the student had made while offline -
+  /// on a flaky connection, a queue of answers was enough for the violation to
+  /// miss the whole pass.
   ///
   /// The pass stops after [maxPassFailures] failures rather than at the first
   /// one: a connection that is down fails that many rows inside the same tick,
@@ -584,74 +622,89 @@ class OfflineSyncService implements ViolationOutbox {
     var deliveredAny = false;
     var failures = 0;
 
-    for (final pending in List<PendingAnswer>.of(_answers)) {
-      if (_disposed) return;
-      if (pending.rejected) continue;
-      try {
-        if (pending.isText) {
-          await _exams.saveTextAnswer(
-            submissionId: pending.submissionId,
-            questionId: pending.questionId,
-            answer: pending.text!,
+    // One write per pass rather than one per row. Each `_persist*` re-encodes the
+    // whole queue and writes it through the store, and the store is the slowest
+    // thing in a pass whose entire job is to be quick: a queue of ten answers used
+    // to rewrite the document ten times before the pass was over. The flags are
+    // flushed in `finally`, so a pass that gives up early still leaves the queue
+    // on disk exactly as it stands in memory.
+    var answersDirty = false;
+    var violationsDirty = false;
+
+    try {
+      for (final pending in List<PendingViolation>.of(_violations)) {
+        if (_disposed) return;
+        pending.attempts++;
+        violationsDirty = true;
+        try {
+          final result = await _proctoring
+              .logViolation(
+                submissionId: pending.submissionId,
+                violation: pending.violation,
+              )
+              .timeout(deliveryTimeout);
+          _violations.remove(pending);
+          deliveredAny = true;
+          // The session may still be on screen: hand it the ruling, so a third
+          // strike that landed while the network was down can still end the
+          // attempt (see ProctoringNotifier's deferred-ruling handler).
+          _deferredRulings.add(
+            ViolationRuling(
+              submissionId: pending.submissionId,
+              violation: pending.violation,
+              warningCount: result.warningCount,
+              disqualified: result.disqualified,
+            ),
           );
-        } else {
-          await _exams.saveAnswer(
-            submissionId: pending.submissionId,
-            questionId: pending.questionId,
-            selectedOption: pending.selectedOption!,
-          );
+        } catch (error) {
+          proctorLog('ProctorGuard: violation still queued ($error)');
+          _offline('Could not deliver a proctoring log yet.');
+          if (++failures >= maxPassFailures) return;
         }
-      } on AnswerWriteRejected {
-        final index = _answers.indexOf(pending);
-        if (index != -1) _answers[index] = pending.markRejected();
-        await _persistAnswers();
-        _lastError =
-            'Some answers were not accepted because this attempt is no longer writable.';
-        _online = true;
-        _notify();
-        continue;
-      } catch (error) {
-        proctorLog('ProctorGuard: answer still queued ($error)');
-        _offline('Could not sync your answers yet.');
-        // The row stays queued either way; only the *pass* gives up, and only
-        // after [maxPassFailures] rows have failed in it.
-        if (++failures >= maxPassFailures) return;
-        continue;
       }
 
-      _answers.remove(pending);
-      deliveredAny = true;
-      await _persistAnswers();
-    }
+      for (final pending in List<PendingAnswer>.of(_answers)) {
+        if (_disposed) return;
+        if (pending.rejected) continue;
+        try {
+          if (pending.isText) {
+            await _exams.saveTextAnswer(
+              submissionId: pending.submissionId,
+              questionId: pending.questionId,
+              answer: pending.text!,
+            );
+          } else {
+            await _exams.saveAnswer(
+              submissionId: pending.submissionId,
+              questionId: pending.questionId,
+              selectedOption: pending.selectedOption!,
+            );
+          }
+        } on AnswerWriteRejected {
+          final index = _answers.indexOf(pending);
+          if (index != -1) _answers[index] = pending.markRejected();
+          answersDirty = true;
+          _lastError =
+              'Some answers were not accepted because this attempt is no longer writable.';
+          _online = true;
+          _notify();
+          continue;
+        } catch (error) {
+          proctorLog('ProctorGuard: answer still queued ($error)');
+          _offline('Could not sync your answers yet.');
+          // The row stays queued either way; only the *pass* gives up, and only
+          // after [maxPassFailures] rows have failed in it.
+          if (++failures >= maxPassFailures) return;
+          continue;
+        }
 
-    for (final pending in List<PendingViolation>.of(_violations)) {
-      if (_disposed) return;
-      pending.attempts++;
-      try {
-        final result = await _proctoring.logViolation(
-          submissionId: pending.submissionId,
-          violation: pending.violation,
-        );
-        _violations.remove(pending);
+        _answers.remove(pending);
         deliveredAny = true;
-        await _persistViolations();
-        // The session may still be on screen: hand it the ruling, so a third
-        // strike that landed while the network was down can still end the
-        // attempt (see ProctoringNotifier's deferred-ruling handler).
-        _deferredRulings.add(
-          ViolationRuling(
-            submissionId: pending.submissionId,
-            violation: pending.violation,
-            warningCount: result.warningCount,
-            disqualified: result.disqualified,
-          ),
-        );
-      } catch (error) {
-        proctorLog('ProctorGuard: violation still queued ($error)');
-        await _persistViolations();
-        _offline('Could not deliver a proctoring log yet.');
-        if (++failures >= maxPassFailures) return;
+        answersDirty = true;
       }
+    } finally {
+      if (violationsDirty) await _persistViolations();
+      if (answersDirty) await _persistAnswers();
     }
 
     // Only a pass that finished cleanly proves the connection is back: one that
@@ -714,10 +767,12 @@ class OfflineSyncService implements ViolationOutbox {
     required Violation violation,
   }) async {
     try {
-      final result = await _proctoring.logViolation(
-        submissionId: submissionId,
-        violation: violation,
-      );
+      final result = await _proctoring
+          .logViolation(
+            submissionId: submissionId,
+            violation: violation,
+          )
+          .timeout(deliveryTimeout);
       _lastError = null;
       _lastSyncedAt = _now();
       _online = true;
@@ -739,7 +794,24 @@ class OfflineSyncService implements ViolationOutbox {
       _trimViolations();
       await _persistViolations();
       _offline('Could not deliver a proctoring log yet.');
+      // A fresh violation is the one row in this queue whose late delivery can
+      // still end the attempt, so it must not inherit the backoff the answer queue
+      // has grown to: a device that has been offline for ten minutes is sitting on
+      // the 60 s ceiling, and evidence that arrives a minute late is evidence the
+      // supervisor reads after the student has already finished. Re-arming at the
+      // floor keeps a *new* strike a couple of seconds away from its first retry,
+      // while the delay still doubles from there if the network stays down.
+      _retryDelay = minRetryDelay;
+      _cancelRetry();
       _scheduleRetry();
+      // An identity-breaking strike ("nobody in front of the camera", a second
+      // face, a virtual lens) is the one row here whose late arrival can still end
+      // the attempt, and the student is standing in front of a paper that is now
+      // being held shut (see `ProctoringNotifier`'s critical types). One immediate
+      // pass costs a single background request and turns a lone dropped connection
+      // into a delivery within the same second; if the network really is gone that
+      // pass fails too, and the timer armed above takes over from there.
+      if (violation.type.isCritical) unawaited(flush());
       return null;
     }
   }

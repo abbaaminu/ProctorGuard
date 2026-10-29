@@ -134,15 +134,18 @@ void main() {
     test('the shipped defaults are the documented window and margin', () {
       final sensor = AudioNoiseDetector();
 
-      // One second of speech above the room's own floor is a strike: a spoken
-      // phrase (a student reading a question aloud, or answering somebody in the
-      // room) still counts, while a cough, a door, a chair or a keyboard does not -
-      // those are one sample (250 ms) or two, and the level has to keep crossing
-      // the line for four or five samples before the window closes. The 400 ms
-      // grace carries the window across the gaps between words.
-      expect(sensor.sustain, const Duration(seconds: 1));
+      // Three quarters of a second of speech above the room's own floor is a
+      // strike: a spoken phrase (a student reading a question aloud, or answering
+      // somebody in the room) still counts, while a cough, a door, a chair or a
+      // keyboard does not - those are one sample (250 ms) or two, and the level has
+      // to keep crossing the line for four samples in a row before the window
+      // closes. The 400 ms grace carries the window across the gaps between words.
+      expect(sensor.sustain, const Duration(milliseconds: 750));
       expect(sensor.releaseGrace, const Duration(milliseconds: 400));
-      expect(sensor.calibrationWindow, const Duration(seconds: 5));
+      // The room is measured for three seconds and nothing can be logged before
+      // that: the calibration window is the start-of-session delay, so it is kept
+      // as short as a median of real samples allows.
+      expect(sensor.calibrationWindow, const Duration(seconds: 3));
       expect(sensor.cooldown, const Duration(seconds: 10));
       // The margin the threshold sits above the measured room floor: wide enough
       // that the room's own flutter (and a browser's peak-reading meter) does not

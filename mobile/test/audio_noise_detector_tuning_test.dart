@@ -28,7 +28,7 @@ void main() {
   ///
   /// The window is pinned wide (2 s) on purpose: these tests step a full second
   /// at a time and are about the *band*, so the measured value is the band's
-  /// effect on the window rather than the shipped 1 s window firing early and
+  /// effect on the window rather than the shipped 750 ms window firing early and
   /// hiding it.
   AudioNoiseDetector measured({double hysteresisDb = 3}) {
     final detector = AudioNoiseDetector(
@@ -271,11 +271,12 @@ void main() {
 
     test('a phrase of a second is a strike, and two seconds is still one', () {
       // At AudioMonitor's real 250 ms rate the shortest burst that can close the
-      // shipped one-second window is five samples: one opens it and the fifth lands
-      // exactly 1000 ms later. That is a spoken phrase - "hey you", a question read
-      // aloud, an answer to somebody in the room - which is what the rule is for.
+      // shipped 750 ms window is four samples: one opens it and the fourth lands
+      // exactly 750 ms later. That is a spoken phrase - "hey you", a question read
+      // aloud, an answer to somebody in the room - which is what the rule is for,
+      // and it is heard a sample earlier than the full second it used to take.
       final phrase = calibrated();
-      expect(sustainedNoise(phrase, const Duration(milliseconds: 1250)), 1);
+      expect(sustainedNoise(phrase, const Duration(milliseconds: 1000)), 1);
 
       // ...and a burst that keeps going is still one strike: the cooldown, not the
       // window, is what keeps one episode to one warning.
@@ -283,33 +284,33 @@ void main() {
       expect(sustainedNoise(outburst, const Duration(seconds: 2)), 1);
     });
 
-    test('a cough, a keystroke or a chair under a second is still not enough',
-        () {
+    test('a cough, a keystroke or a chair is still not enough', () {
       final sensor = calibrated();
 
       // Loud, but over before the window can add up. A browser reports the peak of
       // a short analyser window, so a keyboard, a mouse click, a chair or a single
       // cough all clear the line for a sample or two - which is exactly why the
-      // window is a full second and not half of one: at 500 ms these were strikes,
-      // and `audio_noise` on a student who was only typing is the false positive
-      // live testing found on web and desktop.
+      // window is three quarters of a second and not half of one: at 500 ms these
+      // were strikes, and `audio_noise` on a student who was only typing is the
+      // false positive live testing found on web and desktop. Three samples of
+      // noise are still three samples; the window needs a fourth.
       expect(sustainedNoise(sensor, const Duration(milliseconds: 750)), 0);
       expect(sensor.isNoisy, isTrue, reason: 'suspicious, not a violation');
     });
 
     test('the sampling offset cannot swallow a short burst', () {
       // A burst that starts just after a sample only contributes its remainder to
-      // the window: 1250 ms of noise yields the 1000 ms of evidence the window
+      // the window: 1000 ms of noise yields the 750 ms of evidence the window
       // needs. It is sized so the shortest audible phrase still lands inside that
       // remainder.
       final sensor = calibrated();
-      expect(sensor.sustain, const Duration(seconds: 1));
-      expect(sustainedNoise(sensor, const Duration(milliseconds: 1250)), 1);
+      expect(sensor.sustain, const Duration(milliseconds: 750));
+      expect(sustainedNoise(sensor, const Duration(milliseconds: 1000)), 1);
 
       // One sample less and nothing accrues: the window is not so short that the
       // 250 ms sampling interval alone closes it.
       final tooShort = calibrated();
-      expect(sustainedNoise(tooShort, const Duration(milliseconds: 1000)), 0);
+      expect(sustainedNoise(tooShort, const Duration(milliseconds: 750)), 0);
     });
   });
 }

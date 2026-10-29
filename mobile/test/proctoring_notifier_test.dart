@@ -182,6 +182,133 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 120));
       expect(repo.violations, isNotEmpty);
     });
+
+    test('no_face is a state as well as a strike, and a face clears it',
+        () async {
+      // The exam page blocks the paper on `faceMissing` (see
+      // `EquipmentBlockOverlay`), so the flag has to track the *current* feed
+      // rather than only ever being raised by a strike.
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.setCameraActive(true);
+      notifier.reportGazeSignal(GazeSignal.noFace);
+      await pumpEventQueue();
+      expect(notifier.state.faceMissing, isTrue);
+      expect(notifier.state.warningCount, 1, reason: 'still a strike too');
+
+      // A head turned away is a face that is *present*: the strike stands, but
+      // the paper is not held shut by a "no face" that is no longer true.
+      notifier.reportGazeSignal(GazeSignal.lookingAway);
+      await pumpEventQueue();
+      expect(notifier.state.faceMissing, isFalse);
+
+      notifier.reportGazeSignal(GazeSignal.noFace);
+      notifier.reportGazeSignal(GazeSignal.centered);
+      await pumpEventQueue();
+      expect(notifier.state.faceMissing, isFalse);
+    });
+
+    test('a camera that drops out does not leave a stale "no face" behind',
+        () async {
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.setCameraActive(true);
+      notifier.reportGazeSignal(GazeSignal.noFace);
+      await pumpEventQueue();
+      expect(notifier.state.faceMissing, isTrue);
+
+      // The camera is the thing that stopped, so "nobody in frame" is its finding
+      // rather than the student's: the page has a separate, stricter block for a
+      // dead feed, and it must not be reading a leftover flag.
+      notifier.setCameraActive(false);
+      expect(notifier.state.cameraPaused, isTrue);
+      expect(notifier.state.faceMissing, isFalse);
+
+      // And a signal that arrives while the feed is down cannot re-raise it.
+      notifier.reportGazeSignal(GazeSignal.noFace);
+      await pumpEventQueue();
+      expect(notifier.state.faceMissing, isFalse);
+    });
+  });
+
+  group('evidence budget', () {
+    test('an identity strike overtakes a softer one waiting on the same still',
+        () async {
+      // The camera will not produce a still (`takePicture` on a controller that is
+      // re-initialising simply never answers), so both strikes are stuck behind the
+      // same dead capture - the worst case these two budgets exist for.
+      final stuck = Completer<Uint8List?>();
+      final outbox = _FakeOutbox();
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        outbox: outbox,
+        snapshotSource: () => stuck.future,
+        snapshotTimeout: const Duration(milliseconds: 400),
+        criticalSnapshotTimeout: const Duration(milliseconds: 20),
+      );
+      addTearDown(notifier.dispose);
+
+      // The softer strike is registered *first*, so it would win any tie...
+      notifier.reportAppMinimized();
+      notifier.reportGazeSignal(GazeSignal.noFace);
+
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+
+      // ...and still reaches the server first: "nobody is in front of the camera"
+      // is the strike that can stop an impostor's attempt, so it does not spend the
+      // same three seconds on a photograph that a glance away spends.
+      expect(
+        outbox.logged.map((violation) => violation.type),
+        <ViolationType>[ViolationType.noFace],
+        reason: 'the softer strike is still waiting on its own, longer budget',
+      );
+
+      // Let the abandoned capture finish so no future is left dangling, and confirm
+      // the softer strike goes out on its own budget afterwards.
+      stuck.complete(null);
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      expect(
+        outbox.logged.map((violation) => violation.type),
+        <ViolationType>[ViolationType.noFace, ViolationType.appMinimized],
+      );
+      // Both went out without a picture: the capture never completed, and a
+      // violation is the record while the picture is only the illustration.
+      expect(
+        outbox.logged.every((violation) => violation.snapshotUrl == null),
+        isTrue,
+      );
+    });
+
+    test('a still that arrives in time is still attached', () async {
+      // The budget is a deadline, not a refusal: when the camera answers inside it,
+      // the identity strike carries its photograph like any other.
+      final outbox = _FakeOutbox();
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        outbox: outbox,
+        snapshotSource: () async => Uint8List.fromList(<int>[1, 2, 3]),
+        uploadSnapshot: ({
+          required String submissionId,
+          required String actionType,
+          required Uint8List bytes,
+        }) async =>
+            '$submissionId/${actionType}_1.jpg',
+        criticalSnapshotTimeout: const Duration(seconds: 1),
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportGazeSignal(GazeSignal.multipleFaces);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(outbox.logged.single.type, ViolationType.multipleFaces);
+      expect(outbox.logged.single.snapshotUrl, isNotNull);
+    });
   });
 
   group('violation outbox (requirement 4)', () {
@@ -630,8 +757,19 @@ ProctoringNotifier _notifier({
   ViolationOutbox? outbox,
   void Function()? onForceExit,
   DateTime Function()? clock,
+  SnapshotSource? snapshotSource,
+  // Structurally `SnapshotUploader` (declared next to the Supabase client, which
+  // this suite deliberately does not import), so a fake uploader can be injected
+  // without dragging the singleton in.
+  Future<String?> Function({
+    required String submissionId,
+    required String actionType,
+    required Uint8List bytes,
+  })? uploadSnapshot,
+  Duration snapshotTimeout = const Duration(seconds: 3),
+  Duration criticalSnapshotTimeout = const Duration(milliseconds: 1200),
 }) {
-  return ProctoringNotifier(
+  final notifier = ProctoringNotifier(
     submissionId: 'sub-1',
     proctoringRepo: proctoringRepo,
     examRepo: examRepo ?? _RecordingExamRepository(),
@@ -639,13 +777,20 @@ ProctoringNotifier _notifier({
     outbox: outbox,
     onForceExit: onForceExit ?? () {},
     clock: clock,
-    uploadSnapshot: ({
-      required String submissionId,
-      required String actionType,
-      required Uint8List bytes,
-    }) async =>
-        fail('no snapshot source is attached in these tests'),
+    snapshotTimeout: snapshotTimeout,
+    criticalSnapshotTimeout: criticalSnapshotTimeout,
+    uploadSnapshot: uploadSnapshot ??
+        ({
+          required String submissionId,
+          required String actionType,
+          required Uint8List bytes,
+        }) async =>
+            fail('no snapshot source is attached in these tests'),
   );
+  // Attached after construction, which is also how the exam page does it: the
+  // page owns the camera and hands over the grabber once frames are flowing.
+  if (snapshotSource != null) notifier.attachSnapshotSource(snapshotSource);
+  return notifier;
 }
 
 /// A [ViolationOutbox] a test can drive: [reachable] decides whether a live

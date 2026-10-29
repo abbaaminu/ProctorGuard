@@ -33,6 +33,7 @@ import '../../../../core/widgets/responsive_layout.dart';
 import '../../../proctoring/presentation/providers/audio_monitoring_provider.dart';
 import '../../../proctoring/presentation/providers/proctoring_provider.dart';
 import '../../../proctoring/presentation/widgets/audio_monitor_indicator.dart';
+import '../../../proctoring/presentation/widgets/equipment_block_overlay.dart';
 import '../../../proctoring/presentation/widgets/fullscreen_lock_overlay.dart';
 import '../../../proctoring/presentation/widgets/violation_overlay.dart';
 import '../../domain/entities/exam_submit_result.dart';
@@ -185,6 +186,20 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// revoked, driver crash) so tracking pauses and the student is prompted
   /// instead of silently accruing strikes against a dead feed.
   bool _cameraStreaming = false;
+
+  /// Whether this attempt's camera has streamed at least one frame.
+  ///
+  /// The distinction the blocking overlay needs: `_cameraStreaming == false`
+  /// before the first frame is a camera that is still *opening* (the bootstrap
+  /// owns that, with its own blocking screen and its own retry), while flipping to
+  /// false after it has been true is a feed that was lost mid-attempt — the one
+  /// case where the paper has to be covered until the camera is back.
+  bool _cameraWasLive = false;
+
+  /// Guards [_recoverCamera]: the blocking overlay's button stays tappable while
+  /// the camera is reopening, and a second tap must not start a second pipeline on
+  /// a lens the first one is already holding.
+  bool _recoveringCamera = false;
 
   /// Wakes the queue when the OS brings the exam back to the foreground - the
   /// mobile equivalent of the browser's `online` event, and the moment a
@@ -350,6 +365,14 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// guards and the integrity probe, then the capture pipeline proctoring runs on.
   Future<void> _runBootstrap() async {
     final notifier = ref.read(proctoringProvider(widget.submissionId).notifier);
+
+    // The paper itself, asked for first and not awaited: the fetch has nothing to
+    // do with the device work below, so it overlaps with the disk read, the
+    // microphone, the kiosk pin and the camera instead of queueing behind them.
+    // It is applied at the end of this method (see `loadQuestions`), so the
+    // spinner still covers the whole setup and no question is painted before the
+    // cached answers are back.
+    _session.prefetchQuestions();
 
     // Local-first: the controller loads the durable cache before anything can be
     // painted, so a resumed attempt shows the answers typed before the app was
@@ -739,6 +762,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   void _setCameraStreaming(bool streaming) {
     if (_cameraStreaming == streaming) return;
     _cameraStreaming = streaming;
+    // Sticky on purpose: this is what tells the blocking overlay the difference
+    // between a camera that has not opened yet and one that was taken away.
+    if (streaming) _cameraWasLive = true;
     if (!mounted) return;
 
     ref
@@ -746,10 +772,37 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
         .setCameraActive(streaming);
 
     if (!streaming) {
-      _showMessage(
-        'Camera feed lost. Proctoring is paused - restore the camera to keep '
-        'your attempt.',
-      );
+      // No snack bar: the blocking overlay covers the paper and says this, with
+      // the button that fixes it. A message under an opaque barrier would only
+      // queue up behind it.
+      proctorLog('ProctorGuard: camera feed lost — proctoring paused.');
+    }
+  }
+
+  /// Re-opens the camera after the feed was lost mid-attempt (the blocking
+  /// overlay's action).
+  ///
+  /// The whole bootstrap is re-run rather than just the capture pipeline, because
+  /// it is already the re-runnable path — it releases the kiosk lock, the browser
+  /// guards and the session watchers before starting them again — and because a
+  /// camera that died usually took the reason with it (another app grabbed the
+  /// device, the OS revoked the grant). The dead controller is dropped first:
+  /// [_retryBootstrap] only re-runs the capture pipeline when there is no
+  /// controller, and a failed one still holds the lens it was handed.
+  Future<void> _recoverCamera() async {
+    if (_recoveringCamera) return;
+    _recoveringCamera = true;
+    try {
+      final camera = _cameraController;
+      _cameraController = null;
+      if (camera != null) {
+        camera.removeListener(_onCameraValueChanged);
+        await _releaseCamera(camera);
+      }
+      _setCameraStreaming(false);
+      await _bootstrap();
+    } finally {
+      _recoveringCamera = false;
     }
   }
 
@@ -803,37 +856,102 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     }
   }
 
-  /// Tells the student that audio proctoring needs them, with the one action that
-  /// fixes it.
+  /// Leaves the attempt from a blocking overlay.
   ///
-  /// Only a refusal and a lost device prompt: those are the two states the student
-  /// can act on, and the requirement is that a disconnected microphone is a
-  /// visible, answerable prompt rather than a silent gap in proctoring.
-  /// `unavailable` stays on the indicator - nagging a device that cannot report
-  /// levels would be noise.
-  void _promptAudioAttention(AudioMonitoringState state) {
-    if (!mounted) return;
-    final denied = state.monitor == AudioMonitorState.permissionDenied;
+  /// Imperative `pop` rather than `maybePop`: the equipment block refuses the
+  /// hardware back gesture (see [_proctoringOverlays]), and this button is the one
+  /// thing allowed through it — otherwise a student whose camera died could
+  /// neither carry on nor walk away.
+  void _leaveAttempt() {
+    final navigator = Navigator.of(context);
+    if (navigator.canPop()) navigator.pop();
+  }
 
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          content: Text(
-            state.message ?? 'Audio proctoring needs your attention.',
-          ),
-          duration: const Duration(seconds: 8),
-          action: SnackBarAction(
-            // A refusal cannot be fixed by asking again (Android and iOS stop
-            // prompting after two "don't allow"s), so that state gets the settings
-            // page instead of a retry - the same split the blocking screen makes.
-            label: denied ? 'Settings' : 'Reconnect',
-            onPressed: () => denied
-                ? unawaited(PermissionService().openSettings())
-                : unawaited(_retryAudioMonitoring()),
-          ),
-        ),
+  /// The one thing standing between the student and the paper right now, or null
+  /// when nothing is.
+  ///
+  /// Order matters, and it is the order of "what makes the attempt unproctored":
+  ///
+  ///  1. **camera lost** — nothing is watching at all. Covers everything.
+  ///  2. **microphone gone** — refused, or the device disappeared mid-attempt.
+  ///     Nothing is listening, and the student can fix it, unlike a policy-blocked
+  ///     device which never had levels to give (that stays on the indicator: a full
+  ///     barrier the student cannot clear would strand them, since this app also
+  ///     runs on devices with no working input at all - see `AudioMonitorState`).
+  ///  3. **no face in frame** — the camera is fine and there is nobody in front of
+  ///     it. Last because a camera that is down cannot report a face, so the two
+  ///     can never be shown as competing messages.
+  ///
+  /// The camera comes from this page's own controller rather than from the
+  /// notifier's `cameraPaused` flag, and only after it has streamed once
+  /// ([_cameraWasLive]): before the first frame the bootstrap owns the screen with
+  /// its own blocking state, and a mock-camera session never opens one at all.
+  Widget? _equipmentBlock(
+    ProctoringState proctoringState,
+    AudioMonitoringState audioState,
+  ) {
+    if (!widget.mockMode && _cameraWasLive && !_cameraStreaming) {
+      return EquipmentBlockOverlay(
+        key: const Key('equipment-block-camera'),
+        icon: Icons.videocam_off_outlined,
+        title: 'Your camera has stopped',
+        message: 'Proctoring cannot see you, so the exam is paused. Reopen the '
+            'camera to carry on where you left off — your answers are saved.',
+        actionLabel: 'Restart camera',
+        onAction: () => unawaited(_recoverCamera()),
+        onLeave: _leaveAttempt,
       );
+    }
+
+    switch (audioState.monitor) {
+      case AudioMonitorState.permissionDenied:
+        return EquipmentBlockOverlay(
+          key: const Key('equipment-block-microphone'),
+          icon: Icons.mic_off_outlined,
+          title: 'Your microphone is switched off',
+          message: 'This exam listens for voices around you. Allow microphone '
+              'access, then come back to the exam.',
+          actionLabel: 'Try again',
+          onAction: () => unawaited(_retryAudioMonitoring()),
+          // A refusal that no longer prompts can only be undone in the OS
+          // settings page — the same split the blocking bootstrap screen makes.
+          settingsLabel: 'Open settings',
+          onSettings: () => unawaited(PermissionService().openSettings()),
+          onLeave: _leaveAttempt,
+        );
+      case AudioMonitorState.interrupted:
+        return EquipmentBlockOverlay(
+          key: const Key('equipment-block-microphone'),
+          icon: Icons.mic_off_outlined,
+          title: 'Your microphone was disconnected',
+          message: 'The exam cannot be proctored without it. Reconnect the '
+              'microphone — or the headset it is part of — to carry on.',
+          actionLabel: 'Reconnect',
+          onAction: () => unawaited(_retryAudioMonitoring()),
+          onLeave: _leaveAttempt,
+        );
+      case AudioMonitorState.idle:
+      case AudioMonitorState.starting:
+      case AudioMonitorState.monitoring:
+      case AudioMonitorState.unavailable:
+      case AudioMonitorState.disabled:
+        break;
+    }
+
+    if (proctoringState.faceMissing) {
+      return EquipmentBlockOverlay(
+        key: const Key('equipment-block-face'),
+        icon: Icons.face_retouching_off_outlined,
+        title: 'We cannot see your face',
+        message: 'Face the camera and stay in frame. The exam resumes as soon '
+            'as your face is visible again.',
+        // No action: the fix is the student's face, which is also what clears
+        // this - the overlay disappears on its own the moment one is reported.
+        onLeave: _leaveAttempt,
+      );
+    }
+
+    return null;
   }
 
   /// "camera and microphone", for the permission message in [_runBootstrap].
@@ -1333,21 +1451,12 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     // Audio proctoring for this attempt. Watching it is what keeps the
     // `autoDispose` microphone session alive for as long as the exam screen is
     // (see `audioMonitoringProvider`); the question pane's header renders it.
+    //
+    // No snack-bar prompt any more: a refusal or a lost device is now a blocking
+    // overlay (`_equipmentBlock`), which is the requirement — a disconnected
+    // microphone leaves a hole in proctoring that a dismissible toast does not
+    // close. The header indicator stays, for the healthy states.
     final audioState = ref.watch(audioMonitoringProvider(widget.submissionId));
-
-    // A refusal or a lost device is announced once per transition, so a
-    // microphone that goes away mid-exam prompts the student instead of leaving
-    // a silent hole in proctoring.
-    ref.listen<AudioMonitoringState>(
-      audioMonitoringProvider(widget.submissionId),
-      (previous, next) {
-        if (previous?.monitor == next.monitor) return;
-        if (next.monitor == AudioMonitorState.permissionDenied ||
-            next.monitor == AudioMonitorState.interrupted) {
-          _promptAudioAttention(next);
-        }
-      },
-    );
 
     // --- Blocking states (each one offers a way out) --------------------
     final blockingError = session.blockingError;
@@ -1567,56 +1676,73 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     children: <Widget>[content, ..._proctoringOverlays(proctoringState)],
   );
 
-  /// The warning overlays and the attempt's back-button rule for one frame.
+  /// The warning overlays, the equipment block and the attempt's back-button rule
+  /// for one frame.
   ///
   /// Returned as a list so the *same* widgets are painted above every state the
   /// screen can be in (see [_proctored]).
-  List<Widget> _proctoringOverlays(ProctoringState proctoringState) => <Widget>[
-    // `PopScope` registers with the enclosing `ModalRoute` from wherever it
-    // sits in that route's subtree, so it sits beside the warnings it is
-    // about. While a warning is up, hardware back used to pop the attempt
-    // outright: the strike stayed logged against a session the student had
-    // walked away from, and a "this is your last warning" screen could be
-    // left without being read. Back now does what the overlay's own button
-    // does, and on a disqualification — where no dismiss exists — nothing.
-    PopScope(
-      canPop: !proctoringState.showViolationOverlay,
-      onPopInvokedWithResult: (didPop, Object? result) {
-        if (didPop || proctoringState.disqualified) return;
-        ref
-            .read(proctoringProvider(widget.submissionId).notifier)
-            .dismissOverlay();
-      },
-      child: const SizedBox.shrink(),
-    ),
-    if (proctoringState.showViolationOverlay)
-      ViolationOverlay(
-        type: proctoringState.lastViolation,
-        warningCount: proctoringState.warningCount,
-        isFinal: proctoringState.disqualified,
-        // The same index the supervisor's grid shows for this attempt: it is
-        // derived from this session's own violation list, not passed in.
-        risk: proctoringState.risk,
-        onDismiss: () {
-          if (proctoringState.disqualified) {
-            Navigator.of(context).popUntil((r) => r.isFirst);
-          } else {
-            ref
-                .read(proctoringProvider(widget.submissionId).notifier)
-                .dismissOverlay();
-          }
+  List<Widget> _proctoringOverlays(ProctoringState proctoringState) {
+    final equipmentBlock = _equipmentBlock(
+      proctoringState,
+      ref.watch(audioMonitoringProvider(widget.submissionId)),
+    );
+
+    return <Widget>[
+      // `PopScope` registers with the enclosing `ModalRoute` from wherever it
+      // sits in that route's subtree, so it sits beside the warnings it is
+      // about. While a warning is up, hardware back used to pop the attempt
+      // outright: the strike stayed logged against a session the student had
+      // walked away from, and a "this is your last warning" screen could be
+      // left without being read. Back now does what the overlay's own button
+      // does, and on a disqualification — where no dismiss exists — nothing.
+      //
+      // The equipment block is stricter still: there is nothing to dismiss, so
+      // back stays with the block. Its own `Leave` action pops the route
+      // imperatively, which is the one way out (see [EquipmentBlockOverlay]).
+      PopScope(
+        canPop: !proctoringState.showViolationOverlay && equipmentBlock == null,
+        onPopInvokedWithResult: (didPop, Object? result) {
+          if (didPop || proctoringState.disqualified) return;
+          ref
+              .read(proctoringProvider(widget.submissionId).notifier)
+              .dismissOverlay();
         },
+        child: const SizedBox.shrink(),
       ),
-    // Above the violation overlay: while this countdown is running nothing
-    // has been logged yet, and the only thing the student should be able to
-    // do is come back to fullscreen (which is also the user gesture the
-    // browser needs to grant it).
-    if (_fullscreenDeadline != null)
-      FullscreenLockOverlay(
-        remaining: _fullscreenDeadline!.difference(_now()),
-        onReturnToFullscreen: () => _webGuard?.requestFullscreen(),
-      ),
-  ];
+      if (proctoringState.showViolationOverlay)
+        ViolationOverlay(
+          type: proctoringState.lastViolation,
+          warningCount: proctoringState.warningCount,
+          isFinal: proctoringState.disqualified,
+          // The same index the supervisor's grid shows for this attempt: it is
+          // derived from this session's own violation list, not passed in.
+          risk: proctoringState.risk,
+          onDismiss: () {
+            if (proctoringState.disqualified) {
+              Navigator.of(context).popUntil((r) => r.isFirst);
+            } else {
+              ref
+                  .read(proctoringProvider(widget.submissionId).notifier)
+                  .dismissOverlay();
+            }
+          },
+        ),
+      // Above the warning: dismissing a warning is not a decision a student gets
+      // to make while the camera, the microphone or their own face is missing, and
+      // an opaque barrier means the question is not readable behind the prompt
+      // either - which is the point of blocking rather than warning.
+      ?equipmentBlock,
+      // Above the violation overlay: while this countdown is running nothing
+      // has been logged yet, and the only thing the student should be able to
+      // do is come back to fullscreen (which is also the user gesture the
+      // browser needs to grant it).
+      if (_fullscreenDeadline != null)
+        FullscreenLockOverlay(
+          remaining: _fullscreenDeadline!.difference(_now()),
+          onReturnToFullscreen: () => _webGuard?.requestFullscreen(),
+        ),
+    ];
+  }
 
   /// Whether the answer stored for [question] is the one on screen — what the
   /// three answer widgets mean by "saved".

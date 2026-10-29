@@ -339,6 +339,27 @@ void main() {
       expect(rulings.single.warningCount, 3);
     });
 
+    test('a delivery that never answers is queued instead of hanging', () async {
+      // A row is delivered, or it is queued. There is no third state where a strike
+      // sits in a socket an impostor's exam is still running inside of.
+      sync = _service(
+        exams: exams,
+        proctoring: proctoring,
+        deliveryTimeout: const Duration(milliseconds: 20),
+      );
+      proctoring.hang = true;
+
+      final ruling = await sync.log(
+        submissionId: 'sub-1',
+        violation: _violation(ViolationType.noFace),
+      );
+
+      expect(ruling, isNull, reason: 'null is "queued", not "delivered"');
+      expect(sync.state.pendingViolations, 1);
+      expect(sync.state.online, isFalse);
+      expect(proctoring.violations, isEmpty);
+    });
+
     test('the queue is bounded, newest evidence kept', () async {
       proctoring.online = false;
       sync = _service(
@@ -472,6 +493,7 @@ OfflineSyncService _service({
   NetworkStatus? network,
   Duration minRetryDelay = const Duration(milliseconds: 20),
   int maxQueuedViolations = 200,
+  Duration deliveryTimeout = ViolationOutbox.deliveryTimeout,
 }) =>
     OfflineSyncService(
       exams: exams,
@@ -482,6 +504,7 @@ OfflineSyncService _service({
       minRetryDelay: minRetryDelay,
       maxRetryDelay: const Duration(milliseconds: 400),
       maxQueuedViolations: maxQueuedViolations,
+      deliveryTimeout: deliveryTimeout,
     );
 
 Violation _violation(ViolationType type) => Violation(
@@ -566,6 +589,12 @@ class _FlakyExamRepository implements ExamRepository {
 /// test decide what the server "answers" when a queued violation finally lands.
 class _FlakyProctoringRepository implements ProctoringRepository {
   bool online = true;
+
+  /// Accepts the connection and then never answers - a socket that stays open on a
+  /// server that has stopped replying, which is neither a success nor a failure
+  /// until something puts a clock on it.
+  bool hang = false;
+
   int warningCount = 1;
   int disqualifyAt = 3;
   final List<Violation> violations = <Violation>[];
@@ -575,6 +604,7 @@ class _FlakyProctoringRepository implements ProctoringRepository {
     required String submissionId,
     required Violation violation,
   }) async {
+    if (hang) return Completer<({int warningCount, bool disqualified})>().future;
     if (!online) throw const _Offline();
     violations.add(violation);
     final count = warningCount + violations.length - 1;

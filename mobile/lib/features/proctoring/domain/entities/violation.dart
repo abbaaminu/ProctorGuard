@@ -44,6 +44,39 @@ enum ViolationType {
         ViolationType.idleAfk => 'idle_afk',
       };
 
+  /// Whether this violation means the attempt may not be being sat by the student
+  /// it was issued to: a second person in frame, nobody in frame, a feed that is
+  /// not the device's own lens, or the paper mirrored onto another screen.
+  ///
+  /// These are the strikes a supervisor has to hear about in the same second
+  /// rather than after the next one, because every second one of them sits
+  /// undelivered is a second an impostor spends answering questions under somebody
+  /// else's name. The notifier reads this to bound how long it waits for a still
+  /// frame before it sends the row without one
+  /// (`ProctoringNotifier.criticalSnapshotTimeout`), since evidence-gathering that
+  /// takes three seconds is three seconds of a stranger reading the paper.
+  ///
+  /// The softer types - a glance away, noise in the room, a paste, leaving the tab,
+  /// an idle device - are still strikes, still count towards the 3-strike rule and
+  /// still cost the student a warning. They are simply not evidence that the
+  /// *identity* of the candidate has broken, so they keep the full budget for the
+  /// photograph that a human will later look at.
+  bool get isCritical => switch (this) {
+        ViolationType.multipleFaces ||
+        ViolationType.noFace ||
+        ViolationType.virtualCameraDetected ||
+        ViolationType.secondaryDisplayDetected =>
+          true,
+        ViolationType.lookingAway ||
+        ViolationType.appMinimized ||
+        ViolationType.audioNoise ||
+        ViolationType.copyPasteAttempt ||
+        ViolationType.rightClickBlocked ||
+        ViolationType.devtoolsDetected ||
+        ViolationType.idleAfk =>
+          false,
+      };
+
   /// The inverse of [dbValue], for rows rebuilt from the offline queue.
   ///
   /// Throws on an unknown value rather than defaulting: a queued violation whose

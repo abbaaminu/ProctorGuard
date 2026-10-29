@@ -40,6 +40,16 @@ class ProctoringState {
   /// student instead of letting an unproctored session look normal.
   final bool cameraPaused;
 
+  /// True while the feed is running but no face is being reported in frame.
+  ///
+  /// Deliberately not part of [warningCount]. A strike is an *event*: it happened,
+  /// it is counted, and it stays counted. This is the *current* state of the
+  /// camera — it clears the moment a face is reported again — and that is what
+  /// lets the exam page hold the paper shut while nobody is visibly sitting it
+  /// (`EquipmentBlockOverlay`). A warning the student can dismiss is not a
+  /// guarantee that a face is there; this is.
+  final bool faceMissing;
+
   /// Every violation logged in this session so far, in order.
   ///
   /// This is the attempt's own evidence list, and it is kept as a list rather
@@ -54,6 +64,7 @@ class ProctoringState {
     this.lastViolation,
     this.disqualified = false,
     this.cameraPaused = false,
+    this.faceMissing = false,
     this.violationTypes = const <ViolationType>[],
   });
 
@@ -72,6 +83,7 @@ class ProctoringState {
     ViolationType? lastViolation,
     bool? disqualified,
     bool? cameraPaused,
+    bool? faceMissing,
     List<ViolationType>? violationTypes,
   }) =>
       ProctoringState(
@@ -80,6 +92,7 @@ class ProctoringState {
         lastViolation: lastViolation ?? this.lastViolation,
         disqualified: disqualified ?? this.disqualified,
         cameraPaused: cameraPaused ?? this.cameraPaused,
+        faceMissing: faceMissing ?? this.faceMissing,
         violationTypes: violationTypes ?? this.violationTypes,
       );
 }
@@ -108,7 +121,8 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     required this._onForceExit,
     required this._uploadSnapshot,
     ViolationOutbox? outbox,
-    this.snapshotTimeout = const Duration(seconds: 5),
+    this.snapshotTimeout = const Duration(seconds: 3),
+    this.criticalSnapshotTimeout = const Duration(milliseconds: 1200),
     DateTime Function()? clock,
   })  : _outbox = outbox ?? DirectViolationOutbox(proctoringRepo),
         _now = clock ?? DateTime.now,
@@ -132,9 +146,29 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   final void Function() _onForceExit;
   final SnapshotUploader _uploadSnapshot;
 
-  /// Upper bound on how long a violation waits for its evidence; past this the
-  /// log goes out without a picture rather than delaying escalation.
+  /// Upper bound on the whole evidence step — grab the still *and* store it —
+  /// past which the log goes out without a picture rather than delaying
+  /// escalation.
+  ///
+  /// One deadline for both halves, which is why it is three seconds and not five
+  /// each: the violation is the record, the picture is the illustration, and a
+  /// strike that reaches the supervisor late is worth less than one that arrives
+  /// without a frame.
   final Duration snapshotTimeout;
+
+  /// The same deadline for the evidence of a [ViolationType.isCritical] strike -
+  /// "there is a second person in frame", "there is nobody in frame", "this camera
+  /// is not the device's lens", "this paper is mirrored to another screen".
+  ///
+  /// Shorter than [snapshotTimeout] on purpose, and shorter than a second and a
+  /// half: those four are the strikes where the paper may be in somebody else's
+  /// hands *right now*, so the row that tells the server to stop the attempt is
+  /// worth more than the photograph taken while the attempt carries on. A still is
+  /// a local capture plus one storage upload, so the ordinary case finishes well
+  /// inside this budget; when it does not, the violation goes out without a picture
+  /// (the row's `snapshot_url` is nullable by design, and the incident is still in
+  /// the log for a human to read).
+  final Duration criticalSnapshotTimeout;
 
   /// The clock this session reasons about time with.
   ///
@@ -194,7 +228,12 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     // episode from before the camera dropped out.
     _lastLoggedAt.clear();
     _engine.setStreamActive(active);
-    state = state.copyWith(cameraPaused: !active);
+    // A paused feed says nothing about who is in front of it: "no face" while the
+    // camera is down is the camera's finding, not the student's, and the page
+    // covers the paper for that on its own (`EquipmentBlockOverlay`). Clearing it
+    // here also means a feed that comes back is judged on the frames it produces
+    // next rather than on the last frame it managed to deliver.
+    state = state.copyWith(cameraPaused: !active, faceMissing: false);
   }
 
   /// Whether camera-derived signals are currently being evaluated.
@@ -228,17 +267,38 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
 
     switch (signal) {
       case GazeSignal.centered:
-        return; // no violation
+        // A face is in frame and within the tolerances. Nothing is logged for
+        // being present - but the presence flag is what the exam page's blocking
+        // overlay reads, so it has to be cleared here (`noFace` sets it below).
+        _noteFacePresence(false);
+        return;
       case GazeSignal.lookingAway:
+        // A face *is* in frame: the head is turned, which is the strike, not an
+        // absence. Clearing the flag first means the paper is not also held shut
+        // by a "no face" left over from an earlier episode.
+        _noteFacePresence(false);
         _registerViolation(ViolationType.lookingAway);
         break;
       case GazeSignal.noFace:
+        _noteFacePresence(true);
         _registerViolation(ViolationType.noFace);
         break;
       case GazeSignal.multipleFaces:
+        _noteFacePresence(false);
         _registerViolation(ViolationType.multipleFaces);
         break;
     }
+  }
+
+  /// Records whether a face is currently in frame (see
+  /// [ProctoringState.faceMissing]).
+  ///
+  /// Written *before* the violation is registered, and only when it actually
+  /// changed: `_registerViolation` writes the state again for the strike, and a
+  /// redundant `copyWith` here would rebuild the exam screen for nothing.
+  void _noteFacePresence(bool missing) {
+    if (state.faceMissing == missing) return;
+    state = state.copyWith(faceMissing: missing);
   }
 
   /// The one audio entry point: the classifier has already decided.
@@ -356,7 +416,9 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
 
     // Then collect evidence, time-boxed: a camera that refuses to grab a still
     // (some Android devices do while streaming) or an offline upload must never
-    // delay the escalation below.
+    // delay the escalation below — and for an identity-breaking strike the box is
+    // deliberately shorter than the one a glance away gets, because the row is what
+    // stops an impostor's attempt (see [criticalSnapshotTimeout]).
     final snapshotUrl = await _captureAndUploadSnapshot(type);
     if (!mounted) return; // the page went away while the still was grabbed
 
@@ -423,23 +485,55 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   /// Every step is optional: mock-camera sessions never attach a source, a
   /// capture can fail, an upload can be rejected — in all of those cases this
   /// returns null and the violation is still logged, just without a picture.
+  ///
+  /// The whole evidence step runs under **one** budget, not one per round trip
+  /// ([_evidenceBudget]: [criticalSnapshotTimeout] for the identity-breaking
+  /// strikes, [snapshotTimeout] for the rest). Capture and upload used to each take
+  /// the full timeout in turn, so a camera that would not produce a still and an
+  /// upload that would not complete cost ten seconds before the log went out — ten
+  /// seconds in which the strike counter had not told the server anything, on the
+  /// exact device that was obviously already struggling.
   Future<String?> _captureAndUploadSnapshot(ViolationType type) async {
     final capture = _snapshotSource;
     if (capture == null) return null;
 
-    try {
-      final bytes = await capture().timeout(snapshotTimeout);
-      if (bytes == null || bytes.isEmpty) return null;
+    // A paused feed cannot produce a still: `takePicture` on a controller that is
+    // initialising, blocked or lost either throws or - on some Android devices -
+    // waits for a frame that is never coming. The violation does not wait for
+    // evidence that cannot exist; it goes out now, without a picture.
+    if (!_cameraActive) return null;
 
-      return await _uploadSnapshot(
-        submissionId: submissionId,
-        actionType: type.dbValue,
-        bytes: bytes,
-      ).timeout(snapshotTimeout);
+    try {
+      return await _grabAndStore(capture, type).timeout(_evidenceBudget(type));
     } catch (_) {
       // Evidence is best-effort; proctoring must keep working without it.
       return null;
     }
+  }
+
+  /// How long evidence for [type] may hold up the delivery of its own violation.
+  ///
+  /// See [criticalSnapshotTimeout]: the four identity-breaking strikes get a
+  /// budget measured in one second, everything else gets the full
+  /// [snapshotTimeout]. Read per call rather than captured once, so a test can
+  /// inject a budget it can actually wait for.
+  Duration _evidenceBudget(ViolationType type) =>
+      type.isCritical ? criticalSnapshotTimeout : snapshotTimeout;
+
+  /// The capture-then-upload sequence itself, so [_captureAndUploadSnapshot] can
+  /// put a single deadline around both halves.
+  Future<String?> _grabAndStore(
+    SnapshotSource capture,
+    ViolationType type,
+  ) async {
+    final bytes = await capture();
+    if (bytes == null || bytes.isEmpty) return null;
+
+    return _uploadSnapshot(
+      submissionId: submissionId,
+      actionType: type.dbValue,
+      bytes: bytes,
+    );
   }
 
   /// Ends the attempt: lockout overlay, server-side status, forced exit.

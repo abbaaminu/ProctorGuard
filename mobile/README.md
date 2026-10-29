@@ -294,6 +294,31 @@ Details worth knowing:
   optimistically and the UI still warns; `ViolationOutbox.deferredRulings` hands it
   the server's ruling when the row does land, which is how a third strike taken
   offline still ends the attempt.
+- **A strike is logged before its photograph, and an identity strike does not wait
+  for one.** The whole evidence step — capture *and* upload — runs under **one**
+  budget instead of one per round trip (`ProctoringNotifier._captureAndUploadSnapshot`):
+  `snapshotTimeout` (3s) normally, `criticalSnapshotTimeout` (1.2s) for
+  `ViolationType.isCritical` — `no_face`, `multiple_faces`,
+  `virtual_camera_detected`, `secondary_display_detected`. Those four are the
+  strikes that can stop an impostor mid-attempt, and it is the **row** that stops
+  them, not the picture (`snapshot_url` is nullable, and whoever reviews the
+  evidence signs the path on demand). Spending three seconds photographing a camera
+  that is not producing a still is backwards on exactly the device that is already
+  struggling.
+- **A delivery that never answers is queued, not awaited.** Every
+  `register_violation` call — live, queued or direct — runs under
+  `ViolationOutbox.deliveryTimeout` (10s), so a socket that accepted the request and
+  then went silent becomes "queued" instead of holding the strike in flight until
+  the exam screen is torn down (which in release lost it silently). Replaying is
+  safe: the row carries its own `client_event_id`, so the retry of that one event
+  inserts that one strike.
+- **A fresh strike re-arms the backoff at the floor, and an identity strike skips
+  the wait.** A queue that has been offline for ten minutes is sitting on the 60s
+  ceiling, and evidence that arrives a minute late is read after the attempt is
+  over — so every new violation resets `_retryDelay` to `minRetryDelay` (2s), and a
+  critical one also runs an immediate pass, turning a single dropped request into a
+  delivery within the same second. If the network really is gone that pass fails
+  too, and the armed timer takes over from there.
 - **The server keeps the authoritative timeline.** Every row carries
   `client_timestamp` (when the violation happened on the device) *and* the server's
   own `timestamp`, so a violation delivered late is still placed correctly in the
@@ -304,9 +329,10 @@ Details worth knowing:
   spin frames for as long as the connection is down.
 
 `mobile/test/offline_sync_service_test.dart` covers the queue rules (durability
-before the network, drain on recovery, backoff without help, one queued row per
-question, restore after a restart, corrupt-storage tolerance, the same event id on
-retry, a bounded queue, and the probe's events);
+before the network, drain on recovery with the violations first, backoff without
+help, a delivery that never answers being queued rather than awaited, one queued row
+per question, restore after a restart, corrupt-storage tolerance, the same event id
+on retry, a bounded queue, and the probe's events);
 `mobile/test/exam_taking_page_test.dart` covers what the student sees (the banner,
 the answer kept and later synced, the resumed draft, the attempt resumed past its
 deadline that is *not* submitted behind their back, and the one whose clock runs
@@ -787,6 +813,9 @@ mid-exam, so a silent failure would strand them:
 | Exam has no questions yet | "No questions yet" + **Leave** (the attempt stays `ongoing`, so it can be resumed after a supervisor adds them) |
 | Clock ran out | auto-submit; if the server cannot be reached, a "Time is up" screen with **Send again** / **Leave** |
 | Clock ran out while the screen was closed (a reload, a crash, a tab restored the next morning) | "Time is up" + **Hand in my answers** / **Leave**, and nothing is submitted until that tap (see the countdown bullet below) |
+| Camera goes dark mid-session (unplugged, another app took it, the OS revoked the grant) | the paper is covered by an opaque **"Your camera has stopped"** block with **Restart camera** / **Leave** |
+| Microphone lost or refused mid-session | the same opaque block — **"Your microphone was disconnected"** + **Reconnect**, or **"Your microphone is switched off"** + **Try again** / **Open settings** / **Leave** |
+| No face in frame, or the whole face out of shot | **"We cannot see your face"**, which clears itself the moment a face is reported again (no button: the fix is the student being there) |
 
 There is no silent stand-in for a camera that is not working. The self-view shows
 a live preview, the loud **MOCK CAMERA** tile *only* in an explicit `MOCK_CAMERA`
@@ -839,14 +868,35 @@ Details worth knowing:
   happen. Only a clock that runs out **in front of the student** auto-submits.
   Leaving that panel keeps the submission `ongoing`, so the same explanation is
   what they get if they come back.
-* **Camera loss pauses proctoring and prompts the student.** The page listens to
+* **Camera loss blocks the paper, it does not merely prompt.** The page listens to
   the `CameraController`; if the feed reports an error mid-session it calls
-  `ProctoringNotifier.setCameraActive(false)`, which drops further `GazeSignal`s,
-  clears the engine's frame counters and shows a "restore the camera" prompt - an
-  offline feed no longer accumulates `no_face`/`looking_away` strikes. Frames
-  that arrive before the stream is live are ignored too
-  (`MediaPipeProctoringService.setStreamActive`), so initialising a camera is
-  never read as "no face".
+  `ProctoringNotifier.setCameraActive(false)`, which drops further `GazeSignal`s
+  and clears the engine's frame counters — an offline feed no longer accumulates
+  `no_face`/`looking_away` strikes — **and** it raises `EquipmentBlockOverlay`
+  (`widgets/equipment_block_overlay.dart`): a fully opaque screen with
+  **Restart camera** and **Leave**, above the strike overlay, with `PopScope`
+  refusing the back gesture. A prompt the student can dismiss is a prompt that
+  leaves them sitting an exam with nothing watching, so the question text is
+  covered until the feed is back. Frames that arrive before the stream is live are
+  ignored too (`MediaPipeProctoringService.setStreamActive`), so initialising a
+  camera is never read as "no face". `_recoverCamera` drops the dead controller
+  before reopening it, and the block only exists once the camera has streamed at
+  least once (`_cameraWasLive`) — before the first frame the bootstrap's own
+  blocking state covers the screen, and a `MOCK_CAMERA` session never opens a
+  camera at all.
+* **Nothing blocks unless it makes the attempt unproctored, and the order is
+  fixed.** One place decides what stands between the student and the paper
+  (`_equipmentBlock`), and it answers in the order of "what is missing": **camera**
+  → **microphone** → **no face**. A camera that is down cannot report a face, so
+  the two can never be shown as competing messages. The microphone block covers
+  only the two states the student can fix (`permissionDenied`, `interrupted`); a
+  device with no capture path at all (`unavailable`, `disabled`) stays on the
+  indicator, because a barrier nobody can clear would strand a student on a device
+  that never had an input. **Leave** is always offered — the block holds the paper
+  shut, not the student hostage — and it is the one route past the `PopScope`.
+  Losing the camera or the microphone is still **not a strike**: it is an
+  unproctored gap with a fix, and the strike counter only ever counts sustained
+  speech, faces and escapes.
 * **The camera is video-only; the microphone belongs to audio proctoring.**
   `CameraController` is created with `enableAudio: false`. The camera plugin's own
   audio capture is not used for anything — nothing here records sound — and asking
@@ -861,8 +911,10 @@ Details worth knowing:
   `AudioNoiseDetector`, which measures the room's own noise floor first and then
   treats *sustained* speech above it as `audio_noise`. No audio is ever written to a
   file. A lost or refused microphone is **not** a strike — it is an unproctored gap —
-  so the page prompts **Reconnect** (**Open settings** when the OS will not ask
-  again) rather than letting proctoring go quietly dark. The state machine and the
+  but it does **block** the paper: the page raises the same opaque
+  `EquipmentBlockOverlay` the camera does, with **Reconnect** (a device that went
+  away) or **Try again** / **Open settings** (a grant the OS will not prompt for
+  again), so proctoring can never go quietly dark. The state machine and the
   rules are in [Microphone proctoring](#microphone-proctoring-levels-not-recordings).
 * **Web: access is requested *before* the camera is enumerated.** `camera_web`
   drops every device whose `deviceId` is empty, which is exactly what a browser
@@ -930,6 +982,16 @@ Details worth knowing:
   spinner above; now the session degrades to "not pinned" / "not granted" and the
   screen explains itself. A lock-task *state* query that times out is treated as
   "unknown" rather than as an escape, so a slow device cannot burn a strike.
+* **The bootstrap overlaps what it can, and paints only when it is done.** The
+  question feed is asked for first (`ExamSessionController.prefetchQuestions`) and
+  applied last (`loadQuestions`), so the network round-trip runs alongside the disk
+  read of the durable cache, the microphone, the kiosk pin and the camera instead of
+  queueing behind them — the student waits for the longer of the two, not for their
+  sum. Nothing is painted when it resolves: the spinner still covers the whole
+  setup, and `hydrateCache` is still awaited first, so a resumed attempt's answers
+  are on screen before any question is. A failed fetch is forgotten rather than
+  replayed, so the blocking state's **Try again** asks the server again
+  (`mobile/test/exam_session_prefetch_test.dart`).
 * **Startup permission prompts do not block the first frame.** `main()` fires the
   permission pass without awaiting it (an OS dialog can stay open indefinitely,
   and blocking `runApp` on it is the blank-page startup failure the boot order
@@ -946,7 +1008,10 @@ repository, and a refused roster renders the repository's prose with a retry —
 pumped on a 1400x1200 surface (`useDesktopSurface`) so the side-by-side layout is
 the one under test.
 `mobile/test/exam_taking_page_test.dart` covers the blocking state and its
-retry/leave actions.
+retry/leave actions, and the equipment blocks: a lost or refused microphone and a
+paper with no face in frame each raise the opaque `EquipmentBlockOverlay` (with its
+action, settings and leave keys), the warning overlay's dismissal is unreachable
+behind it, and a `centered` signal is what takes it back down.
 
 ## Supported platforms (and what proctoring each one gets)
 
@@ -1377,11 +1442,15 @@ detector can be asked for without depending on its frame rate, and the shipped
 `web/proctor_face_detector.js` is polled at 350 ms so a covered camera is a strike
 on the second tick; a second person in frame is still reported at once.
 `ProctoringNotifier.setCameraActive` gates the whole camera set while the feed is not
-streaming.
+streaming, and `ProctoringState.faceMissing` is the *state* the page blocks on rather
+than the strike: a `no_face`/`looking_away` signal sets it and the next `centered`
+clears it, so the opaque "We cannot see your face" overlay is up for exactly as long
+as the camera is looking at an empty chair — a strike is one event, presence is live,
+and only presence can hold the paper shut.
 
 Audio is judged the same way, and the rules are deliberately pure Dart
 (`core/services/audio_noise_detector.dart`) so they can be tested without a
-microphone: the first 5s (`calibrationWindow`) measure the room's floor, taking the
+microphone: the first 3s (`calibrationWindow`) measure the room's floor, taking the
 **median** rather than the mean so a student who starts talking immediately cannot
 drag the floor up to their own voice; the threshold becomes that floor + 6 dB
 (`speechMarginDb`), clamped to −50…−32 dBFS (`minThresholdDb`/`maxThresholdDb`). The
@@ -1398,17 +1467,18 @@ sound as `record`'s −160 dBFS sentinel, so a student silent through the calibr
 window would otherwise calibrate at −160 and pin the threshold to the bottom of the
 band, where a mouse click or a chair is a violation. The sentinel is clamped to
 `silenceFloorDb` (−100) before the median sees it, and the clamp floor is −50. The
-level must then add up to 1s above it
+level must then add up to 750 ms above it
 (`sustain`) — a spoken phrase ("hey you", a question read aloud), not two syllables —
 and a gap below the threshold ends the
 episode only once it has lasted longer than 400 ms (`releaseGrace`). That gap allowance
 is what makes the rule catch **talking** rather than only an unbroken shout: at four
 samples a second a real sentence drops below the threshold between words, so a rule
 that reset on any single low sample never filled its window and logged nothing at all.
-A second is well below the two to three seconds a supervisor would call talking on
-purpose, and the meter is read every 250 ms, so a burst that starts just after a sample
-contributes only its remainder — which is why the window is kept short instead of
-absorbing the offset with headroom. A one-off shorter than the window (a cough, a chair,
+750 ms is four consecutive 250 ms samples and well below the two to three seconds a
+supervisor would call talking on purpose, and the meter is read every 250 ms, so a burst
+that starts just after a sample contributes only its remainder — which is why the
+window is kept short instead of absorbing the offset with headroom. A one-off shorter
+than the window (a cough, a chair,
 a door, a keystroke) cannot fill it at all; the grace and the 3 dB hysteresis are what
 keep the gap between two words from restarting it.
 A cough, a chair creak or a breath is still far too brief to add up, a room that has
@@ -1441,7 +1511,11 @@ same way (`WebExamGuard` in `_bootstrap()`, `stop()` in `dispose()`).
 `mobile/test/kiosk_service_test.dart` pins this wire format (including the "our
 own unpin is not an escape" and "a single inactive blip is tolerated" rules);
 `mobile/test/web_exam_guard_test.dart` covers the browser rules;
-`mobile/test/proctoring_notifier_test.dart` covers the strike escalation. The audio
+`mobile/test/proctoring_notifier_test.dart` covers the strike escalation, the
+`faceMissing` state that the equipment block is raised on (set by `no_face` and
+`looking_away`, cleared by `centered` and by a camera that goes down) and the evidence
+budget (a critical strike overtakes a softer one stuck on the same dead capture, and an
+in-time still is still attached). The audio
 half adds `mobile/test/audio_monitoring_test.dart` (the detector's rules and the
 monitor's state machine), `mobile/test/audio_noise_detector_tuning_test.dart` (the
 hysteresis band, the calibration cap and the shipped sensitivity) and the `audio
@@ -1464,21 +1538,25 @@ a microphone can fail has to land somewhere the student can act:
 | --- | --- | --- | --- |
 | Streaming levels | `monitoring` | `Mic live` + live meter | — |
 | Asking for access / waiting for the first sample | `starting` | `Mic starting` | — |
-| Student or OS refuses access | `permissionDenied` | `Mic blocked` | **Open settings** — the OS will not prompt twice |
-| No capture path on this platform | `unavailable` | `Mic unavailable` | retry, or carry on |
+| Student or OS refuses access | `permissionDenied` | `Mic blocked` | the paper is blocked: **Try again** / **Open settings** / **Leave** on the equipment block — the OS will not prompt twice |
+| No capture path on this platform | `unavailable` | `Mic unavailable` | retry, or carry on (indicator only: a barrier nobody can clear would strand the student) |
 | Device cannot be opened (busy, no input) | `unavailable` | `Mic unavailable` | retry |
 | Bridge never answers (8s `startTimeout`) | `unavailable` | `Mic unavailable` | retry |
 | No levels at all for 4s (`levelTimeout`) | `unavailable` | `Mic unavailable` | retry — never pretends to monitor |
-| Stream dies mid-session (headset unplugged, grant revoked, another app took the input) | `interrupted` | `Mic lost` | **Reconnect** prompt |
+| Stream dies mid-session (headset unplugged, grant revoked, another app took the input) | `interrupted` | `Mic lost` | the paper is blocked: **Reconnect** / **Leave** |
 | `--dart-define=AUDIO_MONITORING=false` | `disabled` | `Audio off` | — |
 
 Two of those rows are the point of the feature. A device that cannot be opened, or
 that never reports a single level, is reported as `unavailable` instead of looking
 exactly like an empty room — **not listening must never be mistaken for quiet**. And
-losing the microphone is *not* a strike: it is an unproctored gap, so it surfaces as a
-prompt with an action, and the session's violation count only ever counts sustained
-speech. A refused or unavailable microphone never blocks the exam either; it is
-visible and recoverable, never fatal.
+losing the microphone is *not* a strike: it is an unproctored gap, so the session's
+violation count only ever counts sustained speech. It is not a prompt the student can
+sit through either: `permissionDenied` and `interrupted` both raise the opaque
+`EquipmentBlockOverlay` (see [the exam session screen](#the-exam-session-screen)),
+because a *dismissible* "Mic lost" toast leaves the paper readable and typeable with
+nothing listening — the gap proctoring exists to close. `unavailable` stays on the
+indicator rather than behind a barrier: it can mean a device that will never have an
+input, and a block nobody can clear is a wall, not a requirement.
 
 Every wait in the monitor is time-boxed, the release included. `record` sends all of its
 platform calls through a single permit, so a call the device never answered — the

@@ -49,8 +49,8 @@ import 'dart:math' as math;
 /// interruption).
 class AudioNoiseDetector {
   AudioNoiseDetector({
-    this.calibrationWindow = const Duration(seconds: 5),
-    this.sustain = const Duration(seconds: 1),
+    this.calibrationWindow = const Duration(seconds: 3),
+    this.sustain = const Duration(milliseconds: 750),
     this.releaseGrace = const Duration(milliseconds: 400),
     this.hysteresisDb = 3,
     this.cooldown = const Duration(seconds: 10),
@@ -87,28 +87,45 @@ class AudioNoiseDetector {
         _thresholdDb = defaultThresholdDb;
 
   /// How long the room is measured before any strike can be logged.
+  ///
+  /// Three seconds - twelve of `AudioMonitor`'s 250 ms samples, well over
+  /// [minCalibrationSamples] - is enough for the median to describe a room. It was
+  /// five, and five seconds is a long time to wait at the start of an attempt for a
+  /// detector that is otherwise ready: the calibration window *is* the whole
+  /// start-of-session delay, because nothing can be judged before the floor is
+  /// known. A student who starts talking at 0:01 with a five-second window was not
+  /// heard until 0:06; with three it is 0:04 (see [sustain] for the rest of it).
+  ///
+  /// The median is what makes the shorter window safe: one loud syllable inside it
+  /// does not move the floor, and the floor is only ever read once.
   final Duration calibrationWindow;
 
   /// How long the level must add up to above the threshold before it is a strike.
   ///
-  /// One second - four or five of `AudioMonitor`'s 250 ms samples in a row - is a
-  /// spoken phrase, which is the shortest thing that is *speech* rather than an
-  /// accident: "hey you", "stop that", a name called across the room, a question
-  /// read aloud. It was 500 ms, on the strength of an audit finding against an
+  /// 750 ms - three of `AudioMonitor`'s 250 ms samples of room for a fourth to
+  /// close - is the shortest thing that is *speech* rather than an accident: "hey
+  /// you", "stop that", a name called across the room, a question read aloud. It
+  /// was a full second, and a second is a long time to hold a warning back from a
+  /// student who is clearly talking; 750 ms is the same rule, measured against the
+  /// sampling interval rather than against the clock, so it fires one sample
+  /// earlier without changing what counts.
+  ///
+  /// It was 500 ms before that, on the strength of an audit finding against an
   /// earlier 1.5 s window that needed most of a sentence; live testing on web and
-  /// desktop showed the other end of that trade - the browsers' peak-reading
-  /// meters make a keyboard, a mouse click, a chair or a single cough land over
-  /// the line for several samples in a row, so a half-second window logged
-  /// `audio_noise` for noise that was not a voice at all. A full second is the
-  /// balance: still a *phrase* rather than a paragraph, but long enough that only
-  /// something which keeps going gets counted.
+  /// desktop showed the other end of that trade - the browsers' peak-reading meters
+  /// make a keyboard, a mouse click, a chair or a single cough land over the line
+  /// for several samples in a row, so a half-second window logged `audio_noise` for
+  /// noise that was not a voice at all. The gap between 500 ms and a second is what
+  /// that testing bought, and this sits inside it: still four consecutive
+  /// over-threshold samples (a cough is one, a keystroke is one, a chair creak is
+  /// one), which is the property the false positives were about.
   ///
   /// A cough, a chair creak, a door or a keystroke is shorter than this. At four
-  /// samples a second a 300 ms one-off can contribute at most one over-threshold
-  /// sample, which cannot fill a one-second window; the burst has to keep crossing
-  /// the line across four sampling intervals. [releaseGrace] and [hysteresisDb]
-  /// are what keep the gap *between* two words from restarting the window, so a
-  /// sentence is one episode rather than none.
+  /// samples a second a 300 ms one-off contributes at most one over-threshold
+  /// sample, which cannot fill the window; the burst has to keep crossing the line
+  /// across three sampling intervals. [releaseGrace] and [hysteresisDb] are what
+  /// keep the gap *between* two words from restarting the window, so a sentence is
+  /// one episode rather than none.
   ///
   /// Kept below the length of the noise it is meant to catch on purpose: the
   /// samples are a meter, not a recording, so a burst that starts just after one

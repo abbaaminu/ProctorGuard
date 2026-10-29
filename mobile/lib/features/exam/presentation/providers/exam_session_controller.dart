@@ -302,12 +302,43 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
     );
   }
 
-  /// Loads the question feed, turning a failure into a blocking state with a
+  /// The question fetch, started once and shared by [prefetchQuestions] and
+  /// [loadQuestions].
+  Future<List<Question>>? _questionsInFlight;
+
+  /// Starts the question fetch now, without applying it or waiting for it.
+  ///
+  /// The paper's round-trip is the slowest thing in the bootstrap that is *not*
+  /// a dialog, and it has nothing to do with the device work the bootstrap does
+  /// before it paints a question: enumerating and opening the camera, pinning the
+  /// kiosk, arming the integrity probe. Started here, that wait overlaps with
+  /// those, so the student waits for the longer of the two rather than for their
+  /// sum.
+  ///
+  /// Nothing is painted when this resolves — [loadQuestions] is still what applies
+  /// the feed, at the end of the bootstrap. That keeps two ordering guarantees the
+  /// page already relies on: the spinner covers the whole setup, and the cached
+  /// answers are restored before a question can be shown.
+  void prefetchQuestions() {
+    final pending = _questionsInFlight ??= _exams.getQuestions(args.examId);
+    // A rejection is reported by [loadQuestions], which is always the consumer.
+    // This handler only stops an early failure from surfacing as an unhandled
+    // error while the bootstrap is still working through the device.
+    unawaited(pending.then<void>((_) {}, onError: (Object _) {}));
+  }
+
+  /// Applies the question feed, turning a failure into a blocking state with a
   /// retry instead of leaving the page on its spinner forever (this screen has
   /// no back button to escape with).
+  ///
+  /// Awaits the fetch [prefetchQuestions] started, if there is one, so the
+  /// bootstrap's device work and this request run at the same time. A *failed*
+  /// fetch is dropped here so the retry behind the blocking state asks again
+  /// instead of replaying the same error.
   Future<void> loadQuestions() async {
     try {
-      final questions = await _exams.getQuestions(args.examId);
+      final questions = await (_questionsInFlight ??=
+          _exams.getQuestions(args.examId));
       if (!mounted) return;
       state = state.copyWith(
         questions: questions,
@@ -316,6 +347,10 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
         loading: false,
       );
     } catch (error) {
+      // Forget the failed request: the blocking state's Try again re-enters
+      // through [loadQuestions], and it must ask the server rather than await the
+      // same rejected future forever.
+      _questionsInFlight = null;
       proctorLog('ProctorGuard: could not load questions: $error');
       if (!mounted) return;
       state = state.copyWith(

@@ -18,6 +18,7 @@ import 'package:proctorguard/features/proctoring/domain/entities/violation.dart'
 import 'package:proctorguard/features/proctoring/domain/repositories/proctoring_repository.dart';
 import 'package:proctorguard/features/proctoring/presentation/providers/audio_monitoring_provider.dart';
 import 'package:proctorguard/features/proctoring/presentation/providers/proctoring_provider.dart';
+import 'package:proctorguard/features/proctoring/presentation/widgets/equipment_block_overlay.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -35,8 +36,8 @@ import 'package:flutter_test/flutter_test.dart';
 ///    bar that holds three controls (mark for review + Previous + Next) on a
 ///    360 dp phone without overflowing.
 ///  * **audio proctoring** — the microphone chip, and the rule that a blocked or
-///    unplugged microphone is a visible, answerable prompt rather than a silent
-///    gap in proctoring.
+///    unplugged microphone blocks the paper (an unanswerable prompt would leave a
+///    silent gap in proctoring) while still leaving the student a way out.
 ///  * **review marker and candidate identity** — flagging a question for review
 ///    (local-only, per question, warned about at submit) and the header that says
 ///    who is sitting the exam, which is derived from the name because `profiles`
@@ -698,6 +699,44 @@ void main() {
 
       expect(proctoring.violations.single.type.dbValue, 'no_face');
       expect(find.text('Warning 1 / 3'), findsOneWidget);
+    });
+
+    testWidgets('no_face holds the paper shut until a face is reported again',
+        (tester) async {
+      await openPastGrace(tester);
+
+      // The student leans out of frame and stays out: two detections 350ms apart
+      // are past the monitor's sustain, so this is a covered lens rather than a
+      // blink.
+      faces.emit('no_face');
+      await tester.pump();
+      faces.emit('no_face');
+      now = now.add(const Duration(milliseconds: 350));
+      await tester.pump();
+      await tester.pumpAndSettle();
+
+      // The strike is logged (it is an event) *and* the paper is covered (it is
+      // also the current state of the camera). A warning alone would let the
+      // student read on with nobody visibly sitting the exam.
+      expect(proctoring.violations.single.type.dbValue, 'no_face');
+      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      expect(find.byKey(const Key('equipment-block-face')), findsOneWidget);
+      // Which means the warning's own dismiss button is behind an opaque barrier:
+      // a student cannot click their way back to an unproctored paper.
+      expect(
+        find.descendant(
+          of: find.byKey(const Key('equipment-block-face')),
+          matching: find.text('I understand, continue'),
+        ),
+        findsNothing,
+      );
+
+      // A face comes back, and the paper comes back with it - no tap needed.
+      faces.emit('centered');
+      await tester.pump();
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('equipment-block-face')), findsNothing);
     });
 
     testWidgets('nothing is judged while the page has no detector', (tester) async {
@@ -1455,27 +1494,12 @@ void main() {
   });
 
   group('audio proctoring', () {
-    /// A taller-than-default surface for the tests that read the prompt.
-    ///
-    /// The prompt is a snack bar pinned to the bottom of the Scaffold, and this
-    /// screen is dense enough that the default 800x600 test viewport leaves it
-    /// below the root render tree - where `tap` refuses to hit it.
+    /// A taller-than-default surface, so the blocking overlay's three actions fit
+    /// without scrolling: `tap` refuses to hit a button scrolled out of view.
     void useTallSurface(WidgetTester tester) {
       tester.view.physicalSize = const Size(1000, 1200);
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.reset);
-    }
-
-    /// Drops the current prompt and lets its dismiss animation finish.
-    ///
-    /// The prompt stays up for 8s, and a timer that outlives the test is a failure
-    /// ("A Timer is still pending..."), so a test that reads a prompt it does not
-    /// dismiss through its action closes it here.
-    Future<void> dismissPrompt(WidgetTester tester) async {
-      ScaffoldMessenger.of(
-        tester.element(find.byType(Scaffold).last),
-      ).hideCurrentSnackBar();
-      await tester.pumpAndSettle();
     }
 
     testWidgets('the microphone state is always on screen', (tester) async {
@@ -1494,9 +1518,11 @@ void main() {
       // A quiet room is not a violation: audio proctoring must not strike just
       // because it started listening.
       expect(proctoring.violations, isEmpty);
+      // Nothing is blocked while the microphone is doing its job.
+      expect(find.byType(EquipmentBlockOverlay), findsNothing);
     });
 
-    testWidgets('a lost microphone prompts to reconnect instead of going quiet',
+    testWidgets('a lost microphone blocks the paper until it is back',
         (tester) async {
       useTallSurface(tester);
       final source = _FakeAudioSource();
@@ -1508,49 +1534,33 @@ void main() {
 
       // The headset is unplugged, or the OS revokes the grant mid-session.
       source.fail();
-      // Settled, not merely pumped: the prompt slides in, and a snack bar caught
-      // mid-entrance is not where the tap lands.
       await tester.pumpAndSettle();
 
-      expect(find.text('Mic lost'), findsOneWidget);
-      expect(find.text('Reconnect'), findsOneWidget);
+      // Not a toast the student can ignore their way past: an unproctored attempt
+      // is not one they get to continue. The block is opaque, so the question is
+      // covered rather than merely commented on.
+      final block = find.byKey(const Key('equipment-block-microphone'));
+      expect(block, findsOneWidget);
+      expect(find.text('Mic lost'), findsOneWidget, reason: 'the chip still says it');
+      expect(
+        find.descendant(of: block, matching: find.byType(Scaffold)),
+        findsNothing,
+        reason: 'the block is a barrier, not a screen of its own',
+      );
 
-      // The prompt's action re-opens the session. Tapping it also closes the
-      // snack bar, so no timer is left behind.
-      await tester.tap(find.text('Reconnect'));
+      // The block's action re-opens the session, and the paper comes back with it.
+      await tester.tap(find.byKey(const Key('equipment-block-action')));
       await tester.pumpAndSettle();
 
       expect(source.begins, 2);
       expect(find.text('Mic live'), findsOneWidget);
+      expect(block, findsNothing);
       // A microphone that went away is not itself a strike - it is an unproctored
-      // gap the student is asked to close.
+      // gap the student is made to close.
       expect(proctoring.violations, isEmpty);
     });
 
-    testWidgets('tapping a lost microphone reopens it', (tester) async {
-      useTallSurface(tester);
-      final source = _FakeAudioSource();
-
-      await tester.pumpWidget(pageUnderTest(audioSource: source));
-      await tester.tap(find.text('open exam'));
-      await tester.pumpAndSettle();
-
-      source.fail();
-      await tester.pump();
-      await tester.pump();
-      await dismissPrompt(tester);
-
-      await tester.tap(find.byKey(const Key('audio-indicator-retry')));
-      await tester.pumpAndSettle();
-
-      expect(source.begins, 2);
-      expect(find.text('Mic live'), findsOneWidget);
-      // Nothing to retry while levels are flowing: the chip is not a button then,
-      // so a stray tap cannot throw the room calibration away.
-      expect(find.byKey(const Key('audio-indicator-retry')), findsNothing);
-    });
-
-    testWidgets('a refused microphone offers the OS settings page',
+    testWidgets('a refused microphone blocks the paper and offers settings',
         (tester) async {
       useTallSurface(tester);
       final source = _FakeAudioSource(granted: false);
@@ -1560,19 +1570,35 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('Mic blocked'), findsOneWidget);
-      // Re-asking cannot help after two "don't allow"s, so the fix is the settings
-      // page - offered on the chip and again in the prompt.
-      expect(find.byKey(const Key('audio-indicator-settings')), findsOneWidget);
-      expect(find.text('Settings'), findsOneWidget);
+      final block = find.byKey(const Key('equipment-block-microphone'));
+      expect(block, findsOneWidget);
+      // Re-asking cannot help after two "don't allow"s, so the block offers the
+      // settings page - the only fix a refusal has - beside the retry, and keeps
+      // the chip's own settings action for when the block is gone.
+      expect(
+        find.descendant(
+          of: block,
+          matching: find.byKey(const Key('equipment-block-settings')),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: block,
+          matching: find.byKey(const Key('equipment-block-action')),
+        ),
+        findsOneWidget,
+      );
+      // Leaving is still possible: a block holds the paper shut, not the student.
+      expect(find.byKey(const Key('equipment-block-leave')), findsOneWidget);
       expect(source.begins, 0);
 
       // The settings action asks the OS to open this app's permission page (a no-op
       // on the test VM, where PermissionService swallows the missing plugin): the
       // point is that a refusal is offered the only fix it has.
-      await tester.tap(find.byKey(const Key('audio-indicator-settings')));
+      await tester.tap(find.byKey(const Key('equipment-block-settings')));
       await tester.pumpAndSettle();
 
-      await dismissPrompt(tester);
       expect(proctoring.violations, isEmpty);
     });
   });
