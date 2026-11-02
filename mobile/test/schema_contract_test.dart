@@ -2554,30 +2554,26 @@ void main() {
       expect(predicate, contains('created_by = auth.uid()'));
       // A student only ever sees a *published* paper...
       expect(predicate, contains('is_published = true'));
-      // ...whose labels match their own row. A NULL on the paper's side means
-      // "not narrowed" (untargeted paper). When a paper names a field, the
-      // student's matching field must be non-null and non-blank — incomplete
-      // profiles no longer match every targeted paper.
-      for (final column in <String>['faculty', 'department']) {
+      // ...whose labels match their own row. A paper whose label is
+      // effectively empty (NULL or whitespace-only via nullif(btrim(...)))
+      // is untargeted and stays visible to everybody. A student with a NULL
+      // or whitespace-only label is not matched by a paper that names that field.
+      for (final column in <String>['faculty', 'department', 'level']) {
         expect(
           predicate,
-          contains('$column is null'),
+          contains('nullif(btrim(exams.$column), '') is null'),
         );
         expect(
           predicate,
           contains(
-            'p.$column is not null and p.$column != '
-            'and lower(p.$column) = lower(exams.$column)',
+            'nullif(btrim(p.$column), '') is not null',
           ),
         );
+        expect(
+          predicate,
+          contains('lower(btrim(p.$column)) = lower(btrim(exams.$column))'),
+        );
       }
-      expect(predicate, contains('exams.level is null'));
-      expect(
-        predicate,
-        contains(
-          "p.level is not null and p.level != '' and p.level = exams.level",
-        ),
-      );
       // ...or one they were explicitly allowed to borrow.
       expect(predicate, contains('from public.exam_allowed_students a'));
       expect(
@@ -2665,14 +2661,18 @@ void main() {
       );
     });
 
-    test('submissions_insert_own_ongoing enforces is_published and the window '
-        'but does not duplicate the targeting check (relies on exams_select)', () {
+    test('submissions_insert_own_ongoing relies on exams_select '
+        'because its exams subquery runs under the caller\u2019s RLS', () {
       final sql = schemaSql();
       if (sql == null) return;
 
-      // The insert policy checks the paper is published and open, and does
-      // not add its own faculty/department/level comparison — targeting is
-      // enforced by exams_select at the discoverability level.
+      // The insert policy checks the paper is published and open.  It does not
+      // duplicate the targeting check because the inner `select 1 from
+      // public.exams e where e.id = exam_id` runs under the caller's RLS —
+      // `exams_select` fires and filters out papers the caller may not see.
+      // This needs an executed test against a live/local database to prove the
+      // subquery honours RLS; the static file-level contract only checks that
+      // the policy text does not add its own faculty/department/level clause.
       final policyStart = sql.indexOf(
         'create policy "submissions_insert_own_ongoing"',
       );
@@ -2681,6 +2681,8 @@ void main() {
       expect(sql, contains('e.is_published = true'));
       expect(sql, contains('e.starts_at is null or now() >= e.starts_at'));
       expect(sql, contains('e.ends_at  is null or now() <= e.ends_at'));
+      // No explicit targeting check in this policy — it relies on exams_select.
+      expect(sql.substring(policyStart), isNot(contains('nullif(btrim')));
     });
 
     test('the identity numbers are declared, optional, and forwarded', () {

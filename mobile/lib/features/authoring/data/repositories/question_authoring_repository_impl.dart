@@ -502,6 +502,10 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
           return 'This project has no exam targeting columns yet. Run '
               'supabase/migrations/academic_targeting.sql, then try again.';
         }
+        if (missing.contains('shuffle_questions')) {
+          return 'This project has no shuffle_questions column yet. Run '
+              'supabase/migrations/optional_question_shuffling.sql, then try again.';
+        }
         return 'This project has no exam scheduling columns yet. Run '
             'supabase/migrations/optional_exam_scheduling.sql, then try again.';
       case '42P01':

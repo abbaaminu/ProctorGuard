@@ -584,12 +584,12 @@ drop policy if exists "exams_delete_owner" on public.exams;
 -- always sees their own drafts.
 --
 -- Students see a **published** paper only when it is aimed at them:
---   * every column the paper names must match their own `profiles` row, and a
---     NULL on the paper's side means "not narrowed" — so an untargeted paper (all
---     three NULL, every paper that existed before targeting) stays visible to
---     everybody. A student with NULL or blank faculty/department/level is **not**
---     matched by a paper that names that field, so incomplete profiles lose
---     access to targeted papers they do not belong to.
+--     every column the paper names must match their own `profiles` row. A paper
+--     whose label is effectively empty (NULL or whitespace-only via
+--     `nullif(btrim(...))`) is untargeted and stays visible to everybody. A
+--     student with a NULL or whitespace-only label is **not** matched by a paper
+--     that names that field, so incomplete or blank profiles lose access to
+--     targeted papers they do not belong to.
 --   * or they were explicitly allowed to borrow it (`exam_allowed_students`,
 --     section 2b), which is how a service-course student sees a paper aimed at
 --     another department.
@@ -610,15 +610,15 @@ create policy "exams_select"
           select 1
           from public.profiles p
           where p.id = auth.uid()
-            and (exams.faculty is null
-                 or (p.faculty is not null and p.faculty != ''
-                     and lower(p.faculty) = lower(exams.faculty)))
-            and (exams.department is null
-                 or (p.department is not null and p.department != ''
-                     and lower(p.department) = lower(exams.department)))
-            and (exams.level is null
-                 or (p.level is not null and p.level != ''
-                     and p.level = exams.level))
+            and (nullif(btrim(exams.faculty), '') is null
+                 or (nullif(btrim(p.faculty), '') is not null
+                     and lower(btrim(p.faculty)) = lower(btrim(exams.faculty))))
+            and (nullif(btrim(exams.department), '') is null
+                 or (nullif(btrim(p.department), '') is not null
+                     and lower(btrim(p.department)) = lower(btrim(exams.department))))
+            and (nullif(btrim(exams.level), '') is null
+                 or (nullif(btrim(p.level), '') is not null
+                     and lower(btrim(p.level)) = lower(btrim(exams.level))))
         )
         or exists (
           select 1

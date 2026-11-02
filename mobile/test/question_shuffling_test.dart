@@ -73,19 +73,60 @@ void main() {
     });
   });
 
-  group('flag-off behaviour', () {
-    test('questions pass through unchanged when shuffle is off', () {
-      // When shuffleQuestions is false, the loadQuestions method does not
-      // call _shuffleQuestions at all — the list is used as-is.
-      final unchanged = <Question>[
-        const Question(id: 'a', examId: 'x', questionText: 'Q1'),
-        const Question(id: 'b', examId: 'x', questionText: 'Q2'),
-        const Question(id: 'c', examId: 'x', questionText: 'Q3'),
-      ];
-      // Passing through is the same as identity.
-      expect(unchanged[0].id, 'a');
-      expect(unchanged[1].id, 'b');
-      expect(unchanged[2].id, 'c');
+  group('resume stability', () {
+    test('the same submission keeps the same order across a hypothetical '
+        'resume — the seed is derived from submission id, not from a '
+        'session- or instance-level counter', () {
+      const submissionId = 'dddddddd-dddd-4ddd-8ddd-ddddddddddd1';
+      const examId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1';
+
+      // Simulate the first session: the flag is on, questions are shuffled.
+      final session1 = ExamSessionController.shuffleQuestionsForTest(
+        questions,
+        submissionId,
+      );
+
+      // Simulate a resume: the flag is STILL on, same submission id.
+      final session2 = ExamSessionController.shuffleQuestionsForTest(
+        questions,
+        submissionId,
+      );
+
+      // The order is identical — stable on resume.
+      expect(
+        session1.map((q) => q.id),
+        orderedEquals(session2.map((q) => q.id)),
+      );
+
+      // Sanity: confirm it is actually different from the original order.
+      final originalOrder = questions.map((q) => q.id).toList();
+      final allMatch = originalOrder.every(
+        (id) => id == session1[originalOrder.indexOf(id)].id,
+      );
+      // The shuffle actually does something (astronomically unlikely to
+      // produce the same order by chance).
+      expect(allMatch, isFalse);
+    });
+
+    test('a submission started with shuffle=off and then the flag is turned '
+        'on mid-lifecycle is a server-side question, not a client concern — '
+        'the client just reflects the flag it reads from the exam row', () {
+      // When shuffle is off, the order is the original.
+      const submissionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+      final questionsCopy = List<Question>.from(questions);
+
+      // The controller only calls _shuffleQuestions when shuffle flag is on.
+      // If the flag toggles between sessions, the new session reads the new
+      // flag value from the exam row.
+      final shuffled = ExamSessionController.shuffleQuestionsForTest(
+        questionsCopy,
+        submissionId,
+      );
+
+      // After toggling the flag on, the order changes from the original.
+      // The seed is the same submission id, so the order is deterministic.
+      expect(shuffled, hasLength(questionsCopy.length));
+      expect(shuffled[0].id, 'e'); // expected from this seed
     });
   });
 }

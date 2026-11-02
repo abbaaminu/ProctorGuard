@@ -954,10 +954,12 @@ Details worth knowing:
   `UnimplementedError`, which is the "Proctoring could not start on this device"
   screen a browser student used to get on a perfectly working camera. The preview
   and the still-frame evidence are unaffected; what the web cannot do is run the
-  app's own face model on the feed \u2014 the web runs its own
-  **MediaPipe FaceLandmarker** (`web/proctor_face_detector.js`) which reports
-  face count and 3D head pose in addition to the pixel-level covered/blank
-  checks \u2014 which is what the gate says before the paper starts.
+  app's own face model on the feed \u2014 the web runs the browser\u2019s
+  built-in `window.FaceDetector` where available, falling back to a
+  **MediaPipe FaceLandmarker** (`web/proctor_face_detector.js`, `web/mediapipe/`)
+  WASM model. It reports face count and 3D head pose where the model loads, and
+  degrades to pixel-level covered/blank checks when WASM or the model files are
+  unavailable \u2014 which is what the gate says before the paper starts.
   The shipped page-level sensor still watches the preview for a covered, closed
   or blanked camera (see the web section above), so "nobody in frame" is not
   blind on the web. A camera the browser reports as **still in use** is re-opened
@@ -1034,7 +1036,7 @@ through the web build, in a browser.
 | --- | --- | --- | --- | --- |
 | Android (phone) | `flutter build apk` | ML Kit, on-device | `record` | Lock task / screen pinning + immersive chrome |
 | iOS | `flutter build ios` — scaffolded, unsigned in CI; what is still owed is in [`ios/README.md`](ios/README.md) | ML Kit, on-device | `record` | Best-effort only (`startLock` reports `granted: false`) |
-| Web (Chrome/Edge) | `flutter build web` | `web/proctor_face_detector.js`, shipped with the app: camera presence, blank/covered-frame and face-count checks ([below](#face-signals-on-the-web-the-host-page-bridge)); a host page may add its own detections through the same `proctorGuardFaceSignal` bridge | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
+| Web (Chrome/Edge) | `flutter build web` | `web/proctor_face_detector.js`, shipped with the app: `window.FaceDetector` or MediaPipe FaceLandmarker WASM for face-count and head-pose, pixel-level covered/blank checks, degrading gracefully to presence-only when model files fail ([below](#face-signals-on-the-web-the-host-page-bridge)); a host page may add its own detections through the same `proctorGuardFaceSignal` bridge | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
 | Web (phone/tablet) | the same `flutter build web`, but the app does not render and an exam cannot be sat — see [below](#the-web-build-is-desktop-only) | — | — | — |
 
 ### The web build is desktop-only

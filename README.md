@@ -111,9 +111,13 @@ rather than left to be mistaken for more than it is.
   escape (the app then logs `app_minimized`). Browsers get the DOM lockdown
   (HTML5 fullscreen plus tab/blur detection) instead.
 - **The web ships a browser-native face detector.** `web/proctor_face_detector.js`
-  loads a **MediaPipe FaceLandmarker** model (`web/mediapipe/`) at session start and
-  reports camera presence, covered or frozen frame, face count and 3D head pose
-  (yaw/pitch) on every polling tick. The same detector listens for a host page's
+  loads the browser's built-in `window.FaceDetector` (Shape Detection API) where
+  available, and falls back to a **MediaPipe FaceLandmarker** WASM model
+  (`web/mediapipe/`) in browsers that support WebAssembly but not the native API.
+  It reports camera presence, covered or frozen frame, face count and 3D head pose
+  (yaw/pitch) on every polling tick. If the WASM binary or model files fail to load,
+  the detector degrades gracefully to presence-only checks (pixel-level covered/blank
+  detection) and logs a warning. The same detector listens for a host page's
   own signals through the `window.proctorGuardFaceSignal` bridge (see
   [mobile/README.md](./mobile/README.md#face-signals-on-the-web-the-host-page-bridge)),
   so the app's proctoring works equally well with the shipped model and with an
@@ -134,8 +138,8 @@ rather than left to be mistaken for more than it is.
   desktop ML Kit does, so the device check blocked the exam and named that as the
   reason instead of reporting a broken camera it could never fix
   (`lib/core/services/platform_capabilities.dart`). A macOS, Windows or Linux
-  machine therefore takes part through the web build in a browser, so the "no
-  on-device AI on the web" boundary above applies there too. The web build is
+  machine therefore takes part through the web build in a browser, so the
+  browser-detector description above applies there too. The web build is
   **desktop-only**: `lib/core/widgets/desktop_only_web_guard.dart` shows a
   "desktop browser required" notice on a phone or tablet browser, so the console is
   reached from a computer or from the Android app. The **exam** inside it has its
