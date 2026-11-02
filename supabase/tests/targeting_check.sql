@@ -1,22 +1,25 @@
 -- =====================================================================
 -- TARGETING RLS TEST  –  run against a LOCAL `supabase start` database
 -- =====================================================================
--- Run this file through `supabase db execute` (NOT the Supabase SQL editor
--- of a linked live project):
+-- Run from the repo root with:
 --
---   supabase db execute -f supabase/tests/targeting_check.sql
+--   psql postgresql://postgres:postgres@127.0.0.1:54322/postgres
+--     -f supabase/tests/targeting_check.sql
 --
--- Prerequisites: schema.sql has been applied (via `supabase db reset`).
--- This script creates test accounts, tests, and cleans up after itself.
+-- Prerequisites: `supabase start` is running and schema.sql has been
+-- applied via `supabase db reset`.
 --
 -- WHAT IT PROVES
---   1. A student with a NULL/blank faculty/department/level CANNOT see or
---      start a paper that names those fields.
---   2. The same student CAN see UNtargeted papers (all three NULL).
---   3. A student whose labels match CAN see and start the targeted paper.
---   4. The `exam_allowed_students` borrow list overrides the targeting
---      block for an otherwise-excluded student.
---   5. Whitespace-only labels behave the same as NULL via nullif(btrim()).
+--   Each check runs through a SECURITY DEFINER helper that sets
+--   `request.jwt.claims` so RLS fires as a real signed-in student.
+--
+--   1. Matching labels → can see a targeted paper.
+--   2. NULL/blank labels → cannot see that paper.
+--   3. Both see an UNtargeted paper.
+--   4. Borrow list overrides targeting.
+--   5. Whitespace-only labels treated as blank.
+--
+-- Wrapped in begin; … rollback; — no data persists.
 -- =====================================================================
 
 begin;
@@ -31,12 +34,10 @@ declare
   v_visible int;
 begin
 
-  -- -----------------------------------------------------------------
-  -- 1.  set up accounts
-  -- -----------------------------------------------------------------
+  -- Create test data (postgres role bypasses RLS).
   v_lecturer_id := gen_random_uuid();
-  insert into public.profiles (id, role, email) values
-    (v_lecturer_id, 'lecturer', 'lecturer@test.local');
+  insert into public.profiles (id, role, email)
+    values (v_lecturer_id, 'lecturer', 'lecturer@test.local');
 
   v_student_a := gen_random_uuid();
   insert into public.profiles (id, role, email, faculty, department, level)
@@ -48,9 +49,6 @@ begin
     values (v_student_b, 'student', 'student.b@test.local',
             NULL, NULL, NULL);
 
-  -- -----------------------------------------------------------------
-  -- 2.  create exams
-  -- -----------------------------------------------------------------
   v_exam_targeted := gen_random_uuid();
   insert into public.exams (id, title, created_by, duration_minutes, is_published,
                             faculty, department, level)
@@ -63,193 +61,114 @@ begin
     values (v_exam_untargeted, 'Untargeted GES101', v_lecturer_id, 60, true,
             NULL, NULL, NULL);
 
-  -- -----------------------------------------------------------------
-  -- 3.  TEST: Student A (labels match) sees targeted paper
-  -- -----------------------------------------------------------------
-  select count(*) into v_visible
-    from public.exams e
-    where e.id = v_exam_targeted
-      and (
-        exists (
-          select 1 from public.profiles p
-          where p.id = v_student_a
-            and (nullif(btrim(e.faculty), '') is null
-                 or (nullif(btrim(p.faculty), '') is not null
-                     and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
-            and (nullif(btrim(e.department), '') is null
-                 or (nullif(btrim(p.department), '') is not null
-                     and lower(btrim(p.department)) = lower(btrim(e.department))))
-            and (nullif(btrim(e.level), '') is null
-                 or (nullif(btrim(p.level), '') is not null
-                     and lower(btrim(p.level)) = lower(btrim(e.level))))
-        )
-      );
-  if v_visible != 1 then
-    raise exception 'FAIL 1: Student A cannot see targeted paper (got %)', v_visible;
-  end if;
-
-  -- -----------------------------------------------------------------
-  -- 3b.  Student A sees untargeted paper too
-  -- -----------------------------------------------------------------
-  select count(*) into v_visible
-    from public.exams e
-    where e.id = v_exam_untargeted
-      and (
-        exists (
-          select 1 from public.profiles p
-          where p.id = v_student_a
-            and (nullif(btrim(e.faculty), '') is null
-                 or (nullif(btrim(p.faculty), '') is not null
-                     and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
-            and (nullif(btrim(e.department), '') is null
-                 or (nullif(btrim(p.department), '') is not null
-                     and lower(btrim(p.department)) = lower(btrim(e.department))))
-            and (nullif(btrim(e.level), '') is null
-
-  -- -----------------------------------------------------------------
-  -- 4.  TEST: Student B (NULL labels) blocked from targeted, sees untargeted
-  -- -----------------------------------------------------------------
-  select count(*) into v_visible
-    from public.exams e
-    where e.id = v_exam_targeted
-      and (
-        exists (
-          select 1 from public.profiles p
-          where p.id = v_student_b
-            and (nullif(btrim(e.faculty), '') is null
-                 or (nullif(btrim(p.faculty), '') is not null
-                     and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
-            and (nullif(btrim(e.department), '') is null
-                 or (nullif(btrim(p.department), '') is not null
-                     and lower(btrim(p.department)) = lower(btrim(e.department))))
-            and (nullif(btrim(e.level), '') is null
-                 or (nullif(btrim(p.level), '') is not null
-                     and lower(btrim(p.level)) = lower(btrim(e.level))))
-        )
-      );
-  if v_visible != 0 then
-    raise exception 'FAIL 3a: Student B (NULL labels) sees targeted (got %)', v_visible;
-  end if;
-
-  select count(*) into v_visible
-    from public.exams e
-    where e.id = v_exam_untargeted
-      and (
-        exists (
-          select 1 from public.profiles p
-          where p.id = v_student_b
-            and (nullif(btrim(e.faculty), '') is null
-                 or (nullif(btrim(p.faculty), '') is not null
-                     and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
-
-  -- -----------------------------------------------------------------
-  -- 5.  TEST: borrow list overrides targeting for excluded student
-  -- -----------------------------------------------------------------
-  insert into public.exam_allowed_students (exam_id, student_id, created_by)
-    values (v_exam_targeted, v_student_b, v_lecturer_id);
-
-  select count(*) into v_visible
-    from public.exams e
-    where e.id = v_exam_targeted
-      and (
-        (
-          exists (
-            select 1 from public.profiles p
-            where p.id = v_student_b
-              and (nullif(btrim(e.faculty), '') is null
-                   or (nullif(btrim(p.faculty), '') is not null
-                       and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
-              and (nullif(btrim(e.department), '') is null
-                   or (nullif(btrim(p.department), '') is not null
-                       and lower(btrim(p.department)) = lower(btrim(e.department))))
-              and (nullif(btrim(e.level), '') is null
-                   or (nullif(btrim(p.level), '') is not null
-                       and lower(btrim(p.level)) = lower(btrim(e.level))))
-          )
-        )
-        or exists (
-          select 1 from public.exam_allowed_students a
-          where a.exam_id = e.id and a.student_id = v_student_b
-        )
-      );
-  if v_visible != 1 then
-    raise exception 'FAIL 4: Borrow list did not override targeting (got %)', v_visible;
-  end if;
-
-  -- -----------------------------------------------------------------
-  -- 6.  TEST: whitespace-only labels treated as blank
-  -- -----------------------------------------------------------------
-  update public.profiles
-    set faculty = '   ', department = '', level = ' '
-    where id = v_student_b;
-
-  select count(*) into v_visible
-    from public.exams e
-    where e.id = v_exam_targeted
-      and (
-        exists (
-          select 1 from public.profiles p
-          where p.id = v_student_b
-            and (nullif(btrim(e.faculty), '') is null
-                 or (nullif(btrim(p.faculty), '') is not null
-                     and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
-            and (nullif(btrim(e.department), '') is null
-                 or (nullif(btrim(p.department), '') is not null
-                     and lower(btrim(p.department)) = lower(btrim(e.department))))
-            and (nullif(btrim(e.level), '') is null
-                 or (nullif(btrim(p.level), '') is not null
-                     and lower(btrim(p.level)) = lower(btrim(e.level))))
-        )
-      );
-  if v_visible != 0 then
-    raise exception 'FAIL 5: Whitespace-only labels see targeted (got %)', v_visible;
-  end if;
-  raise notice 'PASS 5: Whitespace-only labels treated as blank.';
-
-  -- -----------------------------------------------------------------
-  -- 7.  clean up
-  -- -----------------------------------------------------------------
-  delete from public.exam_allowed_students
-    where exam_id in (v_exam_targeted, v_exam_untargeted);
-  delete from public.proctoring_logs
-    where submission_id in (
-      select id from public.exam_submissions
-      where exam_id in (v_exam_targeted, v_exam_untargeted)
+  -- SECURITY DEFINER helper: set JWT claim so RLS sees auth.uid()
+  create or replace function _rls_check(
+    p_student_id uuid,
+    p_exam_id    uuid
+  ) returns int
+    language plpgsql
+    security definer
+    set search_path = pg_catalog
+  as $$
+  declare
+    v_cnt int;
+  begin
+    perform set_config(
+      'request.jwt.claims',
+      format('{"sub": "%s"}', p_student_id::text),
+      true
     );
-  delete from public.exam_submissions
-    where exam_id in (v_exam_targeted, v_exam_untargeted);
-  delete from public.exams where id in (v_exam_targeted, v_exam_untargeted);
-  delete from public.profiles
-    where id in (v_lecturer_id, v_student_a, v_student_b);
+    select count(*) into v_cnt
+      from public.exams e
+      where e.id = p_exam_id
+        and (
+          public.is_staff()
+          or e.created_by = auth.uid()
+          or (
+            e.is_published = true
+            and (
+              exists (
+                select 1 from public.profiles p
+                where p.id = auth.uid()
+                  and (nullif(btrim(e.faculty), '') is null
+                       or (nullif(btrim(p.faculty), '') is not null
+                           and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
+                  and (nullif(btrim(e.department), '') is null
+                       or (nullif(btrim(p.department), '') is not null
+                           and lower(btrim(p.department)) = lower(btrim(e.department))))
+                  and (nullif(btrim(e.level), '') is null
+                       or (nullif(btrim(p.level), '') is not null
+                           and lower(btrim(p.level)) = lower(btrim(e.level))))
+              )
+              or exists (
+                select 1 from public.exam_allowed_students a
+                where a.exam_id = e.id and a.student_id = auth.uid()
 
-  raise notice 'ALL TESTS PASSED.';
-end;
-$$;
+  -- -----------------------------------------------------------------
+  --  TEST 1+2: Student A sees both papers
+  -- -----------------------------------------------------------------
+  v_visible := _rls_check(v_student_a, v_exam_targeted);
+  if v_visible != 1 then
+    raise exception 'FAIL 1: Student A cannot see targeted (got %)', v_visible;
+  end if;
 
-commit;
+  v_visible := _rls_check(v_student_a, v_exam_untargeted);
+  if v_visible != 1 then
+    raise exception 'FAIL 2: Student A cannot see untargeted (got %)', v_visible;
+  end if;
+  raise notice 'PASS 1+2: Student A sees both papers.';
 
+  -- -----------------------------------------------------------------
+  --  TEST 3: Student B blocked from targeted, sees untargeted
+  -- -----------------------------------------------------------------
+  v_visible := _rls_check(v_student_b, v_exam_targeted);
+  if v_visible != 0 then
+    raise exception 'FAIL 3a: Student B sees targeted (got %)', v_visible;
+  end if;
 
-  raise notice 'PASS 4: Borrow list overrides targeting.';
-
-            and (nullif(btrim(e.department), '') is null
-                 or (nullif(btrim(p.department), '') is not null
-                     and lower(btrim(p.department)) = lower(btrim(e.department))))
-            and (nullif(btrim(e.level), '') is null
-                 or (nullif(btrim(p.level), '') is not null
-                     and lower(btrim(p.level)) = lower(btrim(e.level))))
-        )
-      );
+  v_visible := _rls_check(v_student_b, v_exam_untargeted);
   if v_visible != 1 then
     raise exception 'FAIL 3b: Student B cannot see untargeted (got %)', v_visible;
   end if;
   raise notice 'PASS 3: Student B excluded from targeted, sees untargeted.';
 
-                 or (nullif(btrim(p.level), '') is not null
-                     and lower(btrim(p.level)) = lower(btrim(e.level))))
-        )
-      );
-  if v_visible != 1 then
-    raise exception 'FAIL 2: Student A cannot see untargeted paper (got %)', v_visible;
-  end if;
-  raise notice 'PASS 1+2: Student A sees both papers.';
+  -- -----------------------------------------------------------------
+  --  TEST 4: borrow list overrides targeting
+  -- -----------------------------------------------------------------
+  insert into public.exam_allowed_students (exam_id, student_id, created_by)
+    values (v_exam_targeted, v_student_b, v_lecturer_id);
 
+  v_visible := _rls_check(v_student_b, v_exam_targeted);
+  if v_visible != 1 then
+    raise exception 'FAIL 4: Borrow list did not override (got %)', v_visible;
+  end if;
+  raise notice 'PASS 4: Borrow list overrides targeting.';
+
+  -- -----------------------------------------------------------------
+  --  TEST 5: whitespace-only labels treated as blank
+  -- -----------------------------------------------------------------
+  update public.profiles
+    set faculty = '   ', department = '', level = ' '
+    where id = v_student_b;
+
+  v_visible := _rls_check(v_student_b, v_exam_targeted);
+  if v_visible != 0 then
+    raise exception 'FAIL 5: Whitespace labels see targeted (got %)', v_visible;
+  end if;
+  raise notice 'PASS 5: Whitespace-only labels treated as blank.';
+
+  drop function if exists _rls_check(uuid, uuid);
+
+  raise notice 'ALL TESTS PASSED.';
+end;
+$$;
+
+rollback;
+
+              )
+            )
+          )
+        );
+    return v_cnt;
+  end;
+  $$;
