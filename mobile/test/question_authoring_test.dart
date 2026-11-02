@@ -1455,6 +1455,7 @@ class _FakeAuthoring implements QuestionAuthoringRepository {
     required String title,
     required int durationMinutes,
     required bool isPublished,
+    bool shuffleQuestions = false,
     DateTime? startsAt,
     DateTime? endsAt,
     String? faculty,

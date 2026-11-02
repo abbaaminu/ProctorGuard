@@ -1691,6 +1691,7 @@ void main() {
           'created_by': '11111111-1111-4111-8111-111111111111',
           'duration_minutes': 50,
           'is_published': false,
+          'shuffle_questions': false,
         });
         // A paper that has just been created has nothing under it, so no second
         // read is issued to learn that its counts are zero.
@@ -2561,17 +2562,17 @@ void main() {
       for (final column in <String>['faculty', 'department', 'level']) {
         expect(
           predicate,
-          contains('nullif(btrim(exams.$column), '') is null'),
+          contains("nullif(btrim(exams.$column), '') is null"),
         );
         expect(
           predicate,
           contains(
-            'nullif(btrim(p.$column), '') is not null',
+            "nullif(btrim(p.$column), '') is not null",
           ),
         );
         expect(
           predicate,
-          contains('lower(btrim(p.$column)) = lower(btrim(exams.$column))'),
+          contains("lower(btrim(p.$column)) = lower(btrim(exams.$column))"),
         );
       }
       // ...or one they were explicitly allowed to borrow.
@@ -2634,15 +2635,11 @@ void main() {
         );
       }
 
-      // The sentence itself, not a paraphrase: a paper that is visible to a
-      // class in a fresh project has to be visible to the same class in an
-      // upgraded one.
-      final schema = schemaSql();
-      if (schema == null) return;
-      expect(
-        selectPredicate(sql, 'exams_select'),
-        selectPredicate(schema, 'exams_select'),
-      );
+      // The `exams_select` predicate is deliberately NOT compared here because
+      // `supabase/migrations/academic_targeting.sql` was restored to its
+      // original (pre-strict-targeting) form.  The predicate is compared
+      // against `supabase/migrations/strict_targeting_null_profiles.sql`
+      // in the test that follows.
     });
 
     test('strict-targeting migration carries the same exams_select policy', () {

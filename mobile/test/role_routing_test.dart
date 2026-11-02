@@ -1055,7 +1055,10 @@ void main() {
       await tester.tap(find.byKey(const Key('admin-reset-password-submit')));
       await tester.pumpAndSettle();
 
-      expect(find.text('Use at least 6 characters'), findsOneWidget);
+      expect(
+        find.text('Use at least $adminMinPasswordLength characters'),
+        findsOneWidget,
+      );
       expect(admin.passwordResets, isEmpty);
     });
 
@@ -1397,6 +1400,7 @@ class _FakeQuestionAuthoringRepository implements QuestionAuthoringRepository {
     required String title,
     required int durationMinutes,
     required bool isPublished,
+    bool shuffleQuestions = false,
     DateTime? startsAt,
     DateTime? endsAt,
     String? faculty,
