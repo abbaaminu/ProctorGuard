@@ -181,8 +181,10 @@ lose proctoring signals but cannot change a result.
    supabase db query --linked -f supabase/migrations/private_proctor_snapshots.sql
    supabase db query --linked -f supabase/migrations/academic_targeting.sql
    supabase db query --linked -f supabase/migrations/profile_identity_numbers.sql
+supabase db query --linked -f supabase/migrations/strict_targeting_null_profiles.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
+supabase db query --linked -f supabase/migrations/optional_question_shuffling.sql
    earlier: without it, an attempt reset from the staff console still works, but
    its audit row cannot be written and the console reports the gap
    (`session_reset_logs` in [mobile/README.md](./mobile/README.md)).
@@ -221,6 +223,7 @@ lose proctoring signals but cannot change a result.
    `add column if not exists` and re-runnable: without them the console still
    creates accounts, it just leaves those columns unset, and every existing
    account and paper keeps the access it had.
+\n    `strict_targeting_null_profiles.sql` **must** come after\n    `academic_targeting.sql` — it replaces the same `exams_select` policy with a\n    stricter version. Re-running `academic_targeting.sql` after it restores the\n    original NULL-matches-all rule, so always apply both together.\n    `optional_question_shuffling.sql` adds the `shuffle_questions` column and is\n    independent of every other migration.\n2. Deploy the account-management functions:
 2. Deploy the account-management functions:
    ```powershell
    supabase functions deploy admin-create-user
@@ -253,13 +256,23 @@ lose proctoring signals but cannot change a result.
   additive and re-runnable, changes no object, and is what makes the bucket's
   evidence reachable only through signed URLs.
 - Apply `supabase/migrations/academic_targeting.sql` and
-  `supabase/migrations/profile_identity_numbers.sql` on any project whose
+  `supabase/migrations/strict_targeting_null_profiles.sql` together (in that
+  order) on any project that predates the academic labels.
+  `strict_targeting_null_profiles.sql` must come **after** `academic_targeting.sql`
+  because it replaces the same `exams_select` policy. Re-running
+  `academic_targeting.sql` afterwards restores the original NULL-matches-all rule.
+  Apply `supabase/migrations/profile_identity_numbers.sql` on any project whose
   `profiles` row predates the academic labels and identity numbers. Both are
   additive and re-runnable. Without them the admin console still creates
   accounts — a field left blank is sent as nothing and the column stays `NULL` —
   but the roster has no faculty, department, level, matriculation number or staff
   ID to show, no paper can be targeted at a cohort, and a filled-in label is
   refused with a message naming the file to apply.
+- Apply `supabase/migrations/optional_question_shuffling.sql` before the first
+  paper that has question-order shuffling enabled. Until it runs, the
+  `shuffle_questions` column does not exist: the authoring console reports the
+  missing column by name, and student-facing paths default to `false` (no
+  shuffle). It is additive and re-runnable.
 - Apply `supabase/migrations/retention_policy.sql` and enable `pg_cron`
   (Dashboard → Database → Extensions). `proctoring_logs` is the one table that
   grows without bound; the migration seeds a 30-day window in
