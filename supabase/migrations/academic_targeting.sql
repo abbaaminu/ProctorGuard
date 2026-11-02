@@ -71,11 +71,11 @@ alter table public.profiles add column if not exists department text;
 alter table public.profiles add column if not exists level      text;
 
 comment on column public.profiles.faculty is
-  'The faculty this account belongs to. Compared with exams.faculty by exams_select; NULL = not stated, and never narrows what the account may see.';
+  'The faculty this account belongs to. Compared with exams.faculty by exams_select; NULL = not stated — a student with no faculty recorded is excluded from a paper that names a faculty.';
 comment on column public.profiles.department is
-  'The department this account belongs to. Compared with exams.department by exams_select; NULL = not stated.';
+  'The department this account belongs to. Compared with exams.department by exams_select; NULL = not stated — a student with no department recorded is excluded from a paper that names a department.';
 comment on column public.profiles.level is
-  'The level (100 .. 600) this account belongs to, in the app catalogue''s spelling. Compared with exams.level by exams_select; NULL = not stated.';
+  'The level (100 .. 600) this account belongs to, in the app catalogue''s spelling. Compared with exams.level by exams_select; NULL = not stated — a student with no level recorded is excluded from a paper that names a level.';
 
 -- The console's roster filter asks "who is in this department and level?"; a
 -- student's own row is a primary-key lookup and needs nothing.
@@ -164,9 +164,11 @@ create index if not exists idx_exam_allowed_students_student
 -- paper picker lists them all.
 --
 -- Students: a *published* paper whose named labels match their own profile row,
--- or a published paper they were explicitly allowed to borrow. Every comparison
--- reads NULL on either side as "not narrowed", which is what keeps an
--- untargeted paper (and a profile with no labels) visible exactly as before.
+-- or a published paper they were explicitly allowed to borrow. A NULL on the
+-- paper's side means "not narrowed" (an untargeted paper stays visible to
+-- everybody). A student with NULL or blank faculty/department/level is **not**
+-- matched by a paper that names that field, so incomplete profiles lose access
+-- to targeted papers they do not belong to.
 --
 -- The borrow list is read through its own policies above, which show a student
 -- precisely the rows that name them, so this EXISTS needs no definer helper and
@@ -186,12 +188,15 @@ create policy "exams_select"
           select 1
           from public.profiles p
           where p.id = auth.uid()
-            and (exams.faculty    is null or p.faculty is null
-                 or lower(p.faculty)    = lower(exams.faculty))
-            and (exams.department is null or p.department is null
-                 or lower(p.department) = lower(exams.department))
-            and (exams.level      is null or p.level is null
-                 or p.level = exams.level)
+            and (exams.faculty is null
+                 or (p.faculty is not null and p.faculty != ''
+                     and lower(p.faculty) = lower(exams.faculty)))
+            and (exams.department is null
+                 or (p.department is not null and p.department != ''
+                     and lower(p.department) = lower(exams.department)))
+            and (exams.level is null
+                 or (p.level is not null and p.level != ''
+                     and p.level = exams.level))
         )
         or exists (
           select 1

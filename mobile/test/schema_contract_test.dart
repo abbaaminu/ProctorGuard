@@ -2554,17 +2554,30 @@ void main() {
       expect(predicate, contains('created_by = auth.uid()'));
       // A student only ever sees a *published* paper...
       expect(predicate, contains('is_published = true'));
-      // ...whose labels match their own row, with NULL on either side read as
-      // "not narrowed" - which is what keeps every untargeted paper visible.
+      // ...whose labels match their own row. A NULL on the paper's side means
+      // "not narrowed" (untargeted paper). When a paper names a field, the
+      // student's matching field must be non-null and non-blank — incomplete
+      // profiles no longer match every targeted paper.
       for (final column in <String>['faculty', 'department']) {
         expect(
           predicate,
-          contains('exams.$column is null or p.$column is null'),
+          contains('$column is null'),
         );
-        expect(predicate, contains('lower(p.$column) = lower(exams.$column)'));
+        expect(
+          predicate,
+          contains(
+            'p.$column is not null and p.$column != '
+            'and lower(p.$column) = lower(exams.$column)',
+          ),
+        );
       }
-      expect(predicate, contains('exams.level is null or p.level is null'));
-      expect(predicate, contains('p.level = exams.level'));
+      expect(predicate, contains('exams.level is null'));
+      expect(
+        predicate,
+        contains(
+          "p.level is not null and p.level != '' and p.level = exams.level",
+        ),
+      );
       // ...or one they were explicitly allowed to borrow.
       expect(predicate, contains('from public.exam_allowed_students a'));
       expect(
@@ -2634,6 +2647,40 @@ void main() {
         selectPredicate(sql, 'exams_select'),
         selectPredicate(schema, 'exams_select'),
       );
+    });
+
+    test('strict-targeting migration carries the same exams_select policy', () {
+      final file = File(
+        '../supabase/migrations/strict_targeting_null_profiles.sql',
+      );
+      if (!file.existsSync()) return; // a checkout without ../supabase
+      final sql = file.readAsStringSync();
+
+      expect(sql, contains('drop policy if exists "exams_select"'));
+      final schema = schemaSql();
+      if (schema == null) return;
+      expect(
+        selectPredicate(sql, 'exams_select'),
+        selectPredicate(schema, 'exams_select'),
+      );
+    });
+
+    test('submissions_insert_own_ongoing enforces is_published and the window '
+        'but does not duplicate the targeting check (relies on exams_select)', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      // The insert policy checks the paper is published and open, and does
+      // not add its own faculty/department/level comparison — targeting is
+      // enforced by exams_select at the discoverability level.
+      final policyStart = sql.indexOf(
+        'create policy "submissions_insert_own_ongoing"',
+      );
+      expect(policyStart, greaterThanOrEqualTo(0));
+      // The subquery checks existence of a published exam within its window.
+      expect(sql, contains('e.is_published = true'));
+      expect(sql, contains('e.starts_at is null or now() >= e.starts_at'));
+      expect(sql, contains('e.ends_at  is null or now() <= e.ends_at'));
     });
 
     test('the identity numbers are declared, optional, and forwarded', () {
