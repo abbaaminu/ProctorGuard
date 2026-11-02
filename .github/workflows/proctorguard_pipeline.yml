@@ -151,8 +151,7 @@ jobs:
     if: >-
       github.repository == 'abbaaminu/ProctorGuard' &&
       (github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'push' &&
-        (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))))
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
     env:
       RELEASE_REPOSITORY: abbaaminu/proctorguard-release
       APK_DIR: ${{ github.workspace }}/mobile/build/app/outputs/flutter-apk
