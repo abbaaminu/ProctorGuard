@@ -902,8 +902,9 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
   ) =>
       _shuffleQuestions(questions, submissionId);
     _countdown?.cancel();
-    _countdown = null;
-    super.dispose();
+    _countdown;
+    super.@override
+  dispose();
   }
 }
 
