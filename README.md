@@ -279,6 +279,13 @@ lose proctoring signals but cannot change a result.
   (`mobile/README.md#content-security-policy-the-browser-build`).
 - Ensure the `admin-create-user`, `admin-delete-user` and `admin-reset-password`
   functions are deployed.
+- Set the `ALLOWED_ORIGIN` environment variable on each deployed admin function
+  to a comma-separated list of permitted origins (for example,
+  `https://console.example.com,https://admin.example.com`). The function's CORS
+  response echoes the request's `Origin` header only when it is in that list, and
+  adds `Vary: Origin`. If the variable is not set the function logs a warning
+  and keeps the previous wide-open behaviour (`Access-Control-Allow-Origin: *`),
+  so existing deployments are not broken before the variable is configured.
 - Configure the Flutter app with the Supabase project URL and a publishable
   client key. Never embed a service-role or secret key in the app.
 - Review the private `proctor-snapshots` bucket's retention policy in

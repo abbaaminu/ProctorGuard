@@ -80,23 +80,70 @@ const DELETER_ROLES: readonly Role[] = ["admin"];
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+/**
+ * Builds CORS response headers that honour the ALLOWED_ORIGIN environment
+ * variable.  The variable holds a comma-separated list of permitted origins;
+ * when the request Origin is in that list it is echoed back and `Vary: Origin`
+ * is added.  If the variable is unset the function keeps the previous
+ * wide-open behaviour (all origins allowed) and logs a warning, so existing
+ * deployments do not break before they configure it.
+ *
+ * The no-argument version always returns the fallback (or the first allowed
+ * origin when configured) and is used by `json()` / `fail()` for error paths
+ * where the request object is not threaded through.
+ */
+function corsHeaders(request?: Request): Record<string, string> {
+  const raw = Deno.env.get("ALLOWED_ORIGIN");
+  const requestOrigin = request?.headers.get("Origin") ?? null;
 
-function json(body: unknown, status = 200): Response {
+  const baseHeaders: Record<string, string> = {
+    "Access-Control-Allow-Headers":
+      "authorization, x-client-info, apikey, content-type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+  };
+
+  if (!raw) {
+    console.warn(
+      "ALLOWED_ORIGIN is not set \u2014 falling back to Access-Control-Allow-Origin: *."
+      + " Set this variable to a comma-separated list of allowed origins.",
+    );
+    return { ...baseHeaders, "Access-Control-Allow-Origin": "*" };
+  }
+
+  const allowed = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  const origin = requestOrigin && allowed.includes(requestOrigin)
+    ? requestOrigin
+    : (allowed.length > 0 ? allowed[0] : "null");
+
+  return {
+    ...baseHeaders,
+    "Access-Control-Allow-Origin": origin,
+    "Vary": "Origin",
+  };
+}
+
+function json(
+  body: unknown,
+  status = 200,
+  headers?: Record<string, string>,
+): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    headers: {
+      ...corsHeaders(),
+      ...headers,
+      "Content-Type": "application/json",
+    },
   });
 }
 
 /** Every failure answers `{ error }` — the shape the console reads. */
-function fail(message: string, status = 400): Response {
-  return json({ error: message }, status);
+function fail(
+  message: string,
+  status = 400,
+  headers?: Record<string, string>,
+): Response {
+  return json({ error: message }, status, headers);
 }
 
 /**
@@ -355,7 +402,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
   // Browser clients preflight cross-origin POSTs; answering also keeps this
   // function usable from the Flutter app.
   if (request.method === "OPTIONS") {
-    return new Response("ok", { headers: CORS_HEADERS });
+    return new Response("ok", { headers: corsHeaders(request) });
   }
   if (request.method !== "POST") {
     return fail("Use POST.", 405);

@@ -540,7 +540,7 @@ this deployment, minting a temporary password and handing it over is how a
 locked-out person gets back in. The dialog takes it twice
 (`admin-new-password` / `admin-confirm-password`) — a typo in a field nobody can
 read back would otherwise become somebody's permanent password — and both fields
-are held to `adminMinPasswordLength`, the `MIN_PASSWORD_LENGTH = 6` floor the
+are held to `adminMinPasswordLength`, the `MIN_PASSWORD_LENGTH = 10` floor the
 function enforces, so a password the server would refuse never leaves the dialog.
 On success the password is shown **once**, in a `SelectableText` the
 administrator has to dismiss: a temporary password nobody wrote down is not a

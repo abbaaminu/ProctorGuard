@@ -735,7 +735,7 @@ void main() {
           .join(', ');
       expect(source, contains('const ROLES = [$expected]'));
       // `{ error }` is what `_messageFromFunctionError` reads out of a 4xx.
-      expect(source, contains('return json({ error: message }, status);'));
+      expect(source, contains('return json({ error: message }, status, headers);'));
       expect(
         source,
         contains('const MIN_PASSWORD_LENGTH = $adminMinPasswordLength;'),
@@ -1224,7 +1224,7 @@ void main() {
         source,
         contains('const MIN_PASSWORD_LENGTH = $adminMinPasswordLength;'),
       );
-      expect(source, contains('return json({ error: message }, status);'));
+      expect(source, contains('return json({ error: message }, status, headers);'));
 
       // Admins only: a *password* reset is an identity action, a different tier
       // from the attempt resets a lecturer or supervisor may run

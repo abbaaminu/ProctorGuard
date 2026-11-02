@@ -21,7 +21,8 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
   static const String resetPasswordFunction = 'admin-reset-password';
 
   /// Supabase Auth's default minimum, mirrored by the Edge Function.
-  static const int minPasswordLength = 6;
+  /// Raised from 6 to 10 for production use.
+  static const int minPasswordLength = 10;
 
   final SupabaseClient _client;
 
