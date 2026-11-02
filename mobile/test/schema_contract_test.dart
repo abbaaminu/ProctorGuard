@@ -1691,7 +1691,6 @@ void main() {
           'created_by': '11111111-1111-4111-8111-111111111111',
           'duration_minutes': 50,
           'is_published': false,
-          'shuffle_questions': false,
         });
         // A paper that has just been created has nothing under it, so no second
         // read is issued to learn that its counts are zero.

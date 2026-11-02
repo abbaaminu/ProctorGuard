@@ -47,7 +47,6 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
           .from('exams')
           .select(
             'id, title, created_by, duration_minutes, is_published, '
-            'shuffle_questions, '
             'starts_at, ends_at, faculty, department, level, '
             'created_at, questions(count), exam_submissions(count)',
           )
@@ -99,7 +98,7 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
             'created_by': _userId,
             'duration_minutes': durationMinutes,
             'is_published': isPublished,
-            'shuffle_questions': shuffleQuestions,
+            if (shuffleQuestions) 'shuffle_questions': shuffleQuestions,
             // The window is *optional*, so an absent bound is omitted rather
             // than sent as null: the column's own default is NULL either way,
             // and the request then says out loud what kind of paper this is.
@@ -116,7 +115,7 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
           })
           .select(
             'id, title, created_by, duration_minutes, is_published, '
-            'shuffle_questions, '
+            '${shuffleQuestions ? 'shuffle_questions, ' : ''}'
             'starts_at, ends_at, faculty, department, level',
           )
           .single();
