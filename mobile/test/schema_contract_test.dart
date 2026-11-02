@@ -2682,7 +2682,13 @@ void main() {
       expect(sql, contains('e.starts_at is null or now() >= e.starts_at'));
       expect(sql, contains('e.ends_at  is null or now() <= e.ends_at'));
       // No explicit targeting check in this policy — it relies on exams_select.
-      expect(sql.substring(policyStart), isNot(contains('nullif(btrim')));
+      // Scope the assertion to just this policy statement (create policy … ;)
+      // so 'nullif(btrim' elsewhere in the file does not produce a false pass.
+      final policyEnd = sql.indexOf(';', policyStart);
+      final policyBody = policyEnd >= 0
+          ? sql.substring(policyStart, policyEnd + 1)
+          : sql.substring(policyStart);
+      expect(policyBody, isNot(contains('nullif(btrim')));
     });
 
     test('the identity numbers are declared, optional, and forwarded', () {
