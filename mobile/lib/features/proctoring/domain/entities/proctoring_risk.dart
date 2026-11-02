@@ -18,20 +18,21 @@ enum RiskBand {
 }
 
 /// The proctoring risk index for one attempt: a 0-100 score recomputed from
-/// every violation logged so far in that session.
+/// every violation logged so far in that session.  The index is a **fixed
+/// formula**, not a learned model, documented below rather than tuned in place.
 ///
-/// "Adaptive" here is a statement about what the score is a function of, not
-/// about a fitted model: it is derived from the running list of signals for
-/// *this* attempt ([ProctoringRisk.fromViolations]), so it moves as evidence
-/// accumulates and - the part that matters - it moves differently as the *kinds*
-/// of evidence change. Three glances off screen do not score like three
-/// different integrity failures, and one second face in frame outranks a long
-/// string of the same camera complaint. Nothing is baselined across students, and
-/// there is deliberately no time decay: every signal in the list already had to
-/// clear its own detector threshold and its per-type cooldown to be logged at all
-/// (`register_violation` server-side, the debounce window in `ProctoringNotifier`
-/// client-side), so decaying the score with time would only hide evidence the
-/// detector was already conservative about.
+/// "Adaptive" here is a statement about what the score is a function of — it is
+/// derived from the running list of signals for *this* attempt
+/// ([ProctoringRisk.fromViolations]), so it moves as evidence accumulates and -
+/// the part that matters - it moves differently as the *kinds* of evidence
+/// change. Three glances off screen do not score like three different integrity
+/// failures, and one second face in frame outranks a long string of the same
+/// camera complaint. Nothing is baselined across students, and there is
+/// deliberately no time decay: every signal in the list already had to clear
+/// its own detector threshold and its per-type debounce window in
+/// `ProctoringNotifier` to be logged at all (`register_violation` dedupes by
+/// `client_event_id`, not by server-side cooldown), so decaying the score with
+/// time would only hide evidence the detector was already conservative about.
 ///
 /// The formula, documented rather than tuned in place:
 ///

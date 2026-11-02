@@ -110,16 +110,15 @@ rather than left to be mistaken for more than it is.
   degrades to screen pinning, which a long-press of Back + Recents can still
   escape (the app then logs `app_minimized`). Browsers get the DOM lockdown
   (HTML5 fullscreen plus tab/blur detection) instead.
-- **No on-device AI on the web.** There is no ML Kit for browsers, so a web
-  session runs the browser guards and audio level only (or an explicit
-  mock/simulated session), with no face signals **of its own**. A browser can
-  still take part in face proctoring if the hosting page runs a detector: the app
-  installs one global hook (`window.proctorGuardFaceSignal('looking_away')`) for
-  the length of an attempt and judges what arrives there with the same
-  sustained-episode rules as the phone build — the detection is the host's, the
-  judgement is the app's. Without such a page those signals are simply **absent**
-  (never invented), and the supervisor sees that gap. The browser is otherwise a fully
-  supported host: the device check probes the camera and the microphone with two
+- **The web ships a browser-native face detector.** `web/proctor_face_detector.js`
+  loads a **MediaPipe FaceLandmarker** model (`web/mediapipe/`) at session start and
+  reports camera presence, covered or frozen frame, face count and 3D head pose
+  (yaw/pitch) on every polling tick. The same detector listens for a host page's
+  own signals through the `window.proctorGuardFaceSignal` bridge (see
+  [mobile/README.md](./mobile/README.md#face-signals-on-the-web-the-host-page-bridge)),
+  so the app's proctoring works equally well with the shipped model and with an
+  institution-provided detector. The web build is otherwise a
+  fully supported host: the device check probes the camera and the microphone with two
   separate `getUserMedia` calls, releasing each stream before the next one opens
   (one combined call is all-or-nothing, so a laptop with no microphone used to be
   reported as a blocked camera), and it opens no capture session of its own — that

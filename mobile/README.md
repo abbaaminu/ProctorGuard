@@ -954,8 +954,10 @@ Details worth knowing:
   `UnimplementedError`, which is the "Proctoring could not start on this device"
   screen a browser student used to get on a perfectly working camera. The preview
   and the still-frame evidence are unaffected; what the web cannot do is run the
-  app's own face model on the feed — the Shape Detection API, where a browser has
-  it, only counts faces — which is what the gate says before the paper starts.
+  app's own face model on the feed \u2014 the web runs its own
+  **MediaPipe FaceLandmarker** (`web/proctor_face_detector.js`) which reports
+  face count and 3D head pose in addition to the pixel-level covered/blank
+  checks \u2014 which is what the gate says before the paper starts.
   The shipped page-level sensor still watches the preview for a covered, closed
   or blanked camera (see the web section above), so "nobody in frame" is not
   blind on the web. A camera the browser reports as **still in use** is re-opened
@@ -1085,7 +1087,7 @@ frames, because ML Kit is Android and iOS only. So on the web:
 
 * the report is marked `faceDetectionInactive`, and the exam screen says so
   before the exam starts rather than a proctoring report admitting it afterwards
-  — the camera keeps recording, and the review is a person's, in full;
+  — the camera feed is live, but only still frames on violation are stored for review;
 * the host page's own detector can still add face signals through the
   `proctorGuardFaceSignal` bridge
   ([below](#face-signals-on-the-web-the-host-page-bridge)), which is how a
