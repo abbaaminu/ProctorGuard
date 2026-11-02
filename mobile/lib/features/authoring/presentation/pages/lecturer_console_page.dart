@@ -84,6 +84,7 @@ class _LecturerConsolePageState extends ConsumerState<LecturerConsolePage> {
                 title: request.title,
                 durationMinutes: request.durationMinutes,
                 isPublished: request.isPublished,
+                shuffleQuestions: request.shuffleQuestions,
                 // Null for an unscheduled paper — the repository omits the key
                 // rather than sending null, so the column keeps its NULL default.
                 startsAt: request.startsAt,
@@ -363,6 +364,7 @@ class _NewExamRequest {
     required this.title,
     required this.durationMinutes,
     required this.isPublished,
+    this.shuffleQuestions = false,
     this.startsAt,
     this.endsAt,
     this.faculty,
@@ -373,6 +375,7 @@ class _NewExamRequest {
   final String title;
   final int durationMinutes;
   final bool isPublished;
+  final bool shuffleQuestions;
   final DateTime? startsAt;
   final DateTime? endsAt;
   final String? faculty;
@@ -405,6 +408,7 @@ class _NewExamDialogState extends State<_NewExamDialog> {
   final _titleController = TextEditingController();
   final _durationController = TextEditingController(text: '60');
   bool _published = false;
+  bool _shuffle = false;
 
   /// Local instants, or null for "no bound". Both are cleared by the same
   /// control that set them, so an accidental window is undone without leaving
@@ -537,6 +541,7 @@ class _NewExamDialogState extends State<_NewExamDialog> {
         title: _titleController.text.trim(),
         durationMinutes: int.parse(_durationController.text.trim()),
         isPublished: _published,
+        shuffleQuestions: _shuffle,
         startsAt: start,
         endsAt: end,
         faculty: _faculty,
@@ -759,6 +764,17 @@ class _NewExamDialogState extends State<_NewExamDialog> {
                 title: const Text('Publish now'),
                 subtitle: const Text(
                   'Off keeps it a draft: students cannot see or start it.',
+                ),
+              ),
+              SwitchListTile(
+                key: const Key('new-exam-shuffle'),
+                contentPadding: EdgeInsets.zero,
+                value: _shuffle,
+                onChanged: (value) => setState(() => _shuffle = value),
+                title: const Text('Shuffle question order'),
+                subtitle: const Text(
+                  'Each student sees the questions in a different order, '
+                  'deterministic from their submission id.',
                 ),
               ),
             ],

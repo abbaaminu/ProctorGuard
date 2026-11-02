@@ -43,6 +43,7 @@ class ExamSessionArgs {
   const ExamSessionArgs({
     required this.examId,
     required this.submissionId,
+    this.shuffleQuestions = false,
     this.durationMinutes,
     this.startedAt,
     this.endsAt,
@@ -51,6 +52,10 @@ class ExamSessionArgs {
 
   final String examId;
   final String submissionId;
+
+  /// When true, questions are displayed in a deterministic shuffled order
+  /// derived from [submissionId].
+  final bool shuffleQuestions;
   final int? durationMinutes;
   final DateTime? startedAt;
 
@@ -70,6 +75,7 @@ class ExamSessionArgs {
       other is ExamSessionArgs &&
       other.examId == examId &&
       other.submissionId == submissionId &&
+      other.shuffleQuestions == shuffleQuestions &&
       other.durationMinutes == durationMinutes &&
       other.startedAt == startedAt &&
       other.endsAt == endsAt &&
@@ -79,6 +85,7 @@ class ExamSessionArgs {
   int get hashCode => Object.hash(
         examId,
         submissionId,
+        shuffleQuestions,
         durationMinutes,
         startedAt,
         endsAt,
@@ -327,9 +334,11 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
     unawaited(pending.then<void>((_) {}, onError: (Object _) {}));
   }
 
-  /// Applies the question feed, turning a failure into a blocking state with a
-  /// retry instead of leaving the page on its spinner forever (this screen has
-  /// no back button to escape with).
+  /// Applies the question feed, shuffling when the exam flag is set.
+  ///
+  /// The shuffle uses a deterministic seed derived from [args.submissionId]
+  /// so the order is stable on resume and offline. Only the display order
+  /// changes; grading and stored answers stay keyed by question id.
   ///
   /// Awaits the fetch [prefetchQuestions] started, if there is one, so the
   /// bootstrap's device work and this request run at the same time. A *failed*
@@ -340,10 +349,15 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
       final questions = await (_questionsInFlight ??=
           _exams.getQuestions(args.examId));
       if (!mounted) return;
+
+      final orderedQuestions = args.shuffleQuestions
+          ? _shuffleQuestions(questions, args.submissionId)
+          : questions;
+
       state = state.copyWith(
-        questions: questions,
+        questions: orderedQuestions,
         currentIndex:
-            state.currentIndex >= questions.length ? 0 : state.currentIndex,
+            state.currentIndex >= orderedQuestions.length ? 0 : state.currentIndex,
         loading: false,
       );
     } catch (error) {
@@ -850,8 +864,43 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
         loading: true,
       );
 
-  @override
-  void dispose() {
+  /// Returns a deterministically shuffled copy of [questions] using a seed
+  /// derived from [submissionId], so the same submission always sees the same
+  /// order — stable on resume and offline.
+  ///
+  /// Uses a Fisher-Yates shuffle with a pseudo-random number generator seeded
+  /// by a hash of the submission id. Only the display order changes; grading
+  /// and stored answers stay keyed by question id.
+  static List<Question> _shuffleQuestions(
+    List<Question> questions,
+    String submissionId,
+  ) {
+    final seed = submissionId.hashCode;
+    final indices = List<int>.generate(questions.length, (i) => i);
+
+    // Fisher-Yates shuffle with a linear-congruential generator seeded from
+    // the submission id.  The same list of question ids always produces the
+    // same shuffled output.
+    var state = seed;
+    for (var i = indices.length - 1; i > 0; i--) {
+      // LCG constants from Numerical Recipes.
+      state = (state * 1103515245 + 12345) & 0x7fffffff;
+      final j = state % (i + 1);
+      final tmp = indices[i];
+      indices[i] = indices[j];
+      indices[j] = tmp;
+    }
+
+    return indices.map((i) => questions[i]).toList(growable: false);
+  }
+
+  /// Test seam: exposes the deterministic shuffle for contract tests.
+  @visibleForTesting
+  static List<Question> shuffleQuestionsForTest(
+    List<Question> questions,
+    String submissionId,
+  ) =>
+      _shuffleQuestions(questions, submissionId);
     _countdown?.cancel();
     _countdown = null;
     super.dispose();

@@ -476,6 +476,7 @@ create table if not exists public.exams (
   created_by       uuid not null references public.profiles(id) on delete cascade,
   duration_minutes int not null check (duration_minutes > 0),
   is_published     boolean not null default false,
+  shuffle_questions boolean not null default false,
   starts_at        timestamptz,
   ends_at          timestamptz,
   created_at       timestamptz not null default now(),
@@ -504,6 +505,7 @@ alter table public.exams add column if not exists ends_at   timestamptz;
 alter table public.exams add column if not exists faculty    text;
 alter table public.exams add column if not exists department text;
 alter table public.exams add column if not exists level      text;
+alter table public.exams add column if not exists shuffle_questions boolean not null default false;
 
 -- `drop constraint if exists` + `add constraint`, like the shape rules in
 -- section 3: the name may already exist on a live project, and an

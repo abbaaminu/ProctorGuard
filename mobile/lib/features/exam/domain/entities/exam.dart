@@ -39,6 +39,7 @@ class Exam extends Equatable {
     required this.createdBy,
     required this.durationMinutes,
     required this.isPublished,
+    this.shuffleQuestions = false,
     this.startsAt,
     this.endsAt,
     this.faculty,
@@ -52,6 +53,7 @@ class Exam extends Equatable {
         createdBy: map['created_by'] as String,
         durationMinutes: map['duration_minutes'] as int,
         isPublished: map['is_published'] as bool,
+        shuffleQuestions: map['shuffle_questions'] as bool? ?? false,
         startsAt: _timestamp(map['starts_at']),
         endsAt: _timestamp(map['ends_at']),
         faculty: _text(map['faculty']),
@@ -64,6 +66,12 @@ class Exam extends Equatable {
   final String createdBy;
   final int durationMinutes;
   final bool isPublished;
+
+  /// When true, the exam session reorders questions with a deterministic
+  /// seed derived from the submission id, so the order is stable on resume
+  /// and offline.  Only the display order changes; grading and stored
+  /// answers stay keyed by question id.
+  final bool shuffleQuestions;
 
   /// The cohort this paper is aimed at. Null means "any" — the reading the
   /// database policy gives an unlabelled paper, and the only reading that keeps
@@ -188,6 +196,7 @@ class Exam extends Equatable {
         createdBy,
         durationMinutes,
         isPublished,
+        shuffleQuestions,
         startsAt,
         endsAt,
         faculty,

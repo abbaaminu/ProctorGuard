@@ -73,6 +73,9 @@ class ExamTakingPage extends ConsumerStatefulWidget {
   /// the visible clock never shows time an answer would be refused in.
   final DateTime? endsAt;
 
+  /// When true, questions are shuffled deterministically per submission.
+  final bool shuffleQuestions;
+
   /// Browser guards for this session; injectable so tests can drive tab-switch
   /// and fullscreen behaviour on the VM, where the real implementation (and its
   /// DOM) does not exist.
@@ -149,6 +152,7 @@ class ExamTakingPage extends ConsumerStatefulWidget {
     this.durationMinutes,
     this.startedAt,
     this.endsAt,
+    this.shuffleQuestions = false,
     this.webGuards,
     this.webFaceSignals,
     this.clock,
@@ -277,6 +281,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   ExamSessionArgs get _args => ExamSessionArgs(
     examId: widget.examId,
     submissionId: widget.submissionId,
+    shuffleQuestions: widget.shuffleQuestions,
     durationMinutes: widget.durationMinutes,
     startedAt: widget.startedAt,
     endsAt: widget.endsAt,
