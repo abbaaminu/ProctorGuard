@@ -1,5 +1,11 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:proctorguard/core/di/providers.dart';
+import 'package:proctorguard/features/exam/domain/entities/exam.dart';
+import 'package:proctorguard/features/exam/domain/entities/exam_submit_result.dart';
 import 'package:proctorguard/features/exam/domain/entities/question.dart';
+import 'package:proctorguard/features/exam/domain/entities/submission.dart';
+import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
 import 'package:proctorguard/features/exam/presentation/providers/exam_session_controller.dart';
 
 /// Pins the deterministic shuffle contract so the same submission id always
@@ -138,4 +144,109 @@ void main() {
       expect(sameOrder, isFalse);
     });
   });
+
+  // The shuffle itself is only half the feature: the controller decides whether
+  // to call it from the flag it read off the exam row (`args.shuffleQuestions`),
+  // and "off means the paper as authored" is that half. The pure function cannot
+  // show it, so these tests drive the controller over a repository that answers
+  // at once and read the order the student would actually be painted.
+  group('the flag decides the order the student sees', () {
+    Future<ExamSessionController> loadedSession({
+      required bool shuffleQuestions,
+    }) async {
+      final exams = _AnsweredExamRepository(questions);
+      final container = ProviderContainer(
+        overrides: <Override>[examRepositoryProvider.overrideWithValue(exams)],
+      );
+      addTearDown(container.dispose);
+
+      final args = ExamSessionArgs(
+        examId: 'x',
+        submissionId: 'sub-1',
+        shuffleQuestions: shuffleQuestions,
+      );
+      // A listener keeps the `autoDispose` provider alive for the test.
+      container.listen(examSessionControllerProvider(args), (_, _) {});
+      final controller =
+          container.read(examSessionControllerProvider(args).notifier);
+
+      await controller.loadQuestions();
+      return controller;
+    }
+
+    test('shuffle off paints the questions in the order the paper stores',
+        () async {
+      final controller = await loadedSession(shuffleQuestions: false);
+
+      expect(
+        controller.state.questions.map((q) => q.id).toList(),
+        questions.map((q) => q.id).toList(),
+        reason: 'a paper that never asked for a shuffle is shown as authored, '
+            'whatever the seed would have produced',
+      );
+    });
+
+    test('shuffle on paints the seeded order, not the stored one', () async {
+      final controller = await loadedSession(shuffleQuestions: true);
+      final expected = ExamSessionController.shuffleQuestionsForTest(
+        questions,
+        'sub-1',
+      );
+
+      expect(
+        controller.state.questions.map((q) => q.id).toList(),
+        expected.map((q) => q.id).toList(),
+        reason: 'the session must paint exactly the order its own seed defines, '
+            'so a resume lands where the student left off',
+      );
+      expect(
+        controller.state.questions.map((q) => q.id).toList(),
+        isNot(questions.map((q) => q.id).toList()),
+        reason: 'a flag that changes nothing is not a shuffle',
+      );
+    });
+  });
+}
+
+/// Answers the question feed immediately: what these tests vary is the flag, not
+/// the timing of the fetch. Every other call is outside their scope and fails
+/// loudly if a future change makes the bootstrap reach for one.
+class _AnsweredExamRepository implements ExamRepository {
+  _AnsweredExamRepository(this.questions);
+
+  final List<Question> questions;
+
+  @override
+  Future<List<Question>> getQuestions(String examId) async => questions;
+
+  @override
+  Future<List<Exam>> getPublishedExams() async => const <Exam>[];
+
+  @override
+  Future<Submission> startOrResumeSubmission(String examId) =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> saveAnswer({
+    required String submissionId,
+    required String questionId,
+    required int selectedOption,
+  }) =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> saveTextAnswer({
+    required String submissionId,
+    required String questionId,
+    required String answer,
+  }) =>
+      throw UnimplementedError();
+
+  @override
+  Future<ExamSubmitResult> submitExam(String submissionId) =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> markDisqualified(String submissionId) =>
+      throw UnimplementedError();
 }

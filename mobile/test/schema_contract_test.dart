@@ -833,16 +833,26 @@ void main() {
         UserRole.supervisor,
       });
 
-      // Every policy the console's reset rides on asks the *reset* predicate: the
-      // DELETE that removes the attempt, the Storage purge of its snapshots, and
-      // the audit row.
-      expect(sql, contains('using (public.is_attempt_resetter());'));
+      // The two steps that *follow* the delete still ask the reset predicate: the
+      // Storage purge of the snapshots and the audit row. The DELETE itself is
+      // narrower - asserted below - because deleting an attempt is a repair of a
+      // paper you wrote, while `is_attempt_resetter()` (every lecturer) let any
+      // lecturer delete any attempt in the institution. The console reads "zero
+      // rows deleted" and stops before purging or auditing.
       expect(sql, contains('and public.is_attempt_resetter()'));
       expect(
         sql,
         contains(
           'with check (public.is_attempt_resetter() and actor_id = auth.uid())',
         ),
+      );
+
+      // The DELETE is ownership-scoped: the intervention tier, or the author of
+      // that paper. Before this it was `is_attempt_resetter()`, which is every
+      // lecturer, so any lecturer could clear any attempt in the institution.
+      expect(
+        _policyUsing(sql, 'submissions_delete_supervisor'),
+        'public.is_exam_supervisor() or public.owns_exam(exam_id)',
       );
 
       // ...while the update policy is the one that keeps the narrower tier.
@@ -856,13 +866,13 @@ void main() {
         ),
       );
 
-      // Exactly four mentions: the definition plus those three policies. A fifth
-      // would be a policy somebody left on the old predicate (or a new caller
-      // that should be checked rather than copied).
+      // Exactly three mentions: the definition plus the two policies that follow
+      // the delete (the snapshot purge and the audit row). A fourth would be a
+      // policy somebody left on the old predicate - the DELETE used to be one.
       expect(
         RegExp(r'public\.is_attempt_resetter\(\)').allMatches(sql).length,
-        4,
-        reason: 'the function definition and its three policies',
+        3,
+        reason: 'the function definition, the snapshot purge and the audit row',
       );
     });
 
@@ -2552,34 +2562,38 @@ void main() {
       // sittings in any department.
       expect(predicate, contains('public.is_staff()'));
       expect(predicate, contains('created_by = auth.uid()'));
-      // A student only ever sees a *published* paper...
-      expect(predicate, contains('is_published = true'));
-      // ...whose labels match their own row. A paper whose label is
-      // effectively empty (NULL or whitespace-only via nullif(btrim(...)))
-      // is untargeted and stays visible to everybody. A student with a NULL
-      // or whitespace-only label is not matched by a paper that names that field.
-      for (final column in <String>['faculty', 'department', 'level']) {
-        expect(
-          predicate,
-          contains("nullif(btrim(exams.$column), '') is null"),
-        );
-        expect(
-          predicate,
-          contains(
-            "nullif(btrim(p.$column), '') is not null",
-          ),
-        );
-        expect(
-          predicate,
-          contains("lower(btrim(p.$column)) = lower(btrim(exams.$column))"),
-        );
-      }
-      // ...or one they were explicitly allowed to borrow.
-      expect(predicate, contains('from public.exam_allowed_students a'));
+      // A student only ever sees a paper the named predicate says is theirs. The
+      // rule itself no longer lives in this policy: it is
+      // `public.student_can_access_exam(id)`, so that the question feed and the
+      // attempt-insert policy ask the same question instead of carrying three
+      // copies of it that could drift apart.
+      expect(predicate, contains('public.student_can_access_exam(id)'));
       expect(
         predicate,
-        contains('a.exam_id = exams.id and a.student_id = auth.uid()'),
+        isNot(contains('is_published')),
+        reason: 'publication is asserted inside the helper, not repeated here',
       );
+
+      // The rule, where it now lives: published, every named label must match the
+      // student's own row (blank on the paper = no narrowing, blank on the
+      // profile = no match), or the student is on the borrow list.
+      final helperMatch = RegExp(
+        r'create or replace function public\.student_can_access_exam'
+        r'\(p_exam_id uuid\)[\s\S]*?as \$\$([\s\S]*?)\$\$;',
+      ).firstMatch(sql.replaceAll('\r\n', '\n'));
+      expect(helperMatch, isNotNull, reason: 'the cohort rule lost its home');
+      final rule = helperMatch!.group(1)!.replaceAll(RegExp(r'\s+'), ' ');
+      expect(rule, contains('e.is_published = true'));
+      for (final column in <String>['faculty', 'department', 'level']) {
+        expect(rule, contains("nullif(btrim(e.$column), '') is null"));
+        expect(rule, contains("nullif(btrim(p.$column), '') is not null"));
+        expect(
+          rule,
+          contains("lower(btrim(p.$column)) = lower(btrim(e.$column))"),
+        );
+      }
+      expect(rule, contains('from public.exam_allowed_students a'));
+      expect(rule, contains('a.exam_id = e.id and a.student_id = auth.uid()'));
     });
 
     test("the borrow list is the student's own row, writable by the author",
@@ -2649,42 +2663,80 @@ void main() {
       final sql = file.readAsStringSync();
 
       expect(sql, contains('drop policy if exists "exams_select"'));
+
+      // The historical file still installs the strict rule **inline** - that is
+      // what a project which predates the helper needs - while `schema.sql` now
+      // delegates the same rule to `public.student_can_access_exam()`. The two are
+      // no longer textually equal, on purpose, so the contract is that each keeps
+      // its own half: the migration the strict terms, `schema.sql` the delegation -
+      // and that the migration is marked so it cannot be applied back over the
+      // hardened policy by mistake.
+      final historical = selectPredicate(sql, 'exams_select');
+      expect(historical, contains('is_published = true'));
+      for (final column in <String>['faculty', 'department', 'level']) {
+        expect(
+          historical,
+          contains("nullif(btrim(exams.$column), '') is null"),
+        );
+      }
+      expect(historical, contains('from public.exam_allowed_students a'));
+      expect(sql, contains('DO NOT RE-RUN AFTER APPLYING'));
+
       final schema = schemaSql();
       if (schema == null) return;
       expect(
-        selectPredicate(sql, 'exams_select'),
         selectPredicate(schema, 'exams_select'),
+        contains('public.student_can_access_exam(id)'),
       );
     });
 
-    test('submissions_insert_own_ongoing relies on exams_select '
-        'because its exams subquery runs under the caller\u2019s RLS', () {
+    test('submissions_insert_own_ongoing asks the cohort rule itself, '
+        'and keeps the window', () {
       final sql = schemaSql();
       if (sql == null) return;
 
-      // The insert policy checks the paper is published and open.  It does not
-      // duplicate the targeting check because the inner `select 1 from
-      // public.exams e where e.id = exam_id` runs under the caller's RLS —
-      // `exams_select` fires and filters out papers the caller may not see.
-      // This needs an executed test against a live/local database to prove the
-      // subquery honours RLS; the static file-level contract only checks that
-      // the policy text does not add its own faculty/department/level clause.
+      // This policy used to rely on `exams_select` filtering the inner subquery,
+      // which is not what a SELECT policy does for an INSERT's WITH CHECK: an
+      // out-of-cohort student could start a paper they could not see, and then
+      // read its questions. It now asks
+      // `public.student_can_access_exam(exam_id)` itself.
       final policyStart = sql.indexOf(
         'create policy "submissions_insert_own_ongoing"',
       );
       expect(policyStart, greaterThanOrEqualTo(0));
-      // The subquery checks existence of a published exam within its window.
-      expect(sql, contains('e.is_published = true'));
-      expect(sql, contains('e.starts_at is null or now() >= e.starts_at'));
-      expect(sql, contains('e.ends_at  is null or now() <= e.ends_at'));
-      // No explicit targeting check in this policy — it relies on exams_select.
-      // Scope the assertion to just this policy statement (create policy … ;)
-      // so 'nullif(btrim' elsewhere in the file does not produce a false pass.
       final policyEnd = sql.indexOf(';', policyStart);
       final policyBody = policyEnd >= 0
           ? sql.substring(policyStart, policyEnd + 1)
           : sql.substring(policyStart);
-      expect(policyBody, isNot(contains('nullif(btrim')));
+      final normalised = policyBody.replaceAll(RegExp(r'\s+'), ' ');
+
+      expect(normalised, contains('public.student_can_access_exam(exam_id)'));
+      // The labels stay in one place - the helper - so this policy does not
+      // carry a second copy of the comparison.
+      expect(normalised, isNot(contains('nullif(btrim')));
+      // Publication is asserted by the helper now, so it is not repeated here.
+      expect(normalised, isNot(contains('e.is_published')));
+      // The window stayed, and this is still its only server-side check.
+      expect(
+        normalised,
+        contains('e.starts_at is null or now() >= e.starts_at'),
+      );
+      expect(normalised, contains('e.ends_at'));
+      // Everything the "fresh attempt" rule needs is still there.
+      for (final requirement in <String>[
+        'student_id = auth.uid()',
+        "status = 'ongoing'",
+        'score is null',
+        "answers = '{}'::jsonb",
+        'submitted_at is null',
+        'started_at = now()',
+      ]) {
+        expect(
+          normalised,
+          contains(requirement),
+          reason: '$requirement is load-bearing',
+        );
+      }
     });
 
     test('the identity numbers are declared, optional, and forwarded', () {
@@ -2759,6 +2811,140 @@ void main() {
       expect(source, contains('academic: academicFields(row)'));
     });
   });
+
+  // ---------------------------------------------------------------------
+  // The hardening wave (`supabase/migrations/2026110309*.sql`): a student
+  // cannot retarget themselves, and a paper is not readable without being
+  // aimed at you.
+  // ---------------------------------------------------------------------
+  group('exam visibility hardening', () {
+    test('the cohort rule is one named predicate, asked by all three callers', () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      // SECURITY DEFINER + stable + a pinned search_path: the question is asked
+      // from a policy on `exam_submissions` and from a definer view, neither of
+      // which may assume the caller can read `profiles`.
+      expect(
+        RegExp(
+          r'create or replace function public\.student_can_access_exam'
+          r'\(p_exam_id uuid\)\s*returns boolean\s*language sql\s*'
+          r'security definer\s*stable\s*set search_path = public',
+        ).hasMatch(sql.replaceAll('\r\n', '\n')),
+        isTrue,
+        reason: 'student_can_access_exam() must be a definer/stable predicate',
+      );
+
+      // The three callers that must not be able to disagree: the paper list, the
+      // question feed, and the attempt insert.
+      expect(
+        _policyUsing(sql, 'exams_select'),
+        contains('public.student_can_access_exam(id)'),
+      );
+      expect(sql, contains('public.student_can_access_exam(e.id)'));
+      expect(
+        sql,
+        contains('and public.student_can_access_exam(exam_id)'),
+      );
+    });
+
+    test('the question feed is aimed, windowed and attempt-aware', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      final match = RegExp(
+        r'create view public\.questions_public as([\s\S]*?);\n',
+      ).firstMatch(sql.replaceAll('\r\n', '\n'));
+      expect(match, isNotNull, reason: 'the view left schema.sql');
+      final view = match!.group(1)!;
+
+      // Still no answer key, on either shape.
+      expect(view, isNot(contains('correct_option')));
+      expect(view, isNot(contains('correct_text_answer')));
+      // The four audiences, and nothing as wide as `is_staff()`.
+      expect(view, contains('public.is_exam_supervisor()'));
+      expect(view, contains('e.created_by = auth.uid()'));
+      expect(view, contains('public.student_can_access_exam(e.id)'));
+      expect(view, contains('e.starts_at'));
+      expect(view, contains('make_interval(mins => e.duration_minutes)'));
+      expect(view, isNot(contains('is_staff')));
+      // The old blanket filter is what made the id guessable into a read.
+      expect(view, isNot(contains('where e.is_published = true;')));
+    });
+
+    test('a lecturer reads their own papers and their own evidence only', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      // The raw table: no `is_staff()` arm, so a colleague's draft is not
+      // readable just because they are employed.
+      expect(
+        _policyUsing(sql, 'questions_select_supervisor'),
+        'public.is_exam_supervisor() or public.owns_exam(exam_id)',
+      );
+
+      // Signing a URL is a SELECT, so this predicate is the read gate on the
+      // evidence itself.
+      final storage = _policyUsing(sql, 'Proctor snapshots read access');
+      expect(storage, contains('public.is_exam_supervisor()'));
+      expect(storage, contains('public.owns_exam(s.exam_id)'));
+      expect(storage, isNot(contains('is_staff')));
+    });
+
+    test('the profile labels a policy compares are not self-service', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      expect(
+        sql,
+        contains('create or replace function public.guard_profile_labels()'),
+      );
+      // INSERT as well as UPDATE: a self-provisioned row must not arrive with a
+      // cohort on it.
+      expect(
+        RegExp(
+          r'create trigger profiles_guard_labels\s*'
+          r'before insert or update on public\.profiles',
+        ).hasMatch(sql.replaceAll('\r\n', '\n')),
+        isTrue,
+        reason: 'the label guard must fire on INSERT and UPDATE',
+      );
+      for (final column in <String>[
+        'faculty',
+        'department',
+        'level',
+        'matric_number',
+        'staff_id',
+        'email',
+      ]) {
+        expect(sql, contains('new.$column'), reason: '$column is not guarded');
+      }
+    });
+
+    test('a snapshot path belongs to its attempt, and the strike still counts', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      // The folder convention the bucket, the upload policy and the purge share.
+      expect(
+        sql,
+        contains("starts_with(p_snapshot_url, p_submission_id::text || '/')"),
+      );
+
+      // The insert policy is where "may this student sit this paper" is enforced
+      // server-side; the window stayed here with it.
+      final match = RegExp(
+        r'create policy "submissions_insert_own_ongoing"'
+        r'[\s\S]*?with check \(([\s\S]*?)\);',
+      ).firstMatch(sql.replaceAll('\r\n', '\n'));
+      expect(match, isNotNull, reason: 'the insert policy left schema.sql');
+      final check = match!.group(1)!.replaceAll(RegExp(r'\s+'), ' ');
+      expect(check, contains('public.student_can_access_exam(exam_id)'));
+      expect(check, contains('started_at = now()'));
+      expect(check, contains('starts_at'));
+      expect(check, contains('ends_at'));
+    });
+  });
 }
 
 /// Reads `supabase/schema.sql`, which sits next to `mobile/` in the repository.
@@ -2787,6 +2973,20 @@ Set<UserRole>? _rolesNamedBy(String sql, String function) {
       .allMatches(match.group(1)!)
       .map((role) => UserRole.fromDb(role.group(1)!))
       .toSet();
+}
+
+/// The `using (...)` predicate of `create policy "<policy>"`, whitespace squashed
+/// to single spaces so the comparison does not depend on layout.
+///
+/// Read out of the file rather than compared against a copy of the sentence: the
+/// text in the file is what the server enforces. Null when [sql] does not declare
+/// that policy.
+String? _policyUsing(String sql, String policy) {
+  final match = RegExp(
+    'create policy "$policy"'
+    r'[\s\S]*?for (?:select|delete|update)[\s\S]*?using \(([\s\S]*?)\);',
+  ).firstMatch(sql.replaceAll('\r\n', '\n'));
+  return match?.group(1)?.replaceAll(RegExp(r'\s+'), ' ').trim();
 }
 
 /// Reads the upgrade migration a database created *before* the four question

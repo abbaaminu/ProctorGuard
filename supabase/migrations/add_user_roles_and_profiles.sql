@@ -1,6 +1,13 @@
 -- =====================================================================
 -- MIGRATION: four-role accounts (public.user_role) + public.profiles
 -- =====================================================================
+-- DO NOT RE-RUN AFTER APPLYING
+--   This file is the historical upgrade path: it installs the definition it was
+--   written against, and the hardened replacements live in
+--   `supabase/migrations/2026110309*.sql` (each lists its own APPLY ORDER). Running
+--   this file again after those would put the older policy or function back - the
+--   `DROP POLICY`/`CREATE POLICY` pair below is idempotent, which is the problem:
+--   it reinstates, silently, exactly what was replaced.
 -- Run ONCE, in the Supabase SQL editor, against a project that already has the
 -- pre-change schema. `supabase/schema.sql` is the source of truth for a fresh
 -- install and already contains everything below, so running this file on a

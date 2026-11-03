@@ -20,6 +20,7 @@ class SupervisorExamPickerPage extends ConsumerStatefulWidget {
     this.supervisorName,
     this.onSignOut,
     this.canResetAttempts = false,
+    this.canResetAnyAttempt = true,
   });
 
   /// Greeting name; the gate passes `profiles.full_name` ("Dr. Ada Nwosu").
@@ -27,7 +28,18 @@ class SupervisorExamPickerPage extends ConsumerStatefulWidget {
 
   /// Sign-out shown in the app bar (the gate owns the Supabase call).
   final VoidCallback? onSignOut;
+  /// Whether the signed-in account may reset an attempt at all
+  /// (`UserRole.canResetAttempts`, i.e. `is_attempt_resetter()`).
   final bool canResetAttempts;
+
+  /// Whether it may reset an attempt on a paper it did **not** write.
+  ///
+  /// `true` for the intervention tier (admin, supervisor) - `is_exam_supervisor()`
+  /// in `submissions_delete_supervisor` - and `false` for a lecturer, who may only
+  /// reset the papers they wrote (`owns_exam(exam_id)`). The monitor then asks the
+  /// paper's own `created_by` before offering the control, so the icon and the
+  /// policy agree instead of disagreeing after a tap.
+  final bool canResetAnyAttempt;
 
   @override
   ConsumerState<SupervisorExamPickerPage> createState() =>
@@ -43,6 +55,12 @@ class _SupervisorExamPickerPageState
           examId: exam.id,
           examTitle: exam.title,
           canResetAttempts: widget.canResetAttempts,
+          // The role gate says whether the account may reset at all; this says
+          // whether *this paper* is one of them. `owns_exam(exam_id)` is what the
+          // DELETE policy enforces, so the control is offered only when it would
+          // succeed.
+          canResetThisExam: widget.canResetAnyAttempt ||
+              exam.createdBy == SupabaseService.instance.currentUser?.id,
         ),
       ),
     );

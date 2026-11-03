@@ -92,6 +92,10 @@ class RoleGate extends ConsumerWidget {
                 UserRole.supervisor => SupervisorExamPickerPage(
                     supervisorName: profile.displayName,
                     canResetAttempts: profile.role.canResetAttempts,
+                    // Admin and supervisor are `is_exam_supervisor()` and may
+                    // reset any sitting; a lecturer only the papers they wrote.
+                    canResetAnyAttempt: profile.role == UserRole.admin ||
+                        profile.role == UserRole.supervisor,
                     onSignOut: () => _signOut(context, ref, userId),
                   ),
                 // A lecturer lands on the console that owns the work only they

@@ -407,7 +407,10 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
                 builder: (_) =>
-                    const SupervisorExamPickerPage(canResetAttempts: true),
+                    const SupervisorExamPickerPage(
+                      canResetAttempts: true,
+                      canResetAnyAttempt: true,
+                    ),
               ),
             ),
             icon: const Icon(Icons.monitor_heart_outlined),

@@ -326,6 +326,84 @@ void main() {
     expect(find.textContaining('Attempt reset'), findsOneWidget);
   });
 
+  testWidgets('the reset control also needs ownership of that paper', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    // `submissions_delete_supervisor` is
+    // `is_exam_supervisor() or owns_exam(exam_id)`: a lecturer has the role but
+    // not every paper. Offering the icon anyway would be a control whose only
+    // possible outcome is "the server deleted nothing", so the monitor asks both
+    // questions - role (`canResetAttempts`) and paper (`canResetThisExam`).
+    final overrides = [
+      examSubmissionsStreamProvider('exam-1').overrideWith(
+        (ref) => Stream.value([
+          {
+            'id': 'attempt-1',
+            'student_id': 'student-1',
+            'status': 'ongoing',
+            'score': null,
+          },
+        ]),
+      ),
+      liveViolationFeedProvider(
+        'exam-1',
+      ).overrideWith((ref) => Stream.value(<Map<String, dynamic>>[])),
+      accountNamesProvider.overrideWith(
+        (ref) => Stream.value({'student-1': 'Aisha Bello'}),
+      ),
+      dashboardRepositoryProvider.overrideWithValue(
+        _FakeDashboardRepository(),
+      ),
+    ];
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: overrides,
+        child: const MaterialApp(
+          home: SupervisorDashboardPage(
+            examId: 'exam-1',
+            examTitle: 'Biology',
+            canResetAttempts: true,
+            canResetThisExam: false,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const Key('reset-attempt-attempt-1')),
+      findsNothing,
+      reason: 'a lecturer may not reset an attempt on somebody else\'s paper',
+    );
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: overrides,
+        child: const MaterialApp(
+          home: SupervisorDashboardPage(
+            examId: 'exam-1',
+            examTitle: 'Biology',
+            canResetAttempts: true,
+            canResetThisExam: true,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const Key('reset-attempt-attempt-1')),
+      findsOneWidget,
+      reason: 'the paper\'s author (or the intervention tier) keeps the control',
+    );
+  });
+
   test('a reset whose audit row was refused still reports the reset', () async {
     final transport = _FakeTransport(
       (request) {

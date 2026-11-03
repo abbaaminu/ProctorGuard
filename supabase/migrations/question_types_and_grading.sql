@@ -47,6 +47,13 @@
 --     after authoring one true/false question and marking one essay: the first
 --     query shows four allowed types, the second counts the mark.
 -- =====================================================================
+-- DO NOT RE-RUN AFTER APPLYING
+--   This file is the historical upgrade path: it installs the definition it was
+--   written against, and the hardened replacements live in
+--   `supabase/migrations/2026110309*.sql` (each lists its own APPLY ORDER). Running
+--   this file again after those would put the older policy or function back - the
+--   `DROP POLICY`/`CREATE POLICY` pair below is idempotent, which is the problem:
+--   it reinstates, silently, exactly what was replaced.
 
 -- ---------------------------------------------------------------------
 -- 1. FOUR SHAPES

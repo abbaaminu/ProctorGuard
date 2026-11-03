@@ -56,6 +56,13 @@
 --                          'session_reset_logs_select_staff');
 --     both expressions should name `owns_exam`.
 -- =====================================================================
+-- DO NOT RE-RUN AFTER APPLYING
+--   This file is the historical upgrade path: it installs the definition it was
+--   written against, and the hardened replacements live in
+--   `supabase/migrations/2026110309*.sql` (each lists its own APPLY ORDER). Running
+--   this file again after those would put the older policy or function back - the
+--   `DROP POLICY`/`CREATE POLICY` pair below is idempotent, which is the problem:
+--   it reinstates, silently, exactly what was replaced.
 
 create or replace function public.owns_exam(p_exam_id uuid)
 returns boolean

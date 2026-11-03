@@ -38,13 +38,19 @@ enum UserRole {
   /// `is_attempt_resetter()` names in `supabase/schema.sql`
   /// (`role in ('admin', 'supervisor', 'lecturer')`).
   ///
-  /// The **policies** are the authority (`submissions_delete_supervisor`, plus
-  /// the Storage delete policy that lets the console drop the snapshots those
-  /// rows pointed at, plus the audit insert). This getter is the same question
-  /// asked by the screens that render the control, and it is asked in exactly
-  /// *one* place for that reason: the role gate, the admin dashboard, the
-  /// lecturer console and the live monitor must not be able to disagree about
-  /// whether an account may reset an attempt.
+  /// Since the reset hardening wave
+  /// (`supabase/migrations/20261103090600_submissions_delete_supervisor.sql`) the
+  /// server splits that action in two: the **DELETE** of the attempt is
+  /// `is_exam_supervisor() or owns_exam(exam_id)` - an administrator or supervisor
+  /// on any sitting, a lecturer only on the papers they wrote - while the snapshot
+  /// **purge** and the **audit row** still ask `is_attempt_resetter()`. This getter
+  /// is the *role* half of that answer, which is why the monitor also asks the
+  /// paper's own `created_by` before offering the control
+  /// (`SupervisorDashboardPage.canResetThisExam`).
+  ///
+  /// It is still asked in exactly one place: the role gate, the admin dashboard,
+  /// the lecturer console and the live monitor must not be able to disagree about
+  /// whether an account may reset an attempt at all.
   /// `schema_contract_test.dart` reads the role list back out of `schema.sql`
   /// and the migrations and fails if the two drift apart.
   ///

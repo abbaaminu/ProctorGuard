@@ -45,6 +45,13 @@
 --     should name that attempt, carry the actor the database derived from the
 --     caller's JWT, and be the only one there.
 -- =====================================================================
+-- DO NOT RE-RUN AFTER APPLYING
+--   This file is the historical upgrade path: it installs the definition it was
+--   written against, and the hardened replacements live in
+--   `supabase/migrations/2026110309*.sql` (each lists its own APPLY ORDER). Running
+--   this file again after those would put the older policy or function back - the
+--   `DROP POLICY`/`CREATE POLICY` pair below is idempotent, which is the problem:
+--   it reinstates, silently, exactly what was replaced.
 
 -- The reset tier, repeated here so this file stays re-runnable on a database that
 -- predates it: `is_attempt_resetter()` is the same sentence

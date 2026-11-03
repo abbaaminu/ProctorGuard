@@ -96,12 +96,30 @@ String _clock(String? iso) {
 class SupervisorDashboardPage extends ConsumerWidget {
   final String examId;
   final String examTitle;
+
+  /// Whether this account may reset an attempt **at all** - the role gate's
+  /// answer (`UserRole.canResetAttempts`, i.e. `is_attempt_resetter()`).
   final bool canResetAttempts;
+
+  /// Whether this account may reset an attempt **on this paper**.
+  ///
+  /// The role gate answers the first question and the policy answers this one:
+  /// `submissions_delete_supervisor` is
+  /// `is_exam_supervisor() or owns_exam(exam_id)`, so an administrator or a
+  /// supervisor may clear any sitting while a lecturer may clear only the papers
+  /// they wrote. Offering the control on somebody else's paper would be an icon
+  /// whose only outcome is "the server deleted nothing" - so the two booleans are
+  /// asked together, and a caller that does not know the paper's author (the role
+  /// gate's lecturer path does know: it only ever lists the lecturer's own papers)
+  /// must pass `false` rather than guess.
+  final bool canResetThisExam;
+
   const SupervisorDashboardPage({
     super.key,
     required this.examId,
     required this.examTitle,
     this.canResetAttempts = false,
+    this.canResetThisExam = true,
   });
 
   /// Human wording for `proctoring_logs.action_type`, kept identical to the
@@ -124,7 +142,7 @@ class SupervisorDashboardPage extends ConsumerWidget {
     final nameById = names.valueOrNull ?? const <String, String>{};
 
     Future<void> resetAttempt(Map<String, dynamic> row) async {
-      if (!canResetAttempts) return;
+      if (!canResetAttempts || !canResetThisExam) return;
       final submissionId = row['id'] as String;
       final inFlight =
           ref.read(submissionResetInFlightProvider(submissionId).notifier);
@@ -328,7 +346,7 @@ class SupervisorDashboardPage extends ConsumerWidget {
                                                   .onSurfaceVariant,
                                         ),
                                       ),
-                                      if (canResetAttempts)
+                                      if (canResetAttempts && canResetThisExam)
                                         Consumer(
                                           builder: (context, watchRef, _) {
                                             final resetting = watchRef.watch(

@@ -47,9 +47,9 @@ android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLoc
    **On the web there is no ML Kit**, so a browser session runs either in mock
    mode (`.\run_app.ps1 -Mock`, or `--dart-define=MOCK_CAMERA=true`) or with a
    webcam and the shipped browser sensor (`web/proctor_face_detector.js`: camera
-   presence, blank/covered-frame detection, and a face count where the browser
-   exposes the Shape Detection API). A hosting page can add its own detections
-   through the `proctorGuardFaceSignal` bridge (see
+   presence, blank/covered-frame detection, and a face count and head pose from
+   `window.FaceDetector` or the shipped MediaPipe model). A hosting page can
+   add its own detections through the `proctorGuardFaceSignal` bridge (see
    [Face signals on the web](#face-signals-on-the-web-the-host-page-bridge)); the
    audio hook (`reportAudioLevel`) and the
    browser guards below are platform-independent and work either way.
@@ -573,16 +573,22 @@ admin-create-user` and why the key never reaches the app).
 
 `SupervisorExamPickerPage` lists published exams and opens
 `SupervisorDashboardPage`, whose roster and incident feed are Supabase Realtime
-streams. Whether the roster offers the reset control is decided in one place,
-`UserRole.canResetAttempts` — `admin`, `supervisor` **and** `lecturer`, which is
-`is_attempt_resetter()`'s own list in `supabase/schema.sql` read back out of the
-file by `schema_contract_test.dart`, so the role gate, the admin dashboard, the
-lecturer console and the live monitor cannot disagree about it. Lecturers reach
+streams. Whether the roster offers the reset control is decided in two questions,
+asked together: the **role**, `UserRole.canResetAttempts` — `admin`, `supervisor`
+**and** `lecturer`, which is `is_attempt_resetter()`'s own list in
+`supabase/schema.sql` read back out of the file by `schema_contract_test.dart` —
+and the **paper**, `canResetThisExam`, which the monitor answers from
+`exams.created_by` unless the caller is admin/supervisor. That second question is
+the delete policy's own: `submissions_delete_supervisor` is
+`is_exam_supervisor() or owns_exam(exam_id)`, so a lecturer may clear an attempt
+on the papers they wrote and not on anybody else's — the control is hidden where
+the server would refuse, rather than offering an icon whose only outcome is "the
+server deleted nothing". Lecturers reach
 this same console from their own home (the app bar's Monitor action) and can watch
 a sitting; what the lecturer's monitor shows *less* of is evidence — its incident
 feed comes back scoped to the papers they wrote (`owns_exam()`), where a
-supervisor's reads every paper's. `AdminDashboardPage` mounts its picker with the
-flag set, because only an admin can reach that screen.
+supervisor's reads every paper's. `AdminDashboardPage` mounts its picker with both
+flags set, because only an admin can reach that screen.
 
 A reset deletes the attempt with its cascaded incident rows, purges the snapshot
 objects those rows pointed at through the Storage API, and then records what it
@@ -708,9 +714,13 @@ have been read without awarding nothing for the ones that have not.
 **Invigilation is not duplicated.** The console's app bar opens the *same*
 supervisor console (`SupervisorExamPickerPage` → the live monitor) rather than a
 second monitor screen, and its reset control is asked of the role
-(`UserRole.lecturer.canResetAttempts`) so this screen and the role gate cannot
+(`UserRole.lecturer.canResetAttempts`) **and** of the paper
+(`canResetAnyAttempt: false`, so the monitor compares the paper's `created_by`
+with the signed-in account) so this screen, the role gate and the policy cannot
 disagree — `is_attempt_resetter()` does name `lecturer`, because the paper's author
-is the one who repairs a wrong answer key. A lecturer can watch a sitting and read
+is the one who repairs a wrong answer key, but the DELETE itself is
+`is_exam_supervisor() or owns_exam(exam_id)`: a lecturer clears attempts on their
+own papers. A lecturer can watch a sitting and read
 every attempt (`is_staff()` on the roster), but what was *recorded* in a sitting
 stays scoped to the papers they wrote (`owns_exam()`) — see "Role routing
 (post-login)" — where the supervisor tier reads every paper's.
@@ -954,12 +964,12 @@ Details worth knowing:
   `UnimplementedError`, which is the "Proctoring could not start on this device"
   screen a browser student used to get on a perfectly working camera. The preview
   and the still-frame evidence are unaffected; what the web cannot do is run the
-  app's own face model on the feed \u2014 the web runs the browser\u2019s
+  app's own face model on the feed — the web runs the browser's
   built-in `window.FaceDetector` where available, falling back to a
   **MediaPipe FaceLandmarker** (`web/proctor_face_detector.js`, `web/mediapipe/`)
   WASM model. It reports face count and 3D head pose where the model loads, and
   degrades to pixel-level covered/blank checks when WASM or the model files are
-  unavailable \u2014 which is what the gate says before the paper starts.
+  unavailable — which is what the gate says before the paper starts.
   The shipped page-level sensor still watches the preview for a covered, closed
   or blanked camera (see the web section above), so "nobody in frame" is not
   blind on the web. A camera the browser reports as **still in use** is re-opened
@@ -1084,16 +1094,18 @@ the dashboard says which host it was.
 `lib/core/services/platform_capabilities.dart` answers the two questions a
 single `kIsWeb` test used to answer in one breath, via `platformHasCamera()` /
 `platformHasFaceDetector()`. The browser is why they are separate: a browser
-camera is real (`camera_web`) while nothing there can pick a face out of the
-frames, because ML Kit is Android and iOS only. So on the web:
+camera is real (`camera_web`) while ML Kit — the engine behind the phone
+build's `MediaPipeProctoringService` — is Android and iOS only. So on the web:
 
-* the report is marked `faceDetectionInactive`, and the exam screen says so
-  before the exam starts rather than a proctoring report admitting it afterwards
-  — the camera feed is live, but only still frames on violation are stored for review;
-* the host page's own detector can still add face signals through the
-  `proctorGuardFaceSignal` bridge
-  ([below](#face-signals-on-the-web-the-host-page-bridge)), which is how a
-  browser session gets automated face evidence at all;
+* the report is marked `faceDetectionInactive` — ML Kit is not the engine here —
+  and the exam screen says so before the exam starts rather than a proctoring
+  report admitting it afterwards; the feed is live, but only stills are stored;
+* face signals keep arriving anyway: `web/proctor_face_detector.js`, shipped
+  with the build and loaded by `web/index.html`, feeds `WebFaceSignalSource`
+  the same sentences a phone's ML Kit feeds the monitor — presence, a covered or
+  frozen frame, face count and head pose are evidence with no host page at all
+  ([below](#face-signals-on-the-web-the-host-page-bridge)); a host page may add
+  its own detections through the same `proctorGuardFaceSignal` bridge;
 * `MOCK_CAMERA=true` still runs the entire exam screen, so the web build is a
   complete development harness without a webcam.
 
@@ -1142,12 +1154,21 @@ shadow root above it. Per tick:
 * **A hidden page reports nothing at all.** A backgrounded tab is already
   `app_minimized` from the web guard, and the browser throttles its timers there;
   charging the same act twice would flag a preview the student could not uncover.
-* **Otherwise a live, non-blank frame.** If the browser exposes the Shape
-  Detection API (`window.FaceDetector`, Chromium only) the count decides:
-  `0` → `no_face`, more than one → `multiple_faces`, one → `centered`. Without it
-  the page says `centered`, which is what ends an absence episode — it is never a
-  strike, so a browser that cannot count faces still catches a covered or closed
-  camera and still cannot invent a missing student.
+* **Otherwise a live, non-blank frame.** A face model decides, and this page has
+  two, in the order they are trusted: the browser's own Shape Detection API
+  (`window.FaceDetector`, Chromium only) and, for every browser that ships none,
+  the **MediaPipe FaceLandmarker** this build carries (`web/mediapipe/`:
+  `vision_bundle.mjs`, the WASM runtime and `face_landmarker.task`, imported
+  lazily from the app's own origin once a camera is live, and moved by a
+  `window.proctorGuardMediaPipe` the host page may set before this script loads).
+  A page never runs both. The count decides: `0` → `no_face`, more than one →
+  `multiple_faces`, one → `centered` or a measured `pose:<yaw>,<pitch>` when the
+  landmarks give an angle. When neither model can look — no Shape Detection API
+  and the shipped model still loading, failed to load, or turned off by the host
+  page, which is why the WASM and the `.task` file have to be deployed beside the
+  build — the page says `centered`: never a strike, so a browser that cannot count
+  faces still catches a covered or closed camera and still cannot invent a missing
+  student.
 
 `ProctorGuardFaceDetector.diagnostics()` in the page console answers "why is
 nothing being flagged" for one sitting: `hook` (is the attempt's Dart side
@@ -1155,10 +1176,14 @@ listening), `video` (was the preview found), `reason` (which state it is in), an
 `lastVerdict` (what the page last said). A page that never finds a preview warns
 once on the console instead of staying silent.
 
-It does **not** report `looking_away`: a head pose is something a model measures,
-and guessing an angle from a bounding box would be inventing evidence. A host
-running a real detector (WASM/WebGPU, or a remote service) keeps using the bridge
-below and can say `looking_away` or `pose:<yaw>,<pitch>` itself.
+It reports `looking_away` only from a **measured** pose, never from a bounding
+box: the MediaPipe landmarks give yaw (how far the nose has swung from the
+midpoint between the eyes) and pitch (its drop below the eye line), smoothed over
+a few ticks and judged by `WebFacePresenceMonitor` with the phone build's own
+tolerances (`15°` yaw / `18°` pitch, and a turn past `30°` yaw at once). A count
+with no angle stays a count. A host running a different detector (WASM/WebGPU, or
+a remote service) keeps using the bridge below and can say `looking_away` or
+`pose:<yaw>,<pitch>` itself.
 
 ```js
 // Once per detection, from any page-level detector (WASM, WebGPU, a remote
@@ -1417,7 +1442,7 @@ the 3-strike rule:
 | Detector | Signal | `action_type` |
 | --- | --- | --- |
 | ML Kit face detection | no face (three consecutive frames) / several faces / head pose off-axis (one frame past ~15 deg yaw or ~18 deg pitch) | `no_face`, `multiple_faces`, `looking_away` |
-| `web/proctor_face_detector.js` (Chrome/Edge) | the preview's camera track ended, is muted/disabled, is paused or hidden, a preview that has shown nothing for five seconds, or the frame carries no picture (featureless whatever its brightness, dim and near-featureless, blown out, or the same thumbnail for three ticks running) → `no_face`; a face count where the browser has the Shape Detection API ([details above](#face-signals-on-the-web-the-host-page-bridge)) | `no_face`, `multiple_faces` |
+| `web/proctor_face_detector.js` (Chrome/Edge) | the preview's camera track ended, is muted/disabled, is paused or hidden, a preview that has shown nothing for five seconds, or the frame carries no picture (featureless whatever its brightness, dim and near-featureless, blown out, or the same thumbnail for three ticks running) → `no_face`; a face count and head pose from the Shape Detection API or the shipped MediaPipe model, so a look-away becomes `looking_away` too ([details above](#face-signals-on-the-web-the-host-page-bridge)) | `no_face`, `multiple_faces`, `looking_away` |
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
 | `WebGuards` (Chrome/Edge) | tab hidden, window blurred, or HTML5 fullscreen left | `app_minimized` |

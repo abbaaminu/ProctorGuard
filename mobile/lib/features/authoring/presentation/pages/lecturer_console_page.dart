@@ -157,6 +157,11 @@ class _LecturerConsolePageState extends ConsumerState<LecturerConsolePage> {
         builder: (_) => SupervisorExamPickerPage(
           supervisorName: fallback,
           canResetAttempts: UserRole.lecturer.canResetAttempts,
+          // A lecturer may only reset an attempt on a paper they wrote
+          // (`owns_exam(exam_id)` in `submissions_delete_supervisor`); this list
+          // is already scoped to their own papers, so each row passes the
+          // ownership test in the monitor.
+          canResetAnyAttempt: false,
         ),
       ),
     );

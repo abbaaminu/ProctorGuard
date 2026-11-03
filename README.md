@@ -128,9 +128,9 @@ rather than left to be mistaken for more than it is.
   reported as a blocked camera), and it opens no capture session of its own — that
   is what Chromium reports as "another app or tab is already using the camera".
   The session asks `CameraPlatform.instance.supportsImageStreaming()` before
-  `startImageStream`, because `camera_web` has no image stream to offer. Raw frames
-  and face signals are the only things missing; the preview, the still-frame
-  evidence and every browser guard are the same code path as the phone build.
+  `startImageStream`, because `camera_web` has no image stream to offer. The app's own
+  frame loop is what a browser cannot run, and the shipped detector above replaces it;
+  the preview, the still-frame evidence and the browser guards are the phone build's.
 - **Android is the only *native* proctoring host.** The repository ships an
   `android/` runner, an `ios/` scaffold and a `web/` target. The `windows/` and
   `linux/` runners have been removed: they built and started, but could **never
@@ -181,10 +181,10 @@ lose proctoring signals but cannot change a result.
    supabase db query --linked -f supabase/migrations/private_proctor_snapshots.sql
    supabase db query --linked -f supabase/migrations/academic_targeting.sql
    supabase db query --linked -f supabase/migrations/profile_identity_numbers.sql
-supabase db query --linked -f supabase/migrations/strict_targeting_null_profiles.sql
+   supabase db query --linked -f supabase/migrations/strict_targeting_null_profiles.sql
+   supabase db query --linked -f supabase/migrations/optional_question_shuffling.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
-supabase db query --linked -f supabase/migrations/optional_question_shuffling.sql
    earlier: without it, an attempt reset from the staff console still works, but
    its audit row cannot be written and the console reports the gap
    (`session_reset_logs` in [mobile/README.md](./mobile/README.md)).
@@ -223,7 +223,12 @@ supabase db query --linked -f supabase/migrations/optional_question_shuffling.sq
    `add column if not exists` and re-runnable: without them the console still
    creates accounts, it just leaves those columns unset, and every existing
    account and paper keeps the access it had.
-\n    `strict_targeting_null_profiles.sql` **must** come after\n    `academic_targeting.sql` — it replaces the same `exams_select` policy with a\n    stricter version. Re-running `academic_targeting.sql` after it restores the\n    original NULL-matches-all rule, so always apply both together.\n    `optional_question_shuffling.sql` adds the `shuffle_questions` column and is\n    independent of every other migration.\n2. Deploy the account-management functions:
+   `strict_targeting_null_profiles.sql` **must** come after
+   `academic_targeting.sql` — it replaces the same `exams_select` policy with a
+   stricter version. Re-running `academic_targeting.sql` after it restores the
+   original NULL-matches-all rule, so always apply both together.
+   `optional_question_shuffling.sql` adds the `shuffle_questions` column and is
+   independent of every other migration.
 2. Deploy the account-management functions:
    ```powershell
    supabase functions deploy admin-create-user

@@ -10,9 +10,14 @@
 --     unless the caller is an admin (guard_user_role_change). The four roles
 --     live in the `user_role` enum: admin, lecturer, supervisor, student.
 --   * Students never see answer keys: there is no student SELECT policy on
---     `questions`; they read the definer view `questions_public` (published
---     exams only, neither `correct_option` nor `correct_text_answer`) while
---     staff (`is_staff()`) read the raw table.
+--     `questions`; they read the definer view `questions_public`, which carries
+--     neither `correct_option` nor `correct_text_answer` and shows a row only to
+--     four audiences (section 3): admins and supervisors, the paper's author, a
+--     student the paper is aimed at **while its window is open**, or the owner of
+--     an ongoing attempt until that attempt's deadline. On the raw table a
+--     lecturer reads the papers they wrote and an admin/supervisor reads every
+--     paper (`questions_select_supervisor`), so being employed is not a way into
+--     somebody else's draft.
 --   * Four question shapes share `questions`: `'multiple_choice'` (options + an
 --     index), `'true_false'` (`correct_text_answer` is 'true' or 'false'),
 --     `'fill_in_the_blank'` (`correct_text_answer`, graded case-insensitively
@@ -290,13 +295,16 @@ $$;
 -- here lets a lecturer rewrite a row in place, which is what that predicate
 -- still guards.
 --
--- Every policy the reset rides on asks this one predicate
--- (`submissions_delete_supervisor`, the `Proctor snapshots supervisor purge`
--- storage policy, and `session_reset_logs_insert_supervisor`), so the tier is
--- named once and the audit trail cannot end up disagreeing with the delete it
--- records. `UserRole.canResetAttempts` in the Flutter app is the same list
--- asked on the client; `mobile/test/schema_contract_test.dart` reads this
--- sentence back out of the file and fails if the two drift apart.
+-- The snapshot purge and the reset audit row ask this predicate - the two steps
+-- that follow the delete and must keep working for the caller the delete has just
+-- allowed. The delete itself is narrower by design:
+-- `submissions_delete_supervisor` asks `is_exam_supervisor() or owns_exam(exam_id)`,
+-- because deleting an attempt is a repair of a paper you wrote, while
+-- `is_attempt_resetter()` (every lecturer) would let any lecturer delete any
+-- attempt in the institution. `UserRole.canResetAttempts` in the Flutter app is
+-- this list (admin, supervisor, lecturer), and the console gates the *control* per
+-- row to the papers the lecturer owns; `mobile/test/schema_contract_test.dart`
+-- reads this sentence back out of the file and fails if the two drift apart.
 create or replace function public.is_attempt_resetter()
 returns boolean
 language sql
@@ -344,6 +352,69 @@ as $$
     where id = p_exam_id and created_by = auth.uid()
   );
 $$;
+
+-- "May this student sit this paper?" - published, and aimed at the caller either
+-- by the paper's faculty/department/level or by its borrow list.
+--
+-- Three places ask it and none of them can ask the others: `exams_select` (may I
+-- see the paper?), `questions_public` (may I read its questions?) and
+-- `submissions_insert_own_ongoing` (may I start it?). A policy on
+-- `exam_submissions` and a definer *view* may not assume the caller can read
+-- `exams`, `profiles` or `exam_allowed_students` without re-entering those tables'
+-- policies - and for `exams`, re-entering `exams_select` itself. Named once here,
+-- the strict rule (blank paper label = no narrowing, blank profile field = no
+-- match, borrow list as its own OR branch) cannot drift between its three callers -
+-- which is exactly how a student used to be unable to *see* a paper while still
+-- being able to start it and read its questions.
+--
+-- No schedule window: "may this student ever sit this paper" and "is the window
+-- open now" are different questions, and a window here would drop a closed paper
+-- out of the student's own history. The callers that need the window ask for it
+-- themselves (`submissions_insert_own_ongoing`, `questions_public`).
+--
+-- No `is_staff()` arm either: staff access does not depend on being aimed at, so
+-- the callers OR in `is_exam_supervisor()` / `owns_exam()` on their own.
+create or replace function public.student_can_access_exam(p_exam_id uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.exams e
+    where e.id = p_exam_id
+      and e.is_published = true
+      and (
+        exists (
+          select 1
+          from public.profiles p
+          where p.id = auth.uid()
+            and (nullif(btrim(e.faculty), '') is null
+                 or (nullif(btrim(p.faculty), '') is not null
+                     and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
+            and (nullif(btrim(e.department), '') is null
+                 or (nullif(btrim(p.department), '') is not null
+                     and lower(btrim(p.department)) = lower(btrim(e.department))))
+            and (nullif(btrim(e.level), '') is null
+                 or (nullif(btrim(p.level), '') is not null
+                     and lower(btrim(p.level)) = lower(btrim(e.level))))
+        )
+        or exists (
+          select 1
+          from public.exam_allowed_students a
+          where a.exam_id = e.id and a.student_id = auth.uid()
+        )
+      )
+  );
+$$;
+
+comment on function public.student_can_access_exam(uuid) is
+  'True when the paper is offered to the caller: published, and matched either by its faculty/department/level labels (blank label = no narrowing, blank profile field = no match) or by the exam_allowed_students borrow list. Not a schedule-window test and not a staff test.';
+
+revoke execute on function public.student_can_access_exam(uuid) from public, anon;
+grant execute on function public.student_can_access_exam(uuid) to authenticated, service_role;
 
 -- Historical name, kept deliberately: a policy or RPC created by an *earlier*
 -- revision of this file still calls it on a database that has not re-run this
@@ -454,6 +525,107 @@ drop trigger if exists profiles_guard_role_change on public.profiles;
 create trigger profiles_guard_role_change
   before update on public.profiles
   for each row execute function public.guard_user_role_change();
+
+-- The same argument as `role`, for the other columns a policy trusts.
+--
+-- `profiles_update_self` and `profiles_insert_self_student` above are *row*
+-- policies, and RLS cannot restrict columns, so an account could rewrite its own
+-- `faculty` / `department` / `level` and retarget itself: `exams_select`,
+-- `student_can_access_exam()` and `questions_public` all compare those columns
+-- against the reader's own row, so aiming a paper is pointless if the target can
+-- move. `matric_number` / `staff_id` are the identity a human reads on the roster
+-- and in every export taken from it, and `email` is the address the row was
+-- provisioned with - the join key a roster import matches, and the login address
+-- in `auth.users`.
+--
+-- For a caller that arrives with JWT claims whose `role` claim is not
+-- 'service_role' and who is not an admin: on INSERT the three labels and the two
+-- identity numbers must be NULL, and `lower(email)` must equal the JWT's `email`
+-- claim (a self-provisioned row is a name and an address, not an academic
+-- identity); on UPDATE those five columns and `email` are immutable. `full_name`
+-- stays editable, since `profiles_update_self` says owners may correct their name
+-- and no policy compares it.
+--
+-- The escape hatches are `guard_user_role_change()`'s, for the same reason - a
+-- project could not be bootstrapped without them: no claims at all (SQL editor,
+-- `supabase db reset`, `seed.sql`, the fixtures in `supabase/tests/`) or the
+-- service_role key (the admin Edge Functions and roster imports).
+create or replace function public.guard_profile_labels()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  -- Null for anything that did not arrive through PostgREST: a migration, the SQL
+  -- editor, `supabase db reset`, a fixture in `supabase/tests/`.
+  v_claims      text := nullif(current_setting('request.jwt.claims', true), '');
+  v_claim_role  text := '';
+  v_claim_email text;
+begin
+  if v_claims is null then
+    return new;
+  end if;
+
+  begin
+    v_claim_role  := coalesce(v_claims::jsonb ->> 'role', '');
+    v_claim_email :=
+      nullif(lower(btrim(coalesce(v_claims::jsonb ->> 'email', ''))), '');
+  exception
+    when others then
+      -- A malformed claim is not a privilege: fall through as an ordinary caller.
+      v_claim_role  := '';
+      v_claim_email := null;
+  end;
+
+  if v_claim_role = 'service_role' or public.is_admin() then
+    return new;
+  end if;
+
+  if tg_op = 'INSERT' then
+    if new.faculty          is not null
+       or new.department    is not null
+       or new.level         is not null
+       or new.matric_number is not null
+       or new.staff_id      is not null then
+      raise exception 'academic labels and identity numbers are set by the institution, not at sign-up'
+        using errcode = '42501',
+              hint = 'leave faculty, department, level, matric_number and staff_id null; an administrator records them from the roster';
+    end if;
+
+    if v_claim_email is null
+       or lower(btrim(new.email)) <> v_claim_email then
+      raise exception 'profiles.email must be the address of the authenticated account'
+        using errcode = '42501',
+              hint = 'insert the row for the address you signed in with; an administrator can correct it later';
+    end if;
+
+    return new;
+  end if;
+
+  if new.faculty          is distinct from old.faculty
+     or new.department    is distinct from old.department
+     or new.level         is distinct from old.level
+     or new.matric_number is distinct from old.matric_number
+     or new.staff_id      is distinct from old.staff_id
+     or new.email         is distinct from old.email then
+    raise exception 'profile labels are set by the institution, not by the account'
+      using errcode = '42501',
+            hint = 'ask an administrator to correct faculty, department, level, matric_number, staff_id or email';
+  end if;
+
+  return new;
+end;
+$$;
+
+comment on function public.guard_profile_labels() is
+  'Refuses a self-service write to the profile labels a policy compares or a human reads: on INSERT the academic labels and identity numbers must be null and the email must be the session''s own; on UPDATE those five columns and email are immutable. Administrators, service_role and claims-less sessions (SQL editor, migrations) may write them.';
+
+drop trigger if exists users_guard_labels on public.profiles;
+drop trigger if exists profiles_guard_labels on public.profiles;
+create trigger profiles_guard_labels
+  before insert or update on public.profiles
+  for each row execute function public.guard_profile_labels();
 
 -- ---------------------------------------------------------------------
 -- 2. EXAMS
@@ -603,30 +775,7 @@ create policy "exams_select"
   using (
     public.is_staff()
     or created_by = auth.uid()
-    or (
-      is_published = true
-      and (
-        exists (
-          select 1
-          from public.profiles p
-          where p.id = auth.uid()
-            and (nullif(btrim(exams.faculty), '') is null
-                 or (nullif(btrim(p.faculty), '') is not null
-                     and lower(btrim(p.faculty)) = lower(btrim(exams.faculty))))
-            and (nullif(btrim(exams.department), '') is null
-                 or (nullif(btrim(p.department), '') is not null
-                     and lower(btrim(p.department)) = lower(btrim(exams.department))))
-            and (nullif(btrim(exams.level), '') is null
-                 or (nullif(btrim(p.level), '') is not null
-                     and lower(btrim(p.level)) = lower(btrim(exams.level))))
-        )
-        or exists (
-          select 1
-          from public.exam_allowed_students a
-          where a.exam_id = exams.id and a.student_id = auth.uid()
-        )
-      )
-    )
+    or public.student_can_access_exam(id)
   );
 
 create policy "exams_insert_supervisor_only"
@@ -739,8 +888,13 @@ drop policy if exists "questions_write_owner" on public.questions;
 drop policy if exists "questions_update_owner" on public.questions;
 drop policy if exists "questions_delete_owner" on public.questions;
 
--- Owner-scoped first, then staff-wide (the same shape as exams_select): staff
--- access to an exam's full question set is separate from the student-safe view.
+-- Two SELECT paths, and the difference between them is the point of this pair:
+-- the author reads their own paper's questions, and an admin or supervisor reads
+-- every paper's. The second used to be `is_staff()` - i.e. every lecturer - so any
+-- lecturer could read any paper's questions, a colleague's unpublished draft
+-- included. `owns_exam()` is the same ownership question asked from the row's
+-- `exam_id`, so this policy and the owner policy below cannot disagree about who
+-- wrote what.
 create policy "questions_select_owner"
   on public.questions for select
   to authenticated
@@ -755,7 +909,10 @@ create policy "questions_select_owner"
 create policy "questions_select_supervisor"
   on public.questions for select
   to authenticated
-  using (public.is_staff());
+  using (
+    public.is_exam_supervisor()
+    or public.owns_exam(exam_id)
+  );
 
 -- NOTE: there is deliberately NO student SELECT policy on this table, and that
 -- is the whole point of the view further down. A policy that lets students read
@@ -796,8 +953,22 @@ create policy "questions_delete_owner"
   );
 
 -- Student-safe view: strips both answer keys (`correct_option` and
--- `correct_text_answer`) so students never receive them, and returns published
--- exams only.
+-- `correct_text_answer`) so students never receive them, and returns one row per
+-- *audience* instead of every published row:
+--   1. an admin or supervisor (`is_exam_supervisor()`);
+--   2. the paper's author (`e.created_by = auth.uid()`), who authored these rows;
+--   3. a student the paper is aimed at, **while its window is open** -
+--      `student_can_access_exam(e.id)` plus `starts_at` / `ends_at`;
+--   4. the owner of an `'ongoing'` attempt on it, until that attempt's deadline
+--      (`started_at + duration_minutes`).
+-- `e.is_published = true` alone - which is what this was - meant a student who
+-- could not even *see* the paper in their list could read its questions by
+-- guessing its id (exam ids travel in links, exports and the console UI), and a
+-- paper not yet open could be read the moment it was published.
+--
+-- The `LEFT JOIN` follows `exam_submissions` on the caller's own attempt, and it
+-- cannot duplicate the feed: that table is `unique (student_id, exam_id)` (§4), so
+-- it contributes at most one row per question.
 --
 -- `security_invoker` is turned OFF on purpose. With invoker semantics the view
 -- runs under the caller's own policies, which would require exactly the student
@@ -822,12 +993,25 @@ create view public.questions_public as
          q.created_at
   from public.questions q
   join public.exams e on e.id = q.exam_id
-  where e.is_published = true;
+  left join public.exam_submissions s
+         on s.exam_id = e.id
+        and s.student_id = auth.uid()
+  where public.is_exam_supervisor()
+     or e.created_by = auth.uid()
+     or (
+       public.student_can_access_exam(e.id)
+       and (e.starts_at is null or now() >= e.starts_at)
+       and (e.ends_at   is null or now() <= e.ends_at)
+     )
+     or (
+       s.status = 'ongoing'
+       and s.started_at + make_interval(mins => e.duration_minutes) > now()
+     );
 
 alter view public.questions_public set (security_invoker = false);
 
 comment on view public.questions_public is
-  'Student-facing question feed: published exams only, neither answer key.';
+  'Student-facing question feed: neither answer key; one row per audience - supervisor/admin, the paper''s author, a student the paper is offered to while its window is open, or the owner of an ongoing attempt until its deadline.';
 
 grant select on public.questions_public to authenticated;
 
@@ -891,6 +1075,15 @@ create policy "submissions_select_own_or_supervisor"
 -- timestamp on a published exam. Otherwise a client could preseed answers or
 -- choose a future start time to bypass the server-enforced deadline.
 --
+-- "Is it this student's paper?" is asked here too, through
+-- `student_can_access_exam(exam_id)` - the same predicate `exams_select` and the
+-- question feed use. Without it, hiding a paper from the list was cosmetic: a
+-- patched client could POST an attempt on any published paper and then read its
+-- questions, and an attempt is the row every other row (answers, logs, snapshots,
+-- the roster card) hangs from. Publication moved inside that predicate, so
+-- `is_published` is no longer repeated below - one statement of "published" per
+-- insert instead of two that could drift apart.
+--
 -- The window is asked here too, and this is the *only* server-side check on it:
 -- hiding a tile in the portal is courtesy, so a patched client gets no attempt
 -- row before `starts_at` or after `ends_at`. Both bounds are optional, so both
@@ -906,10 +1099,10 @@ create policy "submissions_insert_own_ongoing"
     and answers = '{}'::jsonb
     and submitted_at is null
     and started_at = now()
+    and public.student_can_access_exam(exam_id)
     and exists (
       select 1 from public.exams e
       where e.id = exam_id
-        and e.is_published = true
         and (e.starts_at is null or now() >= e.starts_at)
         and (e.ends_at  is null or now() <= e.ends_at)
     )
@@ -933,15 +1126,30 @@ create policy "submissions_update_supervisor"
 -- the evidence go with the attempt.
 --
 -- The reset tier - wider than the update policy above by exactly one role. It is
--- `is_attempt_resetter()` rather than `is_exam_supervisor()` for that reason: the
--- lecturer who wrote the paper can clear an attempt, and a student cannot.
+-- `is_exam_supervisor() or owns_exam(exam_id)`: the intervention tier can clear
+-- any sitting, and the lecturer who wrote *this* paper can clear an attempt on it -
+-- which is the repair the control exists for (the wrong answer key, the mis-aimed
+-- disqualification). It used to be `is_attempt_resetter()`, which is every
+-- lecturer, so any lecturer could delete any student's attempt on any paper in the
+-- institution, cascading away its incident rows - the destructive half of the
+-- review's finding (c).
 -- Students are deliberately left out. A student who could delete their own row
 -- would be able to erase a graded attempt - and the evidence behind a
 -- disqualification - and then simply start the exam again.
+--
+-- The purge of the snapshots and the audit row of §7 keep the wider
+-- `is_attempt_resetter()` tier on purpose: a delete this policy refuses removes
+-- zero rows, and the console reads that zero and stops *before* purging or
+-- auditing (`resetSubmission()` checks `.delete().select()`). Making that
+-- sequence atomic is the reset RPC proposed in `supabase/RESET_ATTEMPT_RPC_PROPOSAL.md`,
+-- not something a policy can do.
 create policy "submissions_delete_supervisor"
   on public.exam_submissions for delete
   to authenticated
-  using (public.is_attempt_resetter());
+  using (
+    public.is_exam_supervisor()
+    or public.owns_exam(exam_id)
+  );
 
 -- A closed attempt stops being editable.
 --
@@ -1164,23 +1372,31 @@ drop policy if exists "Proctor snapshots upload access" on storage.objects;
 drop policy if exists "Proctor snapshots upload own ongoing session" on storage.objects;
 drop policy if exists "Proctor snapshots supervisor purge" on storage.objects;
 
--- Read: the student who owns the submission, or any member of staff. With the
+-- Read (and therefore sign): the student the submission belongs to, the
+-- intervention tier, or the author of the paper the attempt is against. With the
 -- bucket private this is not a convenience any more - it is the only thing that
 -- lets anybody read a still at all, because Storage refuses both the object and
--- the signature without it (signing is a SELECT under the hood). Supervisor-wide
--- on purpose, to match submissions_select_own_or_supervisor.
+-- the signature without it (signing is a SELECT under the hood).
+--
+-- It ended in `or public.is_staff()`, which is everybody employed: any lecturer
+-- could sign a ten-minute URL to a photograph of any student in any sitting. The
+-- evidence tier is narrower than the roster tier for the same reason
+-- `proctoring_logs` is (`owns_exam()`), except that here the evidence is a face.
+-- The supervisor arm is deliberately *outside* the EXISTS so the intervention tier
+-- can still read an object whose folder no longer resolves to a submission - the
+-- state between deleting an attempt and purging its stills.
 create policy "Proctor snapshots read access"
   on storage.objects for select
   to authenticated
   using (
     bucket_id = 'proctor-snapshots'
     and (
-      exists (
+      public.is_exam_supervisor()
+      or exists (
         select 1 from public.exam_submissions s
         where s.id::text = (storage.foldername(name))[1]
-          and s.student_id = auth.uid()
+          and (s.student_id = auth.uid() or public.owns_exam(s.exam_id))
       )
-      or public.is_staff()
     )
   );
 
@@ -1415,6 +1631,17 @@ end $$;
 -- place would make `register_violation(uuid, text)` ambiguous ("function
 -- register_violation(uuid, text) is not unique") now that a defaulted
 -- 3-argument version exists.
+--
+-- The path is the one string the student's device chooses and the database stores
+-- verbatim, so it is checked before it is stored: it must start with
+-- `<p_submission_id>/`, the folder convention §6 and the purge both assume.
+-- Anything else - another submission's folder, a path outside the bucket, a full
+-- URL - is stored as NULL and the violation still counts. Storing NULL rather than
+-- raising is deliberate: a malformed path must not buy a strike back, and the
+-- incident is the fact while the photograph is the optional attachment. Without
+-- this, a forged path is both evidence poisoning (an incident that points at
+-- somebody else's still) and a delete-by-proxy (the next legitimate reset removes
+-- the objects those paths name).
 drop function if exists public.register_violation(uuid, text);
 
 -- The pre-offline-queue signature. Adding the two new *defaulted* parameters below
@@ -1438,6 +1665,7 @@ as $$
 declare
   v_count  int;
   v_status text;
+  v_snapshot_path text;
 begin
   if auth.uid() is null then
     raise exception 'authentication is required to register a violation'
@@ -1478,13 +1706,20 @@ begin
   -- violation into two strikes. A client that reuses an id on purpose only
   -- suppresses its own strike - and a client that controls the app can skip
   -- calling this at all, so the idempotency key costs the rule nothing.
+  -- Only an object path inside this submission's own folder is stored.
+  v_snapshot_path := case
+    when p_snapshot_url is null then null
+    when starts_with(p_snapshot_url, p_submission_id::text || '/') then p_snapshot_url
+    else null
+  end;
+
   insert into public.proctoring_logs (
     submission_id, action_type, snapshot_url, client_timestamp, client_event_id
   )
   values (
     p_submission_id,
     p_action_type,
-    p_snapshot_url,
+    v_snapshot_path,
     coalesce(p_client_timestamp, now()),
     p_client_event_id
   )
