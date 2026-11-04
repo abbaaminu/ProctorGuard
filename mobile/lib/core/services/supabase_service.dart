@@ -626,7 +626,7 @@ class SupabaseService {
   ///
   /// Returns `null` — never throws — when the upload cannot happen (offline,
   /// policy rejection, quota): a missing picture must not stop the violation from
-  /// being logged or the 3-strike escalation from running.
+  /// being logged or the weighted escalation from running.
   Future<String?> uploadViolationSnapshot({
     required String submissionId,
     required String actionType,

@@ -338,14 +338,18 @@ on conflict do nothing;
 
 -- ---------------------------------------------------------------------
 -- 5. PROCTORING LOGS  (public.proctoring_logs)
--- Three alerts leading to the disqualification above: gaze deviation,
--- face missing, then a second sustained gaze deviation. action_type values
--- must match the table's check constraint (they mirror ViolationType.dbValue
--- in the Flutter app).
+-- Three alerts on the disqualified attempt above: a glance off screen, the
+-- face leaving frame, then another glance. action_type values must match the
+-- table's check constraint (they mirror ViolationType.dbValue in the Flutter
+-- app).
 --
--- The app never writes a 4th row - ProctoringNotifier returns early once
--- `disqualified` is set and register_violation() flips the status on the 3rd
--- strike - so 3 logs + status='disqualified' is the consistent shape.
+-- Note what these three rows are worth under `public.violation_weights`
+-- (`schema.sql` section 5a): two `looking_away` at weight 0 and one `no_face` at
+-- weight 1 - one weighted point, short of the threshold of 3. The attempt is
+-- disqualified in this demo because a *supervisor* decided that (the path
+-- `resolve_flagged_attempt` records in `attempt_review_logs`), not because the
+-- rule closed it: the app never writes a 4th row, and no combination of soft
+-- signals can flag an attempt on its own.
 -- snapshot_url holds the bucket-relative Storage *path*, the same value the app
 -- stores after an upload (`<submission_id>/<action_type>_<epoch-ms>.jpg`). The
 -- bucket is private, so this is an identifier rather than a link: this script

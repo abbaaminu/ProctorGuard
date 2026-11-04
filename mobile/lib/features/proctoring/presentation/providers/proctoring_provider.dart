@@ -158,7 +158,7 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
         super(const ProctoringState()) {
     _gazeSub = _engine.signals.listen(_handleGazeSignal);
     // A violation the queue delivered after the fact still carries the server's
-    // ruling: that is how a third strike taken while the network was down ends
+    // ruling: that is how a strike taken while the network was down ends
     // the attempt instead of being discovered only in the audit log.
     _rulingsSub = _outbox.deferredRulings.listen(_handleDeferredRuling);
     // Same entry point the browser guards and the kiosk escape use, so there is
@@ -276,7 +276,7 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   /// hook. It deliberately routes into the same handler the on-device engine
   /// feeds, so a browser look-away goes through the identical ladder: the
   /// camera-paused gate, the per-violation dedupe window, the snapshot, the
-  /// offline queue and the three-strike disqualification.
+  /// offline queue and the server's weighted escalation.
   ///
   /// The signal is one of the four [GazeSignal] values on-device inference also
   /// emits - a page cannot name a violation, only what it saw - and the

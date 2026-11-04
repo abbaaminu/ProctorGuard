@@ -161,7 +161,7 @@ rather than left to be mistaken for more than it is.
 | Sound that is not plain talking (TV, music, a second speaker) | Loudness cannot be attributed to a person or separated from other sound | Sustained-threshold rules (a median-calibrated room floor plus a 6 dB speech margin, a 750 ms window, and a 0.4 s / 3 dB release that tolerates the gaps between words) keep one-offs out; content is deliberately never captured |
 | A microphone that fails mid-session (unplugged, grant revoked, another app took the input) | Level is the only audio signal, so a dead mic stops speech being detected at all | The chip reports `Mic lost` / `Mic unavailable` / `Mic blocked` — **never a false "quiet"** — and the paper is held shut behind the opaque equipment block, with **Reconnect** / **Open settings** / **Leave** (the `unavailable` case stays on the indicator: a barrier nobody can clear would strand the student). A lost mic is an **unproctored gap, not a strike**, so no attempt is ended for it — but nothing can be read or typed behind the block either, so the gap cannot pass as a clean run |
 | Escape from the locked exam surface | Screen pinning (no Device Owner) and browser fullscreen can be left | An escape or a fullscreen exit becomes an `app_minimized` strike; the kiosk badge shows whether pinning is enforced or best-effort |
-| Detector evasion (rooted/virtualised device, camera spoof) | Client-side detectors can be defeated by a determined, technically capable student | Treat the client as untrusted: grading and the 3-strike rule are enforced **server-side** (`register_violation`, `submit_exam`) |
+| Detector evasion (rooted/virtualised device, camera spoof) | Client-side detectors can be defeated by a determined, technically capable student | Treat the client as untrusted: grading and the weighted strike rule are enforced **server-side** (`register_violation`, `submit_exam`, `resolve_flagged_attempt`) |
 | Evidence retention / privacy | Snapshots in `proctor-snapshots` are personal data with no automatic TTL by default | The bucket is **private**: a still is only ever readable through a 10-minute signed URL, and only the owning student or staff can mint one. Set a retention policy for your institution; snapshots are already deleted on an attempt reset, which `session_reset_logs` records (who cleared which attempt, for whom, and how much evidence went with it) |
 
 The client is never the authority: **grading and the strike rule live on the
@@ -191,6 +191,8 @@ lose proctoring signals but cannot change a result.
    supabase db query --linked -f supabase/migrations/20261103090600_submissions_delete_supervisor.sql
    supabase db query --linked -f supabase/migrations/20261103090700_register_violation_snapshot_path.sql
    supabase db query --linked -f supabase/migrations/20261103090800_snapshot_purge_not_live_attempt.sql
+   supabase db query --linked -f supabase/migrations/20261104090000_violation_weights.sql
+   supabase db query --linked -f supabase/migrations/20261104090100_weighted_strikes_and_flagged_review.sql
    supabase db query --linked -f supabase/migrations/optional_question_shuffling.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
@@ -315,6 +317,17 @@ lose proctoring signals but cannot change a result.
   `…090600_submissions_delete_supervisor.sql` and
   `…090800_snapshot_purge_not_live_attempt.sql` after re-running
   `private_proctor_snapshots.sql` or `staff_attempt_resets.sql`.
+- Apply `supabase/migrations/20261104090000_violation_weights.sql` and then
+  `20261104090100_weighted_strikes_and_flagged_review.sql`, in that order, on every
+  project. The first creates and seeds `public.violation_weights`; the second moves
+  the escalation onto it, widens `exam_submissions.status` with
+  `flagged_for_review`, and adds `resolve_flagged_attempt()` and its audit table.
+  Until they run, `register_violation` still disqualifies on the third row of
+  anything. Once they run, an attempt that reaches the threshold **waits for a
+  supervisor** — make sure somebody holds the `supervisor` role (or that the paper's
+  author is around), because nothing resolves a review automatically. Neither file
+  rewrites a `proctoring_logs` row or re-reads an existing attempt: see
+  [Tuning the violation weights](#tuning-the-violation-weights).
 - Apply `supabase/migrations/optional_question_shuffling.sql` before the first
   paper that has question-order shuffling enabled. Until it runs, the
   `shuffle_questions` column does not exist: the authoring console reports the
@@ -325,7 +338,7 @@ lose proctoring signals but cannot change a result.
   grows without bound; the migration seeds a 30-day window in
   `public.retention_policies` and schedules a nightly purge of rows belonging to
   **closed** attempts. Rows of an attempt still `ongoing` are never deleted, so the
-  3-strike count cannot be eroded. Without `pg_cron` the function is still created
+   weighted score cannot be eroded. Without `pg_cron` the function is still created
   and can be called from the SQL editor or an external scheduler:
   `select public.purge_expired_proctoring_logs(p_dry_run => true);` first. The
   per-attempt snapshots are **not** deleted by it — see the file's header for why
@@ -386,7 +399,71 @@ lose proctoring signals but cannot change a result.
   stays a file of its own: it is a `schedule`-triggered ping, not part of a
   push's pipeline.
 
-## Verification
+## Tuning the violation weights
+
+`register_violation()` does not count rows. It adds up the `weight` of every signal
+whose `public.violation_weights` row has `counts_toward_dq = true`, and when the
+total reaches **3** it closes the sitting as `flagged_for_review` — the student is
+told a supervisor will review it, and `resolve_flagged_attempt()` records that
+supervisor's decision. The seeded policy:
+
+| Weight | Counts | Signals |
+|--------|--------|---------|
+| 1 | yes | `multiple_faces`, `no_face`, `app_minimized`, `devtools_detected`, `secondary_display_detected`, `virtual_camera_detected` |
+| 0 | no | `looking_away`, `audio_noise`, `copy_paste_attempt`, `right_click_blocked`, `idle_afk` |
+
+Every signal is still stored in `proctoring_logs` and still shown to the
+supervisor; the weight only decides which ones may end an attempt on their own.
+
+Change one with a single statement — no migration, no redeploy:
+
+```sql
+-- One pasted line is now worth half a strike (not enough to flag on its own, but
+-- it counts towards the three), and a blocked right-click still counts for nothing.
+update public.violation_weights
+   set weight = 1, counts_toward_dq = true
+ where action_type = 'copy_paste_attempt';
+
+update public.violation_weights
+   set weight = 0, counts_toward_dq = false
+ where action_type = 'right_click_blocked';
+```
+
+To see what a change would do before making it, ask the same question the RPC asks:
+
+```sql
+select s.id, s.status,
+       coalesce(sum(case when coalesce(w.counts_toward_dq, true)
+                         then coalesce(w.weight, 1) else 0 end), 0) as weighted_score
+  from public.exam_submissions s
+  left join public.proctoring_logs l on l.submission_id = s.id
+  left join public.violation_weights w on w.action_type = l.action_type
+ group by s.id, s.status
+ order by weighted_score desc;
+```
+
+What a change does **not** do:
+
+- **It does not touch existing evidence.** No `proctoring_logs` row is rewritten,
+  and neither migration backfills anything.
+- **It does not change a decision already made.** An attempt that was
+  `disqualified` or `flagged_for_review` keeps that status, and one that is still
+  `ongoing` simply accumulates under the new weights from the next signal onwards.
+  Re-opening a decided attempt is `resolve_flagged_attempt()` (for a review) or
+  "Reset attempt" in the console — not a side effect of an UPDATE.
+- **It does not get reset by re-running the schema.** The seed uses
+  `on conflict (action_type) do nothing`, so `schema.sql` and
+  `20261104090000_violation_weights.sql` can be replayed without undoing a tuned
+  value. Only an explicit `UPDATE` (or a `DELETE` of the row, which makes the type
+  score as hard, fail-closed) changes it.
+- **It is not enforced by the client.** The app mirrors the weights for display
+  only; `schema_contract_test.dart` fails if the mirror and the seed drift apart.
+
+The threshold itself is `c_flag_threshold` in `register_violation()`
+(`supabase/schema.sql`, mirrored by `ProctoringRisk.disqualificationThreshold`).
+Raising or lowering it — 4 for a more forgiving paper, 2 for a stricter one — is a
+migration, because it changes code rather than policy data.
+
 
 From `mobile/`:
 

@@ -25,11 +25,12 @@ android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLoc
 ## Wiring order (what to do first)
 1. Run `../supabase/schema.sql` in the Supabase SQL editor (or via CLI
    migrations). It
-   creates all 5 tables, the RLS policies, the `questions_public` safe view and
-   four RPCs: `register_violation` (server-enforced 3-strike rule),
+   creates the tables, the RLS policies, the `questions_public` safe view and the
+   RPCs: `register_violation` (server-enforced weighted strike rule),
    `submit_exam` (server-side grading + close), `merge_submission_answer`
-   (race-safe autosave for choices) and `merge_submission_text_answer` (the same
-   for typed answers).
+   (race-safe autosave for choices), `merge_submission_text_answer` (the same
+   for typed answers) and `resolve_flagged_attempt` (a supervisor's decision on an
+   attempt the weighted threshold stopped for review).
 2. `flutter pub get`, then run with:
    ```
    flutter run --dart-define=SUPABASE_URL=... --dart-define=SUPABASE_PUBLISHABLE_KEY=...
@@ -126,10 +127,13 @@ with an expiry rather than a URL that keeps working forever once it is forwarded
 - Capture and upload are **best-effort and time-boxed (5 s each)**: if the
   camera refuses a still while streaming, or Storage rejects the upload, the
   violation is still logged — just without a picture — so evidence collection
-  can never delay the 3-strike escalation.
-- `register_violation(p_submission_id, p_action_type, p_snapshot_url)` carries the
-  snapshot reference (the object path, or a pre-migration URL); the third argument
-  is optional so older clients keep working.
+  can never delay the weighted escalation.
+- `register_violation(p_submission_id, p_action_type, p_snapshot_url,
+  p_client_timestamp, p_client_event_id)` carries the snapshot reference (the
+  object path, or a pre-migration URL) and answers with
+  `(warning_count, disqualified, flagged)`. Only the first three arguments are
+  required, so older clients keep working; `warning_count` is the number of stored
+  rows, which is not the weighted score (the database holds the weights).
 - `register_violation` is `SECURITY DEFINER` (a student may neither insert into
   `proctoring_logs` nor update `exam_submissions`), so it re-checks that the
   caller owns the submission before writing anything. Without that guard any
@@ -241,7 +245,7 @@ counting strikes. Three deliberate mitigations:
 
 That makes this enforcement rather than suggestion: on Chrome and Edge, switching
 tabs, blurring the window or dropping out of fullscreen each log a violation
-through `register_violation` and escalate under the same 3-strike rule as the
+through `register_violation` and escalate under the same weighted rule as the
 camera signals.
 
 To check the DOM half still compiles for a browser without a router or an exam
@@ -292,8 +296,9 @@ Details worth knowing:
   `supabase/schema.sql` inserts the row or nothing, so a lost response cannot turn
   one violation into two strikes. `ProctoringNotifier` still counts the strike
   optimistically and the UI still warns; `ViolationOutbox.deferredRulings` hands it
-  the server's ruling when the row does land, which is how a third strike taken
-  offline still ends the attempt.
+  the server's ruling when the row does land, which is how a strike taken
+  offline still ends the attempt — as `disqualified` or, at the weighted
+  threshold, as `flagged_for_review` for a supervisor to decide.
 - **A strike is logged before its photograph, and an identity strike does not wait
   for one.** The whole evidence step — capture *and* upload — runs under **one**
   budget instead of one per round trip (`ProctoringNotifier._captureAndUploadSnapshot`):
@@ -746,11 +751,12 @@ lecturer's GES301 in `seed.sql`) through `PublishedExamList`, and on tap:
   `unique(student_id, exam_id)` means a second tap resumes rather than duplicates;
 * an `ongoing` attempt pushes `ExamTakingPage(examId, submissionId, durationMinutes,
   startedAt)`: the session screen with the camera (or the `MOCK_CAMERA` feed),
-  question navigation, the countdown, the 3-strike overlay, Android kiosk pinning
+  question navigation, the countdown, the warning overlay, Android kiosk pinning
   and the browser guards;
-* an attempt that is already `submitted` **or `disqualified`** is reported in a
-  SnackBar and *not* reopened — exactly what Aisha hits on CS101 in the seed data,
-  where the server disqualified her after three strikes;
+* an attempt that is already `submitted`, `flagged_for_review` **or `disqualified`**
+  is reported in a SnackBar and *not* reopened — exactly what Aisha hits on CS101 in
+  the seed data, where the server stopped her attempt for review after three
+  counted signals;
 * a failed start shows "Could not start …" instead of a silent no-op.
 
 **A phone or tablet browser is refused before any of that can happen.**
@@ -1437,11 +1443,11 @@ What `SupabaseService` guarantees on web:
 
 Six independent detectors feed one escalation path, and every signal ends in
 the same `register_violation` RPC, so the server stays the source of truth for
-the 3-strike rule:
+the weighted strike rule:
 
 | Detector | Signal | `action_type` |
 | --- | --- | --- |
-| ML Kit face detection | no face (three consecutive frames) / several faces / head pose off-axis (one frame past ~15 deg yaw or ~18 deg pitch) | `no_face`, `multiple_faces`, `looking_away` |
+| ML Kit face detection | no face (three consecutive frames) / several faces / head pose off-axis (a turn past 25 deg yaw or 18 deg pitch, **held for two seconds** across consecutive frames) | `no_face`, `multiple_faces`, `looking_away` |
 | `web/proctor_face_detector.js` (Chrome/Edge) | the preview's camera track ended, is muted/disabled, is paused or hidden, a preview that has shown nothing for five seconds, or the frame carries no picture (featureless whatever its brightness, dim and near-featureless, blown out, or the same thumbnail for three ticks running) → `no_face`; a face count and head pose from the Shape Detection API or the shipped MediaPipe model, so a look-away becomes `looking_away` too ([details above](#face-signals-on-the-web-the-host-page-bridge)) | `no_face`, `multiple_faces`, `looking_away` |
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
@@ -1449,14 +1455,16 @@ the 3-strike rule:
 | `AudioMonitor` + `AudioNoiseDetector` | a `record` capture session streams dBFS samples; the room's own floor is measured first, then speech sustained above it ([details below](#microphone-proctoring-levels-not-recordings)) | `audio_noise` |
 
 Camera signals are **counted in frames**, not measured in seconds: `looking_away`
-fires on the **first** frame that shows the head past ~15 deg yaw or ~18 deg pitch
-(`consecutiveFrameThreshold` is 1), because at a normal viewing distance that is
-already pointing off the screen — and the audit's finding on the earlier three-frame
-count was that a student could glance down at a phone or read a second screen for
-~0.45 s and be back before anything was logged. `no_face` still waits for three
-consecutive frames without a face (`missingFaceFrameThreshold`), because that is the
-one signal a working detector also produces by accident (a blink behind glasses, a
-hand across the lens). Frames are the honest unit here — `inferenceInterval` decides
+is reported only once the head has stayed past 25 deg of yaw or 18 deg of pitch for
+two seconds of consecutive frames (`proctoring_thresholds.dart`:
+`lookAwayYawDegrees`, `lookAwayPitchDegrees`, `lookAwaySustain`), because a single
+frame past a tolerance is a blink, a notification or one bad Euler estimate — the
+earlier rule turned every one of those into a strike, and a student warned for
+glancing at their own keyboard learns to ignore the warning. `no_face` still waits
+for three consecutive frames without a face (`missingFaceFrameThreshold`), because
+that is the one signal a working detector also produces by accident (a blink
+behind glasses, a hand across the lens). Frames are the honest unit here —
+`inferenceInterval` decides
 how much wall time a frame stands for and is throttling, not evidence. Any frame
 back in the tolerated pose resets the counters, so only an unbroken run counts, and
 each episode reports once: a sustained look-away is one strike, not one per
@@ -1513,8 +1521,9 @@ keep the gap between two words from restarting it.
 A cough, a chair creak or a breath is still far too brief to add up, a room that has
 genuinely gone quiet ends the episode inside the grace, and after a strike the detector
 ignores the level for 10s (`cooldown`), so one long outburst is one strike rather than
-one every sample — and a room staying loud cannot climb the three-strike ladder on its
-own. Calibration doubles as the start-of-session grace period: nothing can be logged
+one every sample — and a room staying loud cannot climb the weighted ladder on its
+own (a noise strike weighs 0). Calibration doubles as the start-of-session grace
+period: nothing can be logged
 before it finishes.
 
 Kiosk bridge contract — MethodChannel `lock_task_channel`:
@@ -1616,7 +1625,7 @@ proctoring never flagged anything" is indistinguishable from "the room was quiet
 joins the two halves: the monitor owns the device, the detector owns the rules, and a
 confirmed ruling is handed to `ProctoringNotifier.reportAudioNoise()`, so
 `audio_noise` takes exactly the same path as `no_face` or `app_minimized` — overlay,
-server-side count via `register_violation`, 3-strike escalation and the offline queue
+server-side count via `register_violation`, weighted escalation and the offline queue
 included. The notifier used to carry its own threshold-plus-sustain counter
 (`reportAudioLevel` with `audioNoiseThresholdDb`/`audioNoiseSustain`), written before the
 detector landed; it was deleted rather than kept as a second path, because two places
@@ -1760,10 +1769,16 @@ written-down opt-out for a throwaway demo build and never for one a student runs
   at the top of that job.
 
 ## Key design decisions worth knowing about
-- **Server-enforced escalation.** The 3-strike disqualify rule lives in
+- **Server-enforced escalation.** The weighted strike rule lives in
   the `register_violation` Postgres function, not just in Dart. A student
   patching the client can't spoof past it — the client's `warningCount`
-  is reconciled against the RPC's authoritative return value every time.
+  is reconciled against the RPC's authoritative return value every time — and the
+  weights themselves are rows in `public.violation_weights`, so an institution
+  retunes one with an `UPDATE` (see the root README's "Tuning the violation
+  weights"). At the threshold the attempt becomes `flagged_for_review` rather than
+  `disqualified`: a supervisor decides, and that decision is the only thing that
+  writes `disqualified` (`resolve_flagged_attempt`, audited in
+  `attempt_review_logs`).
 - **Grading never touches the device.** Neither answer key
   (`questions.correct_option`, `questions.correct_text_answer`) is exposed by the
   `questions_public` view the exam-taking page reads (a definer view filtered to

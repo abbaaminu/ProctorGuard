@@ -1,6 +1,26 @@
 # Weighted strikes — proposal
 
-**Status:** Proposal only. Not implemented.
+**Status:** Implemented, with a different shape than proposed below. The proposal
+was written before the review's findings landed; what shipped keeps its core idea
+(weight per `action_type`, read from a table, threshold in points) and changes three
+things it argued for:
+
+* the table is `public.violation_weights` with `weight int` and
+  `counts_toward_dq boolean` (not `numeric(4,2)` with a 1.0 default), so a soft
+  signal is explicitly *not counted* rather than merely worth zero;
+* the threshold is **3 weighted points** (not 4.0), and every counted type weighs
+  1, which keeps "three hard signals" as the rule for the signals that deserve it;
+* reaching it produces **`flagged_for_review`**, not `disqualified` - a supervisor
+  decides through `resolve_flagged_attempt()`, audited in `attempt_review_logs` -
+  and there is **no reconciliation UPDATE** ("§4" below): an attempt that was
+  already disqualified stays disqualified, because deciding after the fact that it
+  should have been a review is a human's call.
+
+Where it landed: `supabase/migrations/20261104090000_violation_weights.sql`,
+`supabase/migrations/20261104090100_weighted_strikes_and_flagged_review.sql`,
+`supabase/schema.sql` §5a / the escalation block, `mobile/lib/features/proctoring/
+domain/entities/violation.dart` (the mirrors) and `supabase/tests/
+weighted_strikes_check.sql`. Tuning is a README section, not a migration.
 
 ## Problem
 

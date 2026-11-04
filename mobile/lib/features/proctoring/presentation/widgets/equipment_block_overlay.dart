@@ -4,8 +4,8 @@ import 'package:flutter/material.dart';
 /// feeding, the microphone is gone, or there is no face in frame.
 ///
 /// Deliberately **not** a warning. A warning is a strike — it is counted, it
-/// says "warning 2 / 3", and it has a button that dismisses it, because the
-/// three-strike ladder is what ends an attempt. This is the equipment the
+/// says "warning 2", and it has a button that dismisses it, because the server's
+/// weighted threshold is what ends an attempt. This is the equipment the
 /// proctoring is *made of*: with the camera down nothing is watching, with the
 /// microphone gone nothing is listening, and with nobody in frame there is
 /// nothing to watch. So there is no "continue anyway" — the paper is covered

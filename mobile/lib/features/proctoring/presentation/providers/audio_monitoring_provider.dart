@@ -129,7 +129,7 @@ class AudioMonitoringState {
 ///  * the notifier answers *"does that cost a strike?"* - through
 ///    [ProctoringNotifier.reportAudioNoise], so an audio strike takes exactly the
 ///    same path as `no_face` or `app_minimized`: overlay, server-side count,
-///    3-strike escalation, offline queue and all.
+///    weighted escalation, offline queue and all.
 class AudioMonitoringNotifier extends StateNotifier<AudioMonitoringState> {
   AudioMonitoringNotifier({
     required this.onNoiseDetected,

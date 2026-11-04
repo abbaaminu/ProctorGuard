@@ -57,8 +57,10 @@ enum ViolationType {
   /// takes three seconds is three seconds of a stranger reading the paper.
   ///
   /// The softer types - a glance away, noise in the room, a paste, leaving the tab,
-  /// an idle device - are still strikes, still count towards the 3-strike rule and
-  /// still cost the student a warning. They are simply not evidence that the
+  /// an idle device - are still strikes, still recorded and still cost the student
+  /// a warning, but they weigh 0 towards the server's threshold and therefore can
+  /// never end an attempt on their own ([weight]). They are simply not evidence
+  /// that the
   /// *identity* of the candidate has broken, so they keep the full budget for the
   /// photograph that a human will later look at.
   bool get isCritical => switch (this) {

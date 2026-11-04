@@ -170,8 +170,8 @@ class AudioNoiseDetector {
   /// Ten seconds, so one continued outburst is one strike. It was five, which was
   /// long enough to stop one *sample* being one strike but not long enough to stop
   /// a room that stays loud for half a minute from climbing the strike ladder on
-  /// its own - and the third strike escalates (`ProctoringNotifier`). A student who
-  /// genuinely talks twice, ten seconds apart, still earns two strikes.
+  /// its own - and the escalation is the server's (`ProctoringNotifier`). A student
+  /// who genuinely talks twice, ten seconds apart, still earns two strikes.
   final Duration cooldown;
 
   /// How far above the measured room floor counts as human noise rather than the
