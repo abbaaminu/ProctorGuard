@@ -139,7 +139,7 @@ void main() {
       expect(
         signals,
         <GazeSignal>[GazeSignal.lookingAway],
-        reason: 'yaw well past the 28° tolerance',
+        reason: 'yaw well past the 25° tolerance',
       );
 
       report('pose:0,0');
@@ -151,7 +151,7 @@ void main() {
       expect(
         signals.last,
         GazeSignal.lookingAway,
-        reason: 'pitch past 30° even with the yaw inside its tolerance',
+        reason: 'pitch past 18° even with the yaw inside its tolerance',
       );
 
       // Case and padding are the host's business: the monitor reads the numbers.

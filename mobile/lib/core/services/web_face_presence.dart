@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'mediapipe_proctoring_service.dart' show GazeSignal;
+import 'proctoring_thresholds.dart' as thresholds;
 import 'web_face_signal_source.dart';
 
 /// The words a host detector speaks.
@@ -54,21 +55,32 @@ abstract final class WebFaceMessages {
 ///    and waiting out the sustain would only delay a warning they are earning;
 ///  * nothing is reported during [startupGrace].
 ///
-/// The difference is the unit of "held". The engine counts frames, because it sees
-/// several a second and a frame is a millisecond of truth; a page's detector may run
-/// at 2 fps or burst ten results from one buffered frame, so the web measures elapsed
-/// [sustain] instead - 300 ms, which is about one engine frame plus the poll it was
-/// caught in. Same effect - a head that has genuinely turned is reported almost
-/// immediately - without assuming a frame rate nothing guarantees, and with the same
-/// single exception both sides make for a head that is already unmistakably turned.
+/// The tolerances are shared with the engine rather than copied
+/// (`proctoring_thresholds.dart`): "turned" has to mean 25 degrees of yaw and 18 of
+/// pitch on both platforms, or a browser session and a phone session judge the same
+/// head differently.
+///
+/// The difference is the unit of "held". The engine counts *frames* for the tick of
+/// evidence and then requires [thresholds.lookAwaySustain] (2 s) of them, because a
+/// single frame past a tolerance is a detector artefact. A page's detector may run at
+/// 2 fps or burst ten results from one buffered frame, so the web measures elapsed
+/// [sustain] instead - 300 ms, two detections at the engine's 150 ms cadence. The
+/// browser is therefore quicker to warn on a *verdict* (`looking_away` as a word),
+/// and a host that measures angles gets the same near-sideways exception as the
+/// engine does for a head that is already unmistakably turned.
+
 class WebFacePresenceMonitor {
   WebFacePresenceMonitor({
     required WebFaceSignalSource source,
     this.sustain = const Duration(milliseconds: 300),
     this.startupGrace = const Duration(seconds: 5),
     this.multipleFacesCooldown = const Duration(seconds: 30),
-    this.offCenterYawDegrees = 15.0,
-    this.offCenterPitchDegrees = 18.0,
+    // The engine's tolerances, from the one file that states the rule. Widened
+    // from 15 to 25 degrees of yaw with the phone engine: a head turned 15 degrees
+    // is a student glancing at their own keyboard, and `pose:15,0` used to be a
+    // strike here while the phone called it a glance.
+    this.offCenterYawDegrees = thresholds.lookAwayYawDegrees,
+    this.offCenterPitchDegrees = thresholds.lookAwayPitchDegrees,
     this.immediateAwayYawDegrees = 30.0,
     DateTime Function()? clock,
   })  : assert(
@@ -123,15 +135,14 @@ class WebFacePresenceMonitor {
   final Duration multipleFacesCooldown;
 
   /// Head-pose tolerances, used only for `pose:` messages (a detector that sends
-  /// a verdict has already applied its own). The engine's defaults: ~15 deg yaw and
-  /// ~18 deg pitch, tight enough that a face pointed off the screen is one strike.
+  /// a verdict has already applied its own). The engine's own numbers - 25 deg of
+  /// yaw and 18 of pitch, from `proctoring_thresholds.dart` - so the same head is
+  /// judged the same way whichever platform it is sitting in front of.
   final double offCenterYawDegrees;
   final double offCenterPitchDegrees;
 
   /// Yaw past which a single `pose:` detection is already unambiguous evidence,
-  /// instead of [sustain] of it - the engine's
-  /// `MediaPipeProctoringService.immediateAwayThresholdDegrees`, for a monitor
-  /// that judges messages rather than frames.
+  /// instead of [sustain] of it.
   ///
   /// A near-sideways verdict is the one thing a sustain cannot improve on: there
   /// is no reading of the screen at that angle, so the second message only makes
