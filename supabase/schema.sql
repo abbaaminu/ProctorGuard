@@ -1377,12 +1377,92 @@ create policy "logs_select_own_or_supervisor"
 
 -- There is deliberately NO insert policy. `register_violation()` is the single
 -- write path for evidence: it re-checks that the caller owns the submission,
--- inserts the row and applies the 3-strike rule in one transaction. Letting
+-- inserts the row and applies the weighted-strike rule in one transaction. Letting
 -- clients insert here as well would give them a second, unguarded way to write
 -- proctoring evidence (and to pad somebody's strike count).
 
 -- ---------------------------------------------------------------------
+-- 5a. VIOLATION WEIGHTS (how much each signal counts)
+-- ---------------------------------------------------------------------
+-- The escalation in `register_violation()` (bottom of this file) used to count
+-- rows: three of anything at all closed the attempt. That made three right-clicks
+-- the same evidence as three sustained second-face sightings. The distinction is
+-- already in the vocabulary `proctoring_logs_action_type_check` carries, so it
+-- lives in this table now rather than in a hard-coded `3`: an institution retunes
+-- a type with one UPDATE (README, "Tuning the violation weights") and the stored
+-- logs are never rewritten to match the new policy.
+--
+--   * `weight`          points added to the attempt's disqualification score.
+--   * `counts_toward_dq` whether the type may contribute at all - `false` keeps a
+--                       signal as evidence for a human, out of the automatic rule.
+--   * No row for a type  is scored as (1, counted) by `register_violation()`: a
+--                       type the constraint accepts can never be a free pass.
+--
+-- The upgrade migration is `migrations/20261104090000_violation_weights.sql`; keep
+-- the seed below in step with it and with `ViolationType` in the mobile app
+-- (`schema_contract_test.dart` fails if either drifts).
+create table if not exists public.violation_weights (
+  action_type      text primary key,
+  weight           int not null check (weight >= 0),
+  counts_toward_dq boolean not null
+);
+
+comment on table public.violation_weights is
+  'How much each proctoring_logs.action_type counts towards automatic disqualification. Read by register_violation(); a missing row is scored as (1, counted) so a new action type can never be a free pass.';
+
+-- `do nothing` on conflict: re-running this file must not reset a weight an
+-- operator tuned with UPDATE.
+insert into public.violation_weights (action_type, weight, counts_toward_dq) values
+  -- Hard: one point each, so three reach the threshold - exactly the signals the
+  -- old row count was meant to protect.
+  ('multiple_faces',               1, true),
+  ('no_face',                      1, true),
+  ('app_minimized',                1, true),
+  ('devtools_detected',            1, true),
+  ('secondary_display_detected',   1, true),
+  ('virtual_camera_detected',      1, true),
+  -- Soft: stored, shown to a supervisor, never automatically fatal.
+  ('looking_away',                 0, false),
+  ('audio_noise',                  0, false),
+  ('copy_paste_attempt',           0, false),
+  ('right_click_blocked',          0, false),
+  ('idle_afk',                     0, false)
+on conflict (action_type) do nothing;
+
+alter table public.violation_weights enable row level security;
+
+drop policy if exists "violation_weights_select_authenticated" on public.violation_weights;
+drop policy if exists "violation_weights_insert_admin" on public.violation_weights;
+drop policy if exists "violation_weights_update_admin" on public.violation_weights;
+drop policy if exists "violation_weights_delete_admin" on public.violation_weights;
+
+create policy "violation_weights_select_authenticated"
+  on public.violation_weights for select
+  to authenticated
+  using (true);
+
+create policy "violation_weights_insert_admin"
+  on public.violation_weights for insert
+  to authenticated
+  with check (public.is_admin());
+
+create policy "violation_weights_update_admin"
+  on public.violation_weights for update
+  to authenticated
+  using (public.is_admin())
+  with check (public.is_admin());
+
+create policy "violation_weights_delete_admin"
+  on public.violation_weights for delete
+  to authenticated
+  using (public.is_admin());
+
+grant select, insert, update, delete on public.violation_weights to authenticated;
+revoke all on public.violation_weights from anon;
+
+-- ---------------------------------------------------------------------
 -- 6. STORAGE BUCKET (Proctoring Violation Snapshots)
+
 -- ---------------------------------------------------------------------
 -- Path convention written by the mobile app (core/services/supabase_service.dart):
 --   <submission_id>/<action_type>_<epoch-ms>.jpg
