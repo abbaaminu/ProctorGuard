@@ -74,6 +74,7 @@ class DashboardRepositoryImpl implements DashboardRepository {
         var ongoing = 0;
         var completed = 0;
         var disqualified = 0;
+        var flagged = 0;
         var scoredCount = 0;
         var scoreTotal = 0.0;
         for (final attempt in attempts) {
@@ -84,6 +85,11 @@ class DashboardRepositoryImpl implements DashboardRepository {
               completed++;
             case 'disqualified':
               disqualified++;
+            // The weighted threshold: closed, but nobody has decided. Counted
+            // separately so the console can say how many sittings are waiting on a
+            // supervisor rather than rounding them into either outcome.
+            case 'flagged_for_review':
+              flagged++;
           }
           final score = attempt['score'];
           if (score is num) {
@@ -94,10 +100,11 @@ class DashboardRepositoryImpl implements DashboardRepository {
         return ExamAnalytics(
           examId: id,
           title: exam['title'] as String,
-          attempts: ongoing + completed + disqualified,
+          attempts: ongoing + completed + disqualified + flagged,
           ongoing: ongoing,
           completed: completed,
           disqualified: disqualified,
+          flagged: flagged,
           incidents: incidentsByExam[id] ?? 0,
           averageScore: scoredCount == 0 ? null : scoreTotal / scoredCount,
           scoredAttempts: scoredCount,
@@ -115,6 +122,32 @@ class DashboardRepositoryImpl implements DashboardRepository {
       throw DashboardException('Could not load analytics: ${error.message}');
     } catch (error) {
       throw DashboardException('Could not load analytics: $error');
+    }
+  }
+
+  @override
+  Future<String> resolveFlaggedAttempt(
+    String submissionId, {
+    required String decision,
+    String? note,
+  }) async {
+    // `p_actor_id` is deliberately not sent: `attempt_review_logs.actor_id`
+    // defaults to `auth.uid()` inside the RPC, so who decided is the database's
+    // answer rather than this client's claim.
+    try {
+      final rows = await _client.rpc('resolve_flagged_attempt', params: {
+        'p_submission_id': submissionId,
+        'p_decision': decision,
+        'p_note': note,
+      }) as List<dynamic>;
+      final row = rows.first as Map<String, dynamic>;
+      return row['new_status'] as String? ?? '';
+    } on PostgrestException catch (error) {
+      throw DashboardException(
+        'Could not resolve the attempt: ${error.message}',
+      );
+    } catch (error) {
+      throw DashboardException('Could not resolve the attempt: $error');
     }
   }
 

@@ -95,12 +95,15 @@ class ExamSubmitResult extends Equatable {
   static String _formatNumber(num value) =>
       value == value.roundToDouble() ? value.round().toString() : '$value';
 
-  /// `submit_exam()` writes exactly `ongoing` / `submitted` / `disqualified`;
-  /// anything else (a column added later, a truncated body) must not take the
-  /// screen down, and "submitted" is the reading that claims the least.
+  /// `submit_exam()` writes exactly `ongoing` / `submitted` / `disqualified`, and
+  /// a flagged attempt is closed before it can get there - so
+  /// `flagged_for_review` can only arrive from a re-read of the row, but it is
+  /// mapped rather than guessed: an attempt under review has no mark, and reading
+  /// it as "submitted" would show the student a 0.
   static SubmissionStatus _statusFrom(Object? value) => switch (value) {
         'submitted' => SubmissionStatus.submitted,
         'disqualified' => SubmissionStatus.disqualified,
+        'flagged_for_review' => SubmissionStatus.flaggedForReview,
         'ongoing' => SubmissionStatus.ongoing,
         _ => SubmissionStatus.submitted,
       };

@@ -154,12 +154,12 @@ class _RecordingProctoringRepository implements ProctoringRepository {
   final List<Violation> violations = <Violation>[];
 
   @override
-  Future<({int warningCount, bool disqualified})> logViolation({
+  Future<({int warningCount, bool disqualified, bool flagged})> logViolation({
     required String submissionId,
     required Violation violation,
   }) async {
     violations.add(violation);
-    return (warningCount: violations.length, disqualified: false);
+    return (warningCount: violations.length, disqualified: false, flagged: false);
   }
 
   @override

@@ -2,17 +2,31 @@ import 'package:equatable/equatable.dart';
 
 enum SubmissionStatus {
   ongoing,
+
+  /// The weighted threshold was reached: the server closed the sitting and a
+  /// supervisor decides (`resolve_flagged_attempt`). Neither gradable nor
+  /// disqualified - the one status whose next state is a person's decision.
+  flaggedForReview,
+
   submitted,
   disqualified;
 
   static SubmissionStatus fromDb(String v) => switch (v) {
         'ongoing' => SubmissionStatus.ongoing,
+        'flagged_for_review' => SubmissionStatus.flaggedForReview,
         'submitted' => SubmissionStatus.submitted,
         'disqualified' => SubmissionStatus.disqualified,
         _ => throw ArgumentError('Unknown status: $v'),
       };
 
-  String get dbValue => name;
+  /// The value `exam_submissions.status` holds. A switch rather than `name`,
+  /// because `flaggedForReview` is snake_case in the database.
+  String get dbValue => switch (this) {
+        SubmissionStatus.ongoing => 'ongoing',
+        SubmissionStatus.flaggedForReview => 'flagged_for_review',
+        SubmissionStatus.submitted => 'submitted',
+        SubmissionStatus.disqualified => 'disqualified',
+      };
 }
 
 class Submission extends Equatable {

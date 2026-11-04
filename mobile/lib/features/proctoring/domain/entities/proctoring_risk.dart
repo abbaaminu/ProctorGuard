@@ -51,9 +51,18 @@ enum RiskBand {
 ///    themselves mean "somebody else is in this exam".
 ///
 /// Bands: 0-19 [RiskBand.low], 20-44 [RiskBand.moderate], 45-69 [RiskBand.high],
-/// 70+ [RiskBand.critical]. So one logged violation reads as "Moderate", and the
-/// third strike - the server's auto-disqualification threshold - always reads at
-/// least "High", whatever the mix of signals that produced it.
+/// 70+ [RiskBand.critical]. So one logged violation reads as "Moderate", and a
+/// session with several signals - which is what the server's weighted threshold
+/// actually closes - reads at least "High".
+///
+/// This index is **not** the rule that ends an attempt, and it must not be treated
+/// as one. That decision is `register_violation()`'s, from
+/// `public.violation_weights` ([ViolationType.weight] /
+/// [ViolationType.countsTowardDisqualification] mirror it for display):
+/// [disqualificationThreshold] weighted points closes the sitting as
+/// `flagged_for_review`, which no combination of soft signals can reach. The index
+/// deliberately keeps counting *every* signal, because a supervisor looking at the
+/// grid is asking "who needs me first", not "who has already been punished".
 class ProctoringRisk {
   const ProctoringRisk({
     required this.score,
@@ -80,6 +89,22 @@ class ProctoringRisk {
     ViolationType.secondaryDisplayDetected,
     ViolationType.devtoolsDetected,
   };
+
+  /// The weighted total at which `register_violation()` closes the attempt as
+  /// `flagged_for_review` (its `c_flag_threshold`; `schema_contract_test.dart`
+  /// pins the pair).
+  ///
+  /// Three, with every counted signal at [ViolationType.weight] = 1: any three
+  /// identity-breaking signals, and never a soft one however many are logged.
+  static const int disqualificationThreshold = 3;
+
+  /// The weighted score a list of signals adds up to, by the server's weights.
+  ///
+  /// A helper for screens that want to explain "this is how close you are" - not a
+  /// second enforcement path. The authoritative number is the server's, computed
+  /// from the rows it holds.
+  static int weightedScoreOf(Iterable<ViolationType> violations) =>
+      violations.fold(0, (total, type) => total + type.weight);
 
   /// 0-100, higher is worse. See the class docs for the formula.
   final int score;

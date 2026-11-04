@@ -133,12 +133,16 @@ class _AttemptCard extends StatelessWidget {
 
   /// A disqualified attempt has no score by design (`submit_exam()` nulls it —
   /// a score would imply it counts), so it is labelled rather than shown as 0,
-  /// which would read like a failed paper.
+  /// which would read like a failed paper. An attempt under review is labelled for
+  /// the mirror-image reason: `grade_submission()` refuses it until a supervisor
+  /// resolves it, so a total here would be a number the server will not accept.
   String get _scoreLine =>
       attempt.submission.status == SubmissionStatus.disqualified
           ? 'Disqualified — not marked'
-          : '${formatMarks(attempt.score ?? 0)} of '
-              '${formatMarks(attempt.maxScore)} marks';
+          : attempt.submission.status == SubmissionStatus.flaggedForReview
+              ? 'Under review — not marked yet'
+              : '${formatMarks(attempt.score ?? 0)} of '
+                  '${formatMarks(attempt.maxScore)} marks';
 
   @override
   Widget build(BuildContext context) {

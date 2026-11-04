@@ -171,6 +171,9 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
           SubmissionStatus.disqualified =>
             'Your "${exam.title}" attempt was disqualified. '
                 'Speak to your supervisor before retaking it.',
+          SubmissionStatus.flaggedForReview =>
+            'Your "${exam.title}" attempt is under review by a supervisor. '
+                'Your answers are saved; you will be told the outcome.',
           SubmissionStatus.submitted =>
             'You have already submitted "${exam.title}".',
           SubmissionStatus.ongoing => '', // handled above

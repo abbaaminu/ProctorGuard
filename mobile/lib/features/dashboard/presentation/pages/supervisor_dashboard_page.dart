@@ -76,6 +76,13 @@ final liveViolationFeedProvider =
 final submissionResetInFlightProvider =
     StateProvider.family<bool, String>((ref, id) => false);
 
+/// Whether a supervisor's `resolve_flagged_attempt` call for one attempt is in
+/// flight, so the two decision buttons disable while it runs (a double-tap must
+/// not look like two decisions - the RPC would refuse the second anyway, but the
+/// console should not offer it).
+final attemptResolutionInFlightProvider =
+    StateProvider.family<bool, String>((ref, id) => false);
+
 /// `profiles.full_name`, falling back to the address (never an empty tile).
 String _displayName(Map<String, dynamic> row) {
   final name = (row['full_name'] as String? ?? '').trim();
@@ -122,6 +129,14 @@ class SupervisorDashboardPage extends ConsumerWidget {
     this.canResetThisExam = true,
   });
 
+  /// Whether this account may resolve a flagged attempt **on this paper**.
+  ///
+  /// `resolve_flagged_attempt()` enforces `is_exam_supervisor() or
+  /// owns_exam(exam_id)` - the same predicate `submissions_delete_supervisor` uses -
+  /// which is exactly what [canResetThisExam] already answers, so the two controls
+  /// appear together or not at all.
+  bool get canResolveHere => canResetThisExam;
+
   /// Human wording for `proctoring_logs.action_type`, kept identical to the
   /// dashboard's incident labels so both consoles read the same.
   static const Map<String, String> actionLabels = {
@@ -140,6 +155,16 @@ class SupervisorDashboardPage extends ConsumerWidget {
 
     final roster = submissions.valueOrNull ?? const <Map<String, dynamic>>[];
     final nameById = names.valueOrNull ?? const <String, String>{};
+
+    // Attempts under review first. They are the only rows here that are waiting on
+    // the person reading them - every other status is either still running or
+    // finished - so the grid leads with the work rather than with the roster order.
+    // Two filters rather than a comparator: `List.sort` is not stable, and the
+    // stream's `started_at` order is worth keeping inside each group.
+    final orderedRoster = <Map<String, dynamic>>[
+      ...roster.where((row) => row['status'] == 'flagged_for_review'),
+      ...roster.where((row) => row['status'] != 'flagged_for_review'),
+    ];
 
     Future<void> resetAttempt(Map<String, dynamic> row) async {
       if (!canResetAttempts || !canResetThisExam) return;
@@ -218,6 +243,113 @@ class SupervisorDashboardPage extends ConsumerWidget {
             'Student ${_shortId(row['student_id'])}',
     };
 
+    /// Decides a flagged attempt: `decision` is `'disqualify'` or `'clear'`.
+    ///
+    /// The row is the only place the console learns an attempt is waiting on a
+    /// person, and the note is part of the record rather than a courtesy - the
+    /// audit trail in `attempt_review_logs` is what an appeal is answered from, so
+    /// the dialog asks for it before it asks for the decision.
+    Future<void> resolveAttempt(
+      Map<String, dynamic> row,
+      String decision,
+    ) async {
+      if (!canResolveHere) return;
+      final submissionId = row['id'] as String;
+      final inFlight =
+          ref.read(attemptResolutionInFlightProvider(submissionId).notifier);
+      if (inFlight.state) return;
+      inFlight.state = true;
+      final studentId = row['student_id'] as String;
+      final studentName =
+          nameById[studentId] ?? 'Student ${_shortId(studentId)}';
+      final disqualify = decision == 'disqualify';
+      final note = TextEditingController();
+      try {
+        final approved = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text(
+              disqualify
+                  ? 'Disqualify $studentName?'
+                  : 'Clear $studentName’s attempt?',
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  disqualify
+                      ? 'The attempt is marked disqualified and does not count. '
+                          'The evidence stays on the record, and the student '
+                          'cannot start this paper again without a reset.'
+                      : 'The attempt is restored to submitted and marked from '
+                          'the answers already saved. Subjective answers can be '
+                          'marked afterwards as usual.',
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  key: const Key('resolve-note'),
+                  controller: note,
+                  maxLength: 2000,
+                  maxLines: 2,
+                  decoration: const InputDecoration(
+                    labelText: 'Note for the record',
+                    helperText: 'Stored with the decision and the reviewer’s name.',
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                key: Key('resolve-confirm-$submissionId'),
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: Text(disqualify ? 'Disqualify' : 'Clear'),
+              ),
+            ],
+          ),
+        );
+        if (approved != true || !context.mounted) return;
+
+        final trimmed = note.text.trim();
+        final outcome = await ref
+            .read(dashboardRepositoryProvider)
+            .resolveFlaggedAttempt(
+              submissionId,
+              decision: decision,
+              note: trimmed.isEmpty ? null : trimmed,
+            );
+        ref.invalidate(examSubmissionsStreamProvider(examId));
+        ref.invalidate(liveViolationFeedProvider(examId));
+        if (!context.mounted) return;
+        final message = switch (outcome) {
+          'disqualified' => 'Attempt disqualified.',
+          'submitted' => 'Attempt cleared and restored for marking.',
+          // The RPC is idempotent: an attempt somebody else already resolved
+          // answers with the status it holds rather than a second decision.
+          '' => 'Attempt resolved.',
+          _ => 'Attempt was already resolved (status: $outcome).',
+        };
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(content: Text(message)));
+      } on DashboardException catch (error) {
+        if (!context.mounted) return;
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(
+            content: Text(error.message),
+            backgroundColor: Theme.of(context).colorScheme.error,
+          ));
+      } finally {
+        note.dispose();
+        if (context.mounted) inFlight.state = false;
+      }
+    }
+
     // Flags are counted from the feed that is already scoped to this exam.
     final flagsBySubmission = <String, int>{};
     for (final log in violations.valueOrNull ?? const <Map<String, dynamic>>[]) {
@@ -280,9 +412,9 @@ class SupervisorDashboardPage extends ConsumerWidget {
                             message: 'No student has started this exam yet.',
                           )
                         : ListView.builder(
-                            itemCount: rows.length,
+                            itemCount: orderedRoster.length,
                             itemBuilder: (context, i) {
-                              final row = rows[i];
+                              final row = orderedRoster[i];
                               final status = row['status'] as String;
                               final score = row['score'];
                               final flags = flagsBySubmission[row['id']] ?? 0;
@@ -346,6 +478,70 @@ class SupervisorDashboardPage extends ConsumerWidget {
                                                   .onSurfaceVariant,
                                         ),
                                       ),
+                                      // The decision controls: only on an attempt
+                                      // that is actually waiting for one, and only
+                                      // for the tier the RPC accepts.
+                                      if (canResolveHere &&
+                                          status == 'flagged_for_review')
+                                        Consumer(
+                                          builder: (context, watchRef, _) {
+                                            final resolving = watchRef.watch(
+                                              attemptResolutionInFlightProvider(
+                                                row['id'] as String,
+                                              ),
+                                            );
+                                            if (resolving) {
+                                              return const Padding(
+                                                padding: EdgeInsets.symmetric(
+                                                  horizontal: 12,
+                                                ),
+                                                child: SizedBox(
+                                                  height: 18,
+                                                  width: 18,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                    strokeWidth: 2,
+                                                  ),
+                                                ),
+                                              );
+                                            }
+                                            return Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                IconButton(
+                                                  key: Key(
+                                                    'resolve-clear-${row['id']}',
+                                                  ),
+                                                  tooltip: 'Clear: restore to '
+                                                      'submitted for marking',
+                                                  onPressed: () => resolveAttempt(
+                                                    row,
+                                                    'clear',
+                                                  ),
+                                                  icon: const Icon(
+                                                    Icons.task_alt,
+                                                    color: Colors.green,
+                                                  ),
+                                                ),
+                                                IconButton(
+                                                  key: Key(
+                                                    'resolve-disqualify-${row['id']}',
+                                                  ),
+                                                  tooltip: 'Disqualify this '
+                                                      'attempt',
+                                                  onPressed: () => resolveAttempt(
+                                                    row,
+                                                    'disqualify',
+                                                  ),
+                                                  icon: const Icon(
+                                                    Icons.gavel,
+                                                    color: Colors.redAccent,
+                                                  ),
+                                                ),
+                                              ],
+                                            );
+                                          },
+                                        ),
                                       if (canResetAttempts && canResetThisExam)
                                         Consumer(
                                           builder: (context, watchRef, _) {
@@ -457,14 +653,21 @@ class _RosterSummary extends StatelessWidget {
         roster.where((row) => row['status'] == 'submitted').length;
     final disqualified =
         roster.where((row) => row['status'] == 'disqualified').length;
+    // Attempts waiting on a decision come first in the list, and first here too:
+    // they are work, not a statistic.
+    final flagged =
+        roster.where((row) => row['status'] == 'flagged_for_review').length;
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
       child: Text(
         '$total attempt(s)  •  $ongoing in progress  •  $submitted submitted  •  '
-        '$disqualified disqualified',
+        '$disqualified disqualified'
+        '${flagged > 0 ? '  •  $flagged under review' : ''}',
         style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
+              color: flagged > 0
+                  ? Colors.orange
+                  : Theme.of(context).colorScheme.onSurfaceVariant,
             ),
       ),
     );
@@ -497,6 +700,7 @@ String _shortId(Object? value) {
 /// Avatar colour per submission status.
 Color _statusColor(String status) => switch (status) {
       'ongoing' => Colors.blue,
+      'flagged_for_review' => Colors.orange,
       'submitted' => Colors.green,
       'disqualified' => Colors.red,
       _ => Colors.grey,

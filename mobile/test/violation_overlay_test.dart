@@ -39,7 +39,7 @@ void main() {
       overlay(warningCount: 2, onDismiss: () => dismissed = true),
     );
 
-    expect(find.text('Warning 2 / 3'), findsOneWidget);
+    expect(find.text('Warning 2'), findsOneWidget);
     expect(find.text('Please keep your eyes on the screen.'), findsOneWidget);
 
     await tester.tap(find.text('I understand, continue'));

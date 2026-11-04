@@ -130,16 +130,28 @@ class ViolationRuling {
     required this.violation,
     required this.warningCount,
     required this.disqualified,
+    this.flagged = false,
   });
 
   final String submissionId;
   final Violation violation;
 
-  /// Authoritative strike count for the attempt.
+  /// Authoritative strike count for the attempt: the rows the server holds, not
+  /// the weighted score (the server keeps those apart on purpose - see
+  /// `register_violation`).
   final int warningCount;
 
   /// True once the backend has flipped the attempt to `disqualified`.
   final bool disqualified;
+
+  /// True once the backend has closed the attempt as `flagged_for_review` - the
+  /// weighted threshold was reached and a supervisor has to decide. Defaulted so a
+  /// ruling built by a test (or by a backend that predates the column) reads as
+  /// "not flagged" rather than failing to construct.
+  final bool flagged;
+
+  /// Whether the attempt has stopped, whichever way the server ended it.
+  bool get closed => disqualified || flagged;
 }
 
 /// How proctoring violations reach the backend.
@@ -150,8 +162,20 @@ class ViolationRuling {
 ///  * `log` returns a [ViolationRuling] when the server answered;
 ///  * `log` returns null when the row was queued for a later attempt;
 ///  * [deferredRulings] then carries the ruling of anything the queue delivered
-///    late, so a strike (or a disqualification) that happened while the network
+///    late, so a strike (or the end of the attempt) that happened while the network
 ///    was down still reaches the session.
+///
+/// Replaying a queued event is safe by construction, and the same three properties
+/// are what make the weighted rule safe to replay:
+///  * every queued row carries the `client_event_id` minted when the event was
+///    seen, and `register_violation` inserts it or nothing - so a retry after a lost
+///    response can never become a second strike, weighted or not;
+///  * the server recomputes the score from the rows it holds, so the number in a
+///    late ruling is the truth rather than an increment that might double;
+///  * a late ruling can say `disqualified` **or** `flagged` (the weighted
+///    threshold), and the session treats both as "the attempt has stopped" - the
+///    only difference is which screen the student is shown
+///    (`ProctoringNotifier._handleDeferredRuling`).
 abstract class ViolationOutbox {
   /// How long one delivery attempt may take before the row counts as undelivered.
   ///
@@ -212,6 +236,7 @@ class DirectViolationOutbox implements ViolationOutbox {
         violation: violation,
         warningCount: result.warningCount,
         disqualified: result.disqualified,
+        flagged: result.flagged,
       );
     } catch (error) {
       proctorLog(
@@ -654,6 +679,7 @@ class OfflineSyncService implements ViolationOutbox {
               violation: pending.violation,
               warningCount: result.warningCount,
               disqualified: result.disqualified,
+              flagged: result.flagged,
             ),
           );
         } catch (error) {
@@ -782,6 +808,7 @@ class OfflineSyncService implements ViolationOutbox {
         violation: violation,
         warningCount: result.warningCount,
         disqualified: result.disqualified,
+        flagged: result.flagged,
       );
     } catch (error) {
       proctorLog(

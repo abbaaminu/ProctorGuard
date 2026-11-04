@@ -16,7 +16,16 @@ import 'risk_index_chip.dart';
 class ViolationOverlay extends StatelessWidget {
   final ViolationType? type;
   final int warningCount;
-  final bool isFinal; // warningCount >= 3 -> disqualified, no dismiss
+
+  /// The attempt was disqualified: the paper does not count.
+  final bool isFinal;
+
+  /// The attempt reached the server's weighted threshold and is under review: the
+  /// paper is closed, nothing has been decided, and a supervisor will decide. The
+  /// screen has to say that rather than "disqualified" - the student has not been
+  /// found guilty of anything yet, and the appeal starts from what this screen told
+  /// them.
+  final bool underReview;
 
   /// The attempt's index so far, recomputed from the session's own violation
   /// list (`ProctoringState.risk`) — never a number passed alongside it.
@@ -28,9 +37,13 @@ class ViolationOverlay extends StatelessWidget {
     required this.type,
     required this.warningCount,
     required this.isFinal,
+    this.underReview = false,
     required this.risk,
     required this.onDismiss,
   });
+
+  /// Whether this screen is the end of the attempt (either ending).
+  bool get _ended => isFinal || underReview;
 
   String _message(ViolationType? t) => switch (t) {
         ViolationType.lookingAway => 'Please keep your eyes on the screen.',
@@ -75,13 +88,25 @@ class ViolationOverlay extends StatelessWidget {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Icon(
-                      isFinal ? Icons.block : Icons.warning_amber_rounded,
-                      color: isFinal ? Colors.redAccent : Colors.amber,
+                      _ended ? Icons.block : Icons.warning_amber_rounded,
+                      color: isFinal
+                          ? Colors.redAccent
+                          : underReview
+                              ? Colors.orangeAccent
+                              : Colors.amber,
                       size: 72,
                     ),
                     const SizedBox(height: 24),
                     Text(
-                      isFinal ? 'Exam Terminated' : 'Warning $warningCount / 3',
+                      isFinal
+                          ? 'Exam Terminated'
+                          : underReview
+                              ? 'Session Under Review'
+                              // No denominator: the server's threshold is a
+                              // weighted score now, and "2 / 3" promised that any
+                              // third signal would end the attempt - which is
+                              // exactly what three pasted lines no longer do.
+                              : 'Warning $warningCount',
                       style: const TextStyle(
                         color: Colors.white,
                         fontSize: 24,
@@ -95,7 +120,12 @@ class ViolationOverlay extends StatelessWidget {
                           ? 'You have exceeded the allowed number of proctoring '
                             'violations. Your exam has been automatically submitted '
                             'and marked as disqualified.'
-                          : _message(type),
+                          : underReview
+                              ? 'Your session has been stopped and sent to a '
+                                'supervisor for review. Your answers are saved. '
+                                'Nothing has been decided yet - you will be told '
+                                'the outcome, and you can close this screen now.'
+                              : _message(type),
                       style: const TextStyle(color: Colors.white70, fontSize: 16),
                       textAlign: TextAlign.center,
                     ),
@@ -113,7 +143,7 @@ class ViolationOverlay extends StatelessWidget {
                       textAlign: TextAlign.center,
                     ),
                     const SizedBox(height: 32),
-                    if (!isFinal)
+                    if (!_ended)
                       ElevatedButton(
                         onPressed: onDismiss,
                         child: const Padding(
@@ -127,7 +157,8 @@ class ViolationOverlay extends StatelessWidget {
                     else
                       ElevatedButton(
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.redAccent,
+                          backgroundColor:
+                              isFinal ? Colors.redAccent : Colors.orangeAccent,
                         ),
                         onPressed: onDismiss, // routes back to login/home
                         child: const Padding(

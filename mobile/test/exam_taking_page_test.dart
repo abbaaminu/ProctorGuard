@@ -481,7 +481,7 @@ void main() {
       await tester.pump();
 
       expect(proctoring.violations.single.type.dbValue, 'app_minimized');
-      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      expect(find.text('Warning 1'), findsOneWidget);
       expect(find.text('Fullscreen required'), findsNothing);
     });
   });
@@ -521,7 +521,7 @@ void main() {
       await tester.pump();
 
       expect(proctoring.violations.single.type.dbValue, 'copy_paste_attempt');
-      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      expect(find.text('Warning 1'), findsOneWidget);
     });
 
     testWidgets('a suppressed menu and a devtools panel are separate strikes',
@@ -539,7 +539,7 @@ void main() {
         proctoring.violations.map((violation) => violation.type.dbValue),
         <String>['right_click_blocked', 'devtools_detected'],
       );
-      expect(find.text('Warning 2 / 3'), findsOneWidget);
+      expect(find.text('Warning 2'), findsOneWidget);
     });
 
     testWidgets('a log the server refuses cannot hold the attempt open',
@@ -639,7 +639,7 @@ void main() {
       await tester.pump();
 
       expect(proctoring.violations.single.type.dbValue, 'looking_away');
-      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      expect(find.text('Warning 1'), findsOneWidget);
     });
 
     testWidgets('a near-sideways head is one looking_away strike on sight',
@@ -654,7 +654,7 @@ void main() {
       await tester.pump();
 
       expect(proctoring.violations.single.type.dbValue, 'looking_away');
-      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      expect(find.text('Warning 1'), findsOneWidget);
 
       // Still held: the same episode is not a second strike.
       now = now.add(const Duration(seconds: 2));
@@ -698,7 +698,7 @@ void main() {
       await tester.pump();
 
       expect(proctoring.violations.single.type.dbValue, 'no_face');
-      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      expect(find.text('Warning 1'), findsOneWidget);
     });
 
     testWidgets('no_face holds the paper shut until a face is reported again',
@@ -719,7 +719,7 @@ void main() {
       // also the current state of the camera). A warning alone would let the
       // student read on with nobody visibly sitting the exam.
       expect(proctoring.violations.single.type.dbValue, 'no_face');
-      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      expect(find.text('Warning 1'), findsOneWidget);
       expect(find.byKey(const Key('equipment-block-face')), findsOneWidget);
       // Which means the warning's own dismiss button is behind an opaque barrier:
       // a student cannot click their way back to an unproctored paper.
@@ -838,7 +838,7 @@ void main() {
       // runs off the same lifecycle, so a strike can land on "Camera unavailable".
       await strike(tester);
 
-      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      expect(find.text('Warning 1'), findsOneWidget);
       // Still blocked underneath: acknowledging the warning returns the student to
       // the retry, not to a paper with no camera behind it.
       expect(find.byKey(const Key('exam-retry')), findsOneWidget);
@@ -847,7 +847,7 @@ void main() {
       await tester.pump();
       await tester.pump();
 
-      expect(find.text('Warning 1 / 3'), findsNothing);
+      expect(find.text('Warning 1'), findsNothing);
       expectBlockingState();
     });
 
@@ -859,14 +859,14 @@ void main() {
       expect(find.text('1 of 3 warnings'), findsNothing);
 
       await strike(tester);
-      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      expect(find.text('Warning 1'), findsOneWidget);
 
       await tester.tap(find.text('I understand, continue'));
       await tester.pumpAndSettle();
 
       // The overlay is gone, the strike is not: the third one ends the attempt, so
       // the count has to outlive the dialog that announced it.
-      expect(find.text('Warning 1 / 3'), findsNothing);
+      expect(find.text('Warning 1'), findsNothing);
       expect(find.text('1 of 3 warnings'), findsOneWidget);
     });
 
@@ -877,7 +877,7 @@ void main() {
       await tester.pumpAndSettle();
 
       await strike(tester);
-      expect(find.text('Warning 1 / 3'), findsOneWidget);
+      expect(find.text('Warning 1'), findsOneWidget);
 
       // A hardware/gesture back on Android reaches the route as `popRoute`, which
       // is `Navigator.maybePop` — the call that used to pop the session out from
@@ -885,7 +885,7 @@ void main() {
       await tester.state<NavigatorState>(find.byType(Navigator)).maybePop();
       await tester.pumpAndSettle();
 
-      expect(find.text('Warning 1 / 3'), findsNothing);
+      expect(find.text('Warning 1'), findsNothing);
       expect(find.text('Question 1 of 2'), findsOneWidget);
       // Acknowledged, not undone: the strike stays the attempt's first.
       expect(proctoring.violations.single.type.dbValue, 'app_minimized');
@@ -1711,7 +1711,7 @@ class _SilentProctoringRepository implements ProctoringRepository {
   final List<Violation> violations = <Violation>[];
 
   @override
-  Future<({int warningCount, bool disqualified})> logViolation({
+  Future<({int warningCount, bool disqualified, bool flagged})> logViolation({
     required String submissionId,
     required Violation violation,
   }) async {
@@ -1720,6 +1720,10 @@ class _SilentProctoringRepository implements ProctoringRepository {
     return (
       warningCount: violations.length,
       disqualified: violations.length >= 3,
+      // This fake never flags: these tests are about the disqualification screen.
+      // The weighted "under review" path has its own tests in
+      // proctoring_notifier_test.dart.
+      flagged: false,
     );
   }
 

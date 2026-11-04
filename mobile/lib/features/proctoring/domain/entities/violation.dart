@@ -77,7 +77,41 @@ enum ViolationType {
           false,
       };
 
-  /// The inverse of [dbValue], for rows rebuilt from the offline queue.
+  /// How much this signal counts towards the **server's** disqualification score,
+  /// mirroring `public.violation_weights` (`supabase/schema.sql` section 5a).
+  ///
+  /// Display-only on this side. The decision is `register_violation()`'s, from the
+  /// database's copy of this table - an institution retunes a weight with one
+  /// UPDATE, and a client that had cached its own numbers would then disagree with
+  /// the only opinion that matters. It is here so the console and the student's own
+  /// explanation can say *why* a signal did or did not count, and so
+  /// `schema_contract_test.dart` can fail when the two drift apart.
+  ///
+  /// One point for the six identity-breaking signals, zero for the five that are
+  /// recorded and reviewed but never automatically fatal. Three points closes the
+  /// attempt as `flagged_for_review`.
+  int get weight => switch (this) {
+        ViolationType.multipleFaces ||
+        ViolationType.noFace ||
+        ViolationType.appMinimized ||
+        ViolationType.devtoolsDetected ||
+        ViolationType.secondaryDisplayDetected ||
+        ViolationType.virtualCameraDetected =>
+          1,
+        ViolationType.lookingAway ||
+        ViolationType.audioNoise ||
+        ViolationType.copyPasteAttempt ||
+        ViolationType.rightClickBlocked ||
+        ViolationType.idleAfk =>
+          0,
+      };
+
+  /// The server's `counts_toward_dq` column: whether this type may contribute at
+  /// all. False for every soft signal - it is still stored, still shown to a
+  /// supervisor, and still costs the student a warning; it just cannot end the
+  /// attempt by itself.
+  bool get countsTowardDisqualification => weight > 0;
+
   ///
   /// Throws on an unknown value rather than defaulting: a queued violation whose
   /// type cannot be mapped is evidence of a *drift* between this enum and the

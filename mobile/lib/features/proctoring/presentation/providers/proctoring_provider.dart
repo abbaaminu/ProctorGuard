@@ -33,7 +33,21 @@ class ProctoringState {
   final int warningCount;
   final bool showViolationOverlay;
   final ViolationType? lastViolation;
+
+  /// The attempt was disqualified. Set only from the server's ruling, and the
+  /// final lockout screen has no dismiss.
   final bool disqualified;
+
+  /// The attempt reached the server's weighted threshold and is therefore
+  /// **under review**: `exam_submissions.status = 'flagged_for_review'`, the paper
+  /// is closed, and a supervisor decides whether it is disqualified or restored.
+  ///
+  /// A separate flag rather than a third value of [disqualified] because the two
+  /// screens say opposite things to the student - "your exam is over and does not
+  /// count" against "your exam is with a supervisor" - and because the client must
+  /// not send `mark_disqualified` for this one: the whole point of the state is
+  /// that nobody on this device decides it.
+  final bool underReview;
 
   /// True while camera-derived tracking is paused because the feed is
   /// initialising, blocked or lost. The exam page watches this to prompt the
@@ -63,10 +77,18 @@ class ProctoringState {
     this.showViolationOverlay = false,
     this.lastViolation,
     this.disqualified = false,
+    this.underReview = false,
     this.cameraPaused = false,
     this.faceMissing = false,
     this.violationTypes = const <ViolationType>[],
   });
+
+  /// Whether the attempt has stopped, whichever way the server ended it.
+  ///
+  /// Every "ignore this late signal" gate reads this rather than [disqualified]:
+  /// a session under review is just as finished, and a stray frame that keeps
+  /// logging against it would be evidence attached to a paper nobody is sitting.
+  bool get ended => disqualified || underReview;
 
   /// The attempt's risk index, recomputed from [violationTypes].
   ///
@@ -82,6 +104,7 @@ class ProctoringState {
     bool? showViolationOverlay,
     ViolationType? lastViolation,
     bool? disqualified,
+    bool? underReview,
     bool? cameraPaused,
     bool? faceMissing,
     List<ViolationType>? violationTypes,
@@ -91,6 +114,7 @@ class ProctoringState {
         showViolationOverlay: showViolationOverlay ?? this.showViolationOverlay,
         lastViolation: lastViolation ?? this.lastViolation,
         disqualified: disqualified ?? this.disqualified,
+        underReview: underReview ?? this.underReview,
         cameraPaused: cameraPaused ?? this.cameraPaused,
         faceMissing: faceMissing ?? this.faceMissing,
         violationTypes: violationTypes ?? this.violationTypes,
@@ -100,7 +124,12 @@ class ProctoringState {
 /// Owns the MediaPipe engine + lifecycle observer for one exam session and
 /// implements the section-3 escalation contract:
 ///   - on violation: warningCount += 1, show full-screen overlay, log to DB
-///   - at warningCount >= 3: auto-submit as 'disqualified' + forced exit
+///   - when the server's weighted score reaches its threshold: the attempt stops
+///     as `flagged_for_review` (or `disqualified`) and the session exits
+///
+/// The client does not decide the ending. It counts what it has seen so the
+/// student gets a warning immediately, and it ends the session when, and only
+/// when, `register_violation` says the attempt is no longer 'ongoing'.
 ///
 /// Every signal — camera, audio, lifecycle, the browser's exam lockdown, the
 /// browser's face-detector bridge and the device-integrity probes — enters
@@ -392,7 +421,7 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     // `state` on a disposed `StateNotifier` asserts in debug and silently drops
     // the write in release.
     if (!mounted) return;
-    if (state.disqualified) return; // already ended, ignore stray signals
+    if (state.ended) return; // already ended, ignore stray signals
 
     // Debounce so one sustained condition doesn't spam multiple identical
     // log rows within the same couple of seconds. Per type: see [_lastLoggedAt].
@@ -452,8 +481,14 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     // protects against a client that raced ahead or fell behind).
     state = state.copyWith(warningCount: ruling.warningCount);
 
+    // The server decides how the attempt ended, and the two outcomes are different
+    // screens: a disqualification says the paper does not count, a flag says a
+    // supervisor is looking at it. Neither is inferred from the count here - a
+    // client cannot know the weights.
     if (ruling.disqualified) {
       await _forceDisqualify();
+    } else if (ruling.flagged) {
+      _endForReview();
     }
   }
 
@@ -466,12 +501,16 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   void _handleDeferredRuling(ViolationRuling ruling) {
     if (!mounted) return; // the queue outlives the session it belongs to
     if (ruling.submissionId != submissionId) return; // another session's queue
-    if (state.disqualified) return; // already ended, nothing left to escalate
+    if (state.ended) return; // already ended, nothing left to escalate
 
     if (ruling.warningCount > state.warningCount) {
       state = state.copyWith(warningCount: ruling.warningCount);
     }
-    if (ruling.disqualified) unawaited(_forceDisqualify());
+    if (ruling.disqualified) {
+      unawaited(_forceDisqualify());
+    } else if (ruling.flagged) {
+      _endForReview();
+    }
   }
 
   /// Captures a still frame and stores it in the private `proctor-snapshots`
@@ -539,8 +578,9 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   /// Ends the attempt: lockout overlay, server-side status, forced exit.
   ///
   /// **Idempotent, and it always exits.** The disqualification is a local
-  /// consequence of the third strike — the server has already recorded
-  /// `status = 'disqualified'` inside `register_violation` — so the
+  /// consequence of the server's ruling — the server has already recorded
+  /// `status = 'disqualified'` inside `register_violation` or
+  /// `resolve_flagged_attempt` — so the
   /// `mark_disqualified` round-trip here is bookkeeping, not the decision. A
   /// student whose confirmation cannot be persisted (offline, RLS, a token that
   /// expired mid-exam) used to be left sitting in an exam that had already ended,
@@ -568,9 +608,29 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     _onForceExit();
   }
 
+  /// Ends the attempt for the weighted threshold: nothing is decided, and the
+  /// student is told a supervisor will decide.
+  ///
+  /// Deliberately does **not** call `markDisqualified`. That call exists so a
+  /// client which never got a ruling can still stop its own session, and it writes
+  /// `p_disqualified => true` - which on a flagged attempt would be the client
+  /// overruling the review it just asked for. For a flagged attempt the server has
+  /// already closed the paper (`status = 'flagged_for_review'`, `submitted_at`
+  /// set), so the only thing left for this device to do is stop showing questions
+  /// and offer the way out.
+  ///
+  /// Idempotent for the same reason as [_forceDisqualify]: one ending, one exit.
+  void _endForReview() {
+    if (!mounted) return;
+    if (state.ended) return;
+
+    state = state.copyWith(underReview: true, showViolationOverlay: true);
+    _onForceExit();
+  }
+
   void dismissOverlay() {
     if (!mounted) return;
-    if (state.disqualified) return; // can't dismiss the final lockout screen
+    if (state.ended) return; // neither the lockout nor the review screen is dismissible
     state = state.copyWith(showViolationOverlay: false);
   }
 

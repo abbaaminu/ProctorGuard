@@ -193,12 +193,18 @@ const List<_Rule> _proctorRules = <_Rule>[
   ),
   _Rule(
     icon: Icons.report_gmailerrorred_outlined,
-    heading: 'Three confirmed strikes close the attempt',
+    heading: 'Serious signals stop the attempt, for review',
     body:
-        'Incidents are counted as they happen and your supervisor sees them '
-        'live. Three confirmed strikes close the attempt as disqualified, and a '
-        'disqualified attempt is not marked. A disqualification aimed at the '
-        'wrong candidate can be undone — the paper\'s author or a supervisor can '
+        'Incidents are recorded as they happen and your supervisor sees them '
+        'live. Not every signal weighs the same: a second person in frame, a face '
+        'missing from the camera, leaving the exam screen, a second display, a '
+        'virtual camera or developer tools each count - three of those stop the '
+        'attempt and send it to a supervisor for review. Glancing away, background '
+        'noise, a blocked paste, a suppressed right-click or sitting idle are '
+        'recorded and reviewed, but on their own they never end the attempt. An '
+        'attempt under review has not been decided: a supervisor either disqualifies '
+        'it or restores it for marking, and a decision aimed at the '
+        'wrong candidate can be undone - the paper\'s author or a supervisor can '
         'reset the attempt, which clears it, its incidents and its snapshots so '
         'it can be sat again.',
   ),

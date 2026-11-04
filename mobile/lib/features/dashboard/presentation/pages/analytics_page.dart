@@ -114,7 +114,8 @@ class AnalyticsPage extends ConsumerWidget {
                           const SizedBox(height: 10),
                           Text(
                             '${exam.attempts} attempts · ${exam.ongoing} in progress · '
-                            '${exam.completed} completed · ${exam.disqualified} disqualified',
+                            '${exam.completed} completed · ${exam.disqualified} disqualified '
+                            '· ${exam.flagged} under review',
                           ),
                           const SizedBox(height: 6),
                           Text(

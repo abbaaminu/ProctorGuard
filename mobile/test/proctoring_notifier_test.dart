@@ -565,6 +565,112 @@ void main() {
       expect(forcedExits, 1);
     });
   });
+  group('the weighted threshold (flagged for review)', () {
+    test('stops the session without disqualifying it', () async {
+      // The server's weighted threshold closes the paper as `flagged_for_review`:
+      // the sitting is over, nothing has been decided, and a supervisor will
+      // decide. The client's job is to (a) stop showing questions and (b) *not*
+      // send `mark_disqualified`, because that would be this device overruling the
+      // review it just asked for.
+      final examRepo = _RecordingExamRepository();
+      var forcedExits = 0;
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(
+          // The server never disqualifies automatically any more; only the flag.
+          disqualifyAfter: 99,
+          flagAfter: 3,
+        ),
+        examRepo: examRepo,
+        onForceExit: () => forcedExits++,
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportAppMinimized();
+      notifier.reportDevtoolsDetected();
+      await pumpEventQueue();
+      expect(notifier.state.underReview, isFalse);
+      expect(forcedExits, 0);
+
+      notifier.reportVirtualCameraDetected(); // the third counted signal
+      await pumpEventQueue();
+
+      expect(notifier.state.underReview, isTrue);
+      expect(notifier.state.disqualified, isFalse);
+      expect(notifier.state.showViolationOverlay, isTrue);
+      // Nothing on this device decided anything.
+      expect(examRepo.disqualified, isEmpty);
+      expect(forcedExits, 1);
+    });
+
+    test('is idempotent: a later signal neither logs nor exits again', () async {
+      final repo = _RecordingProctoringRepository(
+        disqualifyAfter: 99,
+        flagAfter: 1,
+      );
+      var forcedExits = 0;
+      final notifier = _notifier(
+        proctoringRepo: repo,
+        onForceExit: () => forcedExits++,
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportAppMinimized();
+      await pumpEventQueue();
+      expect(notifier.state.underReview, isTrue);
+
+      notifier.reportCopyPasteAttempt();
+      await pumpEventQueue();
+
+      // `state.ended` covers both endings, so a session under review is exactly as
+      // finished as a disqualified one: no second row, no second navigation.
+      expect(repo.violations, hasLength(1));
+      expect(forcedExits, 1);
+    });
+
+    test('a flag delivered late by the queue still ends the session', () async {
+      // The signal that crossed the threshold was logged while the device was
+      // offline, so the ruling arrives on the deferred stream rather than as the
+      // answer to the live call.
+      final outbox = _DeferredOutbox();
+      var forcedExits = 0;
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        outbox: outbox,
+        onForceExit: () => forcedExits++,
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportAppMinimized(); // parked on the wire
+      await pumpEventQueue();
+      expect(notifier.state.underReview, isFalse);
+
+      outbox.emitRuling(warningCount: 3, flagged: true);
+      await pumpEventQueue();
+
+      expect(notifier.state.underReview, isTrue);
+      expect(notifier.state.warningCount, 3);
+      expect(forcedExits, 1);
+    });
+
+    test('the review screen cannot be dismissed with back', () async {
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(
+          disqualifyAfter: 99,
+          flagAfter: 1,
+        ),
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportAppMinimized();
+      await pumpEventQueue();
+      expect(notifier.state.underReview, isTrue);
+
+      notifier.dismissOverlay();
+      expect(notifier.state.showViolationOverlay, isTrue);
+    });
+  });
+
+
 
   group('teardown (the session that is already gone)', () {
     test('a violation still in flight at dispose does not write state', () async {
@@ -823,6 +929,7 @@ class _FakeOutbox implements ViolationOutbox {
     String submissionId = 'sub-1',
     required int warningCount,
     bool disqualified = false,
+    bool flagged = false,
   }) =>
       _rulings.add(ViolationRuling(
         submissionId: submissionId,
@@ -832,6 +939,7 @@ class _FakeOutbox implements ViolationOutbox {
         ),
         warningCount: warningCount,
         disqualified: disqualified,
+        flagged: flagged,
       ));
 
   @override
@@ -859,13 +967,18 @@ class _DeferredOutbox implements ViolationOutbox {
   }
 
   /// Answers the pending [log] call, as the backend would.
-  void complete({required int warningCount, bool disqualified = false}) =>
+  void complete({
+    required int warningCount,
+    bool disqualified = false,
+    bool flagged = false,
+  }) =>
       _pending.complete(
         ViolationRuling(
           submissionId: 'sub-1',
           violation: logged.last,
           warningCount: warningCount,
           disqualified: disqualified,
+          flagged: flagged,
         ),
       );
 
@@ -873,6 +986,7 @@ class _DeferredOutbox implements ViolationOutbox {
     String submissionId = 'sub-1',
     required int warningCount,
     bool disqualified = false,
+    bool flagged = false,
   }) =>
       _rulings.add(ViolationRuling(
         submissionId: submissionId,
@@ -882,6 +996,7 @@ class _DeferredOutbox implements ViolationOutbox {
         ),
         warningCount: warningCount,
         disqualified: disqualified,
+        flagged: flagged,
       ));
 
   @override
@@ -903,16 +1018,21 @@ class _FailingExamRepository extends _RecordingExamRepository {
 }
 
 /// Stands in for `supabase.rpc('register_violation', ...)`: the server owns the
-/// strike count and the threshold (3), which is what the notifier reconciles
+/// strike count and the weighted threshold, which is what the notifier reconciles
 /// its local count against.
 class _RecordingProctoringRepository implements ProctoringRepository {
-  _RecordingProctoringRepository({this.disqualifyAfter = 3});
+  _RecordingProctoringRepository({this.disqualifyAfter = 3, this.flagAfter});
 
   final int disqualifyAfter;
+
+  /// Evidence count at which the fake answers `flagged: true` - the weighted
+  /// threshold, in rows, for a test that only cares about the ending.
+  final int? flagAfter;
+
   final List<Violation> violations = <Violation>[];
 
   @override
-  Future<({int warningCount, bool disqualified})> logViolation({
+  Future<({int warningCount, bool disqualified, bool flagged})> logViolation({
     required String submissionId,
     required Violation violation,
   }) async {
@@ -920,6 +1040,9 @@ class _RecordingProctoringRepository implements ProctoringRepository {
     return (
       warningCount: violations.length,
       disqualified: violations.length >= disqualifyAfter,
+      // `flagAfter` lets a test reach the "under review" ending without the RPC
+      // having to disqualify first; null keeps the old behaviour.
+      flagged: flagAfter != null && violations.length >= flagAfter!,
     );
   }
 

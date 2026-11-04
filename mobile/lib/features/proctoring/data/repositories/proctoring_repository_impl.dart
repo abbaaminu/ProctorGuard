@@ -7,20 +7,21 @@ import '../../domain/repositories/proctoring_repository.dart';
 ///
 /// Contract this file depends on (`supabase/schema.sql`):
 ///  * `public.register_violation(p_submission_id uuid, p_action_type text,
-///    p_snapshot_url text default null) returns table(warning_count int,
-///    disqualified boolean)` — the RPC owns the insert, the 3-strike count and
-///    the automatic `exam_submissions.status = 'disqualified'` flip.
+///    p_snapshot_url text default null, p_client_timestamp timestamptz default
+///    null, p_client_event_id uuid default null) returns table(warning_count int,
+///    disqualified boolean, flagged boolean)` — the RPC owns the insert, the
+///    weighted count and the automatic flip to `flagged_for_review`.
 ///  * `public.proctoring_logs(submission_id uuid, action_type text,
 ///    timestamp timestamptz default now(), snapshot_url text)`; the client never
-///    inserts into it directly so the strike rule can't be bypassed.
-///  * `action_type` is a text check constraint whose five allowed values are
-///    produced by [ViolationType.dbValue].
+///    inserts into it directly so the escalation rule can't be bypassed.
+///  * `action_type` is a text check constraint whose allowed values are produced by
+///    [ViolationType.dbValue].
 class ProctoringRepositoryImpl implements ProctoringRepository {
   final SupabaseClient _client;
   ProctoringRepositoryImpl(this._client);
 
   @override
-  Future<({int warningCount, bool disqualified})> logViolation({
+  Future<({int warningCount, bool disqualified, bool flagged})> logViolation({
     required String submissionId,
     required Violation violation,
   }) async {
@@ -46,6 +47,10 @@ class ProctoringRepositoryImpl implements ProctoringRepository {
     return (
       warningCount: row['warning_count'] as int,
       disqualified: row['disqualified'] as bool,
+      // Absent on a server that predates the weighted rule: an old backend can
+      // only answer "disqualified or not", and guessing `flagged` from the count
+      // would end sessions the backend has not ended.
+      flagged: row['flagged'] as bool? ?? false,
     );
   }
 

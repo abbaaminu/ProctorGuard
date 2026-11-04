@@ -600,15 +600,15 @@ class _FlakyProctoringRepository implements ProctoringRepository {
   final List<Violation> violations = <Violation>[];
 
   @override
-  Future<({int warningCount, bool disqualified})> logViolation({
+  Future<({int warningCount, bool disqualified, bool flagged})> logViolation({
     required String submissionId,
     required Violation violation,
   }) async {
-    if (hang) return Completer<({int warningCount, bool disqualified})>().future;
+    if (hang) return Completer<({int warningCount, bool disqualified, bool flagged})>().future;
     if (!online) throw const _Offline();
     violations.add(violation);
     final count = warningCount + violations.length - 1;
-    return (warningCount: count, disqualified: count >= disqualifyAt);
+    return (warningCount: count, disqualified: count >= disqualifyAt, flagged: false);
   }
 
   @override

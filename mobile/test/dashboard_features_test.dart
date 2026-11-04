@@ -579,6 +579,27 @@ class _FakeDashboardRepository implements DashboardRepository {
   Future<SubmissionResetResult> resetSubmission(String submissionId) async =>
       _reset(submissionId);
 
+  /// Records every decision the console sends, so a test can assert the RPC was
+  /// called with the right decision and note (and prove it was *not* called on a
+  /// row that is not flagged).
+  final List<({String submissionId, String decision, String? note})>
+      resolutions = [];
+
+  /// What the RPC answers: the status it wrote.
+  String resolvedStatus = 'submitted';
+
+  @override
+  Future<String> resolveFlaggedAttempt(
+    String submissionId, {
+    required String decision,
+    String? note,
+  }) async {
+    resolutions.add(
+      (submissionId: submissionId, decision: decision, note: note),
+    );
+    return resolvedStatus;
+  }
+
   Future<SubmissionResetResult> _reset(String submissionId) async {
     resets.add(submissionId);
     return SubmissionResetResult(

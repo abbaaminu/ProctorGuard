@@ -1707,7 +1707,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       PopScope(
         canPop: !proctoringState.showViolationOverlay && equipmentBlock == null,
         onPopInvokedWithResult: (didPop, Object? result) {
-          if (didPop || proctoringState.disqualified) return;
+          if (didPop || proctoringState.ended) return;
           ref
               .read(proctoringProvider(widget.submissionId).notifier)
               .dismissOverlay();
@@ -1719,11 +1719,15 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
           type: proctoringState.lastViolation,
           warningCount: proctoringState.warningCount,
           isFinal: proctoringState.disqualified,
+          // The weighted threshold: the paper is closed and a supervisor decides.
+          // A different screen from the disqualification, because nothing has been
+          // decided - see ViolationOverlay.underReview.
+          underReview: proctoringState.underReview,
           // The same index the supervisor's grid shows for this attempt: it is
           // derived from this session's own violation list, not passed in.
           risk: proctoringState.risk,
           onDismiss: () {
-            if (proctoringState.disqualified) {
+            if (proctoringState.ended) {
               Navigator.of(context).popUntil((r) => r.isFirst);
             } else {
               ref
