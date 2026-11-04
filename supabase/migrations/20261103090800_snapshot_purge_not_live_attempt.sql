@@ -100,3 +100,23 @@ create policy "Proctor snapshots supervisor purge"
       where s.id::text = (storage.foldername(name))[1]
     )
   );
+
+-- A DELETE that has a WHERE clause (which is what `storage.remove()` issues) must
+-- also pass the table's SELECT policies: Postgres only lets a statement delete rows
+-- it is allowed to see. The read policy above admits a lecturer only through an
+-- attempt row, and the purge runs exactly when that row is gone, so without this
+-- companion the purge matched 0 rows for a lecturer and left the stills behind.
+-- Same predicate as the purge policy, on SELECT; it exposes only already-orphaned
+-- objects, to the tier that is about to delete them.
+drop policy if exists "Proctor snapshots orphan read for purge" on storage.objects;
+create policy "Proctor snapshots orphan read for purge"
+  on storage.objects for select
+  to authenticated
+  using (
+    bucket_id = 'proctor-snapshots'
+    and public.is_attempt_resetter()
+    and not exists (
+      select 1 from public.exam_submissions s
+      where s.id::text = (storage.foldername(name))[1]
+    )
+  );

@@ -58,13 +58,21 @@
 --   * Apply after `schema.sql` (or the migrations that precede it): the function
 --     and its index use `exam_submissions.status`.
 -- =====================================================================
--- DO NOT RE-RUN AFTER APPLYING
---   This file is the historical upgrade path: it installs the definition it was
---   written against, and the hardened replacements live in
---   `supabase/migrations/2026110309*.sql` (each lists its own APPLY ORDER). Running
---   this file again after those would put the older policy or function back - the
---   `DROP POLICY`/`CREATE POLICY` pair below is idempotent, which is the problem:
---   it reinstates, silently, exactly what was replaced.
+-- RE-RUNNING THIS FILE, AND WHAT IT CANNOT UNDO
+--   Unlike the other historical files (`private_proctor_snapshots.sql`,
+--   `staff_attempt_resets.sql`, `secure_exam_access_and_deadlines.sql`), this one
+--   creates no RLS policy at all: it owns three objects and nothing else -
+--   `public.retention_policies`, `public.purge_expired_proctoring_logs(boolean)`
+--   and the `proctoring-logs-retention` cron job. The hardening pass in
+--   `supabase/migrations/2026110309*.sql` replaces neither, so re-running this
+--   file cannot put a narrowed policy back.
+--   Two things to know before doing it anyway:
+--     * the seed is `on conflict (table_name) do nothing`, so a re-run leaves an
+--       edited `retention_days` exactly as it is - it does not reset it to 30;
+--     * `create or replace function` does overwrite the body, so if a later
+--       migration ever replaces the purge, check that ordering first.
+--   The files that DO reinstate replaced storage policies are named at the bottom
+--   of `20261103090800_snapshot_purge_not_live_attempt.sql`.
 -- ---------------------------------------------------------------------
 -- 1. The window
 -- ---------------------------------------------------------------------

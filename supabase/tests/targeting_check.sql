@@ -68,6 +68,18 @@
 
 begin;
 
+-- Fixture helper: profiles.id references auth.users(id), which a plain insert
+-- into public.profiles does not create. Rolled back with everything else.
+create function public.tmp_fixture_auth_user() returns trigger
+language plpgsql security definer set search_path = public as $f$
+begin
+  insert into auth.users (id, email) values (new.id, new.email) on conflict (id) do nothing;
+  return new;
+end $f$;
+create trigger a_tmp_fixture_auth_user before insert on public.profiles
+  for each row execute function public.tmp_fixture_auth_user();
+
+
 -- ---------------------------------------------------------------------
 -- Fixtures (as postgres: no claims, RLS bypassed)
 -- ---------------------------------------------------------------------

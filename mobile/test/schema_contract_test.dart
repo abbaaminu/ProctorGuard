@@ -866,13 +866,16 @@ void main() {
         ),
       );
 
-      // Exactly three mentions: the definition plus the two policies that follow
-      // the delete (the snapshot purge and the audit row). A fourth would be a
-      // policy somebody left on the old predicate - the DELETE used to be one.
+      // Exactly four mentions: the definition plus the three policies that follow
+      // the delete (the snapshot purge, its companion orphan-read policy that lets
+      // the purge's DELETE ... WHERE see the rows, and the audit row). A fifth
+      // would be a policy somebody left on the old predicate - the DELETE used to
+      // be one.
       expect(
         RegExp(r'public\.is_attempt_resetter\(\)').allMatches(sql).length,
-        3,
-        reason: 'the function definition, the snapshot purge and the audit row',
+        4,
+        reason: 'the function definition, the snapshot purge, the orphan-read '
+            'companion and the audit row',
       );
     });
 
