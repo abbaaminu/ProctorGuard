@@ -182,6 +182,15 @@ lose proctoring signals but cannot change a result.
    supabase db query --linked -f supabase/migrations/academic_targeting.sql
    supabase db query --linked -f supabase/migrations/profile_identity_numbers.sql
    supabase db query --linked -f supabase/migrations/strict_targeting_null_profiles.sql
+   supabase db query --linked -f supabase/migrations/20261103090000_guard_profile_labels.sql
+   supabase db query --linked -f supabase/migrations/20261103090100_student_can_access_exam.sql
+   supabase db query --linked -f supabase/migrations/20261103090200_exams_select.sql
+   supabase db query --linked -f supabase/migrations/20261103090300_questions_public.sql
+   supabase db query --linked -f supabase/migrations/20261103090400_submissions_insert_own_ongoing.sql
+   supabase db query --linked -f supabase/migrations/20261103090500_snapshot_read_policy.sql
+   supabase db query --linked -f supabase/migrations/20261103090600_submissions_delete_supervisor.sql
+   supabase db query --linked -f supabase/migrations/20261103090700_register_violation_snapshot_path.sql
+   supabase db query --linked -f supabase/migrations/20261103090800_snapshot_purge_not_live_attempt.sql
    supabase db query --linked -f supabase/migrations/optional_question_shuffling.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
@@ -227,6 +236,29 @@ lose proctoring signals but cannot change a result.
    `academic_targeting.sql` — it replaces the same `exams_select` policy with a
    stricter version. Re-running `academic_targeting.sql` after it restores the
    original NULL-matches-all rule, so always apply both together.
+   The nine `2026110309*.sql` files are one hardening pass and are listed above in
+   the order they must be applied, after `strict_targeting_null_profiles.sql`:
+   `…090000_guard_profile_labels` (an account cannot rewrite the labels a policy
+   compares), `…090100_student_can_access_exam` (the cohort rule gets a name),
+   `…090200_exams_select` (the paper list asks that name instead of quoting the
+   rule), `…090300_questions_public` (the feed is aimed, windowed and
+   attempt-aware, and a lecturer no longer reads another lecturer's drafts),
+   `…090400_submissions_insert_own_ongoing` (an attempt can be started only for a
+   paper the student may sit, inside its window), `…090500_snapshot_read_policy` (a
+   still is readable by the owning student, the paper's author or the intervention
+   tier — not by every employee), `…090600_submissions_delete_supervisor` ("Reset
+   attempt" is the intervention tier or the paper's author),
+   `…090700_register_violation_snapshot_path` (a stored `snapshot_url` must be this
+   attempt's own `<action_type>_<epoch-ms>.(jpg|png)` object, or it is stored as
+   `NULL` and the strike still counts) and
+   `…090800_snapshot_purge_not_live_attempt` (a snapshot is purgeable only once its
+   attempt row is gone — the order the console's reset already uses, which is what
+   stops a live sitting's evidence being deleted).
+   Each file is independently re-runnable and its header names its prerequisites and
+   the file it must follow. Two older files recreate policies these replace:
+   re-running `private_proctor_snapshots.sql` undoes `…090500`/`…090800`, and
+   re-running `staff_attempt_resets.sql` undoes `…090600`/`…090800` — re-apply the
+   `…0905*`, `…0906*` and `…0908*` files if that ever happens.
    `optional_question_shuffling.sql` adds the `shuffle_questions` column and is
    independent of every other migration.
 2. Deploy the account-management functions:
@@ -273,6 +305,16 @@ lose proctoring signals but cannot change a result.
   but the roster has no faculty, department, level, matriculation number or staff
   ID to show, no paper can be targeted at a cohort, and a filled-in label is
   refused with a message naming the file to apply.
+- Apply the nine `supabase/migrations/2026110309*.sql` files, in filename order,
+  on every project (they are the exam-visibility hardening pass: the label guard,
+  the named cohort rule, the paper list, the question feed, the attempt insert, the
+  snapshot read policy, the attempt delete, the snapshot-path check and the snapshot
+  purge). They are re-runnable, and a fresh `schema.sql` already carries all nine —
+  the only reason to run them is an existing project. Two older files recreate
+  policies they replace, so re-apply `20261103090500_snapshot_read_policy.sql`,
+  `…090600_submissions_delete_supervisor.sql` and
+  `…090800_snapshot_purge_not_live_attempt.sql` after re-running
+  `private_proctor_snapshots.sql` or `staff_attempt_resets.sql`.
 - Apply `supabase/migrations/optional_question_shuffling.sql` before the first
   paper that has question-order shuffling enabled. Until it runs, the
   `shuffle_questions` column does not exist: the authoring console reports the

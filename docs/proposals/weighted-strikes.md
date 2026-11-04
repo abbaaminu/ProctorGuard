@@ -27,19 +27,24 @@ disqualification threshold becomes a configurable sum rather than a row count.
 
 ### Weight table (new column or separate config table)
 
+The eleven rows below are exactly the `proctoring_logs_action_type_check` vocabulary
+in `supabase/schema.sql` §5 — the same list `ViolationType.dbValue` sends from the
+app. A complete row per type is deliberate: a type with no row would silently take
+the 1.0 default.
+
 | Signal | Weight | Rationale |
 |--------|--------|-----------|
-| `looking_away` / `gaze_left` / `gaze_right` | 1.0 | A glance off screen is common; three is still a pattern. Unchanged. |
+| `looking_away` | 1.0 | A glance off screen is common; three is still a pattern. Unchanged. (Gaze direction is not a separate `action_type`: `looking_away` is the one the app sends.) |
 | `no_face` | 1.0 | Camera may glitch. Three sustained absences are a real concern. |
 | `app_minimized` | 1.0 | Same tier as looking away. |
-| `right_click` | 0.0 | A right-click blocker already prevents the action; an OS-level right-click that bypasses the blocker is worth noting but should not auto-disqualify. |
-| `copy_paste` / `paste` | 0.0 | Undetectable without a fully locked-down kiosk; marking it as zero means it is recorded but never triggers auto-DQ. |
-| `idle` | 0.0 | The AFK watcher already has a long debounce. Logged for the supervisor's review but never auto-disqualifies. |
+| `right_click_blocked` | 0.0 | The blocker already prevents the action; the signal records that it was tried, and should not auto-disqualify. |
+| `copy_paste_attempt` | 0.0 | Undetectable without a fully locked-down kiosk; marking it as zero means it is recorded but never triggers auto-DQ. |
+| `idle_afk` | 0.0 | The AFK watcher already has a long debounce. Logged for the supervisor's review but never auto-disqualifies. |
 | `audio_noise` | 0.0 | A noisy room is environmental, not necessarily cheating. Logged for review only. |
 | `multiple_faces` | 3.0 | A second person in frame is the most serious integrity failure. |
-| `virtual_camera` | 3.0 | An attempt to bypass the camera entirely. |
-| `secondary_display` | 3.0 | Answers being read from another screen. |
-| `devtools_open` | 3.0 | Developer tools over the exam page. |
+| `virtual_camera_detected` | 3.0 | An attempt to bypass the camera entirely. |
+| `secondary_display_detected` | 3.0 | Answers being read from another screen. |
+| `devtools_detected` | 3.0 | Developer tools over the exam page. |
 
 ### Disqualification threshold
 
@@ -59,15 +64,22 @@ create table if not exists public.proctoring_action_weights (
 );
 
 insert into public.proctoring_action_weights (action_type, weight) values
-  ('right_click',          0.0),
-  ('copy_paste',           0.0),
-  ('paste',                0.0),
-  ('idle',                 0.0),
-  ('audio_noise',          0.0),
-  ('multiple_faces',       3.0),
-  ('virtual_camera',       3.0),
-  ('secondary_display',    3.0),
-  ('devtools_open',        3.0)
+  -- Camera / session signals (1.0 - a pattern of three, as today)
+  ('looking_away',             1.0),
+  ('no_face',                  1.0),
+  ('app_minimized',            1.0),
+  -- Browser exam lockdown (0.0 - recorded, never auto-DQ)
+  ('copy_paste_attempt',       0.0),
+  ('right_click_blocked',      0.0),
+  -- Device integrity (3.0 - one sighting plus a 1.0 signal crosses the threshold)
+  ('devtools_detected',        3.0),
+  ('secondary_display_detected', 3.0),
+  ('virtual_camera_detected',  3.0),
+  -- Inactivity and environment (0.0 - logged for review only)
+  ('idle_afk',                 0.0),
+  ('audio_noise',              0.0),
+  -- The most serious single signal in the set.
+  ('multiple_faces',           3.0)
 on conflict (action_type) do nothing;
 
 -- 2. Replace the 3-strike hard stop in register_violation.
@@ -134,7 +146,7 @@ update public.exam_submissions s
    - Three `looking_away` rows → status unchanged (weight 3.0 < 4.0).
    - One `multiple_faces` + one `looking_away` → status changed to
      `disqualified` (weight 4.0 >= 4.0).
-   - Three `right_click` rows → status unchanged (weight 0.0 each).
+   - Three `right_click_blocked` rows → status unchanged (weight 0.0 each).
    - A mix of zero-weight and low-weight signals → no DQ until the weighted
      sum reaches the threshold.
 3. **Client unit tests**:
@@ -152,8 +164,8 @@ weights their `action_type` maps to. An attempt that has two stored violations
 under the old 3-strike rule continues to accumulate weight under the new rule.
 The one-time reconciliation in §4 of the migration re-checks every ongoing
 submission so that borderline cases (three violations that happened to be
-right-click, idle and paste — weight 0.0 each) are not automatically
-disqualified.
+`right_click_blocked`, `idle_afk` and `copy_paste_attempt` — weight 0.0 each) are
+not automatically disqualified.
 
 ### Follow-up: option shuffling
 
