@@ -18,6 +18,7 @@ import 'package:proctorguard/features/exam/domain/entities/submission.dart';
 import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
 import 'package:proctorguard/features/exam/presentation/providers/exam_session_controller.dart';
 import 'package:proctorguard/features/proctoring/data/repositories/proctoring_repository_impl.dart';
+import 'package:proctorguard/features/proctoring/domain/entities/proctoring_risk.dart';
 import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -3070,6 +3071,238 @@ void main() {
       expect(check, contains('ends_at'));
     });
   });
+
+  group('weighted strikes contract', () {
+    /// The `insert into public.violation_weights ... on conflict ...;` block, so a
+    /// row can be compared where it is *seeded* rather than anywhere the word
+    /// appears in a comment.
+    String? weightSeed(String sql) => RegExp(
+          r'insert into public\.violation_weights[\s\S]*?'
+          r'on conflict \(action_type\) do nothing;',
+        ).firstMatch(sql.replaceAll('\r\n', '\n'))?.group(0);
+
+    test('every ViolationType is seeded, with the weight the client mirrors', () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      final seed = weightSeed(sql);
+      expect(seed, isNotNull, reason: 'schema.sql has no violation_weights seed');
+
+      for (final type in ViolationType.values) {
+        final row = RegExp(
+          "\\('${RegExp.escape(type.dbValue)}',\\s*(\\d+),\\s*(true|false)\\)",
+        ).firstMatch(seed!);
+        expect(
+          row,
+          isNotNull,
+          reason: '${type.dbValue} has no violation_weights row - a type with no '
+              'row is scored as one point, so silence is not a safe default',
+        );
+        expect(
+          int.parse(row!.group(1)!),
+          type.weight,
+          reason: '${type.dbValue}: schema weight and ViolationType.weight disagree',
+        );
+        expect(
+          row.group(2) == 'true',
+          type.countsTowardDisqualification,
+          reason: '${type.dbValue}: schema counts_toward_dq and the client disagree',
+        );
+      }
+    });
+
+    test('the upgrade migration seeds the same vocabulary', () {
+      final migration = File(
+        '../supabase/migrations/20261104090000_violation_weights.sql',
+      );
+      if (!migration.existsSync()) return;
+
+      final seed = weightSeed(migration.readAsStringSync());
+      expect(seed, isNotNull);
+      for (final type in ViolationType.values) {
+        expect(
+          seed,
+          contains("('${type.dbValue}',"),
+          reason: '${type.dbValue} is missing from the migration',
+        );
+      }
+    });
+
+    test('register_violation scores through the table and flags, never disqualifies',
+        () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      // The client mirror and the server's constant have to be the same number, or
+      // the console's "how close is this" explanation lies.
+      expect(
+        sql,
+        contains(
+          'c_flag_threshold constant int := '
+          '${ProctoringRisk.disqualificationThreshold}',
+        ),
+      );
+      expect(
+        sql,
+        contains(
+          'left join public.violation_weights w on w.action_type = l.action_type',
+        ),
+        reason: 'the score must come from the weights table',
+      );
+      expect(
+        sql,
+        contains('returns table(warning_count int, disqualified boolean, flagged boolean)'),
+      );
+      expect(
+        sql,
+        contains("set status = 'flagged_for_review'"),
+        reason: 'the threshold closes the attempt for review',
+      );
+      expect(
+        sql,
+        isNot(contains('if v_count >= 3 then')),
+        reason: 'the row count is not the rule any more',
+      );
+    });
+
+    test('the status check accepts flagged_for_review, and the enum matches it', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      expect(
+        sql,
+        contains(
+          "check (status in ('ongoing', 'flagged_for_review', 'submitted', 'disqualified'))",
+        ),
+      );
+      expect(SubmissionStatus.flaggedForReview.dbValue, 'flagged_for_review');
+      expect(
+        SubmissionStatus.fromDb('flagged_for_review'),
+        SubmissionStatus.flaggedForReview,
+      );
+
+      final migration = File(
+        '../supabase/migrations/20261104090100_weighted_strikes_and_flagged_review.sql',
+      );
+      if (!migration.existsSync()) return;
+      expect(
+        migration.readAsStringSync(),
+        contains(
+          "check (status in ('ongoing', 'flagged_for_review', 'submitted', 'disqualified'))",
+        ),
+      );
+    });
+  });
+
+  group('review decision contract', () {
+    test('resolve_flagged_attempt is supervisor-tier, audited and idempotent', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      final start = sql.indexOf(
+        'create or replace function public.resolve_flagged_attempt(',
+      );
+      expect(start, greaterThan(-1), reason: 'the resolve RPC left schema.sql');
+      final end = sql.indexOf(
+        'comment on function public.resolve_flagged_attempt',
+        start,
+      );
+      final fn = sql.substring(start, end);
+
+      // Supervisor, or the lecturer who wrote *this* paper - never `is_staff()`
+      // (every lecturer) and never the student under review.
+      expect(
+        fn,
+        contains('public.is_exam_supervisor() or public.owns_exam(v_exam)'),
+      );
+      expect(fn, isNot(contains('is_staff()')));
+      // The audit row, and an actor the database decides rather than the request.
+      expect(fn, contains('insert into public.attempt_review_logs'));
+      expect(fn, isNot(contains('p_actor_id')));
+      // Both outcomes, and "clear" recomputes the automatic mark so the attempt is
+      // gradable rather than merely open.
+      expect(fn, contains("v_to := 'disqualified'"));
+      expect(fn, contains("v_to := 'submitted'"));
+      expect(fn, contains('public.auto_graded_score(p_submission_id)'));
+      // Retry-safe: an attempt that is no longer flagged answers with its status.
+      expect(fn, contains("if v_status <> 'flagged_for_review' then"));
+
+      expect(
+        sql,
+        contains(
+          'revoke execute on function public.resolve_flagged_attempt(uuid, text, text) from public, anon;',
+        ),
+      );
+    });
+
+    test('the review trail is readable by staff and writable by nobody else', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      expect(
+        sql,
+        contains('create table if not exists public.attempt_review_logs'),
+      );
+      final using = _policyUsing(sql, 'attempt_review_logs_select_staff');
+      expect(using, isNotNull, reason: 'the audit trail needs a read policy');
+      expect(using, contains('public.is_exam_supervisor()'));
+      expect(using, contains('public.owns_exam(exam_id)'));
+      expect(
+        sql,
+        isNot(contains('on public.attempt_review_logs for insert')),
+        reason: 'the definer RPC is the only writer of a review row',
+      );
+    });
+
+    test('grade_submission refuses an attempt under review', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+      expect(
+        sql,
+        contains('is under review and is not graded until it is resolved'),
+      );
+
+      // The migration carries its own copy of the function; a fix applied to one
+      // and not the other is exactly the drift this assertion exists for.
+      final migration = File(
+        '../supabase/migrations/20261104090100_weighted_strikes_and_flagged_review.sql',
+      );
+      if (!migration.existsSync()) return;
+      expect(
+        migration.readAsStringSync(),
+        contains('is under review and is not graded until it is resolved'),
+      );
+    });
+
+    test('the repository maps the flagged column, and tolerates an old server',
+        () async {
+      transport.responseBody =
+          '[{"warning_count": 3, "disqualified": false, "flagged": true}]';
+      final result = await ProctoringRepositoryImpl(client).logViolation(
+        submissionId: 'sub-1',
+        violation: Violation(
+          type: ViolationType.multipleFaces,
+          timestamp: DateTime.utc(2026),
+        ),
+      );
+      expect(result.warningCount, 3);
+      expect(result.flagged, isTrue);
+      expect(result.disqualified, isFalse);
+
+      // A backend that predates the column answers without it: no crash, and never
+      // a flag the server did not send (that would end a live session).
+      transport.responseBody = '[{"warning_count": 1, "disqualified": false}]';
+      final old = await ProctoringRepositoryImpl(client).logViolation(
+        submissionId: 'sub-1',
+        violation: Violation(
+          type: ViolationType.lookingAway,
+          timestamp: DateTime.utc(2026),
+        ),
+      );
+      expect(old.flagged, isFalse);
+    });
+  });
+
 }
 
 /// Reads `supabase/schema.sql`, which sits next to `mobile/` in the repository.
