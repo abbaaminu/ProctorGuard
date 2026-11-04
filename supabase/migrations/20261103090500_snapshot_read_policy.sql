@@ -40,7 +40,10 @@
 --     the reset audit policy, by requirement - the client-ordered delete/purge/
 --     audit sequence is left exactly as it is, and the reset RPC that would make
 --     it atomic is proposed in RESET_ATTEMPT_RPC_PROPOSAL.md rather than
---     implemented here.
+--     implemented here. (A later file,
+--     `20261103090800_snapshot_purge_not_live_attempt.sql`, does narrow that purge
+--     - to the state in which the attempt row is already gone. This file leaves it
+--     exactly as it found it.)
 --   * No bucket change: the bucket stays private, and an expired URL stays dead.
 --   * No `storage.foldername` change: the path shape is what existing rows already
 --     carry, and `SupabaseService.snapshotObjectPath` normalises legacy full URLs

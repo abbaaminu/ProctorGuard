@@ -2872,6 +2872,107 @@ void main() {
       expect(view, isNot(contains('where e.is_published = true;')));
     });
 
+    test('the feed is created after the table it joins', () {
+      // A view body is resolved when the view is created, so `questions_public`
+      // cannot be defined above `exam_submissions`: its LEFT JOIN names that table.
+      // It used to sit at the end of section 3, above it - an order that only worked
+      // because nothing replayed the file from scratch. The helper functions are the
+      // same question (`language sql` bodies naming tables created further down), and
+      // `set check_function_bodies = off` is what lets them be defined first.
+      final sql = schemaSql();
+      if (sql == null) return;
+      final normalised = sql.replaceAll('\r\n', '\n');
+
+      final tableAt = normalised.indexOf(
+        'create table if not exists public.exam_submissions',
+      );
+      final viewAt = normalised.indexOf(
+        'create view public.questions_public as',
+      );
+      expect(tableAt, greaterThan(-1), reason: 'the attempt table left schema.sql');
+      expect(viewAt, greaterThan(-1), reason: 'the feed left schema.sql');
+      expect(
+        viewAt,
+        greaterThan(tableAt),
+        reason: 'questions_public joins exam_submissions, so it must follow it',
+      );
+
+      final flagAt = normalised.indexOf('set check_function_bodies = off;');
+      expect(
+        flagAt,
+        greaterThan(-1),
+        reason: 'the deferred body check left schema.sql',
+      );
+      final helperAt = normalised.indexOf(
+        'create or replace function public.student_can_access_exam',
+      );
+      expect(helperAt, greaterThan(-1));
+      expect(
+        flagAt,
+        lessThan(helperAt),
+        reason: 'the flag has to precede the first helper that names a later table',
+      );
+    });
+
+    test("a live attempt's evidence cannot be purged, a reset one can", () {
+      // The reset sequence is delete -> purge -> audit, and this policy is what
+      // makes the order the rule: an object is purgeable only once its folder no
+      // longer resolves to a submission.
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      final purge = _policyUsing(sql, 'Proctor snapshots supervisor purge');
+      expect(purge, contains("bucket_id = 'proctor-snapshots'"));
+      expect(purge, contains('public.is_attempt_resetter()'));
+      expect(purge, contains('not exists ('));
+      expect(purge, contains('from public.exam_submissions s'));
+      expect(
+        purge,
+        contains('s.id::text = (storage.foldername(name))[1]'),
+        reason: 'the purge must use the same folder expression the read and '
+            'upload policies use',
+      );
+
+      final migration = File(
+        '../supabase/migrations/20261103090800_snapshot_purge_not_live_attempt.sql',
+      );
+      if (migration.existsSync()) {
+        expect(
+          _policyUsing(
+            migration.readAsStringSync(),
+            'Proctor snapshots supervisor purge',
+          ),
+          purge,
+          reason: 'the upgrade migration and schema.sql disagree about the purge',
+        );
+      }
+
+      // ... and the client already does it in that order, which is why the narrower
+      // policy does not break "Reset attempt".
+      final repo = File(
+        '../mobile/lib/features/dashboard/data/repositories/dashboard_repository_impl.dart',
+      );
+      if (repo.existsSync()) {
+        final source = repo.readAsStringSync();
+        final deleteAt = source.indexOf('.delete()');
+        final purgeAt = source.indexOf('.from(snapshotBucket).remove(');
+        expect(deleteAt, greaterThan(-1));
+        expect(purgeAt, greaterThan(-1));
+        expect(
+          deleteAt,
+          lessThan(purgeAt),
+          reason: 'resetSubmission() must delete the attempt before purging its '
+              'snapshots, or the purge removes nothing',
+        );
+        // ... and that DELETE is the attempt's, not some other table's: the chain
+        // it belongs to is `.from('exam_submissions')`.
+        expect(
+          source.lastIndexOf(".from('exam_submissions')", deleteAt),
+          greaterThan(-1),
+        );
+      }
+    });
+
     test('a lecturer reads their own papers and their own evidence only', () {
       final sql = schemaSql();
       if (sql == null) return;
@@ -2925,11 +3026,32 @@ void main() {
       final sql = schemaSql();
       if (sql == null) return;
 
-      // The folder convention the bucket, the upload policy and the purge share.
+      // The stored value must be the object this app mints and nothing else:
+      // `<submission_id>/<action_type>_<epoch-ms>.(jpg|png)`, which is what
+      // `SupabaseService.snapshotPath()` builds and what the bucket's mime list
+      // accepts. A prefix-only test (`starts_with(...)`) also accepted names the app
+      // never writes - `<own id>/evidence.jpg`, `<own id>/nested/x.jpg` - so the rule
+      // is the whole shape, in the RPC and in the migration that upgrades a live
+      // project.
+      const shape =
+          r"p_snapshot_url ~ ('^' || p_submission_id::text || '/[a-z_]+_[0-9]+\.(jpg|png)$')";
+      expect(sql, contains(shape));
       expect(
         sql,
-        contains("starts_with(p_snapshot_url, p_submission_id::text || '/')"),
+        isNot(contains('starts_with(p_snapshot_url')),
+        reason: 'the prefix test is what the shape test replaced',
       );
+
+      final migration = File(
+        '../supabase/migrations/20261103090700_register_violation_snapshot_path.sql',
+      );
+      if (migration.existsSync()) {
+        expect(
+          migration.readAsStringSync(),
+          contains(shape),
+          reason: 'the upgrade migration and schema.sql disagree about the path',
+        );
+      }
 
       // The insert policy is where "may this student sit this paper" is enforced
       // server-side; the window stayed here with it.

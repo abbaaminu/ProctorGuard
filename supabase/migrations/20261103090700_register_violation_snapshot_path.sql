@@ -19,9 +19,19 @@
 --   references it, which the upload policy cannot enforce.
 --
 -- WHAT CHANGES (one statement, inside the function)
---   The value is stored only when it is NULL or starts with
---   `<p_submission_id>/` - the folder convention the bucket and the purge both
---   assume. Anything else is stored as NULL.
+--   The value is stored only when it matches
+--       ^<p_submission_id>/<action_type>_<epoch-ms>\.(jpg|png)$
+--   - the exact name `SupabaseService.snapshotPath()` mints, in this attempt's own
+--   folder: `[a-z_]+` is the action_type vocabulary (every member is lowercase
+--   ASCII and underscores), `[0-9]+` is the epoch-millisecond stamp, and the two
+--   extensions are the only mime types the bucket accepts. Anything else is stored
+--   as NULL.
+--   The first version of this file only asked for the `<p_submission_id>/` prefix,
+--   which left the interesting half open: a folder-shaped name the app never
+--   minted (`<own id>/evidence.jpg`, `<own id>/nested/x.jpg`, `<own id>/x_1.gif`)
+--   passes a prefix test and can point at any object the account can put there.
+--   The regex closes that without touching the folder rule the bucket, the upload
+--   policy and the purge all assume.
 --   It is *stored as NULL rather than rejected* on purpose: the violation must
 --   still count. A client that sends a malformed path - an older build, a device
 --   that minted a full URL, a patched one that knows this rule - must not be able
@@ -56,13 +66,16 @@
 --     `client_event_id` and its partial unique index, and the private
 --     `proctor-snapshots` folder convention (`private_proctor_snapshots.sql`).
 --   * APPLY ORDER: after `private_proctor_snapshots.sql` and after
---     `20261103090400_submissions_insert_own_ongoing.sql`; last of the eight.
+--     `20261103090400_submissions_insert_own_ongoing.sql`; before
+--     `20261103090800_snapshot_purge_not_live_attempt.sql`, which narrows the
+--     purge that consumes these paths (the two are the write half and the purge
+--     half of the same evidence trail).
 --   * Applied through the Supabase CLI:
 --       supabase db query --linked -f supabase/migrations/20261103090700_register_violation_snapshot_path.sql
---   * Verify (expect true, i.e. the new CASE expression is in the live definition):
+--   * Verify (expect true, i.e. the regex CASE expression is in the live definition):
 --       select pg_get_functiondef(
 --                'public.register_violation(uuid,text,text,timestamptz,uuid)'::regprocedure
---              ) like '%starts_with%' as validates_path;
+--              ) like '%[a-z_]+_[0-9]+%' as validates_path;
 -- =====================================================================
 
 -- The pre-offline-queue signatures. An old project can still carry them, and a
@@ -118,11 +131,13 @@ begin
     return;
   end if;
 
-  -- THE NEW RULE. Only an object path inside this submission's own folder is
-  -- stored; anything else becomes NULL and the violation still counts.
+  -- THE NEW RULE. Only this attempt's own snapshot object is stored, and only in
+  -- the shape the app mints: `<p_submission_id>/<action_type>_<epoch-ms>.(jpg|png)`.
+  -- Anything else becomes NULL and the violation still counts. A `~` on NULL is
+  -- NULL, which takes the `else` arm, so a missing path stays missing.
   v_snapshot_path := case
-    when p_snapshot_url is null then null
-    when starts_with(p_snapshot_url, p_submission_id::text || '/') then p_snapshot_url
+    when p_snapshot_url ~ ('^' || p_submission_id::text || '/[a-z_]+_[0-9]+\.(jpg|png)$')
+      then p_snapshot_url
     else null
   end;
 

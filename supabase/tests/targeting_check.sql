@@ -50,10 +50,17 @@
 --       supervisor do.
 --   (i) storage.objects + submissions_delete_supervisor: a lecturer cannot read
 --       another paper's snapshots and cannot delete another paper's attempt; the
---       author, the owning student and a supervisor can.
---   (j) register_violation: a snapshot path that is not inside the attempt's own
---       folder is stored as NULL and the violation still counts; the folder-shaped
---       path is stored; the third strike disqualifies.
+--       author, the owning student and a supervisor can. (i)viii-ix add the purge:
+--       not even the reset tier may delete a *live* attempt's still - the policy
+--       requires the folder to resolve to no submission - while the same folder
+--       becomes purgeable once the attempt row is gone, which is the order
+--       `resetSubmission()` uses.
+--   (k) register_violation: only this attempt's own
+--       `<action_type>_<epoch-ms>.(jpg|png)` object is stored; a full URL, another
+--       attempt's folder, a nested path or a name without the epoch-ms stamp is
+--       stored as NULL and the violation still counts; a matching path is stored as
+--       sent; the third strike disqualifies, and a replayed `client_event_id`
+--       appends nothing.
 --
 -- NOT EXECUTED HERE. This file is written against the schema, not run against a
 -- live database in the change that added it; run it after `supabase db reset`.
@@ -814,11 +821,74 @@ end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);
 
+-- (i) viii: not even the reset tier may delete a *live* attempt's still. The
+-- evidence of an attempt that still exists is cleared by the cascade of its own
+-- delete, never by a purge that runs first - so the folder still resolving to a
+-- submission is what the policy refuses. `sub_a` is live here.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "lecturer.a@test.local"}',
+         current_setting('test.lecturer_a')), true);
+do $$
+declare
+  v_rows int;
+begin
+  delete from storage.objects o
+   where o.bucket_id = 'proctor-snapshots'
+     and o.name = current_setting('test.sub_a') || '/looking_away_1.jpg';
+  get diagnostics v_rows = row_count;
+  if v_rows <> 0 then
+    raise exception 'FAIL (i)viii: a live attempt''s snapshot was purged';
+  end if;
+  -- ... and the object is still there, so "0 rows" means the DELETE was refused
+  -- rather than a target that never existed. `student.a`'s own attempt, and the
+  -- author may read it ((i)iii).
+  if (select count(*) from storage.objects o
+      where o.bucket_id = 'proctor-snapshots'
+        and o.name = current_setting('test.sub_a') || '/looking_away_1.jpg') <> 1 then
+    raise exception 'FAIL (i)viii: the live attempt''s snapshot disappeared';
+  end if;
+  raise notice 'PASS (i)viii: a live attempt''s snapshot cannot be purged';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- (i) ix: once the attempt row is gone - the state `resetSubmission()` creates
+-- before it calls `storage.remove()` - the same folder is purgeable by the reset
+-- tier. `sub_del2` was deleted in (i)vii.
+do $$
+begin
+  insert into storage.objects (bucket_id, name)
+    values ('proctor-snapshots',
+            current_setting('test.sub_del2') || '/looking_away_1.jpg');
+end $$;
+
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "lecturer.a@test.local"}',
+         current_setting('test.lecturer_a')), true);
+do $$
+declare
+  v_rows int;
+begin
+  delete from storage.objects o
+   where o.bucket_id = 'proctor-snapshots'
+     and o.name = current_setting('test.sub_del2') || '/looking_away_1.jpg';
+  get diagnostics v_rows = row_count;
+  if v_rows <> 1 then
+    raise exception 'FAIL (i)ix: an orphaned snapshot could not be purged (% rows)', v_rows;
+  end if;
+  raise notice 'PASS (i)ix: an orphaned snapshot is purgeable once its attempt is gone';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
 -- =====================================================================
--- (j)  register_violation: the snapshot path must be this attempt's own
+-- (k)  register_violation: the snapshot path must be this attempt's own object,
+--      in the shape the app mints
 -- =====================================================================
 
--- (j) i: a full URL (a legacy shape, and what a forged client sends) is stored as
+-- (k) i: a full URL (a legacy shape, and what a forged client sends) is stored as
 -- NULL - and the strike still counts.
 set local role authenticated;
 select set_config('request.jwt.claims',
@@ -837,19 +907,91 @@ begin
          gen_random_uuid());
 
   if r.warning_count <> 1 or r.disqualified then
-    raise exception 'FAIL (j)i: expected 1 strike and no disqualification, got % / %',
+    raise exception 'FAIL (k)i: expected 1 strike and no disqualification, got % / %',
       r.warning_count, r.disqualified;
   end if;
 
   if (select snapshot_url from public.proctoring_logs
        where submission_id = current_setting('test.sub_a')::uuid
        order by timestamp desc limit 1) is not null then
-    raise exception 'FAIL (j)i: a path outside the attempt''s folder was stored';
+    raise exception 'FAIL (k)i: a path outside the attempt''s folder was stored';
   end if;
-  raise notice 'PASS (j)i: a foreign path is stored as NULL and the strike still counts';
+  raise notice 'PASS (k)i: a foreign path is stored as NULL and the strike still counts';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- (k) ii: the folder prefix alone is not enough. A name this app never mints -
+-- `<own id>/looking_away.jpg` (no epoch-ms stamp), `<own id>/nested/x.jpg` (a
+-- folder inside the folder) - is stored as NULL too, and the strikes still count.
+-- A separate attempt on `student_c`, inserted with the superuser's rights: its
+-- `status` defaults to 'ongoing', which is the state `register_violation` accepts,
+-- and `sub_del2` - the only other `student_c` attempt on this paper - was deleted
+-- in (i)vii, so `unique (student_id, exam_id)` is free.
+do $$
+declare
+  v_sub uuid;
+begin
+  insert into public.exam_submissions (exam_id, student_id)
+    values (current_setting('test.untargeted')::uuid,
+            current_setting('test.student_c')::uuid)
+    returning id into v_sub;
+  perform set_config('test.sub_shape', v_sub::text, false);
 end $$;
 
--- (j) ii: a path inside the attempt's own folder is stored as sent.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "student.c@test.local"}',
+         current_setting('test.student_c')), true);
+do $$
+declare
+  r record;
+begin
+  -- No epoch-ms stamp.
+  select * into r
+  from public.register_violation(
+         current_setting('test.sub_shape')::uuid,
+         'looking_away',
+         current_setting('test.sub_shape') || '/looking_away.jpg',
+         now(),
+         gen_random_uuid());
+  if r.warning_count <> 1 then
+    raise exception 'FAIL (k)ii: expected 1 strike, got %', r.warning_count;
+  end if;
+  if (select snapshot_url from public.proctoring_logs
+       where submission_id = current_setting('test.sub_shape')::uuid
+       order by timestamp desc limit 1) is not null then
+    raise exception 'FAIL (k)ii: a name without the epoch-ms stamp was stored';
+  end if;
+
+  -- A folder inside the attempt's folder.
+  select * into r
+  from public.register_violation(
+         current_setting('test.sub_shape')::uuid,
+         'looking_away',
+         current_setting('test.sub_shape') || '/nested/looking_away_2.jpg',
+         now(),
+         gen_random_uuid());
+  if r.warning_count <> 2 then
+    raise exception 'FAIL (k)ii: expected 2 strikes, got %', r.warning_count;
+  end if;
+  if (select snapshot_url from public.proctoring_logs
+       where submission_id = current_setting('test.sub_shape')::uuid
+       order by timestamp desc limit 1) is not null then
+    raise exception 'FAIL (k)ii: a nested path was stored';
+  end if;
+  raise notice 'PASS (k)ii: only the app''s own path shape is stored, and the strikes still count';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- (k) iii: a path inside the attempt's own folder, in the shape the app mints, is
+-- stored as sent. Back to `student.a`, whose attempt already holds the strike from
+-- (k)i - and stays in that role for (k)iv.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "student.a@test.local"}',
+         current_setting('test.student_a')), true);
 do $$
 declare
   r record;
@@ -863,7 +1005,7 @@ begin
          gen_random_uuid());
 
   if r.warning_count <> 2 then
-    raise exception 'FAIL (j)ii: expected 2 strikes, got %', r.warning_count;
+    raise exception 'FAIL (k)iii: expected 2 strikes, got %', r.warning_count;
   end if;
 
   if (select snapshot_url from public.proctoring_logs
@@ -871,15 +1013,18 @@ begin
          and snapshot_url is not null
        order by timestamp desc limit 1)
      is distinct from current_setting('test.sub_a') || '/looking_away_2.jpg' then
-    raise exception 'FAIL (j)ii: the folder-shaped path was not stored';
+    raise exception 'FAIL (k)iii: the folder-shaped path was not stored';
   end if;
-  raise notice 'PASS (j)ii: a path inside the attempt''s folder is stored';
+  raise notice 'PASS (k)iii: a matching path inside the attempt''s folder is stored';
 end $$;
 
--- (j) iii: the third strike disqualifies, and is idempotent per client_event_id.
+-- (k) iv: the third strike disqualifies, and a replayed `client_event_id` is what
+-- the `on conflict` clause is for: the attempt is closed now, so the replay takes
+-- the early-return arm and appends nothing.
 do $$
 declare
   r record;
+  v_event uuid := gen_random_uuid();
 begin
   select * into r
   from public.register_violation(
@@ -887,13 +1032,27 @@ begin
          'multiple_faces',
          null,
          now(),
-         gen_random_uuid());
+         v_event);
 
   if r.warning_count <> 3 or not r.disqualified then
-    raise exception 'FAIL (j)iii: expected 3 strikes and disqualification, got % / %',
+    raise exception 'FAIL (k)iv: expected 3 strikes and disqualification, got % / %',
       r.warning_count, r.disqualified;
   end if;
-  raise notice 'PASS (j)iii: the third strike disqualifies';
+
+  -- The same event, again. One violation, one strike - and the attempt is
+  -- 'disqualified', so this is also the "late callback is harmless" arm.
+  select * into r
+  from public.register_violation(
+         current_setting('test.sub_a')::uuid,
+         'multiple_faces',
+         null,
+         now(),
+         v_event);
+  if r.warning_count <> 3 or not r.disqualified then
+    raise exception 'FAIL (k)iv: a replayed event changed the state (% / %)',
+      r.warning_count, r.disqualified;
+  end if;
+  raise notice 'PASS (k)iv: the third strike disqualifies, and a replay appends nothing';
 end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);

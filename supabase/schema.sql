@@ -53,6 +53,29 @@
 -- =====================================================================
 
 create extension if not exists "uuid-ossp";
+
+-- ---------------------------------------------------------------------
+-- 0a. DEFERRED FUNCTION-BODY CHECKING (before the first helper is created)
+-- ---------------------------------------------------------------------
+-- The helpers in section 1 are `language sql` predicates that name tables
+-- created much later in this file (`profiles`, `exams`, `exam_allow_list`,
+-- `exam_submissions`) - `is_staff()`, `owns_exam()`, `is_attempt_resetter()`,
+-- `student_can_access_exam()`. With `check_function_bodies` on (the server
+-- default) `create function` parses and *resolves* a SQL body at creation time,
+-- so a fresh install would fail with `relation "public.profiles" does not exist`
+-- before it ever reached section 2. That is also what makes this file re-runnable
+-- in one pass on an empty database: the helper outlives the object it quotes and
+-- the tables catch up below.
+--
+-- It only governs *creation-time* validation. Nothing is skipped at run time: a
+-- SQL function still plans against the real tables, and a missing one is an error
+-- the moment the function is called.
+--
+-- Session-scoped, so it needs no reset (the SQL editor ends it with the session).
+-- The alternative - reordering the whole file so `profiles` and `exams` precede
+-- every predicate - would leave the schema unreadable in the order it is
+-- explained. This statement is the one line that buys that layout.
+set check_function_bodies = off;
 -- ---------------------------------------------------------------------
 -- 0. API PRIVILEGES (before the first table exists)
 -- ---------------------------------------------------------------------
@@ -952,90 +975,11 @@ create policy "questions_delete_owner"
     and public.is_staff()
   );
 
--- Student-safe view: strips both answer keys (`correct_option` and
--- `correct_text_answer`) so students never receive them, and returns one row per
--- *audience* instead of every published row:
---   1. an admin or supervisor (`is_exam_supervisor()`);
---   2. the paper's author (`e.created_by = auth.uid()`), who authored these rows;
---   3. a student the paper is aimed at, **while its window is open** -
---      `student_can_access_exam(e.id)` plus `starts_at` / `ends_at`;
---   4. the owner of an `'ongoing'` attempt on it, until that attempt's deadline
---      (`started_at + duration_minutes`).
--- `e.is_published = true` alone - which is what this was - meant a student who
--- could not even *see* the paper in their list could read its questions by
--- guessing its id (exam ids travel in links, exports and the console UI), and a
--- paper not yet open could be read the moment it was published.
---
--- The `LEFT JOIN` follows `exam_submissions` on the caller's own attempt, and it
--- cannot duplicate the feed: that table is `unique (student_id, exam_id)` (§4), so
--- it contributes at most one row per question.
---
--- `security_invoker` is turned OFF on purpose. With invoker semantics the view
--- runs under the caller's own policies, which would require exactly the student
--- SELECT policy on `questions` that leaks the answer keys. As a definer view
--- owned by owner of the schema it reads the base table directly (RLS is not
--- applied to a table's owner) and exposes one fixed column set, filtered to
--- published exams.
---
--- DROP + CREATE rather than `create or replace`: Postgres refuses to reorder or
--- re-type the columns of an existing view, and `question_type` has to sit with
--- the rest of the question shape. The view has no dependants, and the grant is
--- re-applied below.
-drop view if exists public.questions_public;
-
-create view public.questions_public as
-  select q.id,
-         q.exam_id,
-         q.question_text,
-         q.question_type,
-         q.options,
-         q.points,
-         q.created_at
-  from public.questions q
-  join public.exams e on e.id = q.exam_id
-  left join public.exam_submissions s
-         on s.exam_id = e.id
-        and s.student_id = auth.uid()
-  where public.is_exam_supervisor()
-     or e.created_by = auth.uid()
-     or (
-       public.student_can_access_exam(e.id)
-       and (e.starts_at is null or now() >= e.starts_at)
-       and (e.ends_at   is null or now() <= e.ends_at)
-     )
-     or (
-       s.status = 'ongoing'
-       and s.started_at + make_interval(mins => e.duration_minutes) > now()
-     );
-
-alter view public.questions_public set (security_invoker = false);
-
-comment on view public.questions_public is
-  'Student-facing question feed: neither answer key; one row per audience - supervisor/admin, the paper''s author, a student the paper is offered to while its window is open, or the owner of an ongoing attempt until its deadline.';
-
-grant select on public.questions_public to authenticated;
-
--- ... and now take the reader the view was never meant for out of it.
---
--- That grant is not what keeps the public key away: §0's blanket
--- `grant all privileges on all tables` runs on *every* install of this file -
--- including a re-run over a database where this view already exists - and the
--- `alter default privileges` beside it re-applies the same privileges to
--- anything created later, so `anon` holds SELECT on this view (and on
--- `questions`, the table holding the answer keys) unless it is revoked here,
--- after both objects exist. A revoke, not a missing grant, is what makes the
--- reach deterministic no matter which order this file is applied in.
---
--- Nothing in the app needs the feed with the anonymous key: every read of
--- it happens after sign-in (the student's own `questions_public` query runs with
--- their session, and staff access to `questions` uses their session), and the only anonymous
--- consumer was `.github/workflows/keep_alive.yml`, which pinged this view to
--- prove the schema was reachable - i.e. exactly the reach being removed here. It
--- pings `profiles` now, which answers 200 `[]` for `anon` because no policy
--- grants it a row: the schema proves itself without the answer key's table being
--- reachable at all.
-revoke all on public.questions_public from anon;
-revoke all on public.questions        from anon;
+-- The student-safe feed (`questions_public`) is created at the END of section 4,
+-- not here, because it LEFT JOINs `exam_submissions` (§4) on the caller's own
+-- attempt: a view body is resolved when it is created, so this file cannot define
+-- it before the table it joins exists. The whole design note moved with it -
+-- the four audiences, the definer view, and the `anon` revoke.
 
 -- ---------------------------------------------------------------------
 -- 4. EXAM SUBMISSIONS
@@ -1210,6 +1154,105 @@ drop trigger if exists submissions_guard_immutability on public.exam_submissions
 create trigger submissions_guard_immutability
   before update on public.exam_submissions
   for each row execute function public.guard_submission_immutability();
+
+-- ---------------------------------------------------------------------
+-- 4a. THE STUDENT QUESTION FEED (questions_public)
+-- ---------------------------------------------------------------------
+-- Placed HERE, after `exam_submissions`, because the view joins it. It used to
+-- sit at the end of section 3, above the table it reads: a view body is resolved
+-- when the view is created, so on a fresh install that ordering was only survivable
+-- because the CREATE happened to name a relation nobody had made yet - the kind of
+-- defect that stays invisible until the file is replayed from scratch or the order
+-- is trusted by somebody reading it. Section 3's comments point here.
+--
+-- Student-safe view: strips both answer keys (`correct_option` and
+-- `correct_text_answer`) so students never receive them, and returns one row per
+-- *audience* instead of every published row:
+--   1. an admin or supervisor (`is_exam_supervisor()`);
+--   2. the paper's author (`e.created_by = auth.uid()`), who authored these rows;
+--   3. a student the paper is aimed at, **while its window is open** -
+--      `student_can_access_exam(e.id)` plus `starts_at` / `ends_at`;
+--   4. the owner of an `'ongoing'` attempt on it, until that attempt's deadline
+--      (`started_at + duration_minutes`).
+-- `e.is_published = true` alone - which is what this was - meant a student who
+-- could not even *see* the paper in their list could read its questions by
+-- guessing its id (exam ids travel in links, exports and the console UI), and a
+-- paper not yet open could be read the moment it was published.
+--
+-- The `LEFT JOIN` follows `exam_submissions` on the caller's own attempt, and it
+-- cannot duplicate the feed: that table is `unique (student_id, exam_id)` (this
+-- section), so it contributes at most one row per question.
+--
+-- `security_invoker` is turned OFF on purpose. With invoker semantics the view
+-- runs under the caller's own policies, which would require exactly the student
+-- SELECT policy on `questions` that leaks the answer keys. As a definer view
+-- owned by the owner of the schema it reads the base table directly (RLS is not
+-- applied to a table's owner) and exposes one fixed column set, filtered to the
+-- audiences above.
+--
+-- DROP + CREATE rather than `create or replace`: Postgres refuses to reorder or
+-- re-type the columns of an existing view, and `question_type` has to sit with
+-- the rest of the question shape. The view has no dependants, and the grant is
+-- re-applied below.
+drop view if exists public.questions_public;
+
+create view public.questions_public as
+  select q.id,
+         q.exam_id,
+         q.question_text,
+         q.question_type,
+         q.options,
+         q.points,
+         q.created_at
+  from public.questions q
+  join public.exams e on e.id = q.exam_id
+  left join public.exam_submissions s
+         on s.exam_id = e.id
+        and s.student_id = auth.uid()
+  where public.is_exam_supervisor()
+     or e.created_by = auth.uid()
+     or (
+       public.student_can_access_exam(e.id)
+       and (e.starts_at is null or now() >= e.starts_at)
+       and (e.ends_at   is null or now() <= e.ends_at)
+     )
+     or (
+       s.status = 'ongoing'
+       and s.started_at + make_interval(mins => e.duration_minutes) > now()
+     );
+
+alter view public.questions_public set (security_invoker = false);
+
+comment on view public.questions_public is
+  'Student-facing question feed: neither answer key; one row per audience - supervisor/admin, the paper''s author, a student the paper is offered to while its window is open, or the owner of an ongoing attempt until its deadline.';
+
+grant select on public.questions_public to authenticated;
+
+-- ... and now take the reader the view was never meant for out of it.
+--
+-- That grant is not what keeps the public key away: section 0's blanket
+-- `grant all privileges on all tables` runs on *every* install of this file -
+-- including a re-run over a database where this view already exists - and the
+-- `alter default privileges` beside it re-applies the same privileges to
+-- anything created later, so `anon` holds SELECT on this view (and on
+-- `questions`, the table holding the answer keys) unless it is revoked here,
+-- after both objects exist. A revoke, not a missing grant, is what makes the
+-- reach deterministic no matter which order this file is applied in.
+--
+-- Both revokes stay BELOW the create for the same reason the view itself moved
+-- below `exam_submissions`: a revoke can only name an object that exists, and
+-- section 0's default privileges are what put the grant there in the first place.
+--
+-- Nothing in the app needs the feed with the anonymous key: every read of
+-- it happens after sign-in (the student's own `questions_public` query runs with
+-- their session, and staff access to `questions` uses their session), and the only anonymous
+-- consumer was `.github/workflows/keep_alive.yml`, which pinged this view to
+-- prove the schema was reachable - i.e. exactly the reach being removed here. It
+-- pings `profiles` now, which answers 200 `[]` for `anon` because no policy
+-- grants it a row: the schema proves itself without the answer key's table being
+-- reachable at all.
+revoke all on public.questions_public from anon;
+revoke all on public.questions        from anon;
 
 -- ---------------------------------------------------------------------
 -- 5. PROCTORING LOGS
@@ -1421,22 +1464,44 @@ create policy "Proctor snapshots upload own ongoing session"
 -- Delete is one deliberate exception, and it exists for exactly one action - the
 -- staff app's "Reset attempt". That action deletes the submission row first (the
 -- DELETE that `submissions_delete_supervisor` authorizes, whose cascade takes
--- the log rows with it) and then has to drop the stills those rows pointed at: a
--- reset that left a student's images behind in Storage would not be a reset.
+-- the log rows with it) and then drops the stills those rows pointed at: a reset
+-- that left a student's images behind in Storage would not be a reset.
 --
--- This policy is therefore necessarily broader than the two above - it cannot be
--- anchored to the submission folder, because by this point that folder no longer
--- resolves to a submission row. The reset tier is no wider than the delete
--- policy it serves (whoever `is_attempt_resetter()` names can already delete any
--- attempt, log rows included), and it is what keeps the console from leaving
--- orphaned blobs behind: deleting the `storage.objects` rows without the Storage
--- API would do precisely that.
+-- The `not exists` arm is what makes that ORDER the rule rather than a habit of
+-- the client. An object is purgeable only once its folder no longer resolves to a
+-- submission - exactly the state `DashboardRepositoryImpl.resetSubmission()`
+-- creates before it calls `storage.remove()` (it reads the paths, deletes the row
+-- and only then purges). Two holes close with it:
+--   * a plain lecturer account (`is_attempt_resetter()` names every lecturer) could
+--     otherwise delete the stills of *any* sitting in the institution while that
+--     sitting was still running - the evidence gone, the attempt untouched, no
+--     audit row anywhere, because no attempt row was ever deleted;
+--   * the reset tier could purge evidence of an attempt it could not delete
+--     (`submissions_delete_supervisor` asks `is_exam_supervisor()` or the author),
+--     so the destructive half of a reset was reachable without the repair half.
+--
+-- Without `is_attempt_resetter()` the `not exists` arm would be a hole rather than
+-- a guard - any signed-in account could delete the orphaned stills of a finished
+-- reset - so both terms stay. And unlike the read/upload policies above this one
+-- cannot be anchored to the submission folder: its whole purpose is the window
+-- in which that folder resolves to nothing.
+--
+-- The subquery is evaluated under the caller's own permissions (a policy is not
+-- definer rights), so it reads as staff: admin, supervisor and lecturer - the tier
+-- `is_attempt_resetter()` names - are all `is_staff()`, and
+-- `submissions_select_own_or_supervisor` lets staff read every attempt. A role that
+-- could reset an attempt but could not read `exam_submissions` would make the arm
+-- vacuously true, so the two tiers have to stay paired.
 create policy "Proctor snapshots supervisor purge"
   on storage.objects for delete
   to authenticated
   using (
     bucket_id = 'proctor-snapshots'
     and public.is_attempt_resetter()
+    and not exists (
+      select 1 from public.exam_submissions s
+      where s.id::text = (storage.foldername(name))[1]
+    )
   );
 
 -- ---------------------------------------------------------------------
@@ -1633,10 +1698,13 @@ end $$;
 -- 3-argument version exists.
 --
 -- The path is the one string the student's device chooses and the database stores
--- verbatim, so it is checked before it is stored: it must start with
--- `<p_submission_id>/`, the folder convention §6 and the purge both assume.
+-- verbatim, so it is checked before it is stored: it must match
+-- `^<p_submission_id>/<action_type>_<epoch-ms>\.(jpg|png)$` - the exact name
+-- `SupabaseService.snapshotPath()` mints, inside this attempt's own folder,
+-- which is the convention section 6 and the reset purge both assume.
 -- Anything else - another submission's folder, a path outside the bucket, a full
--- URL - is stored as NULL and the violation still counts. Storing NULL rather than
+-- URL, a folder-shaped name this app never minted - is stored as NULL and the
+-- violation still counts. Storing NULL rather than
 -- raising is deliberate: a malformed path must not buy a strike back, and the
 -- incident is the fact while the photograph is the optional attachment. Without
 -- this, a forged path is both evidence poisoning (an incident that points at
@@ -1706,10 +1774,32 @@ begin
   -- violation into two strikes. A client that reuses an id on purpose only
   -- suppresses its own strike - and a client that controls the app can skip
   -- calling this at all, so the idempotency key costs the rule nothing.
-  -- Only an object path inside this submission's own folder is stored.
+  --
+  -- Only THIS attempt's own snapshot object is stored, and only in the exact
+  -- shape `SupabaseService.snapshotPath()` mints:
+  --     <p_submission_id>/<action_type>_<epoch-ms>.(jpg|png)
+  -- `[a-z_]+` is the action_type vocabulary (every member is lowercase ASCII and
+  -- underscores), `[0-9]+` is the epoch-millisecond stamp, and the two extensions
+  -- are the only mime types the bucket accepts (section 6). Everything else is
+  -- stored as NULL, because each rejected shape is a hole of its own:
+  --   * another submission's folder - evidence poisoning (an incident of *this*
+  --     sitting that shows somebody else's face, on which an appeal is judged) and
+  --     a delete-by-proxy (a reset reads these paths back and removes the objects
+  --     they name);
+  --   * a path outside the bucket, a full URL (the shape a build that predates the
+  --     private bucket wrote), a traversal such as `<own id>/../../other` - none of
+  --     them addresses a still of this attempt;
+  --   * a folder-shaped name this app never minted (`<own id>/evidence.jpg`,
+  --     `<own id>/nested/x.jpg`, `<own id>/x_1.gif`) - what a patched client would
+  --     send to park an arbitrary object where a reviewer believes a snapshot of
+  --     this student is.
+  -- A `~` on NULL yields NULL, which takes the `else` arm, so a missing path stays
+  -- missing. Storing NULL rather than raising is deliberate: a malformed path must
+  -- not buy a strike back - the incident is the fact, the photograph is the
+  -- optional attachment.
   v_snapshot_path := case
-    when p_snapshot_url is null then null
-    when starts_with(p_snapshot_url, p_submission_id::text || '/') then p_snapshot_url
+    when p_snapshot_url ~ ('^' || p_submission_id::text || '/[a-z_]+_[0-9]+\.(jpg|png)$')
+      then p_snapshot_url
     else null
   end;
 
