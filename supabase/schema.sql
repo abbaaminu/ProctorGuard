@@ -26,9 +26,11 @@
 --     and fill-in-the-blank go through `merge_submission_text_answer`, which is
 --     also what a true/false tap stores ('true' / 'false' as a JSON string).
 --   * Students cannot grade or close themselves with a direct UPDATE — the
---     RPCs `submit_exam` (automatic grading) and `register_violation`
---     (3-strike rule) are the only writers of status/score/submitted_at, and
---     both re-check that the caller owns the submission. A subjective answer is
+--     RPCs `submit_exam` (automatic grading) and `register_violation` (the
+--     weighted escalation: 3 weighted points closes the attempt as
+--     `flagged_for_review` for `resolve_flagged_attempt()`) are the only writers
+--     of status/score/submitted_at, and both re-check that the caller owns the
+--     submission. A subjective answer is
 --     marked afterwards by the paper's owner through `grade_submission()`, which
 --     records the marks in `question_grades` (section 8) and recomputes `score`
 --     as automatic + awarded.
@@ -990,12 +992,56 @@ create table if not exists public.exam_submissions (
   exam_id       uuid not null references public.exams(id) on delete cascade,
   answers       jsonb not null default '{}'::jsonb,
   status        text not null default 'ongoing'
-                check (status in ('ongoing','submitted','disqualified')),
+                check (status in ('ongoing','flagged_for_review','submitted','disqualified')),
   score         numeric,
   started_at    timestamptz not null default now(),
   submitted_at  timestamptz,
   unique (student_id, exam_id)
 );
+
+-- The list above only applies to a database that does not have the table yet:
+-- `create table if not exists` cannot widen a constraint that already exists. This
+-- is the same refresh as
+-- ../supabase/migrations/20261104090100_weighted_strikes_and_flagged_review.sql,
+-- repeated here so re-running this single file also upgrades an older
+-- installation.
+--
+-- `flagged_for_review` is the weighted-threshold state: the sitting is closed (no
+-- more answers, no more snapshots) but nothing has been decided - a supervisor
+-- calls `resolve_flagged_attempt()` to disqualify it or restore it to 'submitted'
+-- for marking. It sits between 'ongoing' and the two final states on purpose; no
+-- function may treat it as either of them without saying so.
+--
+-- Dropped by *definition* and added NOT VALID + VALIDATE for the same reasons as
+-- the action_type refresh in section 5: re-runnable, no rewrite of the table, and
+-- an unknown existing status surfaces as a validation error that names the row
+-- instead of being silently rewritten.
+do $$
+declare
+  v_constraint text;
+begin
+  for v_constraint in
+    select con.conname
+      from pg_constraint con
+      join pg_class rel on rel.oid = con.conrelid
+      join pg_namespace nsp on nsp.oid = rel.relnamespace
+     where nsp.nspname = 'public'
+       and rel.relname = 'exam_submissions'
+       and con.contype = 'c'
+       and pg_get_constraintdef(con.oid) like '%status%'
+  loop
+    execute format('alter table public.exam_submissions drop constraint %I', v_constraint);
+  end loop;
+end $$;
+
+alter table public.exam_submissions
+  add constraint exam_submissions_status_check
+  check (status in ('ongoing', 'flagged_for_review', 'submitted', 'disqualified'))
+  not valid;
+
+alter table public.exam_submissions
+  validate constraint exam_submissions_status_check;
+
 
 alter table public.exam_submissions enable row level security;
 
@@ -1108,9 +1154,10 @@ create policy "submissions_delete_supervisor"
 -- update, and anything added later.
 --
 -- What stays writable on a closed row is deliberate: `score` and `submitted_at`
--- are how a supervisor re-grades, and `status` may still move between the two
--- closed states ('submitted' <-> 'disqualified') so an after-the-fact
--- disqualification counts and a mistaken one can be undone. Reopening one
+-- are how a supervisor re-grades, and `status` may still move between the closed
+-- states ('submitted' <-> 'disqualified', and 'flagged_for_review' -> either of
+-- them through `resolve_flagged_attempt()`) so an after-the-fact disqualification
+-- counts and a mistaken one can be undone. Reopening one
 -- ('ongoing' again) is not a repair - it would hand a student a live session over
 -- an attempt whose answers were already recorded; the supported way to let
 -- somebody retake an exam is "Reset attempt", which deletes the row.
@@ -1681,6 +1728,58 @@ create policy "session_reset_logs_insert_supervisor"
 -- correction is another row (or SQL by the project owner), never an edit.
 
 -- ---------------------------------------------------------------------
+-- 7a. ATTEMPT REVIEW LOGS (the audit trail behind "resolve")
+-- ---------------------------------------------------------------------
+-- `register_violation()` no longer disqualifies on its own: at the weighted
+-- threshold it closes the sitting as `flagged_for_review` and a person decides.
+-- This table is the record of that decision - who, when, which way, and on what
+-- grounds - which is exactly what an appeal turns on. One row per call, written by
+-- `resolve_flagged_attempt()` (bottom of this file) and by nothing else.
+--
+-- No foreign keys, for the same reason `session_reset_logs` has none: the attempt
+-- this row describes can be deleted afterwards by "Reset attempt", and a reference
+-- would either refuse the insert or - with `on delete set null` - blank out the id
+-- that ties the record to the attempt it is about. `student_id` and `exam_id` stay
+-- as plain uuid evidence, so a deleted exam cannot take its review trail with it.
+create table if not exists public.attempt_review_logs (
+  id            uuid primary key default uuid_generate_v4(),
+  submission_id uuid not null,
+  student_id    uuid not null,
+  exam_id       uuid not null,
+  from_status   text not null,
+  to_status     text not null,
+  decision      text not null check (decision in ('disqualify', 'clear')),
+  note          text,
+  actor_id      uuid not null default auth.uid(),
+  created_at    timestamptz not null default now()
+);
+
+comment on table public.attempt_review_logs is
+  'One row per resolve_flagged_attempt() call: who decided what about an attempt that reached the weighted threshold, with their note. Read-only to clients.';
+
+alter table public.attempt_review_logs enable row level security;
+
+drop policy if exists "attempt_review_logs_select_staff" on public.attempt_review_logs;
+
+-- Read: the intervention tier sees every review; the lecturer who wrote the paper
+-- sees the reviews of their own sitting. Students get no rows - the record names
+-- the member of staff who made the call. Same reach as `session_reset_logs`, and
+-- for the same reason: a shared staff read would expose another teacher's student
+-- and another teacher's decision.
+create policy "attempt_review_logs_select_staff"
+  on public.attempt_review_logs for select
+  to authenticated
+  using (public.is_exam_supervisor() or public.owns_exam(exam_id));
+
+-- No insert policy, and no update or delete one. The row is written inside
+-- `resolve_flagged_attempt()`, a SECURITY DEFINER function that has already
+-- checked the caller's tier, so `actor_id = auth.uid()` is the database's answer
+-- rather than a client's claim.
+grant select on public.attempt_review_logs to authenticated;
+revoke insert, update, delete on public.attempt_review_logs from authenticated;
+revoke all on public.attempt_review_logs from anon;
+
+-- ---------------------------------------------------------------------
 -- 8. QUESTION GRADES (the marks a person awarded, not the RPC)
 -- ---------------------------------------------------------------------
 -- `submit_exam()` grades the questions whose answer key it holds. A subjective
@@ -1787,8 +1886,17 @@ begin
 end $$;
 
 -- ---------------------------------------------------------------------
--- Server-side 3-strike escalation (RPC)
+-- Server-side weighted escalation (RPC)
 -- ---------------------------------------------------------------------
+-- One log row is one piece of evidence, and evidence is not the same as a strike.
+-- `public.violation_weights` (section 5a) says how much each `action_type` counts:
+-- the six identity-breaking signals weigh 1 and the five soft ones weigh 0. Three
+-- weighted points close the sitting as `flagged_for_review` - the student is told a
+-- supervisor will review it - and `resolve_flagged_attempt()` (below) is the human
+-- decision. The rule used to be `count(*) >= 3` and `status = 'disqualified'`,
+-- which made three right-clicks equal to three second faces and left no record of
+-- who ended an attempt.
+--
 -- p_snapshot_url is optional, so a client that only knows the violation type
 -- keeps working. Its value is the *object path* inside the private
 -- `proctor-snapshots` bucket (section 6), not a URL - see the column comment on
@@ -1797,6 +1905,7 @@ end $$;
 -- place would make `register_violation(uuid, text)` ambiguous ("function
 -- register_violation(uuid, text) is not unique") now that a defaulted
 -- 3-argument version exists.
+
 --
 -- The path is the one string the student's device chooses and the database stores
 -- verbatim, so it is checked before it is stored: it must match
@@ -1819,6 +1928,12 @@ drop function if exists public.register_violation(uuid, text);
 -- shape is dropped before the new one is created.
 drop function if exists public.register_violation(uuid, text, text);
 
+-- The five-argument shape is dropped as well, and not for ambiguity: it gains a
+-- third output column (`flagged`), and `create or replace` refuses to change a
+-- function's return type ("cannot change return type of existing function"). Its
+-- grants are re-applied at the end of this block.
+drop function if exists public.register_violation(uuid, text, text, timestamptz, uuid);
+
 create or replace function public.register_violation(
   p_submission_id    uuid,
   p_action_type      text,
@@ -1826,16 +1941,26 @@ create or replace function public.register_violation(
   p_client_timestamp timestamptz default null,
   p_client_event_id  uuid default null
 )
-returns table(warning_count int, disqualified boolean)
+returns table(warning_count int, disqualified boolean, flagged boolean)
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
+  -- The bar, in weighted points. Three, because every seeded hard type weighs 1:
+  -- "any three hard signals" is the rule this replaces for the signals that
+  -- deserve it, and a soft type at weight 0 can never reach it alone. This is the
+  -- one number to change if an institution wants a stricter or looser ceiling -
+  -- changing a *type's* contribution does not need a migration at all (README,
+  -- "Tuning the violation weights").
+  c_flag_threshold constant int := 3;
+
   v_count  int;
   v_status text;
   v_snapshot_path text;
+  v_weighted int;
 begin
+
   if auth.uid() is null then
     raise exception 'authentication is required to register a violation'
       using errcode = '42501';
@@ -1858,14 +1983,17 @@ begin
       using errcode = '42501';
   end if;
 
-  -- Frames that arrive after the attempt closed (submitted, or already at
-  -- strike 3) must not append more evidence or resurrect the session: report
-  -- the final state instead of raising, so a late callback is harmless.
+  -- Frames that arrive after the attempt closed (submitted, under review, or
+  -- already disqualified) must not append more evidence or resurrect the session:
+  -- report the final state instead of raising, so a late callback is harmless.
+  -- `flagged` is read from the stored status, so a client that missed the ruling
+  -- still learns the attempt is under review.
   if v_status <> 'ongoing' then
     select count(*) into v_count
     from public.proctoring_logs
     where submission_id = p_submission_id;
-    return query select v_count, (v_status = 'disqualified');
+    return query select v_count, (v_status = 'disqualified'),
+                        (v_status = 'flagged_for_review');
     return;
   end if;
 
@@ -1920,18 +2048,180 @@ begin
   from public.proctoring_logs
   where submission_id = p_submission_id;
 
-  if v_count >= 3 then
+  -- The weighted score for the whole attempt, recomputed from the stored rows -
+  -- never an increment. A replayed `client_event_id` inserts nothing, a retried
+  -- delivery inserts nothing, and a queue replayed twice must arrive at exactly the
+  -- same number as the evidence actually held.
+  --
+  -- `left join` + coalesce is the fail-closed shape: a row whose action_type has no
+  -- weight yet scores one point, so widening the check constraint (section 5) can
+  -- never hand out a free signal. `counts_toward_dq` gates the point, so a soft
+  -- type contributes 0 even if somebody later gives it a weight.
+  select coalesce(sum(
+           case
+             when coalesce(w.counts_toward_dq, true) then coalesce(w.weight, 1)
+             else 0
+           end
+         ), 0)::int
+    into v_weighted
+  from public.proctoring_logs l
+  left join public.violation_weights w on w.action_type = l.action_type
+  where l.submission_id = p_submission_id;
+
+  if v_weighted >= c_flag_threshold then
+    -- The sitting stops, but nobody has decided anything: `flagged_for_review`
+    -- means "a person must look at this", and `resolve_flagged_attempt()` below is
+    -- that person. `submitted_at` is written once - a replayed call keeps the
+    -- original close time - and `score` is cleared because marking does not start
+    -- until the review ends.
     update public.exam_submissions
-    set status = 'disqualified', submitted_at = now(), score = null
-    where id = p_submission_id and status = 'ongoing';
-    return query select v_count, true;
-  else
-    return query select v_count, false;
+       set status = 'flagged_for_review',
+           submitted_at = coalesce(submitted_at, now()),
+           score = null
+     where id = p_submission_id
+       and status = 'ongoing';
+    return query select v_count, false, true;
+    return;
   end if;
+
+  return query select v_count, false, false;
 end;
 $$;
 revoke execute on function public.register_violation(uuid, text, text, timestamptz, uuid) from public, anon;
 grant execute on function public.register_violation(uuid, text, text, timestamptz, uuid) to authenticated, service_role;
+
+comment on function public.register_violation(uuid, text, text, timestamptz, uuid) is
+  'The single write path for proctoring evidence: ownership-checked, idempotent per client_event_id, and weighted - only types whose violation_weights row counts_toward_dq add points. At 3 weighted points the attempt becomes flagged_for_review for resolve_flagged_attempt() instead of being disqualified automatically.';
+
+-- ---------------------------------------------------------------------
+-- The human decision behind the weighted threshold (RPC)
+-- ---------------------------------------------------------------------
+-- The only way out of `flagged_for_review`, and the only writer of
+-- `attempt_review_logs` (section 7a). A server that stops an attempt on a weighted
+-- score and then leaves it stopped forever would be worse than the 3-strike rule it
+-- replaces: the student would have no outcome and the paper would never be marked.
+--
+-- WHO MAY CALL IT: the tier that may already delete an attempt on this paper -
+-- `is_exam_supervisor()` (admin, supervisor) anywhere and `owns_exam(exam_id)` for
+-- the lecturer who wrote it. A lecturer on somebody else's paper is refused, and so
+-- is the student: the account under review does not get a vote.
+--
+-- 'disqualify' -> status 'disqualified', score cleared.
+-- 'clear'      -> status 'submitted', score recomputed from the automatic key -
+--                 the gradable state. Subjective marks arrive afterwards through
+--                 `grade_submission()`, which refuses a flagged attempt precisely so
+--                 a mark cannot be awarded on a sitting that then stops counting.
+--
+-- Idempotent: an attempt that is no longer flagged returns the status it already
+-- holds and writes no second audit row, so a lost response can be retried. An
+-- 'ongoing' attempt raises - there is nothing to review yet, and closing a live
+-- sitting silently would be a reset by another name.
+create or replace function public.resolve_flagged_attempt(
+  p_submission_id uuid,
+  p_decision      text,
+  p_note          text default null
+)
+returns table(new_status text)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_status  text;
+  v_student uuid;
+  v_exam    uuid;
+  v_to      text;
+  v_score   numeric;
+begin
+  if auth.uid() is null then
+    raise exception 'authentication is required to resolve a flagged attempt'
+      using errcode = '42501';
+  end if;
+
+  if p_decision is null or p_decision not in ('disqualify', 'clear') then
+    raise exception 'a review decision must be ''disqualify'' or ''clear'' (got %)',
+      coalesce(p_decision, 'null')
+      using errcode = '22023';
+  end if;
+
+  -- Locked for the duration: two supervisors pressing "Disqualify" and "Clear" in
+  -- the same second must produce one decision and one audit row, not two that
+  -- disagree.
+  select s.status, s.student_id, s.exam_id
+    into v_status, v_student, v_exam
+  from public.exam_submissions s
+  where s.id = p_submission_id
+  for update;
+
+  if v_status is null then
+    raise exception 'submission % does not exist', p_submission_id
+      using errcode = 'P0002';
+  end if;
+
+  -- The tier check runs BEFORE the status check on purpose: whether an attempt is
+  -- flagged is not something an unauthorised caller should learn from an error
+  -- message, and the refusal has to be identical for every attempt they may not
+  -- touch.
+  if not (public.is_exam_supervisor() or public.owns_exam(v_exam)) then
+    raise exception 'only a supervisor, or the lecturer who wrote this paper, may resolve a flagged attempt'
+      using errcode = '42501';
+  end if;
+
+  if v_status = 'ongoing' then
+    raise exception 'submission % is still in progress: there is nothing to review', p_submission_id
+      using errcode = '55000';
+  end if;
+
+  if v_status <> 'flagged_for_review' then
+    -- Already decided (or never flagged): report the stored outcome and write
+    -- nothing, so a client that lost the response can replay the call without a
+    -- second audit row appearing.
+    return query select v_status;
+    return;
+  end if;
+
+  if p_decision = 'disqualify' then
+    v_to := 'disqualified';
+    v_score := null;
+  else
+    v_to := 'submitted';
+    -- The automatic part of the mark, exactly as submit_exam() computes it, so
+    -- "clear" lands the attempt in the state a normal hand-in would.
+    v_score := public.auto_graded_score(p_submission_id);
+  end if;
+
+  update public.exam_submissions
+     set status = v_to,
+         score = v_score,
+         submitted_at = coalesce(submitted_at, now())
+   where id = p_submission_id;
+
+  insert into public.attempt_review_logs (
+    submission_id, student_id, exam_id, from_status, to_status, decision, note
+  )
+  values (
+    p_submission_id,
+    v_student,
+    v_exam,
+    v_status,
+    v_to,
+    p_decision,
+    -- Capped like every other free-text field here, and blank becomes NULL so "no
+    -- note" has one shape.
+    nullif(btrim(left(coalesce(p_note, ''), 2000)), '')
+  );
+
+  return query select v_to;
+end;
+$$;
+
+comment on function public.resolve_flagged_attempt(uuid, text, text) is
+  'The human decision behind flagged_for_review: disqualify or clear an attempt that reached the weighted threshold, supervisor-only (or the paper''s author), and the only writer of attempt_review_logs. Idempotent; refuses an ongoing attempt.';
+
+revoke execute on function public.resolve_flagged_attempt(uuid, text, text) from public, anon;
+grant execute on function public.resolve_flagged_attempt(uuid, text, text) to authenticated, service_role;
+
+
 
 -- ---------------------------------------------------------------------
 -- The single home of "how long has this attempt got?"
@@ -2317,6 +2607,16 @@ begin
   -- A disqualified attempt is never graded: a score would imply it counts.
   if v_status = 'disqualified' then
     raise exception 'submission % was disqualified and is not graded',
+      p_submission_id
+      using errcode = '55000';
+  end if;
+
+  -- The weighted-threshold state: an attempt under review has no outcome yet, and a
+  -- mark entered now would be a mark on a sitting that may stop counting.
+  -- `resolve_flagged_attempt()` either disqualifies it or restores it to
+  -- 'submitted', after which this function grades it normally.
+  if v_status = 'flagged_for_review' then
+    raise exception 'submission % is under review and is not graded until it is resolved',
       p_submission_id
       using errcode = '55000';
   end if;
