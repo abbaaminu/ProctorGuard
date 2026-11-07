@@ -33,10 +33,12 @@
 --   (g) `purge_expired_snapshots()` deletes the expired objects of finished
 --       attempts, keeps a live sitting's - and a fresh still's - alone, and keeps
 --       the incident row while nulling the pointer to the photograph. A dry run
---       deletes nothing, and a window of zero is refused. The live run sets
---       `storage.allow_delete_query` for its own transaction, standing in for the
---       Storage API (which sets it itself), so that on a hosted project the
---       delete reaches the policy instead of the `protect_delete` trigger.
+--       deletes nothing, and a window of zero is refused. The (g) block sets
+--       `storage.allow_delete_query` as its *first* statement - the flag the
+--       Storage API sets on itself while it is the one deleting - so that on a
+--       hosted project the live run reaches the policy instead of the
+--       `protect_delete` trigger. Nothing later in that block may reset it, and
+--       `mobile/test/schema_contract_test.dart` pins the ordering.
 --   (h) the retention windows the notice quotes exist: `proctor_snapshots` 30,
 --       `profiles` and `exam_submissions` 180.
 --
@@ -616,6 +618,28 @@ declare
   v_fresh  text;
   v_orphan_path text;
 begin
+  -- `storage.allow_delete_query` is the flag the Storage API sets on itself while
+  -- it is the one deleting. On a hosted project `storage.objects` carries the
+  -- `storage.protect_delete()` trigger, which refuses *every* other SQL delete
+  -- with 42501, and `purge_expired_snapshots()` is `security definer` but still a
+  -- plain SQL delete inside - so without this flag the live run below never
+  -- reaches the policy under test, it only meets the project's guard.
+  --
+  -- It is set here, as this block's *first* statement, rather than beside the call
+  -- that needs it: `is_local = true` lasts until the end of the transaction (the
+  -- whole file is one `begin` ... `rollback`, so one flag covers every statement
+  -- in this block), and putting it at the top is what makes the ordering
+  -- structural instead of incidental - no fixture write, no dry run and no
+  -- statement added later can run ahead of it, and the live call can never end up
+  -- on the far side of a reset. Nothing after this line in this block may clear
+  -- it: a `reset all`, a `discard all` or a second `set_config` with `'false'`
+  -- puts `protect_delete()` back in front of the live run.
+  --
+  -- `mobile/test/schema_contract_test.dart` pins both halves of that: the flag is
+  -- the first statement of the block, and nothing between it and the live call
+  -- mentions it again.
+  perform set_config('storage.allow_delete_query', 'true', true);
+
   if to_regprocedure('public.purge_expired_snapshots(interval, boolean)') is null then
     raise notice 'SKIP (g): supabase/migrations/20261106090100_snapshot_retention.sql has not been applied';
     return;
@@ -658,7 +682,7 @@ begin
     (v_closed, 'no_face',      now(),                                     v_fresh);
 
   -- A dry run counts and changes nothing.
-  select public.purge_expired_snapshots() into v_dry;
+  select public.purge_expired_snapshots(make_interval(days => v_days), true) into v_dry;
   if v_dry < 2 then
     raise exception 'FAIL (g): the purge counted % object(s), expected at least 2', v_dry;
   end if;
@@ -672,14 +696,11 @@ begin
   end if;
 
   -- The real run: the finished attempt's expired still and the orphaned one go,
-  -- the live sitting's and the fresh one stay.
-  -- The live run deletes from storage.objects, and on a hosted project that is
-  -- refused with 42501 unless the session sets this flag - the Storage API sets
-  -- it on itself while it is the one deleting. Setting it here stands in for the
-  -- Storage API, so what runs below is the function's real path rather than the
-  -- project's guard. The dry run above needs no flag: it deletes nothing.
-  perform set_config('storage.allow_delete_query', 'true', true);
-  select public.purge_expired_snapshots() into v_done;
+  -- the live sitting's and the fresh one stay. It deletes through
+  -- `purge_expired_snapshots()`, so it runs under the `storage.allow_delete_query`
+  -- flag set at the top of this block - see the note there for why it lives there
+  -- and not here. The dry run above needed no flag, because it deletes nothing.
+  select public.purge_expired_snapshots(make_interval(days => v_days), false) into v_done;
   if v_done < 2 then
     raise exception 'FAIL (g): the purge deleted % object(s), expected at least 2', v_done;
   end if;

@@ -3857,8 +3857,7 @@ void main() {
       final consents = File('../supabase/tests/proctoring_consents_check.sql');
       if (consents.existsSync()) {
         final sql = consents.readAsStringSync().replaceAll('\r\n', '\n');
-        final call =
-            sql.indexOf('select public.purge_expired_snapshots() into v_done');
+        final call = _livePurgeCallIndex(sql);
         expect(call, greaterThan(-1));
         expect(
           sql.substring(0, call),
@@ -3869,6 +3868,68 @@ void main() {
 
       // A scan that quietly matched nothing would pass forever.
       expect(sawDirectDelete, isTrue);
+    });
+
+    test('the consent check sets the storage flag first, in the call\'s own '
+        'block', () {
+      final file = File('../supabase/tests/proctoring_consents_check.sql');
+      if (!file.existsSync()) return;
+      final sql = file.readAsStringSync().replaceAll('\r\n', '\n');
+
+      // The flag the Storage API sets on itself while it deletes. On a hosted
+      // project `storage.protect_delete()` refuses every other SQL delete from
+      // `storage.objects` with 42501, and the live purge call below is one: the
+      // function is `security definer`, but the delete inside it is still a plain
+      // SQL delete.
+      const standIn = "set_config('storage.allow_delete_query', 'true', true)";
+      final call = _livePurgeCallIndex(sql);
+      expect(call, greaterThan(-1), reason: 'the live purge call left the file');
+
+      // ...inside the same DO block as the call. `is_local = true` really lasts
+      // for the transaction, so a flag from an earlier block would still be in
+      // force today - but only because the whole file happens to be one
+      // transaction, and a DO block can be lifted out and run on its own. What is
+      // pinned is that this block carries its own flag.
+      final blockStart = sql.lastIndexOf(r'do $$', call);
+      expect(blockStart, greaterThan(-1),
+          reason: 'the live call is not inside a DO block');
+      expect(sql.indexOf(r'end $$', call), greaterThan(call));
+
+      final flag = sql.lastIndexOf(standIn, call);
+      expect(flag, greaterThan(blockStart),
+          reason: 'the live purge call deletes from storage.objects, so $standIn '
+              'has to run inside the same DO block, ahead of it');
+
+      // Nothing between the flag and the call may put the guard back: a RESET, a
+      // DISCARD, or a second set_config turning it off again. Comments are dropped
+      // first - they name the flag on purpose, and naming it is not a statement.
+      final between =
+          _withoutSqlComments(sql.substring(flag + standIn.length, call));
+      expect(between, isNot(contains('reset')),
+          reason: 'a reset between the flag and the live call clears it');
+      expect(between, isNot(contains('discard')));
+      expect(between, isNot(contains('allow_delete_query')));
+      expect(between, isNot(contains('set_config')));
+
+      // And it is the block's *first* statement: between the `begin` that opens
+      // the block and the flag there is nothing but whitespace (the `declare`
+      // section comes before `begin`, so it is out of scope here). The fixture
+      // writes, the dry run and the live run are therefore all behind it - no
+      // statement of this block can run without the flag, and one inserted ahead
+      // of it later cannot silently reintroduce the 42501.
+      final head = _withoutSqlComments(sql.substring(blockStart, flag));
+      final open = head.lastIndexOf('begin');
+      expect(open, greaterThan(-1), reason: 'the DO block has no begin');
+      // Between `begin` and the flag there is one word: the `perform` that belongs
+      // to the flag statement itself. Anything else is a statement that runs
+      // without the flag - and a completed one always ends in `;`.
+      final ahead = head.substring(open + 'begin'.length);
+      expect(ahead, isNot(contains(';')),
+          reason: 'a completed statement sits between `begin` and the storage flag, '
+              'so it runs without it');
+      expect(ahead.trim(), 'perform',
+          reason: 'the storage flag has to be the first statement of the block that '
+              'makes the live purge call');
     });
 
     test('the README says which purge route runs on a hosted project', () {
@@ -4076,7 +4137,30 @@ String? migrationSql() {
   return file.existsSync() ? file.readAsStringSync() : null;
 }
 
-/// The body of `create or replace function public.<name>(...)` in [sql]: the
+/// [sql] with its `--` line comments removed.
+///
+/// The ordering checks read *statements*, and the prose around them names the
+/// guard and the flag on purpose; dropping the comments is what keeps a sentence
+/// about a `set_config` from reading as one. This is a lexical approximation
+/// (a `--` inside a string literal would be dropped too), which is why it is only
+/// used to look for keywords, never to reproduce SQL.
+String _withoutSqlComments(String sql) => sql.replaceAll(RegExp(r'--[^\n]*'), '');
+
+/// Where the *live* purge call starts in a SQL test file: the statement that
+/// calls `public.purge_expired_snapshots(...)` into `v_done`.
+///
+/// The argument list is deliberately not pinned. Section (g) hands over the
+/// window it read from `public.retention_policies` (so the fixture and the purge
+/// agree when an operator keeps something other than 30 days), and a test that
+/// spelled the call out would go on passing while pinning the wrong thing -
+/// what matters is that the call is there and where it sits.
+///
+/// -1 when the file has no such statement.
+int _livePurgeCallIndex(String sql) =>
+    RegExp(
+      r'select public\.purge_expired_snapshots\((?:[^()]|\([^()]*\))*\) into v_done',
+    ).firstMatch(sql.replaceAll('\r\n', '\n'))?.start ??
+    -1;
 /// `create` keyword through the closing `$$;`, with `--` comments stripped and
 /// every line trimmed.
 ///
