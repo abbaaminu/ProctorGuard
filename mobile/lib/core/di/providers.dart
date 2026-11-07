@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../features/exam/domain/repositories/consent_repository.dart';
 import '../../features/exam/domain/repositories/exam_repository.dart';
 import '../../features/proctoring/domain/repositories/proctoring_repository.dart';
 import '../services/key_value_store.dart';
@@ -24,6 +25,18 @@ final examRepositoryProvider = Provider<ExamRepository>((ref) {
 
 final proctoringRepositoryProvider = Provider<ProctoringRepository>((ref) {
   throw UnimplementedError('Override in ProviderScope with ProctoringRepositoryImpl(client)');
+});
+
+/// The proctoring consent notice: the student's acceptances and the version the
+/// server has in force.
+///
+/// Its own provider rather than two more methods on [examRepositoryProvider]
+/// because it has exactly one caller - the pre-exam consent gate - and because
+/// `submissions_insert_own_ongoing` now refuses an attempt without it: a test
+/// that drives the portal can pass a stub gate and never touch this provider,
+/// while the consent screen's own tests inject the repository directly.
+final consentRepositoryProvider = Provider<ConsentRepository>((ref) {
+  throw UnimplementedError('Override in ProviderScope with ConsentRepositoryImpl(client)');
 });
 
 /// The app-wide offline layer: local answer cache, answer/violation retry queues

@@ -41,6 +41,15 @@ supabase/functions/node_modules/
 # ---- Kotlin/Gradle build state (mobile/android/) ----
 mobile/android/.kotlin/
 
+# ---- Detector evaluation corpus (tools/detector_eval/) ----
+# The evaluation labels are the record and belong in git; the footage does not.
+# A clip of a face is someone's likeness, and a corpus of real exam recordings is
+# not something a clone should download. The tool ships a documented template
+# (`labels.template.csv`) and no images.
+tools/detector_eval/clips/
+tools/detector_eval/labels.csv
+tools/detector_eval/report*.json
+
 # ---- Editor / OS ----
 .vscode/
 .idea/

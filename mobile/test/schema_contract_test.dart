@@ -12,12 +12,15 @@ import 'package:proctorguard/features/auth/domain/entities/user_profile.dart';
 import 'package:proctorguard/features/authoring/data/repositories/question_authoring_repository_impl.dart';
 import 'package:proctorguard/features/authoring/domain/entities/authored_question.dart';
 import 'package:proctorguard/features/authoring/domain/repositories/question_authoring_repository.dart';
+import 'package:proctorguard/features/exam/data/repositories/consent_repository_impl.dart';
 import 'package:proctorguard/features/exam/data/repositories/exam_repository_impl.dart';
+import 'package:proctorguard/features/exam/domain/entities/proctor_consent.dart';
 import 'package:proctorguard/features/exam/domain/entities/question.dart';
 import 'package:proctorguard/features/exam/domain/entities/submission.dart';
 import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
 import 'package:proctorguard/features/exam/presentation/providers/exam_session_controller.dart';
 import 'package:proctorguard/features/proctoring/data/repositories/proctoring_repository_impl.dart';
+import 'package:proctorguard/features/proctoring/domain/entities/heartbeat.dart';
 import 'package:proctorguard/features/proctoring/domain/entities/proctoring_risk.dart';
 import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -3165,6 +3168,48 @@ void main() {
       );
     });
 
+    test('the upgrade drops the old return shape before it recreates the function',
+        () {
+      final migration = File(
+        '../supabase/migrations/20261104090100_weighted_strikes_and_flagged_review.sql',
+      );
+      if (!migration.existsSync()) return;
+      final sql = migration.readAsStringSync().replaceAll('\r\n', '\n');
+
+      // `create or replace function` can change a body, never a return type. On a
+      // project that still carries the two-column `(warning_count, disqualified)`
+      // version the `create` fails with 42P13 - "cannot change return type of
+      // existing function" - and the upgrade stops there, having already added the
+      // weights table and the new status. The signature has to be dropped first,
+      // and the grants re-applied afterwards because a drop takes the ACL with it.
+      final dropped = sql.indexOf(
+        'drop function if exists '
+        'public.register_violation(uuid, text, text, timestamptz, uuid);',
+      );
+      final created = sql.indexOf(
+        'create or replace function public.register_violation(',
+      );
+      expect(
+        dropped,
+        greaterThanOrEqualTo(0),
+        reason: 'a widened return shape can only be replaced by dropping the '
+            'function first',
+      );
+      expect(
+        dropped,
+        lessThan(created),
+        reason: 'a drop after the create would delete the new definition',
+      );
+      expect(
+        sql.indexOf(
+          'grant execute on function '
+          'public.register_violation(uuid, text, text, timestamptz, uuid)',
+        ),
+        greaterThan(created),
+        reason: 'the drop removed the grants, so they have to be granted again',
+      );
+    });
+
     test('the status check accepts flagged_for_review, and the enum matches it', () {
       final sql = schemaSql();
       if (sql == null) return;
@@ -3303,6 +3348,565 @@ void main() {
     });
   });
 
+  group('proctoring heartbeats', () {
+    test('the series is readable by the same audience as the evidence', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      final read = _policyUsing(sql, 'heartbeats_select_own_or_supervisor');
+      expect(read, contains('s.student_id = auth.uid()'));
+      expect(read, contains('public.owns_exam(s.exam_id)'));
+      expect(read, contains('public.is_exam_supervisor()'));
+
+      // The write side is deliberately absent, and that absence *is* the control:
+      // a client-insertable heartbeat table would let a tampered client backfill
+      // the tidy series it never sent - the one thing these rows exist to make
+      // hard. So there must be no insert/update/delete policy at all.
+      for (final action in <String>['insert', 'update', 'delete']) {
+        expect(
+          RegExp('on public\\.proctor_heartbeats\\s+for $action')
+              .hasMatch(sql.replaceAll('\r\n', '\n')),
+          isFalse,
+          reason: 'record_heartbeat() must stay the only writer ($action)',
+        );
+      }
+      expect(
+        sql,
+        contains('grant select on public.proctor_heartbeats to authenticated'),
+      );
+      expect(sql, contains('revoke all on public.proctor_heartbeats from anon'));
+    });
+
+    test('a replayed beat is stored once and a throttled one still counts', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+      final body = _functionBody(sql, 'record_heartbeat');
+      expect(body, isNotNull);
+
+      // One row per queued beat, however many times the queue replays it. The
+      // partial index is what the `on conflict` below targets, and the `where`
+      // clause keeps the many beats with no id at all from colliding.
+      expect(
+        sql.replaceAll('\r\n', '\n'),
+        contains(
+          'on public.proctor_heartbeats(client_event_id)\n'
+          '  where client_event_id is not null',
+        ),
+      );
+      expect(
+        body,
+        contains(
+          'on conflict (client_event_id) where client_event_id is not null do nothing',
+        ),
+      );
+
+      // Three outcomes, and only one of them grew the table.
+      expect(body, contains("'recorded'"));
+      expect(body, contains("'duplicate'"));
+      expect(body, contains("'throttled'"));
+
+      // The window must be shorter than the client's 15s cadence, or an honest
+      // client would be throttled by ordinary jitter.
+      expect(body, contains("interval '8 seconds'"));
+
+      // Every outcome refreshes liveness, so a beat the server chose not to store
+      // is still proof the client is talking to us now: three stamps, one per
+      // branch.
+      expect(
+        RegExp('set last_heartbeat_at = v_now')
+            .allMatches(body!)
+            .length,
+        3,
+        reason: 'recorded, duplicate and throttled must each stamp liveness',
+      );
+
+      // A closed attempt cannot report for duty: accepting the beats would keep a
+      // finished sitting's coverage looking healthy after the fact.
+      expect(body, contains("v_sub.status <> 'ongoing'"));
+      expect(body, contains('security definer'));
+
+      // `beat_count` is declared int and `count(*)` is bigint. A RETURN QUERY is
+      // type-checked against the declared row type exactly - unlike `select ...
+      // into`, it applies no assignment cast - so a bare count fails on the first
+      // call with "Returned type bigint does not match expected type integer in
+      // column 3". Every count a RETURN QUERY returns has to be cast.
+      expect(body, contains('count(*)::integer'));
+      final returned = RegExp(r'return query[\s\S]*?;')
+          .allMatches(body)
+          .map((match) => match.group(0)!.replaceAll(RegExp(r'\s+'), ' '));
+      expect(returned, isNotEmpty);
+      for (final statement in returned) {
+        expect(
+          RegExp(r'count\(\*\)(?!::integer)').hasMatch(statement),
+          isFalse,
+          reason: 'a RETURN QUERY returns count(*)::integer, not bigint: '
+              '$statement',
+        );
+      }
+    });
+
+    test('coverage flags an attempt for a human and never ends one', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+      final body = _functionBody(sql, 'proctoring_coverage');
+      expect(body, isNotNull);
+
+      // The three numbers the report is made of: the cadence the client is
+      // expected to keep, the gap worth a supervisor's time, and the quiet start
+      // every attempt has while the camera and the detector boot.
+      expect(body, contains('c_expected_interval constant numeric  := 15'));
+      expect(body, contains('c_gap_threshold     constant int      := 60'));
+      expect(body, contains("interval '90 seconds'"));
+
+      // The flag's own wording, which is what stops it being read as a verdict.
+      expect(body, contains('coverage never disqualifies an attempt'));
+
+      // Nothing here writes: coverage informs a human, it does not act.
+      expect(body, isNot(contains('update public.exam_submissions')));
+      expect(body, isNot(contains('set status')));
+      expect(body, isNot(contains('delete from')));
+
+      // SECURITY DEFINER, so the visibility rule the RLS policy would have
+      // applied has to be spelled out - and it names the same three audiences.
+      expect(body, contains('v_sub.student_id = auth.uid()'));
+      expect(body, contains('public.owns_exam(v_sub.exam_id)'));
+      expect(body, contains('public.is_exam_supervisor()'));
+
+      // The exam-wide wrapper filters visibility *before* the lateral call, so a
+      // student asking about their own paper gets their row instead of an
+      // exception raised for a classmate's.
+      final examWide = _functionBody(sql, 'proctoring_coverage_for_exam');
+      expect(
+        examWide,
+        contains('cross join lateral public.proctoring_coverage'),
+      );
+      expect(examWide, contains('where s.exam_id = p_exam_id'));
+      expect(examWide, contains('s.student_id = auth.uid()'));
+    });
+
+    test('the beat series expires with the evidence it explains', () {
+      final file = File('../supabase/migrations/retention_policy.sql');
+      if (!file.existsSync()) return;
+      final retention = file.readAsStringSync();
+
+      expect(
+        retention,
+        contains(
+          'create or replace function public.purge_expired_proctor_heartbeats(',
+        ),
+      );
+      // Seeded from a policy row, so an institution can change the window without
+      // editing SQL; and a table with no enabled policy purges *nothing* rather
+      // than everything.
+      expect(retention, contains("values ('proctor_heartbeats', 30)"));
+      expect(retention, contains('nothing purged'));
+
+      // A live attempt's beats are never pruned: deleting them would punch a hole
+      // in a report that is still being written and then read as a gap the client
+      // never caused - the worst kind of false positive in this system.
+      final purge =
+          _functionBody(retention, 'purge_expired_proctor_heartbeats');
+      expect(purge, isNotNull);
+      expect(
+        RegExp(r"s\.status <> 'ongoing'").allMatches(purge!).length,
+        2,
+        reason: 'the dry run and the delete must share the ongoing-attempt guard',
+      );
+
+      // Nightly on its own schedule, so a slow incident purge cannot starve it.
+      expect(retention, contains("'proctor-heartbeats-retention'"));
+      expect(
+        retention,
+        contains("'select public.purge_expired_proctor_heartbeats()'"),
+      );
+    });
+
+    test('a project created from schema.sql and one upgraded agree', () {
+      final sql = schemaSql();
+      final migration = File(
+        '../supabase/migrations/20261105090000_proctor_heartbeats.sql',
+      );
+      if (sql == null || !migration.existsSync()) return;
+      final upgrade = migration.readAsStringSync();
+
+      // The SQL that runs must be identical: comments may differ (schema.sql
+      // explains the same function to a different reader), but a definition that
+      // drifted would enforce something different in a fresh project than in an
+      // upgraded one, and nothing else in the repository would notice.
+      for (final name in <String>[
+        'record_heartbeat',
+        'proctoring_coverage',
+        'proctoring_coverage_for_exam',
+      ]) {
+        expect(
+          _functionBody(upgrade, name),
+          _functionBody(sql, name),
+          reason: '$name differs between schema.sql and the upgrade migration',
+        );
+      }
+
+      // The column the live grid reads, on both paths: created with the table, and
+      // added to a project that already had `exam_submissions`.
+      expect(sql, contains('last_heartbeat_at timestamptz'));
+      expect(upgrade, contains('add column if not exists last_heartbeat_at'));
+      expect(
+        _policyUsing(upgrade, 'heartbeats_select_own_or_supervisor'),
+        _policyUsing(sql, 'heartbeats_select_own_or_supervisor'),
+        reason: 'the two definitions of the read policy disagree',
+      );
+    });
+
+    test('the client sends the argument names the RPC declares', () async {
+      transport.responseBody =
+          '[{"outcome":"recorded","recorded_at":"2026-01-01T10:00:00Z",'
+          '"beat_count":1}]';
+      final repo = ProctoringRepositoryImpl(client);
+
+      final ack = await repo.recordHeartbeat(
+        submissionId: 'sub-1',
+        cameraOk: true,
+        monitoringOk: false,
+        appVersion: '1.0.0+1',
+        clientTime: DateTime.utc(2026, 1, 1, 10),
+        clientEventId: '9f1a4d0e-0f6b-4a1e-9a2b-6c2d2b7a3f11',
+      );
+
+      final request = transport.requests.single;
+      expect(request.method, 'POST');
+      expect(request.url.path, '/rest/v1/rpc/record_heartbeat');
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      expect(body.keys.toSet(), <String>{
+        'p_submission_id',
+        'p_camera_ok',
+        'p_monitoring_ok',
+        'p_app_version',
+        'p_client_time',
+        'p_client_event_id',
+      });
+      // The camera state is the point of the beat, so it must travel even when it
+      // is the default; the version and the device clock are diagnostics.
+      expect(body['p_monitoring_ok'], isFalse);
+      expect(body['p_app_version'], '1.0.0+1');
+      expect(body['p_client_time'], '2026-01-01T10:00:00.000Z');
+
+      expect(ack.outcome, HeartbeatOutcome.recorded);
+      expect(ack.beatCount, 1);
+      expect(ack.provesLiveness, isTrue);
+    });
+  });
+
+  group('proctoring consent', () {
+    test('the record of consent is write-once for the student who gave it', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+      final normalised = sql.replaceAll('\r\n', '\n');
+
+      // The table survives a deleted paper (no FK on `exam_id`) and a null paper
+      // means "every paper". Losing either shape would break the general
+      // acceptance the policy explicitly supports.
+      expect(
+        normalised,
+        contains('create table if not exists public.proctoring_consents'),
+      );
+      expect(RegExp(r'exam_id\s+uuid,').hasMatch(normalised), isTrue);
+      expect(RegExp(r'consent_version\s+text not null').hasMatch(normalised), isTrue);
+      expect(RegExp(r'user_agent\s+text').hasMatch(normalised), isTrue);
+
+      // Accepting is your own act, and only your own.
+      expect(
+        _policyWithCheck(sql, 'consents_insert_own'),
+        contains('student_id = auth.uid()'),
+      );
+
+      // Read: own rows, or the intervention tier. Not `is_staff()` - a lecturer
+      // reads the evidence of a sitting, not a person's agreement.
+      final read = _policyUsing(sql, 'consents_select_own_or_supervisor');
+      expect(read, contains('student_id = auth.uid()'));
+      expect(read, contains('public.is_exam_supervisor()'));
+      expect(read, isNot(contains('is_staff')));
+
+      // The absence *is* the control: no UPDATE or DELETE policy, and no grant
+      // past select/insert.
+      for (final action in <String>['update', 'delete']) {
+        expect(
+          RegExp('on public\\\\.proctoring_consents\\\\s+for $action')
+              .hasMatch(normalised),
+          isFalse,
+          reason: 'an acceptance must not be editable or erasable ($action)',
+        );
+      }
+      expect(
+        normalised,
+        contains(
+          'grant select, insert on table public.proctoring_consents to authenticated',
+        ),
+      );
+      expect(
+        normalised,
+        contains('revoke all on table public.proctoring_consents from anon'),
+      );
+    });
+
+    test('the attempt policy asks for an acceptance', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      final check = _policyWithCheck(sql, 'submissions_insert_own_ongoing');
+      expect(check, contains('public.student_has_consent(exam_id)'));
+      // ...without losing any of the checks that were already there.
+      expect(check, contains('public.student_can_access_exam(exam_id)'));
+      expect(check, contains('started_at = now()'));
+      expect(check, contains('answers = '));
+
+      // `student_can_access_exam()` itself must NOT grow a consent arm: it also
+      // answers `exams_select` and `questions_public`, and a student has to be
+      // able to read a paper before deciding whether to accept the notice for it.
+      final access = _functionBody(sql, 'student_can_access_exam');
+      expect(access, isNotNull);
+      expect(access, isNot(contains('consent')));
+    });
+
+    test('the predicate asks for the current version, or a general acceptance', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      final body = _functionBody(sql, 'student_has_consent');
+      expect(body, isNotNull);
+      expect(body, contains('c.student_id = auth.uid()'));
+      expect(
+        body,
+        contains('c.consent_version = public.current_proctor_consent_version()'),
+      );
+      expect(body, contains('(c.exam_id is null or c.exam_id = p_exam_id)'));
+      expect(body, contains('security definer'));
+    });
+
+    test('accepting is idempotent and records what the client displayed', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      final body = _functionBody(sql, 'record_consent');
+      expect(body, isNotNull);
+      // The version is evidence, not input to be "corrected"; the paper must be
+      // one the student may sit; and the client is never taken at its word about
+      // who it is.
+      expect(body, contains('v_student    uuid := auth.uid()'));
+      expect(body, contains("using errcode = '28000'"));
+      expect(body, contains("using errcode = '22023'"));
+      expect(body, contains("using errcode = '42501'"));
+      expect(body, contains('public.student_can_access_exam(p_exam_id)'));
+      // The transport's own header, not a body field.
+      expect(body, contains("current_setting('request.headers', true)"));
+      expect(body, contains("->> 'user-agent'"));
+      // Idempotent: a retry after a lost response returns the row that exists.
+      expect(body, contains('on conflict do nothing'));
+      // The answer the client needs: does what I stored actually count?
+      expect(
+        body,
+        contains('v_version = public.current_proctor_consent_version()'),
+      );
+
+      // Every name in the INSERT's RETURNING list is qualified with the table's
+      // alias. The OUT parameters are declared `consent_id`, `consent_version`,
+      // `accepted_at` and `is_current`, and PL/pgSQL resolves a bare column name
+      // against those variables first: `returning id, accepted_at into ...` raises
+      //   42702  column reference "accepted_at" is ambiguous
+      // on the *first call*, not at install time - the migration applies cleanly
+      // and the RPC fails, which is why this is pinned here rather than left to a
+      // live test.
+      expect(body, contains('insert into public.proctoring_consents as c ('));
+      expect(
+        body,
+        contains('returning c.id, c.accepted_at into v_id, v_accepted;'),
+      );
+      expect(
+        body,
+        isNot(contains('returning id, accepted_at')),
+        reason: 'an unqualified RETURNING name is ambiguous against the OUT params',
+      );
+    });
+
+    test('the app and the database agree on the shipped notice version', () {
+      final sql = schemaSql();
+      final migration =
+          File('../supabase/migrations/20261106090000_proctoring_consents.sql');
+      if (sql == null || !migration.existsSync()) return;
+
+      // The seed is read out of the SQL rather than compared against a copy of the
+      // string: bumping the wording in one place and not the other is exactly the
+      // drift that would leave every student refused at the insert with
+      // `is_current = false` and no clue why.
+      final seed = RegExp(r"values \(1, '([^']+)'\)")
+          .firstMatch(sql.replaceAll('\r\n', '\n'));
+      expect(seed, isNotNull, reason: 'no consent version is seeded in schema.sql');
+      expect(seed!.group(1), ProctorConsentConfig.version);
+
+      final upgradeSeed = RegExp(r"values \(1, '([^']+)'\)").firstMatch(
+        migration.readAsStringSync().replaceAll('\r\n', '\n'),
+      );
+      expect(upgradeSeed?.group(1), ProctorConsentConfig.version);
+    });
+
+    test('the retention windows the notice quotes are the ones enforced', () {
+      final file =
+          File('../supabase/migrations/20261106090100_snapshot_retention.sql');
+      if (!file.existsSync()) return;
+      final retention = file.readAsStringSync().replaceAll('\r\n', '\n');
+
+      int? windowFor(String table) {
+        final match = RegExp("\\('$table', (\\d+)\\)").firstMatch(retention);
+        return match == null ? null : int.parse(match.group(1)!);
+      }
+
+      // The consent notice renders these numbers from its own constants, so the
+      // sentence a student accepts and the window the purge enforces are the same
+      // value or this fails.
+      expect(windowFor('proctor_snapshots'),
+          ProctorConsentConfig.snapshotRetentionDays);
+      expect(windowFor('exam_submissions'),
+          ProctorConsentConfig.attemptRetentionDays);
+      // "Align with your appeals period" - the account row too, not just the
+      // attempt it belongs to.
+      expect(windowFor('profiles'), ProctorConsentConfig.attemptRetentionDays);
+    });
+
+    test('the snapshot purge keeps the incident and never a live sitting', () {
+      final file =
+          File('../supabase/migrations/20261106090100_snapshot_retention.sql');
+      if (!file.existsSync()) return;
+      final retention = file.readAsStringSync();
+
+      final body = _functionBody(retention, 'purge_expired_snapshots');
+      expect(body, isNotNull);
+      // The pointer goes, the row stays: a flag that happened still happened after
+      // its photograph expired.
+      expect(body, contains('set snapshot_url = null'));
+      expect(body, isNot(contains('delete from public.proctoring_logs')));
+      // A live sitting is exactly when a still matters.
+      expect(body, contains("<> 'ongoing'"));
+      // An operator can look before deleting, and a window of zero is refused
+      // rather than clamped.
+      expect(body, contains('p_dry_run'));
+      expect(body, contains("interval '0'"));
+
+      // Not scheduled: a job that deletes photographs is an operator's decision.
+      expect(retention, isNot(contains('cron.schedule')));
+    });
+
+    test('a project created from schema.sql and one upgraded agree', () {
+      final sql = schemaSql();
+      final migration =
+          File('../supabase/migrations/20261106090000_proctoring_consents.sql');
+      if (sql == null || !migration.existsSync()) return;
+      final upgrade = migration.readAsStringSync();
+
+      for (final name in <String>[
+        'current_proctor_consent_version',
+        'student_has_consent',
+        'record_consent',
+      ]) {
+        expect(
+          _functionBody(upgrade, name),
+          _functionBody(sql, name),
+          reason: '$name differs between schema.sql and the upgrade migration',
+        );
+      }
+
+      // The policy this migration exists to change must be identical on both paths
+      // too, or a fresh install and an upgraded project enforce different rules -
+      // which is the one thing a consent gate must never do.
+      expect(
+        _policyWithCheck(upgrade, 'submissions_insert_own_ongoing'),
+        _policyWithCheck(sql, 'submissions_insert_own_ongoing'),
+        reason: 'the attempt policy disagrees between the two paths',
+      );
+      expect(
+        _policyWithCheck(upgrade, 'consents_insert_own'),
+        _policyWithCheck(sql, 'consents_insert_own'),
+      );
+      expect(
+        _policyUsing(upgrade, 'consents_select_own_or_supervisor'),
+        _policyUsing(sql, 'consents_select_own_or_supervisor'),
+      );
+    });
+
+    test('the client sends the argument names the RPC declares', () async {
+      transport.responseBody = '[{"consent_id":"c-1","consent_version":"'
+          '${ProctorConsentConfig.version}","accepted_at":"2026-01-01T10:00:00Z",'
+          '"is_current":true}]';
+      final repo = ConsentRepositoryImpl(client);
+
+      final record = await repo.recordConsent(
+        examId: 'exam-1',
+        version: ProctorConsentConfig.version,
+      );
+
+      final request = transport.requests.single;
+      expect(request.method, 'POST');
+      expect(request.url.path, '/rest/v1/rpc/record_consent');
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      expect(body.keys.toSet(), <String>{'p_exam_id', 'p_version'});
+      expect(body['p_exam_id'], 'exam-1');
+      expect(body['p_version'], ProctorConsentConfig.version);
+
+      expect(record.id, 'c-1');
+      expect(record.version, ProctorConsentConfig.version);
+      expect(record.isCurrentVersion, isTrue);
+    });
+
+    test('a general acceptance sends a null paper', () async {
+      transport.responseBody = '[{"consent_id":"c-2","consent_version":"v",'
+          '"accepted_at":null,"is_current":true}]';
+
+      await ConsentRepositoryImpl(client).recordConsent(
+        version: ProctorConsentConfig.version,
+      );
+
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      expect(body.containsKey('p_exam_id'), isTrue);
+      expect(body['p_exam_id'], isNull, reason: 'NULL is "every paper"');
+    });
+
+    test('no session means no consent, and no request', () async {
+      final repo = ConsentRepositoryImpl(client);
+
+      // The insert policy would refuse the attempt anyway; making the round trip
+      // would only teach the gate a 401 it cannot act on.
+      expect(await repo.hasCurrentConsent('exam-1'), isFalse);
+      expect(transport.requests, isEmpty);
+    });
+
+    test('a reply that cannot be read does not block the student', () {
+      // The gate is the one screen a student cannot get past: an older server
+      // answering without `is_current` must not read as "your acceptance is
+      // stale".
+      expect(
+        ConsentRecord.fromRpc(<String, dynamic>{
+          'consent_id': 'c-3',
+          'consent_version': 'v',
+        }).isCurrentVersion,
+        isTrue,
+      );
+
+      // ...but an explicit `false` does, which is the whole point of the field.
+      expect(
+        ConsentRecord.fromRpc(<String, dynamic>{'is_current': false})
+            .isCurrentVersion,
+        isFalse,
+      );
+
+      // A list-shaped answer (the PostgREST `returns table` shape) is unwrapped.
+      expect(
+        ConsentRecord.fromRpc(<dynamic>[
+          <String, dynamic>{'consent_id': 'c-4', 'is_current': true},
+        ]).id,
+        'c-4',
+      );
+    });
+  });
+
 }
 
 /// Reads `supabase/schema.sql`, which sits next to `mobile/` in the repository.
@@ -3347,6 +3951,22 @@ String? _policyUsing(String sql, String policy) {
   return match?.group(1)?.replaceAll(RegExp(r'\s+'), ' ').trim();
 }
 
+/// The `with check (...)` predicate of `create policy "<policy>"` on an INSERT
+/// policy, whitespace squashed to single spaces so the comparison does not depend
+/// on layout.
+///
+/// The twin of [_policyUsing] for the policies that only have a WITH CHECK clause
+/// (an INSERT policy cannot have a USING clause). Read out of the file rather than
+/// compared against a copy of the sentence: the text in the file is what the
+/// server enforces. Null when [sql] does not declare that policy.
+String? _policyWithCheck(String sql, String policy) {
+  final match = RegExp(
+    'create policy "$policy"'
+    r'[\s\S]*?for insert[\s\S]*?with check \(([\s\S]*?)\);',
+  ).firstMatch(sql.replaceAll('\r\n', '\n'));
+  return match?.group(1)?.replaceAll(RegExp(r'\s+'), ' ').trim();
+}
+
 /// Reads the upgrade migration a database created *before* the four question
 /// shapes and `question_grades` needs
 /// (`supabase/migrations/question_types_and_grading.sql`).
@@ -3356,4 +3976,26 @@ String? _policyUsing(String sql, String policy) {
 String? migrationSql() {
   final file = File('../supabase/migrations/question_types_and_grading.sql');
   return file.existsSync() ? file.readAsStringSync() : null;
+}
+
+/// The body of `create or replace function public.<name>(...)` in [sql]: the
+/// `create` keyword through the closing `$$;`, with `--` comments stripped and
+/// every line trimmed.
+///
+/// Comments are dropped on purpose. `schema.sql` and an upgrade migration explain
+/// the same function to different readers and may word it differently; what must
+/// not differ is the SQL that runs, and this is the shape to compare on. Null when
+/// [sql] does not declare that function.
+String? _functionBody(String sql, String name) {
+  final normalised = sql.replaceAll('\r\n', '\n');
+  final start = normalised.indexOf('create or replace function public.$name(');
+  if (start < 0) return null;
+  final end = normalised.indexOf(r'$$;', start);
+  if (end < 0) return null;
+  return normalised
+      .substring(start, end)
+      .split('\n')
+      .map((line) => line.replaceFirst(RegExp(r'--.*$'), '').trim())
+      .where((line) => line.isNotEmpty)
+      .join('\n');
 }

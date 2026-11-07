@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:proctorguard/features/admin/domain/entities/managed_account.dart';
+import 'package:proctorguard/features/admin/domain/entities/profile_labels.dart';
 import 'package:proctorguard/features/admin/domain/entities/student_roster.dart';
 import 'package:proctorguard/features/admin/domain/repositories/admin_user_repository.dart';
 import 'package:proctorguard/features/admin/presentation/providers/admin_providers.dart';
@@ -344,6 +345,45 @@ class _FakeAdminUsers implements AdminUserRepository {
     String? staffId,
   }) =>
       throw UnimplementedError('the card only uses createStudentAccounts');
+
+  /// Every page of corrections the card sent, in order.
+  final List<List<StudentLabelCorrection>> correctionPages =
+      <List<StudentLabelCorrection>>[];
+
+  /// Answers a page instead of the default "every row corrected".
+  LabelFixOutcome Function(List<StudentLabelCorrection> page)? answerCorrections;
+
+  @override
+  Future<ManagedAccount> updateProfileLabels({
+    required String userId,
+    required Map<ProfileLabel, String?> labels,
+  }) =>
+      throw UnimplementedError('the card only uses correctStudentLabels');
+
+  @override
+  Future<LabelFixOutcome> correctStudentLabels(
+    List<StudentLabelCorrection> corrections,
+  ) async {
+    correctionPages.add(corrections);
+    final custom = answerCorrections;
+    if (custom != null) return custom(corrections);
+
+    return LabelFixOutcome(
+      updated: <ManagedAccount>[
+        for (final correction in corrections)
+          ManagedAccount(
+            id: correction.userId,
+            email: correction.email ?? '',
+            fullName: '',
+            role: UserRole.student,
+            faculty: correction.labels[ProfileLabel.faculty],
+            department: correction.labels[ProfileLabel.department],
+            level: correction.labels[ProfileLabel.level],
+            matricNumber: correction.labels[ProfileLabel.matricNumber],
+          ),
+      ],
+    );
+  }
 
   @override
   Future<List<ManagedAccount>> listAccounts() async => const <ManagedAccount>[];

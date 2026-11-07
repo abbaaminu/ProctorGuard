@@ -230,6 +230,9 @@ void main() {
               examPageBuilder: (examId, submissionId) =>
                   const Scaffold(body: Text('session screen')),
               hardwareGate: (context, exam) async => true,
+              // The consent notice is `proctor_consent_test.dart`'s subject and
+              // needs a backend; here it only has to be passed.
+              consentGate: (context, exam) async => true,
             ),
           ),
         );

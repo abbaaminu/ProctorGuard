@@ -11,6 +11,7 @@ import 'core/services/supabase_service.dart';
 import 'core/utils/proctor_log.dart';
 import 'core/widgets/desktop_only_web_guard.dart';
 import 'core/widgets/refresh_on_resume.dart';
+import 'core/di/providers.dart';
 import 'core/widgets/setup_required_page.dart';
 import 'features/admin/data/repositories/admin_user_repository_impl.dart';
 import 'features/admin/presentation/providers/admin_providers.dart';
@@ -21,9 +22,9 @@ import 'features/authoring/data/repositories/question_authoring_repository_impl.
 import 'features/authoring/presentation/providers/question_authoring_providers.dart';
 import 'features/dashboard/data/repositories/dashboard_repository_impl.dart';
 import 'features/dashboard/presentation/providers/dashboard_providers.dart';
+import 'features/exam/data/repositories/consent_repository_impl.dart';
 import 'features/exam/data/repositories/exam_repository_impl.dart';
 import 'features/proctoring/data/repositories/proctoring_repository_impl.dart';
-import 'features/proctoring/presentation/providers/proctoring_provider.dart';
 
 /// Boot order is deliberate on web: `--dart-define` values are compiled into
 /// the build, so the Supabase client can be built before the first frame — but
@@ -109,6 +110,12 @@ Future<void> boot() async {
           // screen explains why, instead of some page crashing later.
           if (client != null)
             examRepositoryProvider.overrideWithValue(ExamRepositoryImpl(client)),
+          // The consent gate's own repository: `submissions_insert_own_ongoing`
+          // now refuses an attempt until a consent row exists, so this is bound
+          // with the rest of the backend rather than lazily by the screen.
+          if (client != null)
+            consentRepositoryProvider
+                .overrideWithValue(ConsentRepositoryImpl(client)),
           if (client != null)
             profileRepositoryProvider
                 .overrideWithValue(ProfileRepositoryImpl(client)),

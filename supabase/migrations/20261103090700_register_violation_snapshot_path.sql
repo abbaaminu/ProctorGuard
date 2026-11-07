@@ -56,10 +56,24 @@
 --     evidence stays reviewable and old purges still resolve.
 --
 -- SAFETY
---   * Safe to re-run: `create or replace function` + `drop function if exists` for
---     the two pre-offline-queue overloads (an old project may still carry them, and
---     `create or replace` cannot remove a different signature; leaving them would
---     also make a named 3-argument call ambiguous).
+--   * Re-runnable on its own - **but never after
+--     `20261104090100_weighted_strikes_and_flagged_review.sql`**. That file
+--     replaces this definition with a three-column return shape
+--     (`warning_count, disqualified, flagged`), and `create or replace` cannot
+--     change a return type: run this file afterwards and the `create` below fails
+--     with
+--       42P13  cannot change return type of existing function
+--     ("Use DROP FUNCTION ... first") while the statements above it in the file
+--     have already run, so the operator sees an error and no rollback. If it is
+--     ever run by mistake, re-apply
+--     `20261104090100_weighted_strikes_and_flagged_review.sql`.
+--   * Otherwise safe to re-run: `create or replace function` + `drop function if
+--     exists` for the two pre-offline-queue overloads (an old project may still
+--     carry them, and `create or replace` cannot remove a different signature;
+--     leaving them would also make a named 3-argument call ambiguous).
+--   * A fresh project never needs this file: `supabase/schema.sql` already carries
+--     the current `register_violation()`. Migrations are the upgrade path for a
+--     project that already exists.
 --   * The only refusal that is new is "store NULL instead of that string" - the RPC
 --     never raises for a bad path, so no live client breaks.
 --   * PREREQUISITES: `public.exam_submissions` / `public.proctoring_logs` with

@@ -1,0 +1,36 @@
+# ProctorGuard detector evaluation — labels template.
+#
+# Copy this file to labels.csv (beside eval.mjs) and replace the example rows.
+# Nothing reads this template; it exists so the columns are documented where the
+# operator will be looking when they wonder what `end` is for.
+#
+# One row per WINDOW, not per frame and not per detection:
+#
+#   clip     file name inside --clips. No folders, no absolute paths.
+#   action   looking_away | no_face | multiple_faces
+#   start    seconds from the start of the clip
+#   end      seconds; blank means "to the end of the clip" (read during replay)
+#   label    1 = the action happens here, 0 = it does not
+#   tags     key=value;key=value — free-form, and what the report segments by
+#
+# label 1 is the window the app should have reported inside; label 0 is a hard
+# negative, and it is the only source of a false-positive rate. Label the calm
+# stretch on either side of every episode too, or this run can only measure
+# recall. `#` lines are comments, so notes next to a hard call are welcome.
+#
+# The example rows below are illustrative, not a test fixture — the clips they
+# name are not in the repo, because a corpus of faces is not something a repo
+# ships.
+clip,action,start,end,label,tags
+01-away-left.mp4,looking_away,0.0,2.4,0,lighting=bright;glasses=no;pose=centered
+01-away-left.mp4,looking_away,2.5,6.0,1,lighting=bright;glasses=no;pose=turned-left
+01-away-left.mp4,looking_away,6.1,,0,lighting=bright;glasses=no;pose=centered
+02-glance-down.mp4,looking_away,0.0,3.0,0,lighting=bright;glasses=yes;pose=centered
+02-glance-down.mp4,looking_away,3.1,4.2,0,lighting=bright;glasses=yes;pose=glance
+02-glance-down.mp4,looking_away,4.3,,0,lighting=bright;glasses=yes;pose=centered
+03-empty-chair.mp4,no_face,0.0,1.8,0,lighting=dim;person=present
+03-empty-chair.mp4,no_face,1.9,9.0,1,lighting=dim;person=absent
+03-empty-chair.mp4,no_face,9.1,,0,lighting=dim;person=present
+04-second-person.mp4,multiple_faces,0.0,4.0,0,lighting=bright;wave=alone
+04-second-person.mp4,multiple_faces,4.1,12.0,1,lighting=bright;wave=two
+04-second-person.mp4,multiple_faces,12.1,,0,lighting=bright;wave=alone

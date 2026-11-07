@@ -2,6 +2,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../auth/domain/entities/user_profile.dart';
 import '../../domain/entities/managed_account.dart';
+import '../../domain/entities/profile_labels.dart';
 import '../../domain/entities/student_roster.dart';
 import '../../domain/repositories/admin_user_repository.dart';
 
@@ -19,6 +20,11 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
   static const String createAccountFunction = 'admin-create-user';
   static const String deleteAccountFunction = 'admin-delete-user';
   static const String resetPasswordFunction = 'admin-reset-password';
+
+  /// The repair path for a student whose academic labels are wrong or missing —
+  /// the columns `exams_select` compares, which the student cannot write himself
+  /// (`guard_profile_labels()`).
+  static const String updateProfileFunction = 'admin-update-profile';
 
   /// Supabase Auth's default minimum, mirrored by the Edge Function.
   /// Raised from 6 to 10 for production use.
@@ -146,6 +152,117 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
         'The server did not report per-student results, so nothing was '
         'uploaded. Deploy the latest $createAccountFunction function and try '
         'again.',
+      );
+    }
+    throw const AdminAccountException(
+      'The server returned an unexpected response. Refresh the list to check.',
+    );
+  }
+
+  @override
+  Future<ManagedAccount> updateProfileLabels({
+    required String userId,
+    required Map<ProfileLabel, String?> labels,
+  }) async {
+    if (labels.isEmpty) {
+      // Refused here rather than by the function, so the message is the same
+      // whatever the deployment: a request that names no column would otherwise
+      // be a no-op PATCH, which looks like a save that silently did nothing.
+      throw const AdminAccountException(
+        'Choose at least one label to change before saving.',
+      );
+    }
+
+    final FunctionResponse response;
+    try {
+      response = await _client.functions.invoke(
+        updateProfileFunction,
+        body: <String, dynamic>{
+          'id': userId,
+          // Every stated column travels, blank ones included: on this endpoint an
+          // *absent* key means "leave the column alone", so clearing only happens
+          // when the key is present and null. This is the one request in this
+          // file where the shorter body would be the wrong one.
+          for (final entry in labels.entries)
+            entry.key.column: trimmedOrNull(entry.value),
+        },
+      );
+    } on FunctionException catch (error) {
+      throw AdminAccountException(_messageFromUpdateFunctionError(error));
+    } catch (_) {
+      throw const AdminAccountException(
+        'Could not reach the server. Check your connection and try again.',
+      );
+    }
+
+    final data = response.data;
+    if (data is Map<String, dynamic>) {
+      final error = data['error'];
+      if (error is String && error.isNotEmpty) {
+        throw AdminAccountException(error);
+      }
+      try {
+        // The corrected row, with the columns that were cleared answered as null
+        // rather than omitted — so the tile redraws without them.
+        return ManagedAccount.fromMap(data);
+      } catch (_) {
+        throw const AdminAccountException(
+          'The correction was saved, but the server response could not be read. '
+          'Refresh the list to check.',
+        );
+      }
+    }
+    throw const AdminAccountException(
+      'The server returned an unexpected response. Refresh the list to check.',
+    );
+  }
+
+  @override
+  Future<LabelFixOutcome> correctStudentLabels(
+    List<StudentLabelCorrection> corrections,
+  ) async {
+    if (corrections.isEmpty) return const LabelFixOutcome();
+    if (corrections.length > AdminUserRepository.maxStudentPageSize) {
+      // Same reason as the roster import: the caller pages a file by this
+      // number, so a page that exceeds it means the paging is wrong.
+      throw AdminAccountException(
+        'Send at most ${AdminUserRepository.maxStudentPageSize} students per '
+        'request.',
+      );
+    }
+
+    final FunctionResponse response;
+    try {
+      response = await _client.functions.invoke(
+        updateProfileFunction,
+        body: {
+          'students': [
+            for (final correction in corrections) correction.toJson(),
+          ],
+        },
+      );
+    } on FunctionException catch (error) {
+      throw AdminAccountException(_messageFromUpdateFunctionError(error));
+    } catch (_) {
+      throw const AdminAccountException(
+        'Could not reach the server. Check your connection and try again.',
+      );
+    }
+
+    final data = response.data;
+    if (data is Map<String, dynamic>) {
+      final error = data['error'];
+      if (error is String && error.isNotEmpty) {
+        throw AdminAccountException(error);
+      }
+      final outcome = LabelFixOutcome.fromMap(data);
+      if (!outcome.isEmpty) return outcome;
+      // 200 with neither `updated` nor `failed`: a deployment from before the bulk
+      // branch, which read the body as one correction. Nothing was saved, and
+      // saying so is better than reporting an empty success.
+      throw AdminAccountException(
+        'The server did not report per-student results, so nothing was saved. '
+        'Deploy the latest $updateProfileFunction function and try again.',
       );
     }
     throw const AdminAccountException(
@@ -384,6 +501,34 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
     }
     if (error.status == 401 || error.status == 403) {
       return 'Only an administrator can reset passwords.';
+    }
+    return 'The server refused the request (${error.status}). Try again.';
+  }
+
+  /// Reads the `{ error }` body `admin-update-profile` answers with.
+  ///
+  /// Same shape as the other three, and the same caveat about the 404 branch: the
+  /// function itself answers 404 with `{ error }` ("that account no longer
+  /// exists") for a row that went away, and that message is read by the branch
+  /// above — so reaching the 404 here means the response carried no JSON body at
+  /// all, which is what an un-deployed function (or a proxy) returns.
+  static String _messageFromUpdateFunctionError(FunctionException error) {
+    if (error.status == 0) {
+      return 'Could not reach the server. Check your connection and try again.';
+    }
+    final details = error.details;
+    if (details is Map && details['error'] is String) {
+      return details['error'] as String;
+    }
+    if (details is String && details.trim().isNotEmpty) {
+      return details.trim();
+    }
+    if (error.status == 404) {
+      return 'The $updateProfileFunction function is not deployed on this '
+          'project (see supabase/functions/admin-update-profile).';
+    }
+    if (error.status == 401 || error.status == 403) {
+      return 'Only an administrator can correct academic labels.';
     }
     return 'The server refused the request (${error.status}). Try again.';
   }

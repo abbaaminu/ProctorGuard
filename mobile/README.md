@@ -10,15 +10,19 @@ lib/
   features/
     auth/                   # sign-in form, `profiles.role` profile lookup,
                             # post-login RoleGate router
-    admin/                  # admin roster: create/delete accounts and manage roles
-    exam/                   # domain entities, repo, student portal,
-                            # exam-taking UI (the page delegates to
+    admin/                  # admin roster: create/delete accounts, manage roles,
+                            # correct the academic labels that decide which papers
+                            # an account is offered — one at a time or from a CSV
+    exam/                   # domain entities, repos (incl. the proctoring consent
+                            # notice and its `record_consent()` write), student
+                            # portal, exam-taking UI (the page delegates to
                             # ExamSessionController + extracted session widgets)
     proctoring/             # violation domain model, repo, Riverpod
                             # escalation notifier, full-screen overlay
     dashboard/              # staff analytics, supervisor monitoring and resets
 supabase/schema.sql         # tables, RLS policies, RPCs
-supabase/functions/         # server-side account creation and deletion
+supabase/functions/         # server-side account management, and purge-snapshots
+                            # (the Storage-API half of the snapshot retention)
 android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLock
 ```
 
@@ -155,6 +159,21 @@ with an expiry rather than a URL that keeps working forever once it is forwarded
   bucket went private stays reviewable and still gets purged on a reset.
   `supabase/migrations/private_proctor_snapshots.sql` flips an existing bucket and
   re-asserts the same policies.
+- A still does not live forever. The `proctor_snapshots` window (30 days) is a row
+  in `public.retention_policies`, and the `purge-snapshots` Edge Function (or
+  `public.purge_expired_snapshots()` where the Storage API cannot be reached)
+  deletes what has aged out of a **finished** attempt and nulls the
+  `proctoring_logs.snapshot_url` that points at it. The incident row stays — the
+  flag happened, the photograph expired — so the evidence list still shows the
+  incident, its type and its time, just without a still
+  (`Violation.snapshotUrl` is nullable by design, and the strike keeps its
+  weight). A live
+  sitting never loses a still, and a reset still deletes an attempt's stills
+  immediately. Scheduling is an operator decision; the root
+  [README](../README.md#scheduling-the-snapshot-purge) has both routes. The
+  numbers a student is shown come from `ProctorConsentConfig`
+  (`snapshotRetentionDays` / `attemptRetentionDays`), which the contract test pins
+  to the migration's seeds.
 
 ## Testing without a camera (`MOCK_CAMERA`)
 
@@ -343,6 +362,103 @@ the answer kept and later synced, the resumed draft, the attempt resumed past it
 deadline that is *not* submitted behind their back, and the one whose clock runs
 out on screen, which is) and the fullscreen countdown.
 
+## Heartbeats (was the client even running?)
+
+Every other signal the app sends is a *negative*: a `proctoring_logs` row means
+something went wrong, and the absence of rows means nothing at all — a clean
+sitting and a killed app leave the same empty feed. `ProctoringHeartbeatService`
+(`lib/core/services/proctoring_heartbeat.dart`) closes that hole with a
+*positive* signal: while an attempt is being sat it calls
+`ProctoringRepository.recordHeartbeat` → `public.record_heartbeat()`, which
+stores one row in `proctor_heartbeats` and stamps
+`exam_submissions.last_heartbeat_at` on the server clock.
+
+- **15 s cadence, 4 s deadline.** Fine enough that a supervisor's live grid shows
+  a moving timestamp, coarse enough that an hour costs ~240 rows instead of
+  ~3,600, and slower than the server's 8 s rate limit so jitter never throttles
+  an honest client. The deadline is shorter than the cadence on purpose: a
+  hanging request must not still be the in-flight one when the next tick fires.
+- **Nothing is queued.** The offline queue exists for violations and answers
+  because a late strike still counts and a late answer can still be graded. A
+  late beat cannot: coverage is measured on the server's `received_at`, so a beat
+  replayed when the network returns would fill the very gap it was meant to
+  expose. A beat that misses its deadline is dropped and the next tick tries
+  again — a missing beat is honest, a replayed one is not.
+- **It never throws and never blocks.** Failures are counted and written to the
+  proctor log only; a heartbeat that can interrupt an exam is worse than none.
+  Overlapping calls collapse into the in-flight one, so a slow socket cannot pile
+  requests up behind the timer.
+- **It says what it can see.** `noteCamera(bool)` / `noteMonitoring(bool)` let the
+  exam page record the camera track and the detector loop, so a beat reads
+  "running but blind" (`camera_ok`/`monitoring_ok` false) instead of looking
+  identical to a healthy one. That is the case an empty violation feed used to
+  hide completely.
+- **Lifecycle.** `proctoringHeartbeatProvider` owns one instance; the exam
+  notifier starts it with the attempt and calls `stop()` in `dispose()`. A
+  resumed attempt simply starts a new series in the same table, and the gap
+  between the two series is exactly what it should look like.
+
+On the console, `heartbeatSilence` (45 s) turns that column into three states per
+live row — *proctoring live*, *proctoring silent 3m*, and *no proctoring signal*
+for a `NULL` beat (worded that way on purpose: it is not "no violations") — and the
+roster summary counts the attempts that are not reporting.
+`public.proctoring_coverage()` adds beats-vs-expected, the longest gap and
+the camera-down share, with a `risk_flag` that means *look at this*, never *punish
+this*: coverage never touches `status`, since a dropped network and a closed
+laptop look identical to a determined cheat from the server's side.
+
+**What this does not do.** A beat is the client's own claim. Nothing is attested
+to Google or Apple yet (Play Integrity / App Attest is future work), so a patched
+build could beat on a timer while monitoring nothing — it raises the cost of the
+cheapest cheat (make the proctor vanish and get an empty record), it does not make
+the record trustworthy on its own. `mobile/test/proctoring_heartbeat_test.dart`
+covers the cadence, the deadline, the collapse, the "never throws" rule, and the
+"never queued" rule.
+
+### The consent notice (what the student agrees to, and when)
+
+`ExamConsentPage` (`lib/features/exam/presentation/pages/exam_consent_page.dart`)
+is the **first** screen a tap on a paper can open, ahead of both the device check
+and the instructions: the camera cannot be switched on before the student has been
+told what it does with the frames. It answers five questions in plain language —
+what is recorded, what happens to the stills, who can see them, how long they are
+kept, and who to ask — then asks for a deliberate tap on a checkbox and a second
+tap on **Accept and continue**.
+
+- **One constant.** The version string, the two retention numbers and every
+  sentence live in `ProctorConsentConfig`
+  (`lib/features/exam/domain/entities/proctor_consent.dart`). The retention
+  sentence *interpolates* its numbers, so the promise a student reads is built from
+  the same constants the contract test compares against
+  `supabase/migrations/20261106090100_snapshot_retention.sql`. `TODO(institution)`
+  marks every place the institution's notices office must supply real text — the
+  contact name, the address, and the lawful-basis wording — and `version` must be
+  bumped with `proctoring_consent_config.current_version` in the same release.
+- **It is not advisory.** `submissions_insert_own_ongoing` refuses an attempt until
+  a current-version acceptance exists for that paper (or a general one, with
+  `exam_id IS NULL`), so leaving this screen means no attempt row at all — the
+  same for a patched client, which gets a `42501`.
+- **Accepting is a write, not a flag.** `ConsentRepository.recordConsent` →
+  `public.record_consent(p_exam_id, p_version)` stores the row (the client never
+  supplies the student id; the server stamps the transport `user-agent`) and
+  answers `is_current`. `false` means this build is showing wording the institution
+  has replaced: the screen says *update the app* and keeps the student on it rather
+  than sending them to an insert that would be refused.
+- **A resume does not ask again.** `hasCurrentConsent(examId)` short-circuits the
+  screen for an acceptance already on record — an attempt that exists cannot have
+  been created without one — and a failure of that check falls through to the
+  screen, which is the surface that can explain a real error.
+- **What it does not do.** It records that a notice was accepted, not that it was
+  read, and it is not legal advice. Student-outcome fairness still runs through
+  the review a person performs (`resolve_flagged_attempt`), never through this
+  screen.
+
+`mobile/test/proctor_consent_test.dart` covers the copy, the version pin, the
+disabled-until-ticked button, the stale-build path, a failed write, and that a
+refused notice means **no attempt is created**;
+`mobile/test/schema_contract_test.dart` pins the client's version and retention
+numbers against the SQL and the RPC's argument names.
+
 ## Verifying the native kiosk bridge without a full APK build
 
 `flutter build apk` needs `cmdline-tools` installed (Android Studio → SDK
@@ -525,6 +641,8 @@ in as a different account resolves a different profile.
 | Change a role | `update({role}).eq('id', …)` with `.select('*')`; a row count of zero is treated as a failure, not a silent success. Your own row is not editable — it renders a plain `role (you)` chip |
 | Create an account | POSTs email, full name, a temporary password and a role to `/functions/v1/admin-create-user`, which answers `200` with the created row (`full_name`, also accepted as `fullName`). The optional faculty/department/level dropdowns and the matriculation-number/staff-ID field travel in the same body (`matric_number` for a student, `staff_id` for anybody else), and a blank one is omitted so the column stays `NULL` |
 | Reset a password | POSTs the account id and the new password to `/functions/v1/admin-reset-password` — `admin` only, and the one action allowed on your own row — then shows the password once |
+| Correct one account's labels | Opens **Edit academic labels** (faculty, department, level and the identity number this row's role writes) and POSTs every column it showed — blank ones included — to `/functions/v1/admin-update-profile`, which answers the corrected row. Offered on every row, your own included: these columns decide *which papers* an account is shown |
+| Correct a class's labels (CSV) | `LabelCorrectionWidget` resolves each line's address against the roster already on screen (`StudentLabelCsv.resolve`) before anything is sent, shows what will change and what was skipped with its line number, then sends the file in pages of `maxStudentPageSize` and lists the rows the function refused beside the ones it wrote |
 
 Every failure surfaces as one `AdminAccountException` whose message is already a
 sentence: PostgREST `42501` (a policy, or the `profiles_guard_role_change` trigger
@@ -573,6 +691,78 @@ re-reads the caller's JWT against `profiles` with the anon key, refuses anyone
 who is not an admin, and only then uses the `service_role` key to create the auth
 user (which is why it must be deployed with `supabase functions deploy
 admin-create-user` and why the key never reaches the app).
+
+**Correcting the academic labels** is the repair path this console exists for as
+much as creating logins is. `exams_select` compares a published paper's
+`faculty` / `department` / `level` against the signed-in student's, so a row
+imported with no level — or with `"300 Level"` stored as text where the paper says
+`'300'` — is invisible to every paper aimed at its class. The student cannot put
+that right: `guard_profile_labels()` refuses a label write from any caller that
+arrives with claims, which is the refusal `targeting_check.sql` (e) proves, and
+`profile_labels_admin_check.sql` proves the way back out. That is why the write
+goes through **`admin-update-profile`**, deployed like the other two:
+
+```powershell
+supabase functions deploy admin-update-profile
+```
+
+It is `admin` only (`UPDATER_ROLES`), checked the same way — the JWT says *who* is
+asking, the caller's own `profiles.role` is read back through a client carrying
+their token, and only then is the `service_role` key used — and JWT verification
+stays on, so a forged token never reaches the code. It validates what it is given
+against `AcademicCatalog` before writing: the columns are free text, and
+`"computer science"` stored beside a paper's `"Computer Science"` would be a
+correction that fixed nothing. A column the project does not have yet is answered
+with the name of the migration that adds it, not as a database fault.
+
+One account at a time, a row's **Edit academic labels** button (the tag icon,
+offered on every row including your own, because these columns decide which papers
+an *account* is shown) opens a dialog that starts from what the server has
+(`ManagedAccountLabels.labelSnapshot`), names the labels a student's row leaves
+blank, and closes the department list down to the chosen faculty — a department
+left over from the previous faculty is dropped rather than saved, since the pair
+describes no cohort. The dialog sends **all five columns**, blank ones included,
+and that is the rule the whole endpoint is built on: a key that is *absent* leaves
+its column alone, while a key that is *present and blank* clears it. Both are
+needed — "we do not know this student's level" has to be expressible, or a wrong
+value could only be swapped for another wrong one — so the one identity column
+this row's role does *not* use is sent back as it stands, and a save cannot quietly
+delete a number the dialog never offered. A level an older import stored as
+`300 Level` opens the dialog already normalised to `300`, and a value the catalogue
+cannot read is kept verbatim rather than dropped: opening the dialog and pressing
+save must never clear a label nobody touched. The answer is the corrected row, so
+the tile redraws with the columns the check removed, and the snack bar says which
+labels the account now carries — or that it carries none, which is the state that
+hides every targeted paper.
+
+A whole class at a time, the **Correct class labels** card (directly under the
+roster import, because a class just uploaded with the wrong labels is the case it
+exists for) reads a CSV of
+`email,faculty,department,level,matric_number,staff_id`.
+`StudentLabelCsv.resolve` turns each line into the `profiles.id` the function
+selects rows by, and that resolution is the point: a file names people by address
+and two students in a badly kept roster can share one, so an address match would be
+a coin toss over whose level is being corrected. Nothing is sent before the
+administrator has seen what the file does — the card prints "N students will be
+corrected" and lists every line it refused with the number a spreadsheet shows and
+the reason: an address that names nobody on the roster, a `level` the catalogue
+cannot read, a line whose every cell is blank (it changes nothing, so it is a
+problem rather than a request), or a header with no `email` and no recognised label
+column, which refuses the file whole. The header spellings the roster import
+accepts still resolve (`dept`, `class`, `year`, a byte-order mark,
+`Matric_Number`), with `matric no` / `staff id` added for the two identity
+columns, and a cell that is present and empty clears its column exactly as the
+dialog's blank field does. Pages are `maxStudentPageSize` (50) rows each and are
+sent in sequence, so a class of thirty is three requests rather than thirty
+parallel ones; the rows the function refused are listed under the ones it wrote,
+with the address echoed from the roster so the line can be found in the file. A
+page that fails stops the run and keeps what was already written: the card says
+how many of how many were corrected before it stopped, and that correcting the
+same file again is the retry — re-writing a label that is already right is
+harmless. The picker is the roster import's own (`RosterFile` /
+`pickRosterFile`), and both cards take an injected picker so
+`test/profile_labels_test.dart` can hand in a file; the Edit dialog is driven
+through this page's harness in `test/role_routing_test.dart`.
 
 ### Supervisor console and staff analytics
 
@@ -741,7 +931,11 @@ something real in them on a fresh project.
 `StudentExamPortalPage` lists every published exam (CS101, MAT201 and the
 lecturer's GES301 in `seed.sql`) through `PublishedExamList`, and on tap:
 
-* runs the **mandatory device check first** (`ExamHardwareGatePage`): a real
+* shows the **consent notice first** (`ExamConsentPage`, see
+  [The consent notice](#the-consent-notice-what-the-student-agrees-to-and-when)):
+  accepting writes a `proctoring_consents` row, and *not* accepting returns to the
+  list with nothing written — the database will not accept an attempt without it;
+* then runs the **mandatory device check** (`ExamHardwareGatePage`): a real
   camera *and* a real microphone have to be opened and verified before anything
   else happens, and "Start Exam" stays disabled until both are. Backing out — or
   a failure — returns to the list untouched: **no submission row is created**, so

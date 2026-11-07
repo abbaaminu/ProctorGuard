@@ -9,9 +9,11 @@ import '../../../dashboard/presentation/pages/analytics_page.dart';
 import '../../../dashboard/presentation/pages/supervisor_exam_picker_page.dart';
 import '../../../auth/domain/entities/user_profile.dart';
 import '../../domain/entities/managed_account.dart';
+import '../../domain/entities/profile_labels.dart';
 import '../../domain/repositories/admin_user_repository.dart';
 import '../providers/admin_providers.dart';
 import '../widgets/bulk_student_upload_widget.dart';
+import '../widgets/label_correction_widget.dart';
 
 /// The admin home: create staff/student accounts and manage the roles of the
 /// ones that already exist.
@@ -299,6 +301,47 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
     }
   }
 
+  /// Corrects the academic labels — and the identity number — on [account]
+  /// through the `admin-update-profile` Edge Function.
+  ///
+  /// This is the single-account half of the repair path: a blank or misspelled
+  /// label leaves `exams_select` comparing nothing, and the student cannot fix it
+  /// themselves (`guard_profile_labels()`). The dialog starts from what the
+  /// server has ([ManagedAccountLabels.labelSnapshot]) and returns all the
+  /// columns it showed, so a save means what the administrator saw — including
+  /// clearing a label they could not establish.
+  Future<void> _editLabels(ManagedAccount account) async {
+    if (_busyId != null) return;
+    final labels = await showDialog<Map<ProfileLabel, String?>>(
+      context: context,
+      builder: (_) => _EditLabelsDialog(account: account),
+    );
+    // Cancelled, or the page went away while the dialog was open.
+    if (labels == null || !mounted) return;
+
+    setState(() => _busyId = account.id);
+    try {
+      final updated = await ref
+          .read(adminUserRepositoryProvider)
+          .updateProfileLabels(userId: account.id, labels: labels);
+      if (!mounted) return;
+      ref.invalidate(managedAccountsProvider);
+
+      final label = updated.academicLabel;
+      _showMessage(
+        label == null
+            ? 'Cleared the labels for ${updated.displayName}. They are offered '
+                'only the papers that are not aimed at a cohort.'
+            : 'Updated ${updated.displayName}: $label.',
+        isError: false,
+      );
+    } on AdminAccountException catch (error) {
+      _showMessage(error.message);
+    } finally {
+      if (mounted) setState(() => _busyId = null);
+    }
+  }
+
   Future<void> _deleteAccount(ManagedAccount account) async {
     if (account.id == _selfId || _busyId != null) return;
     final approved = await showDialog<bool>(
@@ -385,12 +428,18 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
       onChangeRole: _changeRole,
       onDelete: _deleteAccount,
       onResetPassword: _resetPassword,
+      onEditLabels: _editLabels,
     );
 
     // Below the form on both layouts: one account at a time is still the common
     // case, and a 40-row class list is the exception that would otherwise push
     // the form off the screen.
     const upload = BulkStudentUploadWidget();
+
+    // Directly under the import: a class that was just uploaded with the wrong
+    // labels is the case this card exists for, and the two files read the same
+    // way.
+    const corrections = LabelCorrectionWidget();
 
     return Scaffold(
       appBar: AppBar(
@@ -476,6 +525,8 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
                               form,
                               const SizedBox(height: 24),
                               upload,
+                              const SizedBox(height: 24),
+                              corrections,
                             ],
                           ),
                         ),
@@ -498,6 +549,8 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
                       form,
                       const SizedBox(height: 24),
                       upload,
+                      const SizedBox(height: 24),
+                      corrections,
                       const SizedBox(height: 24),
                       roster,
                     ],
@@ -834,6 +887,7 @@ class _RosterSection extends ConsumerWidget {
     required this.onChangeRole,
     required this.onDelete,
     required this.onResetPassword,
+    required this.onEditLabels,
   });
 
   final String? selfId;
@@ -842,6 +896,7 @@ class _RosterSection extends ConsumerWidget {
   final void Function(ManagedAccount account, UserRole role) onChangeRole;
   final void Function(ManagedAccount account) onDelete;
   final void Function(ManagedAccount account) onResetPassword;
+  final void Function(ManagedAccount account) onEditLabels;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -901,6 +956,7 @@ class _RosterSection extends ConsumerWidget {
                         onChangeRole: (role) => onChangeRole(account, role),
                         onDelete: () => onDelete(account),
                         onResetPassword: () => onResetPassword(account),
+                        onEditLabels: () => onEditLabels(account),
                       ),
                   ],
                 ),
@@ -958,6 +1014,7 @@ class _AccountTile extends StatelessWidget {
     required this.onChangeRole,
     required this.onDelete,
     required this.onResetPassword,
+    required this.onEditLabels,
   });
 
   final ManagedAccount account;
@@ -971,6 +1028,11 @@ class _AccountTile extends StatelessWidget {
   final ValueChanged<UserRole> onChangeRole;
   final VoidCallback onDelete;
   final VoidCallback onResetPassword;
+
+  /// Opens the label dialog. Offered for every row, the caller's own included:
+  /// the academic labels decide *which papers* an account is shown, and an
+  /// administrator's own row is no different from a student's there.
+  final VoidCallback onEditLabels;
 
   /// The lines under the account's name: the address (unless the address *is*
   /// the name), then the identity number and the cohort as one fact.
@@ -1052,6 +1114,15 @@ class _AccountTile extends StatelessWidget {
                       avatar: const Icon(Icons.expand_more, size: 18),
                     ),
                   ),
+                // Offered for every row: the labels decide which papers the
+                // account is shown, and a blank one is the usual reason a
+                // student never sees the paper aimed at their class.
+                IconButton(
+                  key: Key('admin-edit-labels-${account.id}'),
+                  tooltip: 'Edit academic labels',
+                  onPressed: onEditLabels,
+                  icon: const Icon(Icons.sell_outlined),
+                ),
                 // Offered for every row, the caller's own included: a password
                 // change cannot take away an administrator's own access.
                 IconButton(
@@ -1070,6 +1141,251 @@ class _AccountTile extends StatelessWidget {
                   ),
               ],
             ),
+    );
+  }
+}
+
+/// The "edit academic labels" dialog: the columns `exams_select` compares, plus
+/// the identity number the roster knows the person by.
+///
+/// Every key it shows is sent back, blank ones included, because a save means
+/// what the dialog showed — and because "we do not know this student's level" has
+/// to be expressible, or a wrong value could only be swapped for another wrong
+/// one. The page hands the map to `admin-update-profile`, which validates it
+/// against the catalogue and answers the corrected row.
+class _EditLabelsDialog extends StatefulWidget {
+  const _EditLabelsDialog({required this.account});
+
+  final ManagedAccount account;
+
+  @override
+  State<_EditLabelsDialog> createState() => _EditLabelsDialogState();
+}
+
+class _EditLabelsDialogState extends State<_EditLabelsDialog> {
+  String? _faculty;
+  String? _department;
+  String? _level;
+  late final TextEditingController _identityController;
+
+  /// The catalogue spelling of [stored], or [stored] itself when the catalogue
+  /// does not name it.
+  ///
+  /// Neither null nor a throw: a row imported before a faculty was renamed
+  /// carries a value the dropdowns do not offer, and dropping it here would turn
+  /// "open the dialog and press save" into "clear a label you did not touch".
+  static String? _keep(List<String> catalogue, String? stored) {
+    final value = AcademicCatalog.clean(stored);
+    if (value == null) return null;
+    for (final option in catalogue) {
+      if (option.toLowerCase() == value.toLowerCase()) return option;
+    }
+    return value;
+  }
+
+  /// [catalogue] plus [current] when the catalogue does not offer it, so a
+  /// dropdown's value is always one of its own items.
+  static List<String> _options(List<String> catalogue, String? current) {
+    if (current == null) return catalogue;
+    if (catalogue.any(
+      (option) => option.toLowerCase() == current.toLowerCase(),
+    )) {
+      return catalogue;
+    }
+    return <String>[...catalogue, current];
+  }
+
+  /// The identity column this row's role writes to: a student is examined under
+  /// a matriculation number, everybody else is named by a staff ID.
+  ProfileLabel get _identityLabel =>
+      ProfileLabel.identityFor(widget.account.role);
+
+  @override
+  void initState() {
+    super.initState();
+    final snapshot = widget.account.labelSnapshot;
+    _faculty =
+        _keep(AcademicCatalog.facultyNames, snapshot[ProfileLabel.faculty]);
+    _department = _keep(
+      AcademicCatalog.allDepartments,
+      snapshot[ProfileLabel.department],
+    );
+    final rawLevel = snapshot[ProfileLabel.level];
+    // Normalised first ("300 Level" → "300"), then kept verbatim when nothing
+    // in the catalogue can read it — the dialog's job is to show what is
+    // stored, not to make it disappear.
+    _level = _keep(
+      AcademicCatalog.levels,
+      AcademicCatalog.normaliseLevel(rawLevel) ?? rawLevel,
+    );
+    _identityController = TextEditingController(
+      text: widget.account.identityNumber ?? '',
+    );
+  }
+
+  @override
+  void dispose() {
+    _identityController.dispose();
+    super.dispose();
+  }
+
+  /// Picking a faculty narrows the department list, so a department left over
+  /// from the previous faculty is dropped rather than saved: the pair would then
+  /// describe no cohort in the institution.
+  void _selectFaculty(String? faculty) {
+    setState(() {
+      _faculty = faculty;
+      if (_department != null &&
+          !AcademicCatalog.departmentsFor(faculty).contains(_department)) {
+        _department = null;
+      }
+    });
+  }
+
+  /// The columns the dialog showed, exactly as the page should send them.
+  ///
+  /// All five keys travel, the blank ones included, because a save means what the
+  /// dialog showed. The identity number is trimmed here — it is typed free-hand,
+  /// and a trailing space on a matriculation number would be stored as part of
+  /// it. A blank one is null, which clears the column: the same statement a blank
+  /// cell makes in a corrections file. The identity column the row's role does
+  /// *not* use is sent back as it stands, so a save cannot quietly remove a number
+  /// the dialog never offered.
+  void _submit() {
+    final snapshot = widget.account.labelSnapshot;
+    final identity = _identityLabel;
+    final other = identity == ProfileLabel.matricNumber
+        ? ProfileLabel.staffId
+        : ProfileLabel.matricNumber;
+
+    Navigator.pop(context, <ProfileLabel, String?>{
+      ProfileLabel.faculty: _faculty,
+      ProfileLabel.department: _department,
+      ProfileLabel.level: _level,
+      identity: AcademicCatalog.clean(_identityController.text),
+      other: snapshot[other],
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final account = widget.account;
+    final helperStyle = theme.textTheme.bodySmall?.copyWith(
+      color: theme.colorScheme.onSurfaceVariant,
+    );
+
+    return AlertDialog(
+      title: Text('Labels for ${account.displayName}'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Published papers reach an account through these labels. A blank '
+              'one matches only the papers that are not aimed at a cohort, so a '
+              'student with a blank one never sees the paper set for their '
+              'class.',
+              style: helperStyle,
+            ),
+            if (account.role == UserRole.student && !account.isFullyLabelled) ...[
+              const SizedBox(height: 12),
+              Row(
+                key: const Key('admin-edit-labels-warning'),
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    Icons.warning_amber_outlined,
+                    size: 18,
+                    color: theme.colorScheme.error,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Missing: '
+                      '${account.missingLabels.map((label) => label.column).join(', ')}.',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.error,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 16),
+            _OptionalLabelField(
+              fieldKey: const Key('admin-edit-faculty'),
+              label: 'Faculty',
+              icon: Icons.account_balance_outlined,
+              anyLabel: 'Not stated',
+              options: _options(AcademicCatalog.facultyNames, _faculty),
+              value: _faculty,
+              enabled: true,
+              onChanged: _selectFaculty,
+            ),
+            const SizedBox(height: 8),
+            _OptionalLabelField(
+              fieldKey: const Key('admin-edit-department'),
+              label: 'Department',
+              icon: Icons.menu_book_outlined,
+              anyLabel: 'Not stated',
+              options: _options(
+                AcademicCatalog.departmentsFor(_faculty),
+                _department,
+              ),
+              value: _department,
+              enabled: true,
+              onChanged: (department) =>
+                  setState(() => _department = department),
+            ),
+            const SizedBox(height: 8),
+            _OptionalLabelField(
+              fieldKey: const Key('admin-edit-level'),
+              label: 'Level',
+              icon: Icons.groups_outlined,
+              anyLabel: 'Not stated',
+              options: _options(AcademicCatalog.levels, _level),
+              value: _level,
+              enabled: true,
+              onChanged: (level) => setState(() => _level = level),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              key: const Key('admin-edit-identity'),
+              controller: _identityController,
+              textCapitalization: TextCapitalization.characters,
+              // The label follows the role, like the create form's one field:
+              // a student is examined under a matriculation number, everybody
+              // else is named by a staff ID.
+              decoration: InputDecoration(
+                labelText: _identityLabel == ProfileLabel.matricNumber
+                    ? 'Matriculation number'
+                    : 'Staff ID',
+                helperText: 'Optional. Leave it blank to clear it.',
+                prefixIcon: Icon(
+                  _identityLabel == ProfileLabel.matricNumber
+                      ? Icons.school_outlined
+                      : Icons.badge_outlined,
+                ),
+                border: const OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          key: const Key('admin-edit-labels-cancel'),
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          key: const Key('admin-edit-labels-save'),
+          onPressed: _submit,
+          child: const Text('Save labels'),
+        ),
+      ],
     );
   }
 }

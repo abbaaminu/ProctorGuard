@@ -73,6 +73,77 @@ final liveViolationFeedProvider =
           .toList());
 });
 
+/// How long an ongoing attempt may go without a heartbeat before the monitor
+/// stops calling its proctoring live.
+///
+/// The client beats every 15s (`ProctoringHeartbeatService`) and
+/// `record_heartbeat()` stores at most one beat per 8s, so 45s is three missed
+/// beats: tolerant enough that one dropped request, a sleeping screen or a slow
+/// upload does not blink a student's row, tight enough that a client that died a
+/// minute ago is not still painted as watched.
+const heartbeatSilence = Duration(seconds: 45);
+
+/// What the roster can say about an attempt's proctoring client from
+/// `exam_submissions.last_heartbeat_at` alone.
+///
+/// Three states, because two would lie: [live], [silent] (it checked in, then
+/// stopped) and [never] (`NULL` — nothing ever checked in, which is *not*
+/// evidence of a clean sitting). Only a running attempt has a state at all: a
+/// submitted or disqualified row is over, and its beats belong to the coverage
+/// report rather than to the live grid.
+enum ProctorPulse { live, silent, never }
+
+/// The pulse of [row] at [now], or `null` when the row cannot have one (see
+/// [ProctorPulse]).
+///
+/// Reads the row the realtime stream already delivered — `record_heartbeat()`
+/// stamps `last_heartbeat_at` in the same transaction as the beat, so every
+/// accepted beat arrives here as an UPDATE and the grid refreshes itself without
+/// polling or a second query.
+ProctorPulse? proctorPulseFor(Map<String, dynamic> row, {DateTime? now}) {
+  if (row['status'] != 'ongoing') return null;
+  final raw = row['last_heartbeat_at'];
+  final beat = raw is String ? DateTime.tryParse(raw) : null;
+  if (beat == null) return ProctorPulse.never;
+  final silence = (now ?? DateTime.now()).toUtc().difference(beat.toUtc());
+  return silence <= heartbeatSilence ? ProctorPulse.live : ProctorPulse.silent;
+}
+
+/// The roster's wording for [pulse], given the beat that produced it.
+///
+/// A silent row prints *how long* it has been quiet: "silent 3m" is a question a
+/// supervisor can act on, "silent" on its own is not. Lower case, so the words
+/// read as part of the "Status: …" line they follow.
+String proctorPulseText(
+  ProctorPulse pulse, {
+  required DateTime now,
+  Object? lastHeartbeatAt,
+}) {
+  switch (pulse) {
+    case ProctorPulse.live:
+      return 'proctoring live';
+    case ProctorPulse.silent:
+      final beat =
+          lastHeartbeatAt is String ? DateTime.tryParse(lastHeartbeatAt) : null;
+      final quiet =
+          beat == null ? heartbeatSilence : now.toUtc().difference(beat.toUtc());
+      return 'proctoring silent ${_quietFor(quiet)}';
+    case ProctorPulse.never:
+      // Deliberately not "no violations": silence from the client is the state
+      // this row exists to tell apart from a clean sitting.
+      return 'no proctoring signal';
+  }
+}
+
+/// `45s` / `12m` / `2h`, rounded down, never negative — a device clock ahead of
+/// the server must not print a beat that has not happened yet.
+String _quietFor(Duration quiet) {
+  final seconds = quiet.isNegative ? 0 : quiet.inSeconds;
+  if (seconds < 60) return '${seconds}s';
+  if (seconds < 3600) return '${seconds ~/ 60}m';
+  return '${seconds ~/ 3600}h';
+}
+
 final submissionResetInFlightProvider =
     StateProvider.family<bool, String>((ref, id) => false);
 
@@ -155,6 +226,10 @@ class SupervisorDashboardPage extends ConsumerWidget {
 
     final roster = submissions.valueOrNull ?? const <Map<String, dynamic>>[];
     final nameById = names.valueOrNull ?? const <String, String>{};
+
+    // One clock for the frame: the summary above the list and the rows inside it
+    // must not disagree about which beats have gone quiet.
+    final now = DateTime.now();
 
     // Attempts under review first. They are the only rows here that are waiting on
     // the person reading them - every other status is either still running or
@@ -398,7 +473,7 @@ class SupervisorDashboardPage extends ConsumerWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                _RosterSummary(roster: roster),
+                _RosterSummary(roster: roster, now: now),
                 Expanded(
                   child: submissions.when(
                     loading: () =>
@@ -418,6 +493,14 @@ class SupervisorDashboardPage extends ConsumerWidget {
                               final status = row['status'] as String;
                               final score = row['score'];
                               final flags = flagsBySubmission[row['id']] ?? 0;
+
+                              // Was anything actually watching? An empty
+                              // violation feed and a client that stopped
+                              // reporting look identical without this.
+                              final pulse = proctorPulseFor(row, now: now);
+                              final pulseText = pulse == null
+                                  ? ''
+                                  : '  •  ${proctorPulseText(pulse, now: now, lastHeartbeatAt: row['last_heartbeat_at'])}';
 
                               // The same evidence the "N flags" count is made of,
                               // scored: flags are the strikes, the mapped signals
@@ -450,7 +533,8 @@ class SupervisorDashboardPage extends ConsumerWidget {
                                   ),
                                   subtitle: Text(
                                     'Status: $status'
-                                    '${score != null ? '  •  Score: $score' : ''}',
+                                    '${score != null ? '  •  Score: $score' : ''}'
+                                    '$pulseText',
                                   ),
                                   trailing: Row(
                                     mainAxisSize: MainAxisSize.min,
@@ -641,9 +725,13 @@ class SupervisorDashboardPage extends ConsumerWidget {
 
 /// One-line roll-up above the student list.
 class _RosterSummary extends StatelessWidget {
-  const _RosterSummary({required this.roster});
+  const _RosterSummary({required this.roster, required this.now});
 
   final List<Map<String, dynamic>> roster;
+
+  /// The frame's clock, so this sentence and the rows below it agree on which
+  /// beats have gone quiet (see [proctorPulseFor]).
+  final DateTime now;
 
   @override
   Widget build(BuildContext context) {
@@ -657,15 +745,26 @@ class _RosterSummary extends StatelessWidget {
     // they are work, not a statistic.
     final flagged =
         roster.where((row) => row['status'] == 'flagged_for_review').length;
+    // Running attempts whose proctoring client has gone quiet (or never checked
+    // in). Counted here because it is the one number that separates "nothing
+    // happened" from "nothing was watching" - the case an empty violation feed
+    // used to hide. It marks a row for a human; it ends nothing.
+    final quiet = roster.where((row) {
+      final pulse = proctorPulseFor(row, now: now);
+      return pulse == ProctorPulse.silent || pulse == ProctorPulse.never;
+    }).length;
+
+    final warn = flagged > 0 || quiet > 0;
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
       child: Text(
         '$total attempt(s)  •  $ongoing in progress  •  $submitted submitted  •  '
         '$disqualified disqualified'
-        '${flagged > 0 ? '  •  $flagged under review' : ''}',
+        '${flagged > 0 ? '  •  $flagged under review' : ''}'
+        '${quiet > 0 ? '  •  $quiet not reporting' : ''}',
         style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              color: flagged > 0
+              color: warn
                   ? Colors.orange
                   : Theme.of(context).colorScheme.onSurfaceVariant,
             ),

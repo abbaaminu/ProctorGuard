@@ -9,6 +9,23 @@
 --   this file again after those would put the older policy or function back - the
 --   `DROP POLICY`/`CREATE POLICY` pair below is idempotent, which is the problem:
 --   it reinstates, silently, exactly what was replaced.
+--
+--   `register_violation()` at the bottom is the hard case. It is written to return
+--   `(warning_count, disqualified)`, and
+--   `20261104090100_weighted_strikes_and_flagged_review.sql` replaces it with
+--   `(warning_count, disqualified, flagged)`. `create or replace` cannot change a
+--   return type, so on a project that has that migration this file does not quietly
+--   reinstall an old body - it fails at that `create` with
+--
+--     42P13  cannot change return type of existing function
+--
+--   after the policies, `submit_exam()` and the functions above it have already
+--   run (the file is applied statement by statement). If that ever happens, re-apply
+--   `20261104090100_weighted_strikes_and_flagged_review.sql`.
+--
+--   A fresh project never needs this file: `supabase/schema.sql` is the whole
+--   schema, and every file in `supabase/migrations/` is an upgrade path for a
+--   project that already exists.
 create or replace function public.is_exam_supervisor()
 returns boolean
 language sql

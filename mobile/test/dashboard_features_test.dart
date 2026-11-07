@@ -511,6 +511,195 @@ void main() {
       findsOneWidget,
     );
   });
+
+  group('proctor pulse', () {
+    Map<String, dynamic> rosterRow({
+      required String status,
+      Object? lastHeartbeatAt,
+    }) =>
+        {
+          'id': 'attempt-1',
+          'student_id': 'student-1',
+          'status': status,
+          'score': null,
+          'last_heartbeat_at': lastHeartbeatAt,
+        };
+
+    test('only a running attempt has a pulse', () {
+      final now = DateTime.utc(2026, 1, 1, 10);
+      String beat(Duration ago) => now.subtract(ago).toIso8601String();
+
+      // NULL is not "clean": it means nothing ever checked in, which the grid has
+      // to say out loud or an unwatched attempt reads as an uneventful one.
+      expect(
+        proctorPulseFor(rosterRow(status: 'ongoing'), now: now),
+        ProctorPulse.never,
+      );
+      expect(
+        proctorPulseFor(
+          rosterRow(status: 'ongoing', lastHeartbeatAt: beat(Duration(seconds: 5))),
+          now: now,
+        ),
+        ProctorPulse.live,
+      );
+      // Exactly at the threshold is still live: the boundary is where a client is
+      // written off, and three beats have to be *missed* first.
+      expect(
+        proctorPulseFor(
+          rosterRow(status: 'ongoing', lastHeartbeatAt: beat(heartbeatSilence)),
+          now: now,
+        ),
+        ProctorPulse.live,
+      );
+      expect(
+        proctorPulseFor(
+          rosterRow(
+            status: 'ongoing',
+            lastHeartbeatAt: beat(heartbeatSilence + Duration(seconds: 1)),
+          ),
+          now: now,
+        ),
+        ProctorPulse.silent,
+      );
+
+      // A closed attempt is over, not silent: its beats belong to the coverage
+      // report, and painting a finished row as reporting would be noise.
+      for (final status in <String>[
+        'submitted',
+        'disqualified',
+        'flagged_for_review',
+      ]) {
+        expect(
+          proctorPulseFor(
+            rosterRow(status: status, lastHeartbeatAt: beat(Duration.zero)),
+            now: now,
+          ),
+          isNull,
+          reason: '$status must not carry a live pulse',
+        );
+      }
+    });
+
+    test('the wording says how long a client has been quiet', () {
+      final now = DateTime.utc(2026, 1, 1, 10);
+      String text(ProctorPulse pulse, Duration quiet) => proctorPulseText(
+            pulse,
+            now: now,
+            lastHeartbeatAt: now.subtract(quiet).toIso8601String(),
+          );
+
+      expect(
+        text(ProctorPulse.live, const Duration(seconds: 5)),
+        'proctoring live',
+      );
+      expect(
+        text(ProctorPulse.silent, const Duration(seconds: 50)),
+        'proctoring silent 50s',
+      );
+      expect(
+        text(ProctorPulse.silent, const Duration(minutes: 12)),
+        'proctoring silent 12m',
+      );
+      expect(
+        text(ProctorPulse.silent, const Duration(hours: 2)),
+        'proctoring silent 2h',
+      );
+      // A device clock ahead of the server must not print a beat in the future.
+      expect(
+        text(ProctorPulse.silent, const Duration(seconds: -30)),
+        'proctoring silent 0s',
+      );
+      // Nothing to measure from: the words must not imply a known duration.
+      expect(
+        proctorPulseText(ProctorPulse.never, now: now),
+        'no proctoring signal',
+      );
+    });
+    testWidgets('the roster says which attempts are not reporting', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1200, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      final now = DateTime.now().toUtc();
+      String beat(Duration ago) => now.subtract(ago).toIso8601String();
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            examSubmissionsStreamProvider('exam-1').overrideWith(
+              (ref) => Stream.value([
+                {
+                  'id': 'attempt-live',
+                  'student_id': 'student-1',
+                  'status': 'ongoing',
+                  'score': null,
+                  'last_heartbeat_at': beat(const Duration(seconds: 2)),
+                },
+                {
+                  'id': 'attempt-quiet',
+                  'student_id': 'student-2',
+                  'status': 'ongoing',
+                  'score': null,
+                  'last_heartbeat_at': beat(const Duration(minutes: 10)),
+                },
+                {
+                  'id': 'attempt-null',
+                  'student_id': 'student-3',
+                  'status': 'ongoing',
+                  'score': null,
+                  'last_heartbeat_at': null,
+                },
+                {
+                  'id': 'attempt-done',
+                  'student_id': 'student-4',
+                  'status': 'submitted',
+                  'score': 71,
+                },
+              ]),
+            ),
+            liveViolationFeedProvider(
+              'exam-1',
+            ).overrideWith((ref) => Stream.value(<Map<String, dynamic>>[])),
+            accountNamesProvider.overrideWith(
+              (ref) => Stream.value({
+                'student-1': 'Aisha Bello',
+                'student-2': 'Chinedu Okoye',
+                'student-3': 'Fatima Sani',
+                'student-4': 'Grace Adeyemi',
+              }),
+            ),
+            dashboardRepositoryProvider.overrideWithValue(
+              _FakeDashboardRepository(),
+            ),
+          ],
+          child: const MaterialApp(
+            home: SupervisorDashboardPage(
+              examId: 'exam-1',
+              examTitle: 'Biology',
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // The three states an empty violation feed cannot tell apart.
+      expect(find.textContaining('proctoring live'), findsOneWidget);
+      expect(find.textContaining('proctoring silent 10m'), findsOneWidget);
+      expect(find.textContaining('no proctoring signal'), findsOneWidget);
+
+      // A finished attempt carries no pulse at all - its line is unchanged.
+      expect(find.text('Status: submitted  •  Score: 71'), findsOneWidget);
+
+      // And the one sentence at the top counts both kinds of silence.
+      expect(find.textContaining('2 not reporting'), findsOneWidget);
+    });
+
+  });
 }
 
 SupabaseClient _client(_FakeTransport transport) => SupabaseClient(

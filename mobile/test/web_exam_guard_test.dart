@@ -9,6 +9,7 @@ import 'package:proctorguard/features/exam/domain/entities/exam_submit_result.da
 import 'package:proctorguard/features/exam/domain/entities/question.dart';
 import 'package:proctorguard/features/exam/domain/entities/submission.dart';
 import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
+import 'package:proctorguard/features/proctoring/domain/entities/heartbeat.dart';
 import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
 import 'package:proctorguard/features/proctoring/domain/repositories/proctoring_repository.dart';
 import 'package:proctorguard/features/proctoring/presentation/providers/proctoring_provider.dart';
@@ -412,6 +413,17 @@ class _RecordingProctoringRepository implements ProctoringRepository {
     violations.add(violation);
     return (warningCount: violations.length, disqualified: false, flagged: false);
   }
+
+  @override
+  Future<HeartbeatAck> recordHeartbeat({
+    required String submissionId,
+    bool cameraOk = true,
+    bool monitoringOk = true,
+    String? appVersion,
+    DateTime? clientTime,
+    String? clientEventId,
+  }) async =>
+      HeartbeatAck(outcome: HeartbeatOutcome.recorded, recordedAt: clientTime);
 
   @override
   Stream<List<Map<String, dynamic>>> watchLogs(String submissionId) =>

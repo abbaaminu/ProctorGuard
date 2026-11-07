@@ -10,6 +10,7 @@ import '../../../../core/di/providers.dart';
 import '../../../../core/services/exam_lifecycle_observer.dart';
 import '../../../../core/services/mediapipe_proctoring_service.dart';
 import '../../../../core/services/offline_sync_service.dart';
+import '../../../../core/services/proctoring_heartbeat.dart';
 import '../../../../core/services/supabase_service.dart';
 import '../../../../core/utils/uuid.dart';
 import '../../domain/entities/proctoring_risk.dart';
@@ -150,6 +151,7 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     required this._onForceExit,
     required this._uploadSnapshot,
     ViolationOutbox? outbox,
+    this._heartbeats,
     this.snapshotTimeout = const Duration(seconds: 3),
     this.criticalSnapshotTimeout = const Duration(milliseconds: 1200),
     DateTime Function()? clock,
@@ -166,9 +168,26 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     _lifecycleObserver = ExamLifecycleObserver(
       onMinimized: reportAppMinimized,
     )..attach();
+    // The liveness series: from this point on the server can tell "proctoring
+    // was running and saw nothing" apart from "proctoring was not running".
+    // Optional so a unit test can construct a notifier without a repository, and
+    // stopped - not started - once the session ends.
+    _heartbeats?.start(
+      submissionId,
+      cameraOk: _cameraActive,
+      monitoringOk: _cameraActive,
+    );
   }
 
   final String submissionId;
+
+  /// The liveness beats behind `proctor_heartbeats` / `proctoring_coverage()`.
+  ///
+  /// Nullable rather than required: a heartbeat needs the repository, and the
+  /// notifier's own tests build one without a database. When it is present it is
+  /// started above and stopped in [dispose] - a beat after the page is gone would
+  /// be a claim that something is being watched when nothing is.
+  final ProctoringHeartbeatService? _heartbeats;
   final ViolationOutbox _outbox;
   final ExamRepository _examRepo;
   final MediaPipeProctoringService _engine;
@@ -253,6 +272,12 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     if (!mounted) return;
     if (_cameraActive == active) return;
     _cameraActive = active;
+    // The next beat says what this one could not: a monitor that is up but blind
+    // (`camera_ok = false`) and, while the feed is down, a monitor that is not
+    // really monitoring (`monitoring_ok = false`). Without this a coverage report
+    // cannot tell "watched a student who behaved" from "watched nothing".
+    _heartbeats?.noteCamera(active);
+    _heartbeats?.noteMonitoring(active);
     // A resume must not inherit a stale dedupe stamp or a half-counted frame
     // episode from before the camera dropped out.
     _lastLoggedAt.clear();
@@ -655,10 +680,37 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     final observer = _lifecycleObserver;
     _lifecycleObserver = null;
     observer?.detach();
+
+    // The liveness series ends with the session. `stop` (not `dispose`) because
+    // the service is built and owned by the provider, which disposes it with the
+    // notifier; a resumed attempt must be able to start a fresh series.
+    _heartbeats?.stop();
+
     _engine.dispose();
     super.dispose();
   }
 }
+
+/// The liveness beats for one attempt.
+///
+/// Declared next to the notifier because the two are one decision: the notifier
+/// owns *when* a beat is sent (it knows whether the camera is really up), the
+/// service owns *how*, and both live and die with the exam page. Keyed by
+/// submissionId like [proctoringProvider], and disposed with it, so leaving the
+/// exam cancels the timer rather than leaving a beat behind claiming the session
+/// is still being watched.
+///
+/// It is a plain `Provider` because the service holds no reactive state: coverage
+/// is read from the server (`proctoring_coverage()`), never from the client that
+/// is being measured.
+final proctoringHeartbeatProvider = Provider.autoDispose
+    .family<ProctoringHeartbeatService, String>((ref, submissionId) {
+  final service = ProctoringHeartbeatService(
+    ref.watch(proctoringRepositoryProvider),
+  );
+  ref.onDispose(service.dispose);
+  return service;
+});
 
 /// One notifier instance per exam session (keyed by submissionId), torn
 /// down automatically when the exam-taking page is popped.
@@ -672,6 +724,10 @@ final proctoringProvider = StateNotifierProvider.autoDispose
     // Durable delivery: a violation that cannot reach Supabase now is queued and
     // retried rather than dropped (see OfflineSyncService).
     outbox: ref.watch(violationOutboxProvider),
+    // The positive half of the record: while this session is up the server hears
+    // from it every ~15 s, so an empty violation feed can be read as "watched and
+    // clean" instead of "possibly not watched at all".
+    heartbeats: ref.watch(proctoringHeartbeatProvider(submissionId)),
     onForceExit: () => ref.read(forceExitSignalProvider.notifier).state = submissionId,
     // The composition root is the right place to bind Storage; the notifier
     // itself stays free of the Supabase singleton, which keeps it unit-testable

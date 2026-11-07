@@ -1,5 +1,6 @@
 import '../../../auth/domain/entities/user_profile.dart';
 import '../entities/managed_account.dart';
+import '../entities/profile_labels.dart';
 import '../entities/student_roster.dart';
 
 /// A failure the administrator should read verbatim.
@@ -80,6 +81,42 @@ abstract class AdminUserRepository {
     List<NewStudentAccount> students,
   );
 
+
+  /// Corrects the academic labels — and the identity number — on an existing
+  /// account, through the `admin-update-profile` Edge Function.
+  ///
+  /// This is the repair path for a locked-out student: a blank or misspelled
+  /// `faculty / department / level` leaves `exams_select` comparing nothing, and
+  /// the `guard_profile_labels()` trigger refuses the student's own attempt to
+  /// fix it. Only an admin (or the service_role the function holds) may write
+  /// those columns, so the correction is somebody else's job.
+  ///
+  /// [labels] says what to write and — by what it leaves out — what to leave
+  /// alone: a key that is absent keeps its column, a key mapping to null or blank
+  /// clears it. The console's Edit dialog sends all five keys, because a save
+  /// means what the dialog showed. A value the catalogue does not name is refused
+  /// server-side, as is a faculty/department pair `exams_select` could never
+  /// match, so what comes back is the row as the policy now reads it. Throws
+  /// [AdminAccountException] when the caller is not an admin, when [userId] no
+  /// longer exists, or when the request never reached the server.
+  Future<ManagedAccount> updateProfileLabels({
+    required String userId,
+    required Map<ProfileLabel, String?> labels,
+  });
+
+  /// Corrects one page of accounts — the bulk repair for a class list that was
+  /// imported with the wrong labels, or with none.
+  ///
+  /// A page is *not* all-or-nothing: rows that could not be corrected come back
+  /// in [LabelFixOutcome.failed] with the reason, next to the ones that were.
+  /// Send at most [maxStudentPageSize] rows per call — the same page the roster
+  /// import uses, and the number `admin-update-profile` refuses above. Throws
+  /// [AdminAccountException] only when the whole request failed (not an admin,
+  /// the function is missing, the network dropped), never because one row was
+  /// refused.
+  Future<LabelFixOutcome> correctStudentLabels(
+    List<StudentLabelCorrection> corrections,
+  );
 
   /// Every profile row the caller may read — an admin reads all of them
   /// (`profiles_select_own_or_staff`), so this is the full roster.

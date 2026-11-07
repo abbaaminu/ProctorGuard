@@ -984,6 +984,188 @@ create policy "questions_delete_owner"
 -- the four audiences, the definer view, and the `anon` revoke.
 
 -- ---------------------------------------------------------------------
+-- 3b. PROCTORING CONSENTS (the notice accepted before an attempt exists)
+-- ---------------------------------------------------------------------
+-- Placed here, in front of section 4, for one reason: the attempt policy in §4
+-- asks `student_has_consent()`, and a policy's expression is resolved when the
+-- policy is created - so the table and the function have to exist first. (Same
+-- argument that puts `student_can_access_exam()` in §1.) An existing project
+-- gets the identical objects from
+-- `supabase/migrations/20261106090000_proctoring_consents.sql`, which also
+-- carries the full design note; what follows is the short version.
+--
+-- What was missing: consent was a claim the client made by *starting*. Nothing
+-- recorded what wording a student was shown, when, or whether they were shown
+-- anything at all - for a system that turns a camera on somebody and keeps a
+-- photograph of their face when a rule is broken, that is not a record. Here it
+-- becomes one: a row per (student, paper, notice version), written before the
+-- attempt exists, immutable afterwards.
+--
+-- The server owns "which version is current" (`proctoring_consent_config`); the
+-- app owns the text and carries the matching version string
+-- (`ProctorConsentConfig` in the Flutter app). A build showing older wording can
+-- still record what it showed - `record_consent()` stores it and answers
+-- `is_current = false` - but it cannot satisfy the policy, so the student is
+-- told to update rather than being refused at the insert with no explanation.
+create table if not exists public.proctoring_consent_config (
+  id              smallint primary key default 1,
+  current_version text not null
+                  check (length(btrim(current_version)) between 1 and 64),
+  updated_at      timestamptz not null default now(),
+  constraint proctoring_consent_config_single_row check (id = 1)
+);
+
+insert into public.proctoring_consent_config (id, current_version)
+values (1, '2026-11-v1')
+on conflict (id) do nothing;
+
+comment on table public.proctoring_consent_config is
+  'The proctoring consent notice version a student must have accepted before an attempt can be created. One row. Read by current_proctor_consent_version() / student_has_consent(); set current_version here when the wording changes, and ship an app build whose ProctorConsentConfig.version matches it.';
+
+comment on column public.proctoring_consent_config.current_version is
+  'The notice version in force. A consent row only satisfies student_has_consent() when consent_version equals this, so a stale acceptance does not carry over to new wording.';
+
+alter table public.proctoring_consent_config enable row level security;
+
+-- Readable by any signed-in caller; writable through the API by nobody (no
+-- write policy, and no grant past `select`). `postgres` and `service_role`
+-- bypass this, which is where a version is meant to be changed.
+revoke all on table public.proctoring_consent_config from anon, authenticated;
+grant select on table public.proctoring_consent_config to authenticated;
+grant all on table public.proctoring_consent_config to service_role;
+
+drop policy if exists "consent_config_read_all" on public.proctoring_consent_config;
+create policy "consent_config_read_all"
+  on public.proctoring_consent_config for select
+  to authenticated
+  using (true);
+
+create or replace function public.current_proctor_consent_version()
+returns text
+language sql
+security definer
+stable
+set search_path = public, pg_temp
+as $$
+  select c.current_version
+    from public.proctoring_consent_config c
+   where c.id = 1;
+$$;
+
+comment on function public.current_proctor_consent_version() is
+  'The proctoring consent notice version currently in force, or NULL when none is configured (which makes every student_has_consent() call false - fail-closed, never "no notice required").';
+
+revoke execute on function public.current_proctor_consent_version() from public, anon;
+grant execute on function public.current_proctor_consent_version()
+  to authenticated, service_role;
+
+
+-- The acceptances themselves.
+--
+-- `exam_id` is nullable - NULL is "a general acceptance covering every paper" -
+-- and carries no foreign key, because this is evidence of what a person agreed
+-- to and a cascade from `exams` would let deleting a paper erase the acceptance
+-- given to sit it (the same argument `attempt_review_logs` and
+-- `session_reset_logs` make). `student_id` does cascade, from `profiles`: an
+-- account deletion is the one path that should take the record with it.
+create table if not exists public.proctoring_consents (
+  id              uuid primary key default uuid_generate_v4(),
+  student_id      uuid not null references public.profiles(id) on delete cascade,
+  exam_id         uuid,
+  consent_version text not null
+                  check (length(btrim(consent_version)) between 1 and 64),
+  accepted_at     timestamptz not null default now(),
+  user_agent      text
+);
+
+comment on table public.proctoring_consents is
+  'One row per acceptance of the proctoring consent notice: which version, for which paper (NULL = every paper), by whom, when, from what client. Written only by record_consent(); no update or delete path exists for an API caller.';
+
+comment on column public.proctoring_consents.exam_id is
+  'The paper this acceptance covers, or NULL for a general acceptance covering every paper. No foreign key: the record of consent outlives the paper it was given for.';
+
+comment on column public.proctoring_consents.consent_version is
+  'The notice version the client reported displaying. Only a row matching proctoring_consent_config.current_version satisfies student_has_consent().';
+
+comment on column public.proctoring_consents.user_agent is
+  'The transport User-Agent captured by record_consent(). Evidence of what client accepted, not a validated value: nothing branches on it.';
+
+-- Two partial unique indexes, not one constraint: `exam_id` is nullable and
+-- NULLs are distinct in a unique index, so a single constraint would let a
+-- student accumulate any number of "general" rows and `record_consent()` would
+-- quietly stop being idempotent there.
+create unique index if not exists proctoring_consents_exam_version_key
+  on public.proctoring_consents (student_id, exam_id, consent_version)
+  where exam_id is not null;
+
+create unique index if not exists proctoring_consents_general_version_key
+  on public.proctoring_consents (student_id, consent_version)
+  where exam_id is null;
+
+create index if not exists proctoring_consents_student_accepted_idx
+  on public.proctoring_consents (student_id, accepted_at desc);
+
+alter table public.proctoring_consents enable row level security;
+
+drop policy if exists "consents_insert_own" on public.proctoring_consents;
+drop policy if exists "consents_select_own_or_supervisor" on public.proctoring_consents;
+
+-- Accepting is the student's own act in their own name.
+create policy "consents_insert_own"
+  on public.proctoring_consents for insert
+  to authenticated
+  with check (student_id = auth.uid());
+
+-- Read: your own acceptances, or the intervention tier (admin + supervisor).
+-- Deliberately not `is_staff()`: a lecturer reads the evidence of a sitting;
+-- "did this person agree, and to what wording?" is a supervisory question.
+--
+-- And again the control is an absence - no UPDATE policy, no DELETE policy, and
+-- `select, insert` as the only grants (the schema's default privileges hand every
+-- new table `all` to `authenticated`, so UPDATE/DELETE/TRUNCATE are revoked
+-- explicitly: `truncate` ignores RLS, which is why it is named). A consent record
+-- its subject can rewrite or remove is not a record.
+create policy "consents_select_own_or_supervisor"
+  on public.proctoring_consents for select
+  to authenticated
+  using (
+    student_id = auth.uid()
+    or public.is_exam_supervisor()
+  );
+
+revoke all on table public.proctoring_consents from anon;
+revoke update, delete, truncate on table public.proctoring_consents from authenticated;
+grant select, insert on table public.proctoring_consents to authenticated;
+grant all on table public.proctoring_consents to service_role;
+
+-- "Has this student accepted the current notice, for this paper or generally?"
+-- SECURITY DEFINER with an explicit ownership term, like
+-- `student_can_access_exam()`: the answer must not shift if the read policy above
+-- is ever tightened.
+create or replace function public.student_has_consent(p_exam_id uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public, pg_temp
+as $$
+  select exists (
+    select 1
+      from public.proctoring_consents c
+     where c.student_id = auth.uid()
+       and c.consent_version = public.current_proctor_consent_version()
+       and (c.exam_id is null or c.exam_id = p_exam_id)
+  );
+$$;
+
+comment on function public.student_has_consent(uuid) is
+  'True when the caller has accepted the proctoring consent notice currently in force, either for this paper or as a general acceptance (exam_id NULL). False when no notice version is configured - fail-closed by design. Asked by submissions_insert_own_ongoing; it grants nothing else.';
+
+revoke execute on function public.student_has_consent(uuid) from public, anon;
+grant execute on function public.student_has_consent(uuid) to authenticated, service_role;
+
+
+-- ---------------------------------------------------------------------
 -- 4. EXAM SUBMISSIONS
 -- ---------------------------------------------------------------------
 create table if not exists public.exam_submissions (
@@ -996,6 +1178,10 @@ create table if not exists public.exam_submissions (
   score         numeric,
   started_at    timestamptz not null default now(),
   submitted_at  timestamptz,
+  -- When this attempt's proctoring client last reported for duty (section 5b).
+  -- NULL means *nothing has ever checked in* - which is a different statement from
+  -- "checked in and saw nothing", and the whole reason this column exists.
+  last_heartbeat_at timestamptz,
   unique (student_id, exam_id)
 );
 
@@ -1042,6 +1228,17 @@ alter table public.exam_submissions
 alter table public.exam_submissions
   validate constraint exam_submissions_status_check;
 
+-- Added for databases created before the heartbeat existed; a no-op on a fresh
+-- install, where the CREATE TABLE above already carries it.
+--
+-- Nothing else reads or writes it: `record_heartbeat()` (bottom of this file) is
+-- the single writer, and it is what lets a supervisor tell an attempt that was
+-- watched and clean apart from one nobody was watching at all. The denormalised
+-- copy exists so the live grid can answer "is this client still there" from the
+-- row it already streams, without a join per attempt.
+alter table public.exam_submissions
+  add column if not exists last_heartbeat_at timestamptz;
+
 
 alter table public.exam_submissions enable row level security;
 
@@ -1079,6 +1276,14 @@ create policy "submissions_select_own_or_supervisor"
 -- row before `starts_at` or after `ends_at`. Both bounds are optional, so both
 -- tests are written as "NULL, or inside it" - an unscheduled paper (the common
 -- case, and every paper authored before scheduling existed) passes unchanged.
+--
+-- "Has this student accepted the proctoring notice?" is the third question, and
+-- §3b is why it exists: `student_has_consent(exam_id)` is true for a general
+-- acceptance (a row with `exam_id IS NULL`) or for one naming this paper, and
+-- only for the notice version currently in force. It is asked *here* rather than
+-- folded into `student_can_access_exam()` because that predicate also answers
+-- `exams_select` and `questions_public` - a student must be able to read the
+-- paper before they can decide whether to accept the notice for it.
 create policy "submissions_insert_own_ongoing"
   on public.exam_submissions for insert
   to authenticated
@@ -1090,6 +1295,7 @@ create policy "submissions_insert_own_ongoing"
     and submitted_at is null
     and started_at = now()
     and public.student_can_access_exam(exam_id)
+    and public.student_has_consent(exam_id)
     and exists (
       select 1 from public.exams e
       where e.id = exam_id
@@ -1097,6 +1303,7 @@ create policy "submissions_insert_own_ongoing"
         and (e.ends_at  is null or now() <= e.ends_at)
     )
   );
+
 
 -- There is deliberately NO student UPDATE policy: status, score and
 -- submitted_at are written by submit_exam() and register_violation(), both
@@ -1508,6 +1715,112 @@ grant select, insert, update, delete on public.violation_weights to authenticate
 revoke all on public.violation_weights from anon;
 
 -- ---------------------------------------------------------------------
+-- 5b. PROCTORING HEARTBEATS (was the client running?)
+-- ---------------------------------------------------------------------
+-- Every other piece of proctoring evidence is a *negative*: no violations
+-- recorded. That silence has two completely different causes, and until now the
+-- database could not tell them apart -
+--
+--   * the client was running, watched the camera, and saw nothing, or
+--   * the client was never running (closed tab, killed app, blocked script,
+--     wifi dropped, JS error before the first frame).
+--
+-- An empty `proctoring_logs` feed reads as "clean sitting" in both cases. This
+-- table is the positive signal that makes the difference visible: the client
+-- says "still here, camera streaming, monitoring active" every few seconds, and
+-- a gap in that series is a fact a human can act on ("this student's proctoring
+-- stopped at 14:22, look at it") rather than a silent assumption.
+--
+-- What a heartbeat is NOT, and this is the honest limit of the whole feature:
+--
+--   * It proves an authenticated client *claimed* to be running. A tampered or
+--     scripted client can send beats while doing nothing, exactly as it can send
+--     fabricated violation photos. Heartbeats raise the cost of the trivial
+--     attack (close the app and get a clean record) - they do not attest to
+--     application integrity. Platform attestation (Play Integrity / App Attest)
+--     is listed as future work in the README.
+--   * A gap is not misconduct. Network loss, a stolen laptop and a genuinely
+--     broken webcam all look identical from here, so a gap only ever produces a
+--     *flag for a human* (`proctoring_coverage()` below never disqualifies).
+--   * `received_at` is the server clock; `client_time` is what the device said.
+--     A beat replayed from the offline queue therefore arrives with a `client_time`
+--     in the past - it still proves the client is *alive now*, not that it was
+--     being honest earlier. Coverage prefers `received_at` for exactly that
+--     reason.
+--
+-- Growth: one row per client per ~15s is ~240 rows/hour/student. That is fine
+-- for a sitting and too much to keep for a year, which is why it has its own
+-- retention policy (`retention_policy.sql`, `proctor_heartbeats`).
+create table if not exists public.proctor_heartbeats (
+  id             uuid primary key default uuid_generate_v4(),
+  submission_id  uuid not null references public.exam_submissions(id) on delete cascade,
+  -- Server clock. The only timestamp a supervisor should trust; see the note
+  -- above about replayed beats.
+  received_at    timestamptz not null default now(),
+  -- Device clock at the moment the beat was produced. NULL for a live beat from
+  -- a build that does not send it. Kept for diagnostics ("the gap is real" vs
+  -- "the phone's clock jumped"), never used for the gap arithmetic.
+  client_time    timestamptz,
+  -- Did the camera have a live track at that moment? A beat with camera_ok=false
+  -- is the "proctoring is running but blind" case - the one an empty log feed
+  -- used to hide completely.
+  camera_ok      boolean not null default true,
+  -- Is the monitor as a whole (detector loop, foreground app) up? false covers
+  -- "app backgrounded", "detector paused", "session ended early".
+  monitoring_ok  boolean not null default true,
+  app_version    text,
+  -- Set by the offline queue so a retried beat is stored once. Same idea as
+  -- `proctoring_logs.client_event_id`.
+  client_event_id uuid
+);
+
+-- One row per queued beat, however many times the retry replays it.
+create unique index if not exists idx_heartbeats_client_event_id
+  on public.proctor_heartbeats(client_event_id)
+  where client_event_id is not null;
+
+comment on table public.proctor_heartbeats is
+  'Proctoring client liveness beats. Answers "was anything watching?", which an empty proctoring_logs feed cannot. Proves a client claimed to be running - never that it was doing its job (no application attestation).';
+comment on column public.proctor_heartbeats.received_at is
+  'Server clock at insert. The only timestamp coverage trusts: a beat replayed from the offline queue has a client_time in the past.';
+comment on column public.proctor_heartbeats.camera_ok is
+  'Whether the camera had a live track when the beat was produced. false is the "monitor running but blind" case an empty log feed used to hide.';
+comment on column public.proctor_heartbeats.monitoring_ok is
+  'Whether the monitor as a whole (detector loop, foreground app) was up. false covers backgrounded, paused or ended early.';
+comment on column public.proctor_heartbeats.client_event_id is
+  'Idempotency key for the offline queue: record_heartbeat() stores one row per beat however many times it is replayed.';
+comment on column public.exam_submissions.last_heartbeat_at is
+  'Server time of the last accepted proctoring heartbeat (record_heartbeat()). NULL = the client never reported, which is not evidence of a clean sitting.';
+
+alter table public.proctor_heartbeats enable row level security;
+
+drop policy if exists "heartbeats_select_own_or_supervisor" on public.proctor_heartbeats;
+
+-- Read: the same audience as the evidence itself - the student whose attempt it
+-- is, the lecturer who wrote the paper, and the intervention tier. Anything
+-- broader turns the table into a presence tracker for the whole institution.
+create policy "heartbeats_select_own_or_supervisor"
+  on public.proctor_heartbeats for select
+  to authenticated
+  using (
+    exists (
+      select 1 from public.exam_submissions s
+      where s.id = submission_id
+        and (s.student_id = auth.uid() or public.owns_exam(s.exam_id))
+    )
+    or public.is_exam_supervisor()
+  );
+
+-- Again, deliberately NO insert/update/delete policy. `record_heartbeat()` is
+-- the only writer: it re-checks ownership and the attempt's status, rate-limits
+-- the caller and stamps `exam_submissions.last_heartbeat_at` in the same
+-- transaction. A client-insertable heartbeat table would let a tampered client
+-- backfill a tidy series of beats it never sent - the one thing this table is
+-- supposed to make hard.
+grant select on public.proctor_heartbeats to authenticated;
+revoke all on public.proctor_heartbeats from anon;
+
+-- ---------------------------------------------------------------------
 -- 6. STORAGE BUCKET (Proctoring Violation Snapshots)
 
 -- ---------------------------------------------------------------------
@@ -1846,6 +2159,13 @@ create index if not exists idx_submissions_student_id on public.exam_submissions
 create index if not exists idx_submissions_exam_status on public.exam_submissions(exam_id, status);
 create index if not exists idx_logs_submission_id on public.proctoring_logs(submission_id);
 create index if not exists idx_logs_timestamp on public.proctoring_logs(timestamp desc);
+-- Heartbeats are read as a time series for one attempt (the coverage function
+-- walks them in `received_at` order) and pruned by age (retention), so the
+-- composite serves the read and `idx_heartbeats_received_at` the prune.
+create index if not exists idx_heartbeats_submission_received
+  on public.proctor_heartbeats(submission_id, received_at);
+create index if not exists idx_heartbeats_received_at
+  on public.proctor_heartbeats(received_at);
 -- The audit trail is read newest-first, and per exam when an appeal asks "what
 -- was cleared during this sitting".
 create index if not exists idx_session_reset_logs_created_at on public.session_reset_logs(created_at desc);
@@ -2092,6 +2412,501 @@ grant execute on function public.register_violation(uuid, text, text, timestampt
 
 comment on function public.register_violation(uuid, text, text, timestamptz, uuid) is
   'The single write path for proctoring evidence: ownership-checked, idempotent per client_event_id, and weighted - only types whose violation_weights row counts_toward_dq add points. At 3 weighted points the attempt becomes flagged_for_review for resolve_flagged_attempt() instead of being disqualified automatically.';
+
+-- ---------------------------------------------------------------------
+-- Recording a consent acceptance (RPC)
+-- ---------------------------------------------------------------------
+-- The write half of §3b, and the only writer of `proctoring_consents`. It is an
+-- RPC rather than a plain PostgREST insert for three reasons the table cannot
+-- express on its own:
+--
+--   * `student_id` is `auth.uid()`, never a body field - the ownership is stated
+--     once, in the server;
+--   * `user_agent` comes from the *transport* headers
+--     (`request.headers` -> `user-agent`), so it is the server's record of what
+--     client asked rather than the client's account of itself. That setting only
+--     exists behind PostgREST, hence the wrapped read: a direct psql call has no
+--     headers and the column is evidence, not a condition;
+--   * `is_current` answers a question the client cannot answer for itself: is the
+--     version I just displayed the one in force? `false` means this build shipped
+--     older wording, and the consent screen says so ("update the app") instead of
+--     letting the student accept text the institution has replaced and then be
+--     refused at the insert with no explanation.
+--
+-- Idempotent: a retry after a lost response returns the row that already exists
+-- (the two partial unique indexes in §3b are what make that a no-op rather than a
+-- duplicate or a unique-violation the student cannot act on). The version is
+-- stored verbatim - a server that "corrected" it would be writing a claim nobody
+-- made - and an exam-scoped acceptance is only accepted for a paper the student
+-- may sit, so a random uuid cannot be used to fill the table.
+create or replace function public.record_consent(
+  p_exam_id uuid default null,
+  p_version text default null
+)
+returns table (
+  consent_id      uuid,
+  consent_version text,
+  accepted_at     timestamptz,
+  is_current      boolean
+)
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_student    uuid := auth.uid();
+  v_version    text;
+  v_user_agent text;
+  v_id         uuid;
+  v_accepted   timestamptz;
+begin
+  if v_student is null then
+    raise exception 'Sign in before accepting the proctoring notice.'
+      using errcode = '28000';
+  end if;
+
+  v_version := nullif(btrim(coalesce(p_version, '')), '');
+  if v_version is null then
+    raise exception 'The consent notice version is required.'
+      using errcode = '22023';
+  end if;
+  if length(v_version) > 64 then
+    raise exception 'The consent notice version is longer than 64 characters.'
+      using errcode = '22023';
+  end if;
+
+  -- "May this student sit this paper at all?" is the same predicate the attempt
+  -- policy asks, so an acceptance can never be stored for a paper the student has
+  -- no access to. A general acceptance (no paper) skips the question.
+  if p_exam_id is not null and not public.student_can_access_exam(p_exam_id) then
+    raise exception 'That paper is not offered to you, so there is nothing to accept for it.'
+      using errcode = '42501';
+  end if;
+
+  -- The transport's header, when there is one. Wrapped because
+  -- `request.headers` is a PostgREST setting that a direct psql session does not
+  -- have, and its absence must not fail an acceptance: this column is evidence,
+  -- not a condition.
+  begin
+    v_user_agent := nullif(btrim(coalesce(
+      (current_setting('request.headers', true)::jsonb) ->> 'user-agent', '')), '');
+  exception
+    when others then
+      v_user_agent := null;
+  end;
+
+  -- The table is aliased and every name in the RETURNING list is qualified: the
+  -- OUT parameters above are named `consent_id`, `consent_version`,
+  -- `accepted_at` and `is_current`, and PL/pgSQL resolves a bare column name
+  -- against its variables first - an unqualified `accepted_at` here raises
+  -- 42702 ("column reference "accepted_at" is ambiguous") the first time the RPC
+  -- runs, which is why it is spelled `c.accepted_at`.
+  insert into public.proctoring_consents as c (
+    student_id, exam_id, consent_version, user_agent
+  )
+  values (
+    v_student, p_exam_id, v_version, v_user_agent
+  )
+  -- No conflict target on purpose: the two partial unique indexes above split on
+  -- `exam_id is null`, and "swallow whichever one this row hit" is exactly the
+  -- intent - either shape is already stored, once.
+  on conflict do nothing
+  returning c.id, c.accepted_at into v_id, v_accepted;
+
+  if v_id is null then
+    select c.id, c.accepted_at into v_id, v_accepted
+      from public.proctoring_consents c
+     where c.student_id = v_student
+       and c.consent_version = v_version
+       and c.exam_id is not distinct from p_exam_id
+     order by c.accepted_at
+     limit 1;
+  end if;
+
+  return query
+    select v_id, v_version, v_accepted,
+           v_version = public.current_proctor_consent_version();
+end;
+$$;
+
+comment on function public.record_consent(uuid, text) is
+  'Records the caller''s acceptance of the proctoring consent notice for one paper (or generally, when p_exam_id is NULL). Stores the version the client says it displayed plus the transport User-Agent, is idempotent, and reports is_current = false when the version sent is not the one in force. The only writer of public.proctoring_consents.';
+
+revoke execute on function public.record_consent(uuid, text) from public, anon;
+grant execute on function public.record_consent(uuid, text) to authenticated, service_role;
+
+
+-- ---------------------------------------------------------------------
+-- The proctoring heartbeat (RPC)
+-- ---------------------------------------------------------------------
+-- The complement of `register_violation()`: that RPC records what the client
+-- *saw*, this one records that the client was *there to see it*. Without it an
+-- empty `proctoring_logs` feed means either "watched and clean" or "nobody was
+-- watching", and a supervisor has no way to tell which - see section 5b for the
+-- full argument and for what a heartbeat cannot prove.
+--
+-- Shape of the contract, chosen so a client can stay simple and a server can
+-- still be strict:
+--
+--   * ownership and status are re-checked here, never trusted from the request;
+--   * one row per beat, deduplicated on `client_event_id` so the offline queue
+--     can replay a batch of beats without inflating the series;
+--   * a beat arriving inside the rate-limit window is answered, not raised: the
+--     client retries on a timer and must not have to special-case "you are too
+--     early", which is never the student's fault;
+--   * the same transaction stamps `exam_submissions.last_heartbeat_at`, so the
+--     live grid can ask "is this client still here" from the row it already
+--     streams.
+--
+-- A throttled or duplicated beat still means the client is alive *right now*, so
+-- `last_heartbeat_at` is refreshed for all three outcomes. Only the insert is
+-- skipped - the series must not be padded by retries.
+create or replace function public.record_heartbeat(
+  p_submission_id   uuid,
+  p_camera_ok       boolean     default true,
+  p_monitoring_ok   boolean     default true,
+  p_app_version     text        default null,
+  p_client_time     timestamptz default null,
+  p_client_event_id uuid        default null
+)
+returns table (
+  -- 'recorded' | 'duplicate' | 'throttled'. Not an error for the last two: the
+  -- client's job is to keep the beat going, not to negotiate about one.
+  outcome     text,
+  recorded_at timestamptz,
+  beat_count  int
+)
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  -- The client beats every 15s (mobile: ProctoringHeartbeatService). The window is
+  -- deliberately *shorter* than that so an honest client is never throttled by
+  -- jitter, while a script hammering the RPC still cannot write a thousand rows a
+  -- second.
+  c_min_interval constant interval := interval '8 seconds';
+  v_now   timestamptz := now();
+  v_sub   public.exam_submissions;
+  v_last  timestamptz;
+  v_first timestamptz;
+  v_count int;
+begin
+
+
+  if auth.uid() is null then
+    raise exception 'record_heartbeat: sign in before reporting a heartbeat'
+      using errcode = '28000';
+  end if;
+
+  -- `for update` serialises two beats that arrive together, so the rate-limit
+  -- read below cannot be raced into writing two rows inside one window.
+  select * into v_sub
+  from public.exam_submissions s
+  where s.id = p_submission_id
+  for update;
+
+  if not found then
+    raise exception 'record_heartbeat: no attempt with id %', p_submission_id
+      using errcode = 'P0002';
+  end if;
+
+  if v_sub.student_id <> auth.uid() then
+    raise exception 'record_heartbeat: attempt % belongs to another student', p_submission_id
+      using errcode = '42501';
+  end if;
+
+  -- A closed attempt cannot report for duty. Accepting these would let an ended
+  -- (or flagged) sitting keep its coverage looking healthy after the fact.
+  if v_sub.status <> 'ongoing' then
+    raise exception 'record_heartbeat: attempt % is %, not ongoing', p_submission_id, v_sub.status
+      using errcode = '22023';
+  end if;
+
+  select count(*) into v_count
+  from public.proctor_heartbeats h
+  where h.submission_id = p_submission_id;
+
+  -- Idempotency first: a replay of a beat that is already stored is not "too
+  -- early", it is already done.
+  if p_client_event_id is not null then
+    select h.received_at into v_last
+    from public.proctor_heartbeats h
+    where h.client_event_id = p_client_event_id;
+
+    if v_last is not null then
+      -- Still refresh liveness: the client is talking to us *now*, whatever the
+      -- beat it replayed was about.
+      update public.exam_submissions
+         set last_heartbeat_at = v_now
+       where id = p_submission_id;
+      return query select 'duplicate'::text, v_last, v_count;
+      return;
+    end if;
+  end if;
+
+  select max(h.received_at) into v_last
+  from public.proctor_heartbeats h
+  where h.submission_id = p_submission_id;
+
+  if v_last is not null and v_last > v_now - c_min_interval then
+    update public.exam_submissions
+       set last_heartbeat_at = v_now
+     where id = p_submission_id;
+    return query select 'throttled'::text, v_last, v_count;
+    return;
+  end if;
+
+  insert into public.proctor_heartbeats (
+    submission_id, received_at, client_time, camera_ok, monitoring_ok,
+    app_version, client_event_id
+  )
+  values (
+    p_submission_id,
+    v_now,
+    p_client_time,
+    coalesce(p_camera_ok, true),
+    coalesce(p_monitoring_ok, true),
+    p_app_version,
+    p_client_event_id
+  )
+  on conflict (client_event_id) where client_event_id is not null do nothing
+  returning received_at into v_first;
+
+  update public.exam_submissions
+     set last_heartbeat_at = v_now
+   where id = p_submission_id;
+
+  -- The insert may have been swallowed by the unique index if two deliveries of
+  -- the same beat raced; either way the attempt is alive and the series holds one
+  -- row, so both answers are honest.
+  -- `count(*)` is bigint and `beat_count` is int: a RETURN QUERY is checked
+  -- against the declared row type exactly (no assignment cast, unlike
+  -- `select ... into`), so the cast is what keeps the RPC from failing with
+  -- "Returned type bigint does not match expected type integer in column 3".
+  return query select
+    case when v_first is null then 'duplicate' else 'recorded' end,
+    coalesce(v_first, v_now),
+    (select count(*)::integer from public.proctor_heartbeats h
+      where h.submission_id = p_submission_id);
+end;
+$$;
+revoke execute on function public.record_heartbeat(uuid, boolean, boolean, text, timestamptz, uuid) from public, anon;
+grant execute on function public.record_heartbeat(uuid, boolean, boolean, text, timestamptz, uuid) to authenticated, service_role;
+
+comment on function public.record_heartbeat(uuid, boolean, boolean, text, timestamptz, uuid) is
+  'The single write path for proctoring heartbeats: ownership- and status-checked, idempotent per client_event_id, rate-limited to one stored beat per 8s, and the only writer of exam_submissions.last_heartbeat_at. Proves a client was running, never that it was doing its job.';
+
+-- ---------------------------------------------------------------------
+-- Coverage: what the heartbeat series can and cannot say (RPC)
+-- ---------------------------------------------------------------------
+-- Answers "was this attempt actually watched?" with numbers a supervisor can
+-- check, and a `risk_flag` that means *look at this*, never *punish this*:
+--
+--   * `beats = 0`                  nothing ever checked in;
+--   * `longest_gap_seconds > 60`   proctoring stopped for a while;
+--   * `camera_down_beats > 0`      the monitor was up with no camera behind it;
+--   * `coverage_ratio < 0.5`       most of the expected beats never arrived.
+--
+-- The grace window exists because every attempt blinks for the first minute: the
+-- client boots, asks for the camera, waits for the detector model. Flagging that
+-- would turn the report into noise. And no branch here touches
+-- `exam_submissions.status`: coverage informs a human, it does not act.
+create or replace function public.proctoring_coverage(p_submission_id uuid)
+returns table (
+  submission_id         uuid,
+  student_id            uuid,
+  exam_id               uuid,
+  status                text,
+  started_at            timestamptz,
+  ended_at              timestamptz,
+  beats                 int,
+  expected_beats        int,
+  coverage_ratio        numeric,
+  first_beat_at         timestamptz,
+  last_beat_at          timestamptz,
+  longest_gap_seconds   int,
+  silent_seconds        int,
+  camera_down_beats     int,
+  monitoring_down_beats int,
+  risk_flag             boolean,
+  reason                text
+)
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  -- The cadence the client is expected to keep (mobile ProctoringHeartbeatService).
+  -- Expected beats are derived from the attempt's own length, so a 20-minute
+  -- sitting is not judged against a 2-hour one.
+  c_expected_interval constant numeric  := 15;
+  -- Anything longer than this between two beats is a gap worth a human's time.
+  c_gap_threshold     constant int      := 60;
+  -- No verdict of any kind for the first stretch of an attempt.
+  c_grace             constant interval := interval '90 seconds';
+
+  v_sub      public.exam_submissions;
+  v_now      timestamptz := now();
+  v_end      timestamptz;
+  v_window   numeric;
+  v_beats    int;
+  v_expected int;
+  v_ratio    numeric;
+  v_first    timestamptz;
+  v_last     timestamptz;
+  v_gap      int;
+  v_head     int;
+  v_tail     int;
+  v_camera   int;
+  v_monitor  int;
+  v_silent   int;
+  v_flag     boolean := false;
+  v_reasons  text[]  := '{}';
+begin
+  select * into v_sub
+  from public.exam_submissions s
+  where s.id = p_submission_id;
+
+  if not found then
+    raise exception 'proctoring_coverage: no attempt with id %', p_submission_id
+      using errcode = 'P0002';
+  end if;
+
+  -- SECURITY DEFINER, so the visibility rule the RLS policy on
+  -- `proctor_heartbeats` would have applied has to be spelled out here. Same
+  -- three audiences as `logs_select_own_or_supervisor`.
+  if not (
+    v_sub.student_id = auth.uid()
+    or public.owns_exam(v_sub.exam_id)
+    or public.is_exam_supervisor()
+  ) then
+    raise exception 'proctoring_coverage: attempt % is not yours to read', p_submission_id
+      using errcode = '42501';
+  end if;
+
+  v_end := coalesce(v_sub.submitted_at, v_now);
+
+  select count(*),
+         min(h.received_at),
+         max(h.received_at),
+         count(*) filter (where not h.camera_ok),
+         count(*) filter (where not h.monitoring_ok)
+    into v_beats, v_first, v_last, v_camera, v_monitor
+  from public.proctor_heartbeats h
+  where h.submission_id = p_submission_id;
+
+  -- Longest silence *between* stored beats, then the two ends: the head gap
+  -- (attempt started, nothing checked in yet) and the tail (client went quiet
+  -- before the attempt closed). All three are the same fact - a stretch with no
+  -- evidence of a running monitor - so the report keeps the largest.
+  select coalesce(max(g.seconds), 0) into v_gap
+  from (
+    select extract(epoch from (h.received_at
+             - lag(h.received_at) over (order by h.received_at)))::int as seconds
+    from public.proctor_heartbeats h
+    where h.submission_id = p_submission_id
+  ) g
+  where g.seconds is not null;
+
+  v_head := greatest(0, extract(epoch from (coalesce(v_first, v_end) - v_sub.started_at))::int);
+  v_tail := greatest(0, extract(epoch from (v_end - coalesce(v_last, v_sub.started_at)))::int);
+  v_gap  := greatest(v_gap, v_head, v_tail);
+
+  v_window   := greatest(0, extract(epoch from (v_end - v_sub.started_at)));
+  v_expected := floor(v_window / c_expected_interval)::int + 1;
+  v_ratio    := round(v_beats::numeric / greatest(v_expected, 1), 3);
+
+  -- Silence *now* only means something while the attempt is live; a closed
+  -- attempt's silence is already in the tail gap above.
+  v_silent := case
+    when v_sub.status = 'ongoing'
+      then greatest(0, extract(epoch from (v_now - coalesce(v_last, v_sub.started_at)))::int)
+    else 0
+  end;
+
+  if v_sub.status = 'ongoing' and v_now - v_sub.started_at < c_grace then
+    -- Too early to say anything: reported as a row (so a console can still show
+    -- "0 beats so far") but never as a gap.
+    v_reasons := array_append(v_reasons, 'attempt just started - too early to judge');
+  else
+    if v_beats = 0 then
+      v_flag := true;
+      v_reasons := array_append(v_reasons,
+        'the proctoring client never checked in - no evidence of monitoring for this attempt');
+    end if;
+    if v_gap > c_gap_threshold then
+      v_flag := true;
+      v_reasons := array_append(v_reasons,
+        format('proctoring went quiet for %ss (longest, including the ends)', v_gap));
+    end if;
+    if v_camera > 0 then
+      v_flag := true;
+      v_reasons := array_append(v_reasons,
+        format('the camera was not streaming on %s heartbeat(s)', v_camera));
+    end if;
+    if v_ratio < 0.5 then
+      v_flag := true;
+      v_reasons := array_append(v_reasons,
+        format('only %s of ~%s expected heartbeats arrived', v_beats, v_expected));
+    end if;
+    if v_monitor > 0 and v_camera = 0 then
+      -- Recorded, never flagged on its own: a beat with monitoring_ok = false and
+      -- the camera up is the client admitting it was backgrounded, which the gap
+      -- rules above will usually have caught anyway.
+      v_reasons := array_append(v_reasons,
+        format('%s heartbeat(s) reported monitoring inactive', v_monitor));
+    end if;
+    if v_flag then
+      v_reasons := array_append(v_reasons,
+        'flag for human review only - a gap can be a dropped network or a broken webcam; coverage never disqualifies an attempt');
+    elsif v_reasons = '{}' then
+      v_reasons := array_append(v_reasons,
+        format('%s heartbeats, largest gap %ss - proctoring was running throughout', v_beats, v_gap));
+    end if;
+  end if;
+
+  return query select
+    v_sub.id, v_sub.student_id, v_sub.exam_id, v_sub.status,
+    v_sub.started_at,
+    case when v_sub.submitted_at is null then null else v_end end,
+    v_beats, v_expected, v_ratio, v_first, v_last,
+    v_gap, v_silent, v_camera, v_monitor, v_flag,
+    array_to_string(v_reasons, '; ');
+end;
+$$;
+revoke execute on function public.proctoring_coverage(uuid) from public, anon;
+grant execute on function public.proctoring_coverage(uuid) to authenticated, service_role;
+
+comment on function public.proctoring_coverage(uuid) is
+  'Per-attempt heartbeat coverage: beats received vs expected, longest gap, silent time and camera-down beats, plus a risk_flag that marks the attempt for human review. Never changes exam_submissions.status - a gap can be a network drop, so coverage informs, it does not disqualify.';
+
+-- Every attempt in one sitting, for the supervisor who is about to decide
+-- something: one call, no joins. Visibility is filtered *before* the lateral call
+-- so a student asking about their exam gets their own row instead of an exception
+-- for a classmate's.
+create or replace function public.proctoring_coverage_for_exam(p_exam_id uuid)
+returns setof record
+language sql
+security invoker
+set search_path = public, pg_temp
+as $$
+  select c.*
+  from public.exam_submissions s
+  cross join lateral public.proctoring_coverage(s.id) c
+  where s.exam_id = p_exam_id
+    and (
+      s.student_id = auth.uid()
+      or public.owns_exam(s.exam_id)
+      or public.is_exam_supervisor()
+    )
+  order by c.risk_flag desc, c.last_beat_at nulls first;
+$$;
+revoke execute on function public.proctoring_coverage_for_exam(uuid) from public, anon;
+grant execute on function public.proctoring_coverage_for_exam(uuid) to authenticated, service_role;
+
+comment on function public.proctoring_coverage_for_exam(uuid) is
+  'proctoring_coverage() for every attempt in one exam, risk-flagged rows first. Returns setof record, so callers must name the columns: select * from proctoring_coverage_for_exam(...) as c(submission_id uuid, student_id uuid, exam_id uuid, status text, started_at timestamptz, ended_at timestamptz, beats int, expected_beats int, coverage_ratio numeric, first_beat_at timestamptz, last_beat_at timestamptz, longest_gap_seconds int, silent_seconds int, camera_down_beats int, monitoring_down_beats int, risk_flag boolean, reason text).';
 
 -- ---------------------------------------------------------------------
 -- The human decision behind the weighted threshold (RPC)

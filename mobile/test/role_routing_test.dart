@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:proctorguard/core/services/supabase_service.dart';
 import 'package:proctorguard/features/admin/domain/entities/managed_account.dart';
+import 'package:proctorguard/features/admin/domain/entities/profile_labels.dart';
 import 'package:proctorguard/features/admin/domain/entities/student_roster.dart';
 import 'package:proctorguard/features/admin/domain/repositories/admin_user_repository.dart';
 import 'package:proctorguard/features/admin/presentation/providers/admin_providers.dart';
@@ -171,6 +172,11 @@ void main() {
             studentName: name,
             examPageBuilder: builder,
             hardwareGate: gate ?? (_, _) async => true,
+            // The consent notice writes to `proctoring_consents` through
+            // Supabase; that screen has its own file
+            // (`proctor_consent_test.dart`), and these routing tests only need
+            // the gate to be passed.
+            consentGate: (_, _) async => true,
           ),
         ),
       );
@@ -1159,6 +1165,94 @@ void main() {
       expect(admin.passwordResets, isEmpty);
       await letSnackBarExpire(tester);
     });
+    testWidgets(
+      'the label dialog sends every column it showed, blanks included',
+      (tester) async {
+        useDesktopSurface(tester);
+        profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
+
+        await tester.pumpWidget(gateUnderTest(userId: rootAdmin.id));
+        await tester.pumpAndSettle();
+
+        // Aisha has no labels at all: the gap the dialog exists to close. The
+        // control is on every row, the caller's included, because the labels
+        // decide which papers an account is offered rather than what it may do.
+        await tester.tap(find.byKey(Key('admin-edit-labels-$aishaId')));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Labels for Aisha Bello'), findsOneWidget);
+        expect(
+          find.byKey(const Key('admin-edit-labels-warning')),
+          findsOneWidget,
+        );
+
+        await chooseFromDropdown(
+          tester,
+          const Key('admin-edit-faculty'),
+          'Science',
+        );
+        await chooseFromDropdown(
+          tester,
+          const Key('admin-edit-department'),
+          'Computer Science',
+        );
+        await chooseFromDropdown(tester, const Key('admin-edit-level'), '300');
+        await tester.enterText(
+          find.byKey(const Key('admin-edit-identity')),
+          'CSC/2021/041',
+        );
+        await tester.tap(find.byKey(const Key('admin-edit-labels-save')));
+        await tester.pumpAndSettle();
+
+        final sent = admin.lastLabelUpdate;
+        expect(sent?.$1, aishaId);
+        // Every key the endpoint understands, so a blank means *clear* rather
+        // than "leave whatever was there" — the distinction the function's own
+        // docs turn on. The staff ID is the identity this row's role does not
+        // use, and it travels back as it stands (null here).
+        expect(sent?.$2, <ProfileLabel, String?>{
+          ProfileLabel.faculty: 'Science',
+          ProfileLabel.department: 'Computer Science',
+          ProfileLabel.level: '300',
+          ProfileLabel.matricNumber: 'CSC/2021/041',
+          ProfileLabel.staffId: null,
+        });
+        expect(find.textContaining('Updated Aisha Bello'), findsOneWidget);
+        await letSnackBarExpire(tester);
+      },
+    );
+
+    testWidgets('a refused label correction is reported, not swallowed', (
+      tester,
+    ) async {
+      useDesktopSurface(tester);
+      profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
+      admin.labelError = const AdminAccountException(
+        'Only an administrator can correct labels.',
+      );
+
+      await tester.pumpWidget(gateUnderTest(userId: rootAdmin.id));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(Key('admin-edit-labels-$aishaId')));
+      await tester.pumpAndSettle();
+      await chooseFromDropdown(
+        tester,
+        const Key('admin-edit-level'),
+        '300',
+      );
+      await tester.tap(find.byKey(const Key('admin-edit-labels-save')));
+      await tester.pumpAndSettle();
+
+      // The dialog has closed by then, so the sentence has to reach the page's
+      // SnackBar or the administrator would believe the save worked.
+      expect(
+        find.text('Only an administrator can correct labels.'),
+        findsOneWidget,
+      );
+      expect(admin.lastLabelUpdate, isNull);
+      await letSnackBarExpire(tester);
+    });
   });
 }
 
@@ -1286,6 +1380,53 @@ class _FakeAdminUserRepository implements AdminUserRepository {
     if (failure != null) throw failure;
     passwordResets.add((userId, password));
   }
+
+  /// The most recent correction, so a test can prove the Edit dialog sent every
+  /// key — including the blank ones, which are what *clear* a column.
+  (String, Map<ProfileLabel, String?>)? lastLabelUpdate;
+  Object? labelError;
+
+  @override
+  Future<ManagedAccount> updateProfileLabels({
+    required String userId,
+    required Map<ProfileLabel, String?> labels,
+  }) async {
+    final failure = labelError;
+    if (failure != null) throw failure;
+    lastLabelUpdate = (userId, labels);
+
+    final index = accounts.indexWhere((account) => account.id == userId);
+    if (index < 0) {
+      throw const AdminAccountException('That account no longer exists.');
+    }
+    final before = accounts[index];
+    // Merged the way the function merges: a key that was sent replaces (or
+    // clears) its column, a key that was not sent leaves it alone.
+    final after = <ProfileLabel, String?>{
+      ...before.labelSnapshot,
+      ...labels,
+    };
+    final corrected = ManagedAccount(
+      id: before.id,
+      email: before.email,
+      fullName: before.fullName,
+      role: before.role,
+      createdAt: before.createdAt,
+      faculty: after[ProfileLabel.faculty],
+      department: after[ProfileLabel.department],
+      level: after[ProfileLabel.level],
+      matricNumber: after[ProfileLabel.matricNumber],
+      staffId: after[ProfileLabel.staffId],
+    );
+    accounts[index] = corrected;
+    return corrected;
+  }
+
+  @override
+  Future<LabelFixOutcome> correctStudentLabels(
+    List<StudentLabelCorrection> corrections,
+  ) async =>
+      throw UnimplementedError('not reached by the routing tests');
 }
 
 /// Stands in for `ProfileRepositoryImpl`: a swappable [behaviour] so a test can

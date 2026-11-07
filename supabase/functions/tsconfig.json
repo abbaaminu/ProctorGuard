@@ -32,7 +32,15 @@
     "skipLibCheck": true,
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
-    "isolatedModules": true
+    "isolatedModules": true,
+    /*
+     * Deno resolves a relative import by its file name, so a function that splits
+     * itself over two files imports `./catalogue.ts` with the extension
+     * (`admin-update-profile` does). A TypeScript server refuses that extension
+     * unless this is on — legal here only because `noEmit` is set: the emitter is
+     * `supabase functions deploy`, never `tsc`.
+     */
+    "allowImportingTsExtensions": true
   },
   /*
    * Every function in this folder, plus the type declarations above them, so a

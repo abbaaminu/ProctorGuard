@@ -14,6 +14,7 @@ import 'package:proctorguard/features/exam/domain/repositories/exam_repository.d
 import 'package:proctorguard/features/exam/presentation/pages/exam_taking_page.dart';
 import 'package:proctorguard/features/exam/presentation/widgets/exam_session_widgets.dart';
 import 'package:proctorguard/features/exam/presentation/widgets/mobile_exam_only.dart';
+import 'package:proctorguard/features/proctoring/domain/entities/heartbeat.dart';
 import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
 import 'package:proctorguard/features/proctoring/domain/repositories/proctoring_repository.dart';
 import 'package:proctorguard/features/proctoring/presentation/providers/audio_monitoring_provider.dart';
@@ -1710,6 +1711,11 @@ class _SilentProctoringRepository implements ProctoringRepository {
   bool online = true;
   final List<Violation> violations = <Violation>[];
 
+  /// Beats the exam screen asked for. Heartbeats are counted, never failed: this
+  /// fake exists to test the submit gate, and a liveness series that is not the
+  /// subject of the test must not be able to interfere with it.
+  int heartbeatCount = 0;
+
   @override
   Future<({int warningCount, bool disqualified, bool flagged})> logViolation({
     required String submissionId,
@@ -1724,6 +1730,25 @@ class _SilentProctoringRepository implements ProctoringRepository {
       // The weighted "under review" path has its own tests in
       // proctoring_notifier_test.dart.
       flagged: false,
+    );
+  }
+
+  @override
+  Future<HeartbeatAck> recordHeartbeat({
+    required String submissionId,
+    bool cameraOk = true,
+    bool monitoringOk = true,
+    String? appVersion,
+    DateTime? clientTime,
+    String? clientEventId,
+  }) async {
+    // Counted rather than ignored: a test can assert the exam screen opened the
+    // liveness series at all, which is the half of coverage the client owns.
+    heartbeatCount++;
+    return HeartbeatAck(
+      outcome: HeartbeatOutcome.recorded,
+      recordedAt: clientTime,
+      beatCount: heartbeatCount,
     );
   }
 

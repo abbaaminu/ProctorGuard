@@ -1,6 +1,3 @@
-import 'dart:convert';
-
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -9,24 +6,12 @@ import '../../data/student_roster_csv.dart';
 import '../../domain/entities/student_roster.dart';
 import '../../domain/repositories/admin_user_repository.dart';
 import '../providers/admin_providers.dart';
+import 'roster_file.dart';
 
-/// A roster file the administrator chose, already read off disk.
-///
-/// The contents arrive as a string rather than bytes so the widget (and a test)
-/// only has to deal with the file's text; the decoding lives in
-/// [_BulkStudentUploadWidgetState._pickWithPlatform].
-class RosterFile {
-  const RosterFile({required this.name, required this.contents});
-
-  /// The file's name, shown so the administrator can see which list is on
-  /// screen — "students.csv" is not a guarantee about its contents.
-  final String name;
-
-  final String contents;
-}
-
-/// Picks the roster file, or null when the administrator closed the picker.
-typedef RosterFilePicker = Future<RosterFile?> Function();
+// `RosterFile` / `RosterFilePicker` used to live here. They moved to
+// `roster_file.dart` when the label-correction card needed the same two types,
+// and are re-exported so every existing import of this file still sees them.
+export 'roster_file.dart';
 
 /// Bulk student creation from a CSV, embedded in the admin console.
 ///
@@ -247,25 +232,11 @@ class _BulkStudentUploadWidgetState
   /// The platform picker, used when no [BulkStudentUploadWidget.pickFile] was
   /// supplied.
   ///
-  /// `file_picker` 12 returns a [PlatformFile] rather than a path, and its bytes
-  /// are read on demand — which is what makes this work on the web, where the
-  /// picker (rightly) hands out no path at all.
-  Future<RosterFile?> _pickWithPlatform() async {
-    final file = await FilePicker.pickFile(
-      dialogTitle: 'Choose the student list',
-      type: FileType.custom,
-      allowedExtensions: const <String>['csv', 'txt'],
-    );
-    if (file == null) return null;
-
-    return RosterFile(
-      name: file.name,
-      // Malformed input is replaced rather than thrown on: one stray byte in a
-      // name should not hide the rest of the class from the parser, which
-      // reports what it cannot use far more precisely.
-      contents: utf8.decode(await file.readAsBytes(), allowMalformed: true),
-    );
-  }
+  /// The platform picker itself lives in `roster_file.dart`, shared with the
+  /// label-correction card.
+  Future<RosterFile?> _pickWithPlatform() => pickRosterFile(
+        dialogTitle: 'Choose the student list',
+      );
 
   /// Sends the parsed rows, one page at a time.
   ///

@@ -12,9 +12,15 @@ supabase/     Schema, migrations, seed data, and Edge Functions
 
 ## Staff features
 
-- **Administrators** can list accounts, create logins, change roles, and
-  permanently delete accounts from the Admin Dashboard. Creation and deletion
-  use the `admin-create-user` and `admin-delete-user` Edge Functions.
+- **Administrators** can list accounts, create logins, change roles, permanently
+  delete accounts, and correct the academic labels an account is targeted by —
+  one row at a time, or for a whole class from a CSV — from the Admin Dashboard.
+  Creation and deletion use the `admin-create-user` and `admin-delete-user` Edge
+  Functions; a label correction goes through `admin-update-profile`, because the
+  student it is for is refused that write by `guard_profile_labels()`. A blank or
+  misspelt `faculty` / `department` / `level` is the usual reason a student never
+  sees the paper set for their class, and repairing it is the administrator's job
+  rather than theirs.
 - **Lecturers** author the papers they own — multiple-choice, true/false,
   fill-in-the-blank and essay questions — publish them when they are ready, and
   mark the essays that come back. Only the paper's owner (or an administrator)
@@ -162,15 +168,111 @@ rather than left to be mistaken for more than it is.
 | A microphone that fails mid-session (unplugged, grant revoked, another app took the input) | Level is the only audio signal, so a dead mic stops speech being detected at all | The chip reports `Mic lost` / `Mic unavailable` / `Mic blocked` — **never a false "quiet"** — and the paper is held shut behind the opaque equipment block, with **Reconnect** / **Open settings** / **Leave** (the `unavailable` case stays on the indicator: a barrier nobody can clear would strand the student). A lost mic is an **unproctored gap, not a strike**, so no attempt is ended for it — but nothing can be read or typed behind the block either, so the gap cannot pass as a clean run |
 | Escape from the locked exam surface | Screen pinning (no Device Owner) and browser fullscreen can be left | An escape or a fullscreen exit becomes an `app_minimized` strike; the kiosk badge shows whether pinning is enforced or best-effort |
 | Detector evasion (rooted/virtualised device, camera spoof) | Client-side detectors can be defeated by a determined, technically capable student | Treat the client as untrusted: grading and the weighted strike rule are enforced **server-side** (`register_violation`, `submit_exam`, `resolve_flagged_attempt`) |
-| Evidence retention / privacy | Snapshots in `proctor-snapshots` are personal data with no automatic TTL by default | The bucket is **private**: a still is only ever readable through a 10-minute signed URL, and only the owning student or staff can mint one. Set a retention policy for your institution; snapshots are already deleted on an attempt reset, which `session_reset_logs` records (who cleared which attempt, for whom, and how much evidence went with it) |
+| A fabricated heartbeat series | A beat is the client's own claim: a patched build can report "camera up, monitor running" while nothing is running, and no app attestation (Play Integrity / App Attest) verifies the build yet | The series is a **positive** signal only - an attempt that never checked in, or went quiet, is shown as *not reporting*, never as clean. Writes go through `record_heartbeat()` alone (the table has no insert policy), on the server clock, idempotent per `client_event_id` and rate-limited to one stored beat per 8 s, so a client can neither backfill history nor rewrite it - and `proctoring_coverage()` can only flag an attempt for a human, never end one |
+| Evidence retention / privacy | Snapshots in `proctor-snapshots` are personal data, and no scheduled job deletes them unless an operator sets one up | The bucket is **private**: a still is only ever readable through a 10-minute signed URL, and only the owning student or staff can mint one. A `proctor_snapshots` window (30 days) lives in `public.retention_policies`, enforced by the `purge-snapshots` Edge Function or `public.purge_expired_snapshots()` - both keep the incident row and null its pointer - and a reset deletes an attempt's stills immediately, which `session_reset_logs` records. The photograph has a lifetime now; see [Scheduling the snapshot purge](#scheduling-the-snapshot-purge) for the job itself, which is deliberately left to the operator |
 
 The client is never the authority: **grading and the strike rule live on the
 server** (see `supabase/schema.sql`), so a modified or compromised client can
 lose proctoring signals but cannot change a result.
 
+**Did the proctoring client actually run?**
+
+An empty violation feed is ambiguous: it can mean *nothing happened* or *the
+client was not running*, and the two look identical on a dashboard. The app
+closes that gap with a **heartbeat**: every 15 seconds the exam page calls
+`public.record_heartbeat()`, which stores a row in `proctor_heartbeats` and
+stamps `exam_submissions.last_heartbeat_at` in the same transaction. The
+supervisor roster reads that column and shows one of three states per live
+attempt - *proctoring live*, *proctoring silent 3m* once a beat is 45 s overdue,
+or *no proctoring signal* for an attempt that never checked in, which is
+deliberately not worded as "no violations" - and the summary counts the attempts
+that are not reporting.
+`public.proctoring_coverage(submission_id)` turns the same series into numbers a
+supervisor can check (beats received vs expected for that attempt's own length,
+longest gap including the ends, camera-down beats, share of expected beats)
+with a `risk_flag` that means **look at this**, never *punish this*.
+
+What a heartbeat proves, and what it cannot:
+
+- it proves a client of ours was running and in reach of the server at that
+  moment, and it carries what that client said about the camera and the monitor
+  (`camera_ok`, `monitoring_ok`) - the "running but blind" case an empty log
+  feed used to hide completely;
+- it does **not** prove the client was honest. Nothing here is attested to
+  Google or Apple, so a patched build could call the RPC on a timer from a spare
+  room with the phone face down. App attestation (Play Integrity / App Attest)
+  is **not** implemented yet; that is the step that would make the claim
+  expensive to fake, and it is listed in the risk register below;
+- so a gap is a **flag for human review, never a disqualification**. Coverage
+  never touches `exam_submissions.status`: a dropped network and a closed laptop
+  produce exactly the same silence as a determined cheat, and only a person with
+  the rest of the evidence can tell them apart.
+
+**Is the student on record as having agreed to any of this?**
+
+Until the consent gate existed, no. The camera, the stills and the supervisor who
+reads them all rested on a paragraph in an instructions dialog nobody could prove
+had been shown: consent was a claim the client made by *starting*, which is not a
+record. It is a record now.
+
+- `public.proctoring_consents` holds one row per acceptance - **who**, **which
+  paper** (or `NULL` for a general acceptance that covers every paper), **which
+  wording version**, **when** (the server's clock) and from what client (the
+  transport's own `User-Agent`, not one the body claims).
+- `public.proctoring_consent_config` names the version currently in force. The
+  server decides what "current" means; the app carries the matching text
+  (`ProctorConsentConfig` in
+  `mobile/lib/features/exam/domain/entities/proctor_consent.dart`) and the two are
+  pinned together by `mobile/test/schema_contract_test.dart`. A build showing
+  older wording still records what it showed - `record_consent()` answers
+  `is_current: false` - and the screen tells the student to update rather than
+  letting them accept text the institution has replaced.
+- `submissions_insert_own_ongoing` **requires** a current-version acceptance for
+  that paper (or a general one) before an attempt row can exist, so a dismissed
+  dialog, a patched build or a hand-written POST gets a `42501` and no attempt.
+  The refusal lives in the same place as every other "you may not start this".
+- the record is write-once: `record_consent()` is the only writer, acceptance has
+  no UPDATE or DELETE policy and no grant, and the student can read their own
+  rows while the intervention tier (admin, supervisor) can read them too. A
+  consent record its subject can rewrite is not a record.
+- **what this does not do**: it records that a notice was accepted, not that it
+  was *read*, and it is not legal advice. The wording is plain-language
+  placeholder text with `TODO(institution)` markers wherever your notices office
+  must supply the real sentences (lawful basis, controller identity, complaints
+  route). Bump `ProctorConsentConfig.version` **and**
+  `proctoring_consent_config.current_version` together when they do.
+
+**And the photographs?**
+
+The consent notice says a still is deleted after 30 days, so something has to make
+that true. The `proctor_snapshots` window lives in `public.retention_policies`
+beside the incident and heartbeat windows, and there are two ways to enforce it:
+
+- the **`purge-snapshots` Edge Function** (supported path on Supabase): it goes
+  through the Storage API, so the file goes with the row, deletes only objects
+  older than the window whose attempt is **not** `ongoing`, and then nulls
+  `proctoring_logs.snapshot_url` for each. The incident row survives - the flag
+  happened, the photograph expired;
+- **`public.purge_expired_snapshots(p_older_than, p_dry_run)`** (fallback, for a
+  deployment that cannot reach the Storage API): the same rules, but it can only
+  delete Storage's *bookkeeping* row, so the object in the bucket is left behind
+  and - because the row is gone - becomes invisible to the Storage API from then
+  on. **Do not run both on the same window.** Use the function only where the
+  Edge Function cannot run.
+
+Neither is scheduled by the migrations: a job that deletes photographs is an
+operator's decision. See
+[Scheduling the snapshot purge](#scheduling-the-snapshot-purge).
+
 ## Getting started
 
 1. Create a Supabase project and run `supabase/schema.sql` in its SQL editor.
+   **A fresh project needs only that file.** `schema.sql` is the whole database —
+   tables, policies, RPCs, the storage bucket, the seeded catalogues - and every
+   file in `supabase/migrations/` is an *upgrade path for a project that already
+   exists*. Applying a migration to a new project is unnecessary, and for the two
+   files called out in the warning below it is not harmless either: they cannot be
+   re-run once `20261104090100_weighted_strikes_and_flagged_review.sql` has run.
    For an existing project, run any unapplied files in `supabase/migrations/`;
    each migration documents its purpose and verification steps, and one can be
    applied on its own through the CLI:
@@ -194,6 +296,10 @@ lose proctoring signals but cannot change a result.
    supabase db query --linked -f supabase/migrations/20261104090000_violation_weights.sql
    supabase db query --linked -f supabase/migrations/20261104090100_weighted_strikes_and_flagged_review.sql
    supabase db query --linked -f supabase/migrations/optional_question_shuffling.sql
+   supabase db query --linked -f supabase/migrations/20261105090000_proctor_heartbeats.sql
+   supabase db query --linked -f supabase/migrations/retention_policy.sql
+   supabase db query --linked -f supabase/migrations/20261106090000_proctoring_consents.sql
+   supabase db query --linked -f supabase/migrations/20261106090100_snapshot_retention.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -256,25 +362,118 @@ lose proctoring signals but cannot change a result.
    `…090800_snapshot_purge_not_live_attempt` (a snapshot is purgeable only once its
    attempt row is gone — the order the console's reset already uses, which is what
    stops a live sitting's evidence being deleted).
-   Each file is independently re-runnable and its header names its prerequisites and
-   the file it must follow. Two older files recreate policies these replace:
+   Each file's header names its prerequisites and the file it must follow.
+   Re-running the nine in the order listed above is safe, with one exception that
+   arrived later: `…090700_register_violation_snapshot_path` recreates
+   `register_violation()` with the two-column `(warning_count, disqualified)`
+   return shape, and `20261104090100_weighted_strikes_and_flagged_review.sql`
+   replaces that function with a three-column one. `create or replace` cannot
+   change a return type, so once `…04090100` is installed, re-running `…090700` (or
+   `secure_exam_access_and_deadlines.sql`, which installs the same two-column
+   version) fails with `42P13` — "cannot change return type of existing function" —
+   with the statements above it in the file already applied. **Do not re-run either
+   file once `…04090100` is in place**; if one is run by mistake, re-apply
+   `20261104090100_weighted_strikes_and_flagged_review.sql` (which drops the
+   two-column signature before recreating it, so it repairs the project either
+   way).
+   Two older files recreate policies these replace:
    re-running `private_proctor_snapshots.sql` undoes `…090500`/`…090800`, and
    re-running `staff_attempt_resets.sql` undoes `…090600`/`…090800` — re-apply the
    `…0905*`, `…0906*` and `…0908*` files if that ever happens.
    `optional_question_shuffling.sql` adds the `shuffle_questions` column and is
    independent of every other migration.
-2. Deploy the account-management functions:
+2. Deploy the account-management functions, and the snapshot purge:
    ```powershell
    supabase functions deploy admin-create-user
    supabase functions deploy admin-delete-user
    supabase functions deploy admin-reset-password
+   supabase functions deploy admin-update-profile
+   supabase functions deploy purge-snapshots
    ```
    The project supplies `SUPABASE_URL`, `SUPABASE_ANON_KEY` (or
    `SUPABASE_PUBLISHABLE_KEY`), and `SUPABASE_SERVICE_ROLE_KEY` to the
    functions. The service-role key is used only on Supabase servers.
+   `admin-update-profile` is what the console's Edit dialog and its corrections
+   file call: it checks the labels against the app's academic catalogue before
+   writing (the columns are free text, so an unvalidated `"computer science"`
+   beside a paper's `"Computer Science"` would be a correction that fixed
+   nothing), and it answers a *page* of a corrections file with
+   `{ updated, failed }` — one refused row travels beside the rows written rather
+   than failing the request.
+   `purge-snapshots` is deployed **without** `--no-verify-jwt`: the platform's
+   JWT check is not its authorization decision (that is the role check inside it,
+   or the service-role key a scheduler presents), but leaving it on means a
+   forged or expired token never reaches the code.
 3. Optionally run `supabase/seed.sql` to load demo accounts, exams, and
    questions. Demo credentials and account roles are documented at the top of
    that file.
+## Scheduling the snapshot purge
+
+Nothing in this repository schedules a photograph deletion. The function and the
+Edge Function are both there, the window is a row, and the decision - *when*, and
+*with which appeals period in front of you* - is the institution's. Two
+supported routes, both run at an hour when no sitting is closing:
+
+**Dashboard -> Edge Functions -> Schedules (simplest).** Pick `purge-snapshots`,
+choose a daily cron (`7 4 * * *` matches the other retention jobs), and set the
+authorization header to `Bearer <service-role key>`. No request body is needed:
+the window comes from `retention_policies`, so changing it there changes the job
+without touching the schedule.
+
+**pg_cron from the database.** `pg_cron` plus `pg_net` (Dashboard -> Database ->
+Extensions), then:
+
+```sql
+select cron.schedule(
+  'proctor-snapshots-retention',
+  '7 4 * * *',
+  $$
+  select net.http_post(
+    url     := 'https://<project-ref>.supabase.co/functions/v1/purge-snapshots',
+    headers := jsonb_build_object(
+                 'Content-Type',  'application/json',
+                 'Authorization', 'Bearer <service-role key>'),
+    body    := '{}'::jsonb
+  );
+  $$
+);
+```
+
+Both routes end up in the same place. **Dry run first**, either by hand or as a
+one-off: it reports what would go and deletes nothing.
+
+```powershell
+# a person, signed in as an admin - the function checks profiles.role
+curl -X POST "https://<project-ref>.supabase.co/functions/v1/purge-snapshots" `
+  -H "Authorization: Bearer <admin access token>" `
+  -H "Content-Type: application/json" `
+  -d '{"dry_run":true}'
+# { "bucket":"proctor-snapshots", "window_days":30, "dry_run":true,
+#   "folders":412, "scanned":95, "expired":7, "removed":0, "nulled":0,
+#   "kept_live":2, "capped":false }
+```
+
+Things worth knowing before you turn it on:
+
+- it **never** touches a still whose attempt is still `ongoing`, whatever its age
+  (an abandoned attempt therefore keeps its evidence), and it never touches
+  anything inside the window;
+- it nulls `proctoring_logs.snapshot_url` for each object it removes and keeps the
+  incident row: after the purge the log still says *looking_away at 14:02*, and
+  the still is gone;
+- it responds `"capped": true` when a backlog is larger than one run
+  (`MAX_OBJECTS` in `supabase/functions/purge-snapshots/index.ts`), which means
+  "run me again", not "done";
+- the **SQL fallback** (`public.purge_expired_snapshots(p_dry_run => true)`) is
+  for a deployment that cannot reach the Storage API. It removes Storage's
+  bookkeeping row only, so the object stays in the bucket and becomes invisible
+  to the Storage API afterwards. Run the Edge Function, or that function, never
+  both on the same window;
+- an hour of distance from `proctoring-logs-retention` (03:23) and
+  `proctor-heartbeats-retention` (04:07) keeps three deleting jobs from walking
+  `exam_submissions` at the same moment.
+
+
 4. See [mobile/README.md](./mobile/README.md) for Flutter setup, configuration,
    and run/build commands.
 
@@ -306,13 +505,25 @@ lose proctoring signals but cannot change a result.
   accounts — a field left blank is sent as nothing and the column stays `NULL` —
   but the roster has no faculty, department, level, matriculation number or staff
   ID to show, no paper can be targeted at a cohort, and a filled-in label is
-  refused with a message naming the file to apply.
+  refused with a message naming the file to apply. Correcting a label afterwards
+  — the Edit dialog, or a class's corrections file — goes through
+  `admin-update-profile`, which answers the missing column by that same file name
+  rather than as a database fault.
 - Apply the nine `supabase/migrations/2026110309*.sql` files, in filename order,
   on every project (they are the exam-visibility hardening pass: the label guard,
   the named cohort rule, the paper list, the question feed, the attempt insert, the
   snapshot read policy, the attempt delete, the snapshot-path check and the snapshot
   purge). They are re-runnable, and a fresh `schema.sql` already carries all nine —
-  the only reason to run them is an existing project. Two older files recreate
+  the only reason to run them is an existing project. One exception to
+  "re-runnable": `20261103090700_register_violation_snapshot_path.sql` cannot be
+  re-run after `20261104090100_weighted_strikes_and_flagged_review.sql`, which
+  replaces its function with a wider return shape (`create or replace` cannot
+  change a return type: the re-run fails with `42P13` and leaves the caller
+  thinking the path rule was re-applied). If that happens, re-apply
+  `20261104090100_weighted_strikes_and_flagged_review.sql`.
+   `secure_exam_access_and_deadlines.sql` installs the same two-column
+   version, so that warning covers it too, and the same re-apply repairs it.
+   Two older files recreate
   policies they replace, so re-apply `20261103090500_snapshot_read_policy.sql`,
   `…090600_submissions_delete_supervisor.sql` and
   `…090800_snapshot_purge_not_live_attempt.sql` after re-running
@@ -333,17 +544,43 @@ lose proctoring signals but cannot change a result.
   `shuffle_questions` column does not exist: the authoring console reports the
   missing column by name, and student-facing paths default to `false` (no
   shuffle). It is additive and re-runnable.
+- Apply `supabase/migrations/20261105090000_proctor_heartbeats.sql` (a new
+  project gets all of it from `schema.sql`). It adds
+  `exam_submissions.last_heartbeat_at`, the `proctor_heartbeats` table and the two
+  functions the dashboard reads - `record_heartbeat()` and
+  `proctoring_coverage()`. It is additive and re-runnable; until it runs there is
+  no pulse to show, every live attempt reads as *no proctoring signal*, and that
+  is the honest reading - "no data" is not "no violations".
 - Apply `supabase/migrations/retention_policy.sql` and enable `pg_cron`
-  (Dashboard → Database → Extensions). `proctoring_logs` is the one table that
-  grows without bound; the migration seeds a 30-day window in
+  (Dashboard → Database → Extensions). `proctoring_logs` and
+  `proctor_heartbeats` are the tables that grow without bound; the migration
+  seeds a 30-day window in
   `public.retention_policies` and schedules a nightly purge of rows belonging to
   **closed** attempts. Rows of an attempt still `ongoing` are never deleted, so the
-   weighted score cannot be eroded. Without `pg_cron` the function is still created
+   weighted score cannot be eroded and a report still being written cannot lose
+  beats. Without `pg_cron` the functions are still created
   and can be called from the SQL editor or an external scheduler:
-  `select public.purge_expired_proctoring_logs(p_dry_run => true);` first. The
-  per-attempt snapshots are **not** deleted by it — see the file's header for why
+  `select public.purge_expired_proctoring_logs(p_dry_run => true);` and
+  `select public.purge_expired_proctor_heartbeats(p_dry_run => true);` first. The
+  per-attempt snapshots are **not** deleted by either — see the file's header for why
   (`storage.objects` deletes through SQL orphan the S3 object) and use a Storage
   lifecycle rule for the bucket.
+- Apply `supabase/migrations/20261106090000_proctoring_consents.sql` **together
+  with the app build that carries the consent screen**. It adds the consent
+  tables and `record_consent()`, and it recreates
+  `submissions_insert_own_ongoing` with one new arm: an attempt cannot be created
+  until the student has accepted the notice currently in force. Applied against an
+  older client, every start is refused with a `42501` until that build ships - so
+  deploy both, and re-apply this file after anything that recreates that policy
+  (`20261103090400_submissions_insert_own_ongoing.sql` does). A fresh project gets
+  all of it from `schema.sql`.
+- Apply `supabase/migrations/20261106090100_snapshot_retention.sql` after
+  `retention_policy.sql`. It seeds the `proctor_snapshots` (30 day), `profiles`
+  (180 day) and `exam_submissions` (180 day) windows - **align the two 180s with
+  your appeals period** - and creates `public.purge_expired_snapshots()`, the
+  fallback purge described in
+  [And the photographs?](#and-the-photographs). It schedules nothing: no still is
+  deleted until an operator runs a purge, which is the next section.
 - Set `--dart-define=SENTRY_DSN=...` on a build that should report crashes
   (`mobile/README.md#crash-reporting-sentry--off-until-configured`). Unset is the
   default and installs nothing. A self-hosted Sentry also needs its ingest origin
@@ -354,14 +591,17 @@ lose proctoring signals but cannot change a result.
   self-hosted Supabase also needs its API/websocket origin added there
   (`mobile/README.md#content-security-policy-the-browser-build`).
 - Ensure the `admin-create-user`, `admin-delete-user` and `admin-reset-password`
-  functions are deployed.
+  functions are deployed, and `purge-snapshots` if you want the snapshot window
+  enforced through the Storage API (see
+  [Scheduling the snapshot purge](#scheduling-the-snapshot-purge)).
 - Set the `ALLOWED_ORIGIN` environment variable on each deployed admin function
-  to a comma-separated list of permitted origins (for example,
-  `https://console.example.com,https://admin.example.com`). The function's CORS
-  response echoes the request's `Origin` header only when it is in that list, and
-  adds `Vary: Origin`. If the variable is not set the function logs a warning
-  and keeps the previous wide-open behaviour (`Access-Control-Allow-Origin: *`),
-  so existing deployments are not broken before the variable is configured.
+  **and on `purge-snapshots`** to a comma-separated list of permitted origins (for
+  example, `https://console.example.com,https://admin.example.com`). The
+  function's CORS response echoes the request's `Origin` header only when it is in
+  that list, and adds `Vary: Origin`. If the variable is not set the function logs
+  a warning and keeps the previous wide-open behaviour
+  (`Access-Control-Allow-Origin: *`), so existing deployments are not broken
+  before the variable is configured.
 - Configure the Flutter app with the Supabase project URL and a publishable
   client key. Never embed a service-role or secret key in the app.
 - Review the private `proctor-snapshots` bucket's retention policy in

@@ -33,7 +33,11 @@
 --   (b) submissions_insert_own_ongoing: an out-of-cohort student cannot start a
 --       paper at all; a student cannot start a paper before its window opens, nor a
 --       draft. (This block used to assert the *opposite* - "both inserts succeed,
---       targeting is not checked on insert" - which was the hole.)
+--       targeting is not checked on insert" - which was the hole.) Every student
+--       fixture is seeded with a *general* consent in the fixtures block, so a
+--       refusal here is the cohort rule, the window or the draft - never the
+--       consent arm the same policy carries (proven in
+--       `proctoring_consents_check.sql`).
 --   (c) exam_allowed_students still overrides the labels, for read and for insert.
 --   (d) whitespace-only labels are blank after btrim.
 --   (e) guard_profile_labels: a student cannot insert a row carrying academic
@@ -121,6 +125,18 @@ begin
       (v_closed, 'Closed a minute ago', v_lecturer_a, 60, true,
        'Science', 'CS', '300'),
       (v_draft, 'Lecturer A draft', v_lecturer_a, 60, false, 'Science', 'CS', '300');
+
+  -- The consent gate (`20261106090000_proctoring_consents.sql`) makes an attempt
+  -- impossible without an acceptance, and this file is about the cohort rule, the
+  -- window and the schedule - not about consent. So every student fixture accepts
+  -- the notice *generally* (exam_id = NULL, the shape the policy accepts for every
+  -- paper) up front, which keeps each refusal below meaning the rule its block is
+  -- testing. The gate itself is proven in `proctoring_consents_check.sql`.
+  insert into public.proctoring_consents (student_id, exam_id, consent_version)
+  select p.id, null, cc.current_version
+    from public.profiles p
+    cross join public.proctoring_consent_config cc
+   where p.role = 'student' and cc.id = 1;
 
   update public.exams set starts_at = now() + interval '1 day'
    where id = v_later;

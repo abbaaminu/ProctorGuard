@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>ProctorGuard detector evaluation</title></head>
+<!--
+  The page a clip is replayed on (driven by lib/replay.mjs).
+
+  It reproduces only what the detector actually depends on:
+
+    * the DOM Flutter builds for the `camera_web` platform view - a
+      <flt-platform-view> appended to <flt-glass-pane>'s light DOM and revealed
+      through an open shadow root's slot - because that tree is what the detector
+      has to find the <video> in;
+    * the Dart hook, `window.proctorGuardFaceSignal`, installed exactly as
+      `WebFaceSignalSource` installs it during an attempt;
+    * the shipped detector itself, served from mobile/web/ by the runner, with the
+      MediaPipe assets it lazily imports at the paths it imports them from.
+
+  The camera is a real live track, not a video element with a `src`: a `<video>`
+  playing the clip is painted onto a canvas every frame and the canvas is
+  captured with `captureStream()`, so the preview carries a genuine MediaStream
+  (`inactiveReason` is `no-stream` for anything else) and the detector sees what
+  a browser camera would show it.
+
+  Every verdict is stamped with the *clip's own* `currentTime`
+  (`?clip=<file>`, served under /clip/). Wall-clock time would let a slow machine
+  stretch a two-second look-away into a five-second one, and a fast one shrink it.
+
+  `?maxtime=<seconds>` is a hard cap on the replay: a clip that never ends must
+  cost one clip, not the run. `?fps=<n>` sets the capture rate (default 30) so a
+  slow machine can be made to deliver frames the way a phone does.
+
+  The page decides nothing. It reports `{ clip, duration, verdicts, frames,
+  model, errors, complete }` on `window.__result`, and `lib/judge.mjs` - the port
+  of `WebFacePresenceMonitor` - decides what those verdicts are worth.
+-->
+<body style="margin:0;background:#101010;color:#ddd;font:12px monospace">
+<pre id="log" style="margin:0;padding:4px"></pre>
+<flutter-view style="display:block;position:absolute;left:0;top:0;width:640px;height:480px">
+  <flt-glass-pane id="glass" style="display:block;position:absolute;left:0;top:0;width:640px;height:480px"></flt-glass-pane>
+</flutter-view>
+<script>
+(function () {
+  'use strict';
+
+  window.__errors = [];
+  window.addEventListener('error', function (event) {
+    window.__errors.push(String(event.message) + ' @' + event.filename + ':' + event.lineno);
+  });
+  // A rejected `import()` of the model is not an `error` event, so the one failure
+  // this page is most likely to produce has to be caught here.
+  window.addEventListener('unhandledrejection', function (event) {
+    var reason = event && event.reason;
+    window.__errors.push(
+      'unhandledrejection: ' + String(reason && reason.message ? reason.message : reason)
+    );
+  });
+
+  var params = new URLSearchParams(location.search);
+  var clip = params.get('clip') || '';
+  var maxSeconds = Number(params.get('maxtime') || '180');
+  var fps = Math.min(60, Math.max(5, Number(params.get('fps') || '30')));
+
+  function note(text) {
+    var line = document.createElement('div');
+    line.textContent = text;
+    document.getElementById('log').appendChild(line);
+    while (document.getElementById('log').childNodes.length > 40) {
+      document.getElementById('log').removeChild(document.getElementById('log').firstChild);
+    }
+  }
+
+  if (!clip) {
+    window.__fatal = 'no ?clip= given';
+    return;
+  }
+
+  window.__partial = { duration: null, verdicts: [], frames: 0, model: 'none', errors: window.__errors };
+
+  // ---- The DOM Flutter builds for a platform view -------------------------
+  // Exactly what the engine does: the <flt-platform-view> wrapper is appended to
+  // <flt-glass-pane>'s LIGHT DOM and revealed through an open shadow root slot.
+  var glass = document.getElementById('glass');
+  var shadow = glass.attachShadow({ mode: 'open' });
+  var slotWrapper = document.createElement('flt-platform-view-slot');
+  slotWrapper.style.cssText =
+    'position:absolute;left:0;top:0;width:640px;height:480px;pointer-events:auto;' +
+    'transform:matrix(1,0,0,1,0,0) rotate(0deg)';
+  var slot = document.createElement('slot');
+  slot.name = 'flt-pv-slot-7';
+  slotWrapper.appendChild(slot);
+  shadow.appendChild(slotWrapper);
+
+  var wrapper = document.createElement('flt-platform-view');
+  wrapper.id = 'flt-pv-7';
+  wrapper.setAttribute('slot', 'flt-pv-slot-7');
+  wrapper.style.cssText = 'position:absolute;left:0;top:0;width:640px;height:480px';
+
+  var holder = document.createElement('div');
+  holder.style.cssText = 'object-fit:cover;height:100%;width:100%';
+  // The preview `camera_web` builds: muted, inline, and playing — the three
+  // properties `inactiveReason` refuses to proctor without.
+  var preview = document.createElement('video');
+  preview.autoplay = false;
+  preview.muted = true;
+  preview.setAttribute('playsinline', '');
+  preview.style.cssText = 'pointer-events:none;width:100%;height:100%;object-fit:cover';
+  holder.appendChild(preview);
+  wrapper.appendChild(holder);
+  glass.appendChild(wrapper);
+
+  window.__preview = preview;
+
+  // ---- The Dart hook ------------------------------------------------------
+  window.__verdicts = [];
+  window.proctorGuardFaceSignal = function (message) {
+    var verdict = { message: String(message), t: clipTime() };
+    window.__verdicts.push(verdict);
+    window.__partial.verdicts = window.__verdicts;
+    note('hook <- ' + verdict.message + ' @' + verdict.t.toFixed(2) + 's');
+  };
+
+
+
+  // ---- The clip, played off-screen ----------------------------------------
+  // Never appended to the document: a `<video>` with a `src` in the tree would be
+  // a candidate for the detector's `findVideo`, and the detector must proctor the
+  // preview, not the file.
+  var source = document.createElement('video');
+  source.preload = 'auto';
+  source.muted = true;
+  source.setAttribute('playsinline', '');
+  source.src = '/clip/' + encodeURIComponent(clip);
+
+  function clipTime() {
+    var now = source.currentTime;
+    return Number.isFinite(now) && now > 0 ? now : 0;
+  }
+
+  // ---- The camera the detector watches ------------------------------------
+  var canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 480;
+  var ctx = canvas.getContext('2d', { alpha: false });
+
+  // The warm-up picture: animated grey noise, i.e. a live, non-blank camera with
+  // nobody in front of it. The detector only starts loading its model once a camera
+  // is live, so the camera has to be live *before* the clip plays — otherwise the
+  // first seconds of every clip would be judged by a page that cannot measure a
+  // pose, and a `looking_away` that starts at t=1s would be a miss by construction.
+  var noise = document.createElement('canvas');
+  noise.width = 64;
+  noise.height = 48;
+  var noiseCtx = noise.getContext('2d');
+  var noiseData = noiseCtx.createImageData(64, 48);
+
+  function paintNoise() {
+    var pixels = noiseData.data;
+    for (var i = 0; i < pixels.length; i += 4) {
+      var value = 60 + Math.random() * 130;
+      pixels[i] = value;
+      pixels[i + 1] = value;
+      pixels[i + 2] = value;
+      pixels[i + 3] = 255;
+    }
+    noiseCtx.putImageData(noiseData, 0, 0);
+    ctx.drawImage(noise, 0, 0, canvas.width, canvas.height);
+  }
+
+  // `object-fit: cover`, so a 16:9 clip is cropped into the 4:3 preview the app
+  // builds, instead of being stretched into a shape no face has.
+  function paintClip() {
+    var width = source.videoWidth;
+    var height = source.videoHeight;
+    if (!width || !height) return;
+    var scale = Math.max(canvas.width / width, canvas.height / height);
+    var drawnWidth = width * scale;
+    var drawnHeight = height * scale;
+    ctx.drawImage(
+      source,
+      (canvas.width - drawnWidth) / 2,
+      (canvas.height - drawnHeight) / 2,
+      drawnWidth,
+      drawnHeight
+    );
+  }
+
+  var stream = canvas.captureStream(fps);
+  window.__stream = stream;
+  preview.srcObject = stream;
+  preview.play().then(null, function (error) {
+    // Autoplay is allowed by the runner's own flag; a refusal here means the page
+    // cannot be a camera at all, which is a fatal for the run, not a zero score.
+    window.__fatal =
+      'preview.play() refused: ' + String(error && error.message ? error.message : error);
+  });
+
+
+  source.addEventListener('error', function () {
+    var code = source.error ? source.error.code : '?';
+    window.__fatal = 'cannot play ' + clip + ' (media error ' + code + ')';
+  });
+
+  // ---- Warm up, then play -------------------------------------------------
+  var phase = 'warmup';
+  var frames = 0;
+  var startedAtWall = null;
+  var duration = null;
+  var maxWallMs = (Number.isFinite(maxSeconds) && maxSeconds > 0 ? maxSeconds : 180) * 1000;
+
+  function detector() {
+    return window.ProctorGuardFaceDetector || null;
+  }
+
+  /// Waits until the page either has a face model or has given up on one.
+  ///
+  /// Polling `diagnostics()` is the detector's own answer to "why is nothing being
+  /// flagged", so the wait ends on the same evidence a human would use: `ready`,
+  /// `failed` (it tried and could not) or `off` (a host disabled it). A page that
+  /// can only count pixels is a valid evaluation target — an old browser — and it
+  /// must not hang the run waiting for a model it will never have.
+  function modelSettled() {
+    var instance = detector();
+    if (!instance || !instance.diagnostics) return false;
+    var state = instance.diagnostics().modelState;
+    return state === 'ready' || state === 'failed' || state === 'off';
+  }
+
+  function modelName() {
+    var instance = detector();
+    if (!instance || !instance.diagnostics) return 'none';
+    return instance.diagnostics().faceModel || 'none';
+  }
+
+  function startClip() {
+    if (phase !== 'warmup') return;
+    phase = 'clip';
+    // The verdicts collected while the model was loading were about a noise camera.
+    // Cleared in place, because the hook and `__partial` hold this same array.
+    window.__verdicts.length = 0;
+    startedAtWall = Date.now();
+    window.__partial = {
+      duration: null,
+      verdicts: window.__verdicts,
+      frames: frames,
+      model: modelName(),
+      errors: window.__errors,
+    };
+    note('clip started: ' + clip);
+    source.play().then(null, function (error) {
+      window.__fatal =
+        'clip.play() refused: ' + String(error && error.message ? error.message : error);
+    });
+  }
+
+  // A detector that never loads must not hold the run hostage: the clip is played
+  // anyway, and every verdict the page cannot produce is a miss the report shows.
+  var warmupDeadline = Date.now() + 30000;
+
+  function frame() {
+    if (phase === 'done') return;
+    if (phase === 'warmup') {
+      paintNoise();
+      frames += 1;
+      if (!modelSettled() && Date.now() < warmupDeadline) {
+        requestAnimationFrame(frame);
+        return;
+      }
+      if (!modelSettled()) note('warm-up gave up after 30s; no face model');
+      startClip();
+      requestAnimationFrame(frame);
+      return;
+    }
+
+    // A buffer underrun paints nothing, so the preview freezes — which is what a
+    // browser shows when a decoder stalls, and the detector is entitled to call a
+    // stalled picture what it is. Painting something else would invent evidence the
+    // app would never see.
+    if (source.readyState >= 2) {
+      paintClip();
+      frames += 1;
+    }
+    if (duration === null && Number.isFinite(source.duration) && source.duration > 0) {
+      duration = source.duration;
+      window.__partial.duration = duration;
+    }
+
+    // The last fraction of a second is not judged: a `<video>` that reaches its end
+    // pauses, and a paused preview is `no_face` — a measurement artefact that would
+    // otherwise put a violation at the end of every clip. A quarter of a second is
+    // shorter than the app's sustain, so nothing that was already running is lost.
+    if (duration !== null && source.currentTime >= duration - 0.25) {
+      finish(true);
+      return;
+    }
+    if (source.ended) {
+      finish(true);
+      return;
+    }
+    if (Date.now() - startedAtWall > maxWallMs) {
+      note('maxtime reached');
+      finish(false);
+      return;
+    }
+    requestAnimationFrame(frame);
+  }
+
+  function finish(complete) {
+    if (phase === 'done') return;
+    phase = 'done';
+    var instance = detector();
+    try {
+      if (instance && instance.stop) instance.stop();
+    } catch (error) {
+      /* stopping is best-effort: the result below is what matters */
+    }
+    // A tick may already be in flight, and after `stop()` its answer would be about
+    // a preview that is no longer playing. The pause is long enough for it to land
+    // and be discarded, and short enough that nobody notices it.
+    setTimeout(function () {
+      publish(complete);
+    }, 400);
+  }
+
+  function publish(complete) {
+    var instance = detector();
+    var diag = null;
+    try {
+      diag = instance && instance.diagnostics ? instance.diagnostics() : null;
+    } catch (error) {
+      diag = null;
+    }
+    window.__result = {
+      clip: clip,
+      duration: duration,
+      verdicts: window.__verdicts.slice(),
+      frames: frames,
+      model: (diag && diag.faceModel) || 'none',
+      modelState: diag ? diag.modelState : 'unknown',
+      modelError: diag ? diag.modelError : null,
+      // `reason` is why the last tick saw no usable picture. A run whose every clip
+      // says `hidden` or `no-frame-yet` is a broken harness, not a blind detector,
+      // and this is the field that says so.
+      reason: diag ? diag.reason : null,
+      complete: complete,
+      errors: window.__errors.slice(),
+    };
+    note(
+      'result: ' +
+        window.__result.verdicts.length +
+        ' verdicts, model ' +
+        window.__result.model +
+        ', reason ' +
+        window.__result.reason
+    );
+  }
+
+  // ---- Go ----------------------------------------------------------------
+
+  // The clip starts as soon as the model has settled, and never later than the
+  // warm-up deadline: a page that can only count pixels is a valid target.
+  requestAnimationFrame(frame);
+})();
+</script>
+<script src="/detector.js"></script>
+</body>
+</html>

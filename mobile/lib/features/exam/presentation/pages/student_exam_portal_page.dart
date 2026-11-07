@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:supabase_flutter/supabase_flutter.dart' show PostgrestException;
 
+import '../../../../core/di/providers.dart';
 import '../../../../core/services/crash_reporting.dart';
 import '../../../../core/services/supabase_service.dart' show SupabaseService;
 import '../../../../core/widgets/responsive_layout.dart';
-import '../../../proctoring/presentation/providers/proctoring_provider.dart';
 import '../../domain/entities/exam.dart';
 import '../../domain/entities/exam_submit_result.dart';
 import '../../domain/entities/submission.dart';
@@ -12,6 +13,7 @@ import '../providers/exam_providers.dart';
 import '../widgets/exam_instructions_dialog.dart';
 import '../widgets/mobile_exam_only.dart';
 import '../widgets/published_exam_list.dart';
+import 'exam_consent_page.dart';
 import 'exam_hardware_gate_page.dart';
 import 'exam_taking_page.dart';
 
@@ -32,15 +34,30 @@ typedef HardwareGateRequest = Future<bool> Function(
   Exam exam,
 );
 
+/// Shows the proctoring consent notice and reports whether the student accepted.
+///
+/// Called **before** the hardware gate, so the notice is the first thing a
+/// student meets when they choose a paper - it explains the camera the gate is
+/// about to switch on. Injectable for the same reason as the gate: the real screen
+/// writes to `proctoring_consents` through Supabase, which a widget test cannot
+/// reach, and `submissions_insert_own_ongoing` refuses an attempt without that
+/// row - so a test driving the portal passes a stub that answers `true`.
+typedef ConsentGateRequest = Future<bool> Function(
+  BuildContext context,
+  Exam exam,
+);
+
 /// The student home: every published exam (CS101, MAT201, …) and the state of
 /// this student's own attempt at each one.
 ///
-/// Tapping an exam starts or resumes its submission and pushes the session
-/// screen — [ExamTakingPage] by default, which is where the camera/mock feed,
-/// question navigation, kiosk pinning and the browser guards live. An attempt
-/// that is already `submitted` or `disqualified` is reported instead of being
-/// reopened: the server owns that state, and re-sitting a closed attempt would
-/// only produce a rejected write.
+/// Tapping an exam walks three gates before anything is written: the consent
+/// notice ([ExamConsentPage], once per notice version), the device check
+/// ([ExamHardwareGatePage]), and only then `startOrResumeSubmission` followed by
+/// the session screen — [ExamTakingPage] by default, which is where the
+/// camera/mock feed, question navigation, kiosk pinning and the browser guards
+/// live. An attempt that is already `submitted` or `disqualified` is reported
+/// instead of being reopened: the server owns that state, and re-sitting a closed
+/// attempt would only produce a rejected write.
 class StudentExamPortalPage extends ConsumerStatefulWidget {
   /// Greeting name; the gate passes `profiles.full_name` ("Aisha Bello").
   final String? studentName;
@@ -51,6 +68,15 @@ class StudentExamPortalPage extends ConsumerStatefulWidget {
   /// Defaults to pushing [ExamHardwareGatePage]. Returns true only when a real
   /// camera *and* microphone were verified.
   final HardwareGateRequest? hardwareGate;
+
+  /// Defaults to pushing [ExamConsentPage]. Returns true only when the student
+  /// accepted the notice and the acceptance was stored.
+  ///
+  /// Runs *before* [hardwareGate]: the notice explains the camera the gate is
+  /// about to switch on, and `submissions_insert_own_ongoing` refuses an attempt
+  /// without the row this screen writes. An attempt that is only being **resumed**
+  /// skips it - it could not exist otherwise.
+  final ConsentGateRequest? consentGate;
 
   /// Sign-out shown in the app bar (the gate owns the Supabase call).
   final VoidCallback? onSignOut;
@@ -90,6 +116,7 @@ class StudentExamPortalPage extends ConsumerStatefulWidget {
     this.studentName,
     this.examPageBuilder,
     this.hardwareGate,
+    this.consentGate,
     this.onSignOut,
     this.clock,
     this.isWeb,
@@ -150,10 +177,19 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
       return;
     }
 
-    // The hardware gate runs *first*: no submission row is created and no
-    // session screen is pushed until a real camera and microphone have been
-    // verified. Refusing here (or backing out of the gate) leaves the student on
-    // the list with nothing written to the server.
+    // The consent notice runs before everything else the student can refuse: it
+    // is the screen that explains the camera, the stills and how long they are
+    // kept, and `submissions_insert_own_ongoing` now refuses an attempt without
+    // the acceptance it writes. Nothing has been created at this point, so
+    // backing out here leaves no trace and no `ongoing` row.
+    final consent = widget.consentGate ?? _pushConsentGate;
+    final accepted = await consent(context, exam);
+    if (!mounted || !accepted) return;
+
+    // The hardware gate runs next: no submission row is created and no session
+    // screen is pushed until a real camera and microphone have been verified.
+    // Refusing here (or backing out of the gate) leaves the student on the list
+    // with nothing written to the server.
     final gate = widget.hardwareGate ?? _pushHardwareGate;
     final verified = await gate(context, exam);
     if (!mounted || !verified) return;
@@ -237,8 +273,20 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
         context: 'StudentExamPortal failed to open exam',
       );
       if (mounted) {
+        // 42501 is the row policy refusing the insert. With the consent arm in
+        // place that is the most likely refusal on this screen - an account whose
+        // consent an administrator removed, a notice version bumped between the
+        // student opening the portal and tapping the paper, or a stale build - so
+        // it gets a sentence a student can act on instead of "check your
+        // connection", which would be the wrong advice.
+        final refused = error is PostgrestException && error.code == '42501';
         _showMessage(
-          'Could not start "${exam.title}". Check your connection and try again.',
+          refused
+              ? 'You must accept the proctoring notice before starting '
+                  '"${exam.title}". Open it from the exam again to read and '
+                  'accept it.'
+              : 'Could not start "${exam.title}". Check your connection and '
+                  'try again.',
         );
       }
     } finally {
@@ -256,6 +304,33 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
       ),
     );
     return verified ?? false;
+  }
+
+  /// The production consent gate: an acceptance this student already gave for
+  /// this notice version skips the screen, otherwise [ExamConsentPage] is pushed
+  /// and its `true` is the only thing that lets the attempt continue.
+  ///
+  /// The pre-check is a convenience, not a control: a resumed attempt can only
+  /// exist because a consent row was written (`submissions_insert_own_ongoing`),
+  /// so asking again would make a student re-accept something they cannot change.
+  /// If the check itself fails - no backend, no session, a slow network - the
+  /// screen is shown anyway, and *it* reports the real error when the student
+  /// accepts.
+  Future<bool> _pushConsentGate(BuildContext context, Exam exam) async {
+    final repository = ref.read(consentRepositoryProvider);
+    try {
+      if (await repository.hasCurrentConsent(exam.id)) return true;
+    } catch (_) {
+      // Fall through to the screen: it is the surface that can explain a failure.
+    }
+    if (!context.mounted) return false;
+
+    final accepted = await Navigator.of(context).push<bool>(
+      MaterialPageRoute<bool>(
+        builder: (_) => ExamConsentPage(exam: exam, repository: repository),
+      ),
+    );
+    return accepted ?? false;
   }
 
   /// What the student is told the moment an attempt closes.

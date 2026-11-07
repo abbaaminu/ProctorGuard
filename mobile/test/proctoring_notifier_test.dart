@@ -4,11 +4,13 @@ import 'dart:typed_data';
 
 import 'package:proctorguard/core/services/mediapipe_proctoring_service.dart';
 import 'package:proctorguard/core/services/offline_sync_service.dart';
+import 'package:proctorguard/core/services/proctoring_heartbeat.dart';
 import 'package:proctorguard/features/exam/domain/entities/exam.dart';
 import 'package:proctorguard/features/exam/domain/entities/exam_submit_result.dart';
 import 'package:proctorguard/features/exam/domain/entities/question.dart';
 import 'package:proctorguard/features/exam/domain/entities/submission.dart';
 import 'package:proctorguard/features/exam/domain/repositories/exam_repository.dart';
+import 'package:proctorguard/features/proctoring/domain/entities/heartbeat.dart';
 import 'package:proctorguard/features/proctoring/domain/entities/proctoring_risk.dart';
 import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
 import 'package:proctorguard/features/proctoring/domain/repositories/proctoring_repository.dart';
@@ -852,6 +854,62 @@ void main() {
       expect(repo.violations.last.timestamp, now);
     });
   });
+
+  group('liveness series (proctor_heartbeats)', () {
+    test('a session beats as soon as it is constructed', () async {
+      // The whole point of the feature: the first beat must not wait a cadence,
+      // because a supervisor looking at a just-started attempt needs to see the
+      // client is there now, not fifteen seconds from now.
+      final repo = _RecordingProctoringRepository();
+      final service = ProctoringHeartbeatService(repo);
+      final notifier = _notifier(proctoringRepo: repo, heartbeats: service);
+      addTearDown(notifier.dispose);
+
+      await pumpEventQueue();
+
+      expect(service.isBeating, isTrue);
+      expect(service.beatsAcked, 1);
+      expect(repo.heartbeats, ['sub-1 camera=true monitoring=true']);
+    });
+
+    test('a camera that is down is reported, not hidden', () async {
+      // "Monitored" and "monitoring nothing" must not look the same in the
+      // table: without this the coverage report cannot tell a clean sitting from
+      // one where the proctor was blind the whole time.
+      final repo = _RecordingProctoringRepository();
+      final service = ProctoringHeartbeatService(repo);
+      final notifier = _notifier(proctoringRepo: repo, heartbeats: service);
+      addTearDown(notifier.dispose);
+      await pumpEventQueue();
+
+      notifier.setCameraActive(false);
+      await service.beatNow();
+
+      expect(repo.heartbeats.last, 'sub-1 camera=false monitoring=false');
+
+      // ...and the recovery is reported too, so the series shows when the feed
+      // came back rather than staying red until the attempt ends.
+      notifier.setCameraActive(true);
+      await service.beatNow();
+      expect(repo.heartbeats.last, 'sub-1 camera=true monitoring=true');
+    });
+
+    test('leaving the exam stops the series', () async {
+      // A beat after the page is gone would claim a session is being watched
+      // when nothing is - the one lie the client can still tell cheaply.
+      final repo = _RecordingProctoringRepository();
+      final service = ProctoringHeartbeatService(repo);
+      final notifier = _notifier(proctoringRepo: repo, heartbeats: service);
+      await pumpEventQueue();
+      expect(repo.heartbeats, hasLength(1));
+
+      notifier.dispose();
+      await service.beatNow(); // ignored: nothing is beating any more
+
+      expect(service.isBeating, isFalse);
+      expect(repo.heartbeats, hasLength(1));
+    });
+  });
 }
 
 /// Builds a notifier wired to fakes. The uploader fails loudly: with no
@@ -861,6 +919,7 @@ ProctoringNotifier _notifier({
   ExamRepository? examRepo,
   MediaPipeProctoringService? engine,
   ViolationOutbox? outbox,
+  ProctoringHeartbeatService? heartbeats,
   void Function()? onForceExit,
   DateTime Function()? clock,
   SnapshotSource? snapshotSource,
@@ -881,6 +940,7 @@ ProctoringNotifier _notifier({
     examRepo: examRepo ?? _RecordingExamRepository(),
     engine: engine ?? MediaPipeProctoringService(),
     outbox: outbox,
+    heartbeats: heartbeats,
     onForceExit: onForceExit ?? () {},
     clock: clock,
     snapshotTimeout: snapshotTimeout,
@@ -1031,6 +1091,11 @@ class _RecordingProctoringRepository implements ProctoringRepository {
 
   final List<Violation> violations = <Violation>[];
 
+  /// One entry per heartbeat this fake was asked for, in the form
+  /// `'<submissionId> camera=<bool> monitoring=<bool>'`: proof that the notifier
+  /// opened the liveness series, and what each beat was allowed to claim.
+  final List<String> heartbeats = <String>[];
+
   @override
   Future<({int warningCount, bool disqualified, bool flagged})> logViolation({
     required String submissionId,
@@ -1043,6 +1108,23 @@ class _RecordingProctoringRepository implements ProctoringRepository {
       // `flagAfter` lets a test reach the "under review" ending without the RPC
       // having to disqualify first; null keeps the old behaviour.
       flagged: flagAfter != null && violations.length >= flagAfter!,
+    );
+  }
+
+  @override
+  Future<HeartbeatAck> recordHeartbeat({
+    required String submissionId,
+    bool cameraOk = true,
+    bool monitoringOk = true,
+    String? appVersion,
+    DateTime? clientTime,
+    String? clientEventId,
+  }) async {
+    heartbeats.add('$submissionId camera=$cameraOk monitoring=$monitoringOk');
+    return HeartbeatAck(
+      outcome: HeartbeatOutcome.recorded,
+      recordedAt: clientTime,
+      beatCount: heartbeats.length,
     );
   }
 

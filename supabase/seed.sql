@@ -337,6 +337,40 @@ on conflict do nothing;
 --           'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb9', 3.5, 'Good threat model.')
 
 -- ---------------------------------------------------------------------
+-- 4c. THE CONSENT BEHIND THOSE TWO ATTEMPTS
+--     (public.proctoring_consents)
+-- An attempt cannot exist without one any more:
+-- `submissions_insert_own_ongoing` refuses the insert unless the student has
+-- accepted the consent notice currently in force
+-- (`20261106090000_proctoring_consents.sql`). These rows are written by
+-- `record_consent()` in the app, never by hand - they are seeded here only because
+-- the two attempts above were inserted by this script with superuser rights, and
+-- demo data that claims a sitting happened without a notice having been accepted
+-- would be a bad example to copy.
+--
+-- A general acceptance (exam_id = NULL) covers every paper, which is the shape an
+-- institution uses when its notice is one document for the whole exam period.
+-- `accepted_at` is placed just before each attempt started, and `user_agent` is
+-- the Android app's own string so the supervisor's view looks like a real one.
+-- ---------------------------------------------------------------------
+insert into public.proctoring_consents
+  (student_id, exam_id, consent_version, accepted_at, user_agent)
+select v.student_id, null, cc.current_version, v.accepted_at, v.user_agent
+  from (
+        values
+          ('22222222-2222-4222-8222-222222222222'::uuid,
+           now() - interval '10 minutes',
+           'ProctorGuard/1.0.0 (Android 14; Pixel 7)'),
+          ('33333333-3333-4333-8333-333333333333'::uuid,
+           now() - interval '41 minutes',
+           'ProctorGuard/1.0.0 (Android 14; Pixel 7)')
+       ) as v(student_id, accepted_at, user_agent)
+  cross join public.proctoring_consent_config cc
+ where cc.id = 1
+on conflict do nothing;
+
+
+-- ---------------------------------------------------------------------
 -- 5. PROCTORING LOGS  (public.proctoring_logs)
 -- Three alerts on the disqualified attempt above: a glance off screen, the
 -- face leaving frame, then another glance. action_type values must match the

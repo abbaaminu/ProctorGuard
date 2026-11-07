@@ -1,5 +1,6 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../../domain/entities/heartbeat.dart';
 import '../../domain/entities/violation.dart';
 import '../../domain/repositories/proctoring_repository.dart';
 
@@ -16,6 +17,14 @@ import '../../domain/repositories/proctoring_repository.dart';
 ///    inserts into it directly so the escalation rule can't be bypassed.
 ///  * `action_type` is a text check constraint whose allowed values are produced by
 ///    [ViolationType.dbValue].
+///  * `public.record_heartbeat(p_submission_id uuid, p_camera_ok boolean default
+///    true, p_monitoring_ok boolean default true, p_app_version text default null,
+///    p_client_time timestamptz default null, p_client_event_id uuid default null)
+///    returns table(outcome text, recorded_at timestamptz, beat_count int)` — the
+///    counterpart of `register_violation`: it records that the client was *there*,
+///    re-checks ownership and `status = 'ongoing'`, rate-limits to one stored beat
+///    per 8s and stamps `exam_submissions.last_heartbeat_at`. `proctor_heartbeats`
+///    has no insert policy at all, so this RPC is the only way in.
 class ProctoringRepositoryImpl implements ProctoringRepository {
   final SupabaseClient _client;
   ProctoringRepositoryImpl(this._client);
@@ -61,5 +70,47 @@ class ProctoringRepositoryImpl implements ProctoringRepository {
         .stream(primaryKey: ['id'])
         .eq('submission_id', submissionId)
         .order('timestamp');
+  }
+
+  @override
+  Future<HeartbeatAck> recordHeartbeat({
+    required String submissionId,
+    bool cameraOk = true,
+    bool monitoringOk = true,
+    String? appVersion,
+    DateTime? clientTime,
+    String? clientEventId,
+  }) async {
+    // Same argument names as the SQL, and every one of them is a plain value: the
+    // RPC decides the outcome, so there is nothing here for a patched client to
+    // gain by lying beyond the two booleans - which are the point of the feature
+    // and are documented as unverifiable in the README.
+    final rows = await _client.rpc('record_heartbeat', params: {
+      'p_submission_id': submissionId,
+      'p_camera_ok': cameraOk,
+      'p_monitoring_ok': monitoringOk,
+      'p_app_version': appVersion,
+      'p_client_time': clientTime?.toUtc().toIso8601String(),
+      'p_client_event_id': clientEventId,
+    }) as List<dynamic>;
+
+    final row = rows.first as Map<String, dynamic>;
+    return HeartbeatAck(
+      outcome: HeartbeatOutcome.fromDb(row['outcome'] as String?),
+      // Read defensively: the columns are part of the contract, but a beat that
+      // reached the server has already done its job, and failing to parse the
+      // answer would turn that success into a failure the retry loop acts on.
+      recordedAt: switch (row['recorded_at']) {
+        final String value => DateTime.tryParse(value),
+        final DateTime value => value,
+        _ => null,
+      },
+      beatCount: switch (row['beat_count']) {
+        final int value => value,
+        final num value => value.toInt(),
+        final String value => int.tryParse(value),
+        _ => null,
+      },
+    );
   }
 }
