@@ -35,6 +35,13 @@ android/.../MainActivity.kt # kiosk bridge: lock_task_channel::startLock/stopLoc
    (race-safe autosave for choices), `merge_submission_text_answer` (the same
    for typed answers) and `resolve_flagged_attempt` (a supervisor's decision on an
    attempt the weighted threshold stopped for review).
+
+   Then run `../supabase/migrations/retention_policy.sql` and, after it,
+   `../supabase/migrations/20261106090100_snapshot_retention.sql`. `schema.sql`
+   carries neither `public.retention_policies` nor the `purge_expired_*` functions,
+   and the snapshot file refuses to run without that table (it names the file to
+   apply first) — the root README's *Getting started* explains why the order is
+   fixed.
 2. `flutter pub get`, then run with:
    ```
    flutter run --dart-define=SUPABASE_URL=... --dart-define=SUPABASE_PUBLISHABLE_KEY=...
@@ -160,12 +167,14 @@ with an expiry rather than a URL that keeps working forever once it is forwarded
   `supabase/migrations/private_proctor_snapshots.sql` flips an existing bucket and
   re-asserts the same policies.
 - A still does not live forever. The `proctor_snapshots` window (30 days) is a row
-  in `public.retention_policies`, and the `purge-snapshots` Edge Function (or
-  `public.purge_expired_snapshots()` where the Storage API cannot be reached)
-  deletes what has aged out of a **finished** attempt and nulls the
-  `proctoring_logs.snapshot_url` that points at it. The incident row stays — the
-  flag happened, the photograph expired — so the evidence list still shows the
-  incident, its type and its time, just without a still
+  in `public.retention_policies`, and the `purge-snapshots` Edge Function deletes
+  what has aged out of a **finished** attempt and nulls the
+  `proctoring_logs.snapshot_url` that points at it. (`public.purge_expired_snapshots()`
+  is the same rule as a SQL function, for a self-hosted deployment that cannot use
+  Edge Functions - a hosted project refuses it with `42501`, see the root README's
+  [And the photographs?](../README.md#and-the-photographs).) The incident row
+  stays — the flag happened, the photograph expired — so the evidence list still
+  shows the incident, its type and its time, just without a still
   (`Violation.snapshotUrl` is nullable by design, and the strike keeps its
   weight). A live
   sitting never loses a still, and a reset still deletes an attempt's stills

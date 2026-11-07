@@ -169,7 +169,7 @@ rather than left to be mistaken for more than it is.
 | Escape from the locked exam surface | Screen pinning (no Device Owner) and browser fullscreen can be left | An escape or a fullscreen exit becomes an `app_minimized` strike; the kiosk badge shows whether pinning is enforced or best-effort |
 | Detector evasion (rooted/virtualised device, camera spoof) | Client-side detectors can be defeated by a determined, technically capable student | Treat the client as untrusted: grading and the weighted strike rule are enforced **server-side** (`register_violation`, `submit_exam`, `resolve_flagged_attempt`) |
 | A fabricated heartbeat series | A beat is the client's own claim: a patched build can report "camera up, monitor running" while nothing is running, and no app attestation (Play Integrity / App Attest) verifies the build yet | The series is a **positive** signal only - an attempt that never checked in, or went quiet, is shown as *not reporting*, never as clean. Writes go through `record_heartbeat()` alone (the table has no insert policy), on the server clock, idempotent per `client_event_id` and rate-limited to one stored beat per 8 s, so a client can neither backfill history nor rewrite it - and `proctoring_coverage()` can only flag an attempt for a human, never end one |
-| Evidence retention / privacy | Snapshots in `proctor-snapshots` are personal data, and no scheduled job deletes them unless an operator sets one up | The bucket is **private**: a still is only ever readable through a 10-minute signed URL, and only the owning student or staff can mint one. A `proctor_snapshots` window (30 days) lives in `public.retention_policies`, enforced by the `purge-snapshots` Edge Function or `public.purge_expired_snapshots()` - both keep the incident row and null its pointer - and a reset deletes an attempt's stills immediately, which `session_reset_logs` records. The photograph has a lifetime now; see [Scheduling the snapshot purge](#scheduling-the-snapshot-purge) for the job itself, which is deliberately left to the operator |
+| Evidence retention / privacy | Snapshots in `proctor-snapshots` are personal data, and no scheduled job deletes them unless an operator sets one up | The bucket is **private**: a still is only ever readable through a 10-minute signed URL, and only the owning student or staff can mint one. A `proctor_snapshots` window (30 days) lives in `public.retention_policies`, enforced by the `purge-snapshots` Edge Function - the one route that also removes the *file*, and the only one that runs on hosted Supabase, where `storage.protect_delete()` refuses a SQL delete with `42501` (a self-hosted project without that guard can use `public.purge_expired_snapshots()` instead). Both keep the incident row and null its pointer, and a reset deletes an attempt's stills immediately, which `session_reset_logs` records. The photograph has a lifetime now; see [Scheduling the snapshot purge](#scheduling-the-snapshot-purge) for the job itself, which is deliberately left to the operator |
 
 The client is never the authority: **grading and the strike rule live on the
 server** (see `supabase/schema.sql`), so a modified or compromised client can
@@ -246,19 +246,29 @@ record. It is a record now.
 
 The consent notice says a still is deleted after 30 days, so something has to make
 that true. The `proctor_snapshots` window lives in `public.retention_policies`
-beside the incident and heartbeat windows, and there are two ways to enforce it:
+beside the incident and heartbeat windows, and there are two ways to enforce it -
+but on a hosted Supabase project only one of them actually runs:
 
-- the **`purge-snapshots` Edge Function** (supported path on Supabase): it goes
-  through the Storage API, so the file goes with the row, deletes only objects
-  older than the window whose attempt is **not** `ongoing`, and then nulls
-  `proctoring_logs.snapshot_url` for each. The incident row survives - the flag
-  happened, the photograph expired;
-- **`public.purge_expired_snapshots(p_older_than, p_dry_run)`** (fallback, for a
-  deployment that cannot reach the Storage API): the same rules, but it can only
-  delete Storage's *bookkeeping* row, so the object in the bucket is left behind
-  and - because the row is gone - becomes invisible to the Storage API from then
-  on. **Do not run both on the same window.** Use the function only where the
-  Edge Function cannot run.
+- the **`purge-snapshots` Edge Function** (the supported path, and on hosted
+  Supabase the only one): it goes through the Storage API, so the file goes with
+  the row, deletes only objects older than the window whose attempt is **not**
+  `ongoing`, and then nulls `proctoring_logs.snapshot_url` for each. The incident
+  row survives - the flag happened, the photograph expired;
+- **`public.purge_expired_snapshots(p_older_than, p_dry_run)`**, for a
+  self-hosted or base deployment that cannot use Edge Functions. Two things to
+  know before you rely on it. First, **on a hosted Supabase project it refuses and
+  purges nothing**: `storage.objects` there carries the `protect_delete` trigger
+  (`storage.protect_delete()`), which refuses every SQL DELETE with `42501`
+  *Direct deletion from storage tables is not allowed*, and the function
+  deliberately does not switch that guard off - it raises `42501` naming the
+  Edge Function instead. Second,
+  even where the guard is absent it can only delete Storage's *bookkeeping* row,
+  so the object in the bucket is left behind and - because the row is gone -
+  becomes invisible to the Storage API from then on. **Do not run both on the same
+  window.**
+
+The function's dry run (`p_dry_run => true`) is safe anywhere, trigger or no
+trigger: it counts what would expire and deletes nothing.
 
 Neither is scheduled by the migrations: a job that deletes photographs is an
 operator's decision. See
@@ -266,13 +276,21 @@ operator's decision. See
 
 ## Getting started
 
-1. Create a Supabase project and run `supabase/schema.sql` in its SQL editor.
-   **A fresh project needs only that file.** `schema.sql` is the whole database —
-   tables, policies, RPCs, the storage bucket, the seeded catalogues - and every
-   file in `supabase/migrations/` is an *upgrade path for a project that already
-   exists*. Applying a migration to a new project is unnecessary, and for the two
-   files called out in the warning below it is not harmless either: they cannot be
-   re-run once `20261104090100_weighted_strikes_and_flagged_review.sql` has run.
+1. Create a Supabase project and run three files, in this order:
+   `supabase/schema.sql`, then `supabase/migrations/retention_policy.sql`, then
+   `supabase/migrations/20261106090100_snapshot_retention.sql`.
+   `schema.sql` is the database — tables, policies, RPCs, the storage bucket, the
+   seeded catalogues — but it is **not** the whole of it: `public.retention_policies`
+   and the three purge functions (`purge_expired_proctoring_logs`,
+   `purge_expired_proctor_heartbeats`, `purge_expired_snapshots`) live only in the
+   other two files, and the second one refuses to run without the table the first
+   one creates (it says so by name and stops). Skip them and a fresh project keeps
+   every heartbeat, every incident row and every still for ever, with no window to
+   enforce. Every *other* file in `supabase/migrations/` is an *upgrade path for a
+   project that already exists*: applying it to a new project is unnecessary, and
+   for the two files called out in the warning below it is not harmless either —
+   they cannot be re-run once `20261104090100_weighted_strikes_and_flagged_review.sql`
+   has run.
    For an existing project, run any unapplied files in `supabase/migrations/`;
    each migration documents its purpose and verification steps, and one can be
    applied on its own through the CLI:
@@ -464,11 +482,14 @@ Things worth knowing before you turn it on:
 - it responds `"capped": true` when a backlog is larger than one run
   (`MAX_OBJECTS` in `supabase/functions/purge-snapshots/index.ts`), which means
   "run me again", not "done";
-- the **SQL fallback** (`public.purge_expired_snapshots(p_dry_run => true)`) is
-  for a deployment that cannot reach the Storage API. It removes Storage's
-  bookkeeping row only, so the object stays in the bucket and becomes invisible
-  to the Storage API afterwards. Run the Edge Function, or that function, never
-  both on the same window;
+- the **SQL fallback** (`public.purge_expired_snapshots(...)`) is for a
+  self-hosted deployment that cannot use Edge Functions, and **on a hosted
+  Supabase project it raises `42501` and purges nothing**:
+  `storage.protect_delete()` refuses the SQL delete and the function says so
+  rather than bypassing that guard, because a SQL delete would remove the
+  bookkeeping row and leave the file behind, invisible to the Storage API from
+  then on. Its `p_dry_run => true` form works everywhere and deletes nothing. Run
+  the Edge Function, or that function, never both on the same window;
 - an hour of distance from `proctoring-logs-retention` (03:23) and
   `proctor-heartbeats-retention` (04:07) keeps three deleting jobs from walking
   `exam_submissions` at the same moment.
@@ -551,6 +572,14 @@ Things worth knowing before you turn it on:
   `proctoring_coverage()`. It is additive and re-runnable; until it runs there is
   no pulse to show, every live attempt reads as *no proctoring signal*, and that
   is the honest reading - "no data" is not "no violations".
+- A **fresh** project is three files, in this order: `supabase/schema.sql`, then
+  `supabase/migrations/retention_policy.sql`, then
+  `supabase/migrations/20261106090100_snapshot_retention.sql`. `schema.sql` does
+  not carry `public.retention_policies` or any `purge_expired_*` function, and the
+  snapshot file seeds rows into the table the retention file creates - which is why
+  the order is fixed. Skipping either leaves a project that keeps every proctoring
+  log row, every heartbeat and every snapshot for ever, with nothing scheduled to
+  remove them. Everything else a fresh project needs is in `schema.sql`.
 - Apply `supabase/migrations/retention_policy.sql` and enable `pg_cron`
   (Dashboard → Database → Extensions). `proctoring_logs` and
   `proctor_heartbeats` are the tables that grow without bound; the migration
@@ -579,8 +608,10 @@ Things worth knowing before you turn it on:
   (180 day) and `exam_submissions` (180 day) windows - **align the two 180s with
   your appeals period** - and creates `public.purge_expired_snapshots()`, the
   fallback purge described in
-  [And the photographs?](#and-the-photographs). It schedules nothing: no still is
-  deleted until an operator runs a purge, which is the next section.
+  [And the photographs?](#and-the-photographs). On a hosted project that function
+  refuses with `42501` (`storage.protect_delete()`) and the `purge-snapshots` Edge
+  Function is the route; its dry run still works there. It schedules nothing: no
+  still is deleted until an operator runs a purge, which is the next section.
 - Set `--dart-define=SENTRY_DSN=...` on a build that should report crashes
   (`mobile/README.md#crash-reporting-sentry--off-until-configured`). Unset is the
   default and installs nothing. A self-hosted Sentry also needs its ingest origin
