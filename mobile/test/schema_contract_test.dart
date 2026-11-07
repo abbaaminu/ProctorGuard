@@ -3794,6 +3794,104 @@ void main() {
       expect(retention, isNot(contains('cron.schedule')));
     });
 
+    test('the SQL purge reports the hosted guard instead of bypassing it', () {
+      final file =
+          File('../supabase/migrations/20261106090100_snapshot_retention.sql');
+      if (!file.existsSync()) return;
+      final retention = file.readAsStringSync();
+
+      final body = _functionBody(retention, 'purge_expired_snapshots');
+      expect(body, isNotNull);
+      // `storage.objects` on a hosted project carries storage.protect_delete(),
+      // which refuses every SQL DELETE (42501) unless the session sets
+      // storage.allow_delete_query - the flag the Storage API sets on itself.
+      // The function must NOT set it: it would remove the bookkeeping row and
+      // strand the file, invisible to the Storage API for good. So the refusal is
+      // translated into the route that actually deletes the photograph.
+      expect(body, isNot(contains('allow_delete_query')));
+      expect(body, isNot(contains('set_config')));
+      expect(body, contains('when insufficient_privilege then'));
+      // The SQLSTATE survives the translation, so a caller's own
+      // `when sqlstate '42501'` still matches what it did before.
+      expect(body, contains("errcode = '42501'"));
+      expect(body, contains('storage.protect_delete()'));
+      expect(body, contains('purge-snapshots Edge Function'));
+      // And a refused run is not a count: it must not come back as 0, which reads
+      // as "nothing had expired" and would have an operator stop looking.
+      expect(body, contains('return v_deleted'));
+    });
+
+    test('the SQL tests stand in for the Storage API before they delete', () {
+      final dir = Directory('../supabase/tests');
+      if (!dir.existsSync()) return;
+      // The flag the Storage API sets on itself while it deletes. Without it a
+      // hosted project refuses every SQL delete from storage.objects with 42501,
+      // and the test below would be reporting the guard instead of the policy or
+      // the purge it is there to check.
+      const standIn = "set_config('storage.allow_delete_query', 'true', true)";
+      var sawDirectDelete = false;
+
+      for (final file in dir
+          .listSync()
+          .whereType<File>()
+          .where((file) => file.path.endsWith('.sql'))) {
+        final sql = file.readAsStringSync().replaceAll('\r\n', '\n');
+        for (final delete
+            in RegExp(r'delete from storage\.objects').allMatches(sql)) {
+          sawDirectDelete = true;
+          final before = sql.substring(0, delete.start);
+          expect(
+            before.lastIndexOf(standIn) > before.lastIndexOf(r'do $$'),
+            isTrue,
+            reason: '${file.path}: a direct delete from storage.objects has no '
+                '$standIn earlier in its own DO block, so a hosted project '
+                'refuses it with 42501',
+          );
+        }
+      }
+
+      // One delete is indirect: section (g) of the consent check calls the purge
+      // function, whose live path deletes. It needs the same flag, or that
+      // section fails on a hosted project for a reason that has nothing to do
+      // with retention.
+      final consents = File('../supabase/tests/proctoring_consents_check.sql');
+      if (consents.existsSync()) {
+        final sql = consents.readAsStringSync().replaceAll('\r\n', '\n');
+        final call =
+            sql.indexOf('select public.purge_expired_snapshots() into v_done');
+        expect(call, greaterThan(-1));
+        expect(
+          sql.substring(0, call),
+          contains(standIn),
+          reason: 'the live purge call deletes from storage.objects',
+        );
+      }
+
+      // A scan that quietly matched nothing would pass forever.
+      expect(sawDirectDelete, isTrue);
+    });
+
+    test('the README says which purge route runs on a hosted project', () {
+      final file = File('../README.md');
+      if (!file.existsSync()) return;
+      final readme = file.readAsStringSync().replaceAll('\r\n', '\n');
+
+      final start = readme.indexOf('**And the photographs?**');
+      expect(start, greaterThan(-1));
+      final end = readme.indexOf('## Getting started', start);
+      expect(end, greaterThan(start));
+      final section = readme.substring(start, end);
+
+      // The section is where an operator decides what to schedule, so the block
+      // belongs here in as many words - not only in a migration header.
+      expect(section, contains('storage.protect_delete()'));
+      expect(section, contains('42501'));
+      expect(section, contains('purge-snapshots'));
+      expect(section, contains('on a hosted Supabase project it refuses'));
+      // ...and the dry run, the one form that works everywhere.
+      expect(section, contains('dry run'));
+    });
+
     test('a project created from schema.sql and one upgraded agree', () {
       final sql = schemaSql();
       final migration =

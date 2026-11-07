@@ -28,7 +28,9 @@
 --   2. `purge_expired_snapshots(p_older_than interval default '30 days',
 --      p_dry_run boolean default false)` - deletes the `storage.objects` rows for
 --      stills older than the window that do not belong to a live attempt, and
---      nulls `proctoring_logs.snapshot_url` for each one.
+--      nulls `proctoring_logs.snapshot_url` for each one. Where the deployment
+--      permits a SQL delete: on hosted Supabase the trigger described below
+--      refuses it, and the function says so instead of half-doing it.
 --
 -- WHAT THE FUNCTION DELIBERATELY KEEPS
 --   * The incident row itself. A violation that happened still happened after
@@ -58,6 +60,25 @@
 --       afterwards. Run the Edge Function, or this, never a race between them.
 --   Both write the same result into `proctoring_logs` (the pointer is nulled), so
 --   the app and the console read the same thing either way.
+--
+-- READ THIS TOO: ON A HOSTED PROJECT THE SQL ROUTE IS BLOCKED, NOT JUST LIMITED
+--   On hosted Supabase, `storage.objects` carries a `protect_delete` trigger
+--   (`storage.protect_delete()`) that refuses *every* SQL DELETE from it:
+--       42501  Direct deletion from storage tables is not allowed
+--   It lets a delete through only when the session has set
+--   `storage.allow_delete_query = 'true'` - the flag the Storage API sets on
+--   itself while it is the one deleting. This function deliberately does **not**
+--   set that flag, because on such a project a SQL delete would strand the file
+--   anyway (see above): it removes the bookkeeping row, never reaches the object
+--   store, and leaves an object nothing can enumerate again. So:
+--     * on a hosted project `purge-snapshots` is the **only supported route** -
+--       the live path of this function raises 42501, with a message naming that
+--       Edge Function, and purges nothing (the pointer update rolls back with it,
+--       so a refused run leaves the database exactly as it was);
+--     * the dry run works everywhere, trigger or no trigger: it counts and
+--       deletes nothing, so "what would expire?" can always be asked;
+--     * where the trigger is absent (a self-hosted or base image that has not
+--       added it) the live path does run, with the caveat above about the file.
 --
 -- WHAT THIS FILE DOES NOT DO
 --   * It does not schedule anything. A cron job that deletes photographs is a
@@ -209,23 +230,53 @@ begin
      set snapshot_url = null
    where l.snapshot_url = any (v_paths);
 
-  delete from storage.objects o
-   where o.bucket_id = 'proctor-snapshots'
-     and o.name = any (v_paths);
-  get diagnostics v_deleted = row_count;
+  -- On hosted Supabase `storage.objects` carries the `protect_delete` trigger
+  -- (`storage.protect_delete()`), which refuses *every* SQL DELETE from that
+  -- table -
+  --     42501  Direct deletion from storage tables is not allowed
+  -- unless the session has set `storage.allow_delete_query = 'true'`: the flag
+  -- the Storage API sets on itself while it deletes (see this file's header).
+  -- This function does not set that flag. Where the trigger is installed, a SQL
+  -- delete only removes the bookkeeping row and strands the file - an object the
+  -- Storage API can never enumerate again - which is the worse of the two
+  -- outcomes. So the refusal is translated, not bypassed.
+  --
+  -- The nested block earns its keep twice: the original SQLSTATE (42501) is kept
+  -- in the re-raise, so a caller's own `when sqlstate '42501'` still matches, and
+  -- PL/pgSQL rolls a block's changes back when its handler catches - which means
+  -- the pointer update above goes with it. A refused run therefore changes
+  -- nothing at all: no log row is left pointing at an object that was not
+  -- deleted.
+  begin
+    delete from storage.objects o
+     where o.bucket_id = 'proctor-snapshots'
+       and o.name = any (v_paths);
+    get diagnostics v_deleted = row_count;
+  exception
+    when insufficient_privilege then
+      raise exception
+        'purge_expired_snapshots: the storage.objects delete was refused (%) and '
+        'nothing was purged. On hosted Supabase that is the '
+        'storage.protect_delete() trigger, which blocks every SQL delete: run the '
+        'purge-snapshots Edge Function there instead - it goes through the Storage '
+        'API, so the file goes with its row.', sqlerrm
+        using errcode = '42501',
+              hint = 'What would expire, deleting nothing: '
+                     'select public.purge_expired_snapshots(p_dry_run => true);';
+  end;
 
   raise notice 'retention: purged % snapshot object(s) older than % (of % expired)',
     v_deleted, p_older_than, v_count;
 
-  -- The count that matters is what actually went, not what was attempted: a
-  -- project where Storage refuses the delete reports 0 and the operator goes to
-  -- the Edge Function.
+  -- The count that matters is what actually went, not what was attempted. A
+  -- refusal is *not* one of these numbers: it raised, above, rather than
+  -- returning a 0 that would read as "nothing had expired".
   return v_deleted;
 end;
 $$;
 
 comment on function public.purge_expired_snapshots(interval, boolean) is
-  'Deletes proctor-snapshots objects older than the window (default 30 days) and nulls the proctoring_logs.snapshot_url pointer to each, keeping the incident row. Never touches an attempt that is still ongoing, a dry run deletes nothing, and a window of zero or less is refused. Removes the storage.objects rows only - the file is removed by the purge-snapshots Edge Function (Storage API) or a bucket lifecycle rule; read this file''s header before scheduling either.';
+  'Deletes proctor-snapshots objects older than the window (default 30 days) and nulls the proctoring_logs.snapshot_url pointer to each, keeping the incident row. Never touches an attempt that is still ongoing, a dry run deletes nothing, and a window of zero or less is refused. Removes the storage.objects rows only - the file is removed by the purge-snapshots Edge Function (Storage API) or a bucket lifecycle rule. On hosted Supabase the storage.protect_delete() trigger refuses every SQL delete, so the live run raises 42501 naming the Edge Function and purges nothing; read this file''s header before scheduling either.';
 
 revoke all on function public.purge_expired_snapshots(interval, boolean)
   from public, anon, authenticated;

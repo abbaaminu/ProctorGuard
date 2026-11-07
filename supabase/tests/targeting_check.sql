@@ -63,8 +63,9 @@
 --       `<action_type>_<epoch-ms>.(jpg|png)` object is stored; a full URL, another
 --       attempt's folder, a nested path or a name without the epoch-ms stamp is
 --       stored as NULL and the violation still counts; a matching path is stored as
---       sent; the third strike disqualifies, and a replayed `client_event_id`
---       appends nothing.
+--       sent; the third *counted* signal (three weight-1 types) flags the attempt
+--       for review - `status = 'flagged_for_review'`, `flagged = true`,
+--       `disqualified = false` - and a replayed `client_event_id` appends nothing.
 --
 -- NOT EXECUTED HERE. This file is written against the schema, not run against a
 -- live database in the change that added it; run it after `supabase db reset`.
@@ -861,6 +862,13 @@ do $$
 declare
   v_rows int;
 begin
+  -- Stands in for the Storage API, which sets this flag on itself while it is
+  -- the one deleting: on a hosted project the `protect_delete` trigger on
+  -- storage.objects refuses every other SQL DELETE with 42501. Setting it here
+  -- is what makes the next statement a fair question - "does the *policy* refuse
+  -- this row?" - instead of a question about the trigger, and it leaves the
+  -- assertion below untouched: 0 rows must still mean the row survived.
+  perform set_config('storage.allow_delete_query', 'true', true);
   delete from storage.objects o
    where o.bucket_id = 'proctor-snapshots'
      and o.name = current_setting('test.sub_a') || '/looking_away_1.jpg';
@@ -899,6 +907,11 @@ do $$
 declare
   v_rows int;
 begin
+  -- As in (i)viii: the flag the Storage API sets for itself. Without it the
+  -- `protect_delete` trigger on a hosted project would refuse this delete with
+  -- 42501, and the "1 row" assertion below could never be reached - the test
+  -- would report the guard, not the policy it is here to check.
+  perform set_config('storage.allow_delete_query', 'true', true);
   delete from storage.objects o
    where o.bucket_id = 'proctor-snapshots'
      and o.name = current_setting('test.sub_del2') || '/looking_away_1.jpg';
@@ -918,6 +931,14 @@ select set_config('request.jwt.claims', '', true);
 
 -- (k) i: a full URL (a legacy shape, and what a forged client sends) is stored as
 -- NULL - and the strike still counts.
+--
+-- The three strikes on `sub_a` ((k)i, (k)iii and (k)iv) are all weight-1 types -
+-- `multiple_faces`, `no_face`, `app_minimized` - on purpose. Escalation is weighted
+-- now: `register_violation` sums `violation_weights.weight` for the types whose
+-- `counts_toward_dq` is true, so three *soft* signals (the `looking_away` this
+-- block used to send) are stored and reported but never reach the threshold, and
+-- the third one would not end the attempt. (k)ii keeps the soft type on an attempt
+-- of its own, precisely because a soft strike must still be stored as a row.
 set local role authenticated;
 select set_config('request.jwt.claims',
   format('{"sub": "%s", "role": "authenticated", "email": "student.a@test.local"}',
@@ -929,14 +950,14 @@ begin
   select * into r
   from public.register_violation(
          current_setting('test.sub_a')::uuid,
-         'looking_away',
+         'multiple_faces',
          'https://example.supabase.co/storage/v1/object/public/proctor-snapshots/legacy.jpg',
          now(),
          gen_random_uuid());
 
-  if r.warning_count <> 1 or r.disqualified then
-    raise exception 'FAIL (k)i: expected 1 strike and no disqualification, got % / %',
-      r.warning_count, r.disqualified;
+  if r.warning_count <> 1 or r.disqualified or r.flagged then
+    raise exception 'FAIL (k)i: expected 1 strike and no ruling, got % / % / %',
+      r.warning_count, r.disqualified, r.flagged;
   end if;
 
   if (select snapshot_url from public.proctoring_logs
@@ -1027,60 +1048,83 @@ begin
   select * into r
   from public.register_violation(
          current_setting('test.sub_a')::uuid,
-         'looking_away',
-         current_setting('test.sub_a') || '/looking_away_2.jpg',
+         'no_face',
+         current_setting('test.sub_a') || '/no_face_2.jpg',
          now(),
          gen_random_uuid());
 
-  if r.warning_count <> 2 then
-    raise exception 'FAIL (k)iii: expected 2 strikes, got %', r.warning_count;
+  if r.warning_count <> 2 or r.disqualified or r.flagged then
+    raise exception 'FAIL (k)iii: expected 2 strikes and no ruling, got % / % / %',
+      r.warning_count, r.disqualified, r.flagged;
   end if;
 
   if (select snapshot_url from public.proctoring_logs
        where submission_id = current_setting('test.sub_a')::uuid
          and snapshot_url is not null
        order by timestamp desc limit 1)
-     is distinct from current_setting('test.sub_a') || '/looking_away_2.jpg' then
+     is distinct from current_setting('test.sub_a') || '/no_face_2.jpg' then
     raise exception 'FAIL (k)iii: the folder-shaped path was not stored';
   end if;
   raise notice 'PASS (k)iii: a matching path inside the attempt''s folder is stored';
 end $$;
 
--- (k) iv: the third strike disqualifies, and a replayed `client_event_id` is what
--- the `on conflict` clause is for: the attempt is closed now, so the replay takes
--- the early-return arm and appends nothing.
+-- (k) iv: the third counted signal flags the attempt for review. Nothing is decided
+-- at this point - `flagged_for_review` is "a person must look at this", not "this
+-- paper does not count" - so the RPC reports `flagged = true` and
+-- `disqualified = false`, and the attempt row itself is closed for marking.
+--
+-- The replay is what the `on conflict` clause is for: the attempt is closed now, so
+-- the second call takes the early-return arm and appends nothing - the same event
+-- can never turn one violation into two strikes.
 do $$
 declare
   r record;
   v_event uuid := gen_random_uuid();
+  v_status text;
+  v_rows int;
 begin
   select * into r
   from public.register_violation(
          current_setting('test.sub_a')::uuid,
-         'multiple_faces',
+         'app_minimized',
          null,
          now(),
          v_event);
 
-  if r.warning_count <> 3 or not r.disqualified then
-    raise exception 'FAIL (k)iv: expected 3 strikes and disqualification, got % / %',
-      r.warning_count, r.disqualified;
+  if r.warning_count <> 3 or not r.flagged or r.disqualified then
+    raise exception 'FAIL (k)iv: expected 3 strikes and a flag for review, got % / % / %',
+      r.warning_count, r.flagged, r.disqualified;
+  end if;
+
+  select s.status into v_status
+  from public.exam_submissions s
+  where s.id = current_setting('test.sub_a')::uuid;
+  if v_status <> 'flagged_for_review' then
+    raise exception 'FAIL (k)iv: the attempt is %, expected flagged_for_review', v_status;
   end if;
 
   -- The same event, again. One violation, one strike - and the attempt is
-  -- 'disqualified', so this is also the "late callback is harmless" arm.
+  -- 'flagged_for_review', so this is also the "late callback is harmless" arm.
   select * into r
   from public.register_violation(
          current_setting('test.sub_a')::uuid,
-         'multiple_faces',
+         'app_minimized',
          null,
          now(),
          v_event);
-  if r.warning_count <> 3 or not r.disqualified then
-    raise exception 'FAIL (k)iv: a replayed event changed the state (% / %)',
-      r.warning_count, r.disqualified;
+  if r.warning_count <> 3 or not r.flagged or r.disqualified then
+    raise exception 'FAIL (k)iv: a replayed event changed the state (% / % / %)',
+      r.warning_count, r.flagged, r.disqualified;
   end if;
-  raise notice 'PASS (k)iv: the third strike disqualifies, and a replay appends nothing';
+
+  select count(*) into v_rows
+  from public.proctoring_logs
+  where submission_id = current_setting('test.sub_a')::uuid;
+  if v_rows <> 3 then
+    raise exception 'FAIL (k)iv: the replay appended a row (% stored)', v_rows;
+  end if;
+
+  raise notice 'PASS (k)iv: the third counted signal flags the attempt for review, and a replay appends nothing';
 end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);

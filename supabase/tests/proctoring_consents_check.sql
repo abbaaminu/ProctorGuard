@@ -33,7 +33,10 @@
 --   (g) `purge_expired_snapshots()` deletes the expired objects of finished
 --       attempts, keeps a live sitting's - and a fresh still's - alone, and keeps
 --       the incident row while nulling the pointer to the photograph. A dry run
---       deletes nothing, and a window of zero is refused.
+--       deletes nothing, and a window of zero is refused. The live run sets
+--       `storage.allow_delete_query` for its own transaction, standing in for the
+--       Storage API (which sets it itself), so that on a hosted project the
+--       delete reaches the policy instead of the `protect_delete` trigger.
 --   (h) the retention windows the notice quotes exist: `proctor_snapshots` 30,
 --       `profiles` and `exam_submissions` 180.
 --
@@ -670,6 +673,12 @@ begin
 
   -- The real run: the finished attempt's expired still and the orphaned one go,
   -- the live sitting's and the fresh one stay.
+  -- The live run deletes from storage.objects, and on a hosted project that is
+  -- refused with 42501 unless the session sets this flag - the Storage API sets
+  -- it on itself while it is the one deleting. Setting it here stands in for the
+  -- Storage API, so what runs below is the function's real path rather than the
+  -- project's guard. The dry run above needs no flag: it deletes nothing.
+  perform set_config('storage.allow_delete_query', 'true', true);
   select public.purge_expired_snapshots() into v_done;
   if v_done < 2 then
     raise exception 'FAIL (g): the purge deleted % object(s), expected at least 2', v_done;

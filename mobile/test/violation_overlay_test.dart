@@ -19,6 +19,7 @@ void main() {
     ViolationType? type = ViolationType.lookingAway,
     int warningCount = 1,
     bool isFinal = false,
+    bool underReview = false,
     ProctoringRisk risk = ProctoringRisk.none,
     VoidCallback? onDismiss,
   }) => MaterialApp(
@@ -26,6 +27,7 @@ void main() {
       type: type,
       warningCount: warningCount,
       isFinal: isFinal,
+      underReview: underReview,
       risk: risk,
       onDismiss: onDismiss ?? () {},
     ),
@@ -59,6 +61,36 @@ void main() {
     expect(find.text('Exam Terminated'), findsOneWidget);
     expect(find.text('Exit'), findsOneWidget);
     expect(find.text('I understand, continue'), findsNothing);
+  });
+
+  testWidgets('a flagged attempt says it is under review, not that it is final',
+      (tester) async {
+    // The third counted signal no longer disqualifies: the attempt is closed and a
+    // supervisor decides. The screen has to say that, or a student reads
+    // "terminated" and believes the paper has already been lost.
+    var dismissed = false;
+
+    await tester.pumpWidget(
+      overlay(
+        type: ViolationType.appMinimized,
+        warningCount: 3,
+        underReview: true,
+        onDismiss: () => dismissed = true,
+      ),
+    );
+
+    expect(find.text('Session Under Review'), findsOneWidget);
+    expect(find.text('Exam Terminated'), findsNothing);
+    expect(
+      find.textContaining('sent to a supervisor for review'),
+      findsOneWidget,
+    );
+    // Still no way back into the paper - only out of it.
+    expect(find.text('I understand, continue'), findsNothing);
+    expect(find.text('Exit'), findsOneWidget);
+
+    await tester.tap(find.text('Exit'));
+    expect(dismissed, isTrue);
   });
 
   testWidgets('prints the attempt\'s own risk index and what it is made of',

@@ -10,11 +10,17 @@
 //   purge (`public.purge_expired_snapshots`), because some deployments cannot
 //   reach the Storage API from a function. SQL can only delete the
 //   `storage.objects` *row*: Supabase's Storage API is what also removes the file
-//   from the object store, and on a hosted project a raw SQL delete is refused
-//   outright in some setups. So the supported path is this one, and the SQL
-//   function is the documented fallback - never both on the same window, because
-//   a missing bookkeeping row makes the file invisible to the Storage API for
-//   good.
+//   from the object store. On a hosted project a raw SQL delete is not merely
+//   partial, it is refused outright: `storage.objects` carries the
+//   `protect_delete` trigger (`storage.protect_delete()`), which raises
+//       42501  Direct deletion from storage tables is not allowed
+//   unless the session has set `storage.allow_delete_query = 'true'` - which the
+//   Storage API does for itself and which the SQL function deliberately does not
+//   do (it would strand the file behind a deleted row). So this function is the
+//   supported path and the only one that runs on a hosted project; the SQL
+//   function is the documented fallback for self-hosted deployments, and never
+//   both on the same window, because a missing bookkeeping row makes the file
+//   invisible to the Storage API for good.
 //
 //   Deploy with:  supabase functions deploy purge-snapshots
 //   Deploy WITHOUT `--no-verify-jwt`: the platform's JWT check is not the

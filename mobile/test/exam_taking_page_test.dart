@@ -891,6 +891,54 @@ void main() {
       // Acknowledged, not undone: the strike stays the attempt's first.
       expect(proctoring.violations.single.type.dbValue, 'app_minimized');
     });
+
+    testWidgets('a flagged attempt ends the session on the review screen',
+        (tester) async {
+      // The weighted threshold: the server answers `flagged`, not `disqualified`,
+      // and the page has to end the attempt all the same - review screen, no way
+      // back into the paper, no "continue". The flag arrives on the *second* strike
+      // on purpose: the count is not the trigger any more, the ruling is.
+      proctoring.flagAt = 2;
+
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+      expect(find.text('Question 1 of 2'), findsOneWidget);
+
+      // Strike one, then past the evidence budget (`snapshotTimeout`) so the
+      // server's ruling - "one strike, nothing decided" - has actually landed
+      // before the next signal is reported.
+      notifierOf(tester).reportAppMinimized();
+      await tester.pump();
+      expect(find.text('Warning 1'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 4));
+      expect(find.text('Session Under Review'), findsNothing);
+
+      await tester.tap(find.text('I understand, continue'));
+      await tester.pumpAndSettle();
+
+      // Strike two is a *different* signal: the notifier dedupes one type within
+      // two seconds, and a pasted line beside a window switch is an everyday pair.
+      notifierOf(tester).reportCopyPasteAttempt();
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 4));
+
+      expect(find.text('Session Under Review'), findsOneWidget);
+      expect(find.text('Exam Terminated'), findsNothing);
+      expect(find.text('I understand, continue'), findsNothing);
+
+      // Back does not undo it: the route refuses to pop while the overlay is up.
+      await tester.state<NavigatorState>(find.byType(Navigator)).maybePop();
+      await tester.pump();
+      expect(find.text('Session Under Review'), findsOneWidget);
+
+      // Exit is the one way out, and it leaves the attempt behind.
+      await tester.tap(find.text('Exit'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(ExamTakingPage), findsNothing);
+      expect(find.text('open exam'), findsOneWidget);
+    });
   });
 
   /// The platform rule (see `examRunsOnPlatform` in `mobile_exam_only.dart`).
@@ -1711,6 +1759,11 @@ class _SilentProctoringRepository implements ProctoringRepository {
   bool online = true;
   final List<Violation> violations = <Violation>[];
 
+  /// When set, the server answers `flagged: true` from this strike count on - the
+  /// weighted ending a third *counted* signal produces. Null (the default) keeps
+  /// this fake on the disqualification path its other tests are about.
+  int? flagAt;
+
   /// Beats the exam screen asked for. Heartbeats are counted, never failed: this
   /// fake exists to test the submit gate, and a liveness series that is not the
   /// subject of the test must not be able to interfere with it.
@@ -1723,13 +1776,14 @@ class _SilentProctoringRepository implements ProctoringRepository {
   }) async {
     if (!online) throw const _NoNetwork();
     violations.add(violation);
+    final flagged = flagAt != null && violations.length >= flagAt!;
     return (
       warningCount: violations.length,
-      disqualified: violations.length >= 3,
-      // This fake never flags: these tests are about the disqualification screen.
-      // The weighted "under review" path has its own tests in
-      // proctoring_notifier_test.dart.
-      flagged: false,
+      // What the server does once an attempt is flagged: it keeps answering
+      // `flagged` (the attempt is closed, so the outcome cannot change), never
+      // `disqualified`.
+      disqualified: !flagged && violations.length >= 3,
+      flagged: flagged,
     );
   }
 
