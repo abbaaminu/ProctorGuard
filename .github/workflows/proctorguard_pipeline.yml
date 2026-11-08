@@ -349,7 +349,7 @@ jobs:
             dist/apk/*.apk
             mobile/build/app/outputs/mapping/release/mapping.txt
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 1
 
       - name: Clone and Push to Release Repository
         working-directory: ${{ runner.temp }}
