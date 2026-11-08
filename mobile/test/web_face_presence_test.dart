@@ -139,19 +139,32 @@ void main() {
       expect(
         signals,
         <GazeSignal>[GazeSignal.lookingAway],
-        reason: 'yaw well past the 25° tolerance',
+        reason: 'yaw well past the 15° tolerance',
       );
 
       report('pose:0,0');
       await flush();
       expect(signals.last, GazeSignal.centered);
 
-      sustain('pose:20,45');
+      sustain('pose:12,45');
       await flush();
       expect(
         signals.last,
         GazeSignal.lookingAway,
-        reason: 'pitch past 18° even with the yaw inside its tolerance',
+        reason: 'pitch past 15° even with the yaw inside its tolerance',
+      );
+
+      // The same tilt the other way is the same evidence: pitch is judged on the
+      // absolute angle, so "chin down" and "chin up" are one rule even though the
+      // two detectors do not agree on which is positive.
+      report('pose:0,0');
+      await flush();
+      sustain('pose:-12,-45');
+      await flush();
+      expect(
+        signals.last,
+        GazeSignal.lookingAway,
+        reason: 'a tilt up past 15° is a look away exactly like a tilt down',
       );
 
       // Case and padding are the host's business: the monitor reads the numbers.

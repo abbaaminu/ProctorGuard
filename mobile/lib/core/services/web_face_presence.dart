@@ -56,9 +56,11 @@ abstract final class WebFaceMessages {
 ///  * nothing is reported during [startupGrace].
 ///
 /// The tolerances are shared with the engine rather than copied
-/// (`proctoring_thresholds.dart`): "turned" has to mean 25 degrees of yaw and 18 of
-/// pitch on both platforms, or a browser session and a phone session judge the same
-/// head differently.
+/// (`proctoring_thresholds.dart`): "turned" has to mean the same 15 degrees on
+/// both axes, in either direction, on both platforms, or a browser session and a
+/// phone session judge the same head differently. Both engines compare the
+/// absolute angle, so which direction a particular detector calls positive cannot
+/// change the verdict.
 ///
 /// The difference is the unit of "held". The engine counts *frames* for the tick of
 /// evidence and then requires [thresholds.lookAwaySustain] (2 s) of them, because a
@@ -75,10 +77,10 @@ class WebFacePresenceMonitor {
     this.sustain = const Duration(milliseconds: 300),
     this.startupGrace = const Duration(seconds: 5),
     this.multipleFacesCooldown = const Duration(seconds: 30),
-    // The engine's tolerances, from the one file that states the rule. Widened
-    // from 15 to 25 degrees of yaw with the phone engine: a head turned 15 degrees
-    // is a student glancing at their own keyboard, and `pose:15,0` used to be a
-    // strike here while the phone called it a glance.
+    // The engine's tolerances, from the one file that states the rule: 15 degrees
+    // on each axis, absolute, so `pose:15,0` and `pose:-15,0` are both a glance
+    // and `pose:16,0` is not. Shared rather than restated - a browser that judged
+    // a head differently from the phone would make the platform decide the appeal.
     this.offCenterYawDegrees = thresholds.lookAwayYawDegrees,
     this.offCenterPitchDegrees = thresholds.lookAwayPitchDegrees,
     this.immediateAwayYawDegrees = 30.0,
@@ -135,8 +137,8 @@ class WebFacePresenceMonitor {
   final Duration multipleFacesCooldown;
 
   /// Head-pose tolerances, used only for `pose:` messages (a detector that sends
-  /// a verdict has already applied its own). The engine's own numbers - 25 deg of
-  /// yaw and 18 of pitch, from `proctoring_thresholds.dart` - so the same head is
+  /// a verdict has already applied its own). The engine's own numbers - 15 deg on
+  /// each axis, absolute, from `proctoring_thresholds.dart` - so the same head is
   /// judged the same way whichever platform it is sitting in front of.
   final double offCenterYawDegrees;
   final double offCenterPitchDegrees;

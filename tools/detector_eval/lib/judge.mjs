@@ -34,8 +34,13 @@ export const MESSAGES = {
  * `--grace 5` reproduces the app exactly, for the comparison worth making once.
  */
 export const DEFAULT_RULES = Object.freeze({
-  yawDegrees: 25,
-  pitchDegrees: 18,
+  // 15 degrees on both axes, judged on the absolute angle: the same pair
+  // `proctoring_thresholds.dart` states, and the test below fails if they drift.
+  // `immediateYawDegrees` is the only number that is not in that file - it is the
+  // web monitor's own "no sustain needed" line, and the two are consistent only
+  // because 30 is still well outside a gate of 15.
+  yawDegrees: 15,
+  pitchDegrees: 15,
   immediateYawDegrees: 30,
   sustainMs: 300,
   graceMs: 0,

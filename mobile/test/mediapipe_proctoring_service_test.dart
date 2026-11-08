@@ -202,18 +202,20 @@ void main() {
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      // 12 deg yaw and 15 deg pitch sit inside the 25 / 18 deg tolerances, for as
-      // many frames as the student keeps reading and typing. The second case is the
-      // boundary itself: the comparison is strict, so a head exactly on the line is
-      // still centered and a normal sitting position can never nudge a strike.
+      // 12 deg of yaw and 15 deg of pitch sit inside the tolerance - the pitch is
+      // the boundary itself, and the comparison is strict, so a head exactly on the
+      // line is still centered and a normal sitting position can never nudge a
+      // strike.
       feed(
         engine,
         const FaceFrameResult(faceCount: 1, yawDegrees: 12, pitchDegrees: 15),
         10,
       );
+      // The same boundary on the other axis and the other sign: 15 deg of yaw to
+      // the left, 15 deg of pitch up.
       feed(
         engine,
-        const FaceFrameResult(faceCount: 1, yawDegrees: 25, pitchDegrees: -18),
+        const FaceFrameResult(faceCount: 1, yawDegrees: 15, pitchDegrees: -15),
         10,
       );
 
@@ -228,7 +230,7 @@ void main() {
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      // Yaw 30 is past the 25 deg tolerance, and one frame of it is 150 ms: a
+      // Yaw 30 is past the 15 deg tolerance, and one frame of it is 150 ms: a
       // blink, a notification, or one bad Euler estimate. The two-second sustain
       // is what turns "the detector saw a turned head" into "the student is
       // looking somewhere else", and the student who glances at their keyboard is
@@ -300,30 +302,46 @@ void main() {
       );
     });
 
-    test('a look down past the pitch tolerance also has to be sustained',
-        () async {
-      // Pitch has its own tolerance (18 deg, narrower than the 25 deg yaw) because
-      // reading a question on paper and typing both lower the chin - but a chin
-      // that far down for two seconds is as good a reason to look at the student as
-      // a turned head, and it is judged by the same rule.
+    test('a chin down and a chin up are one rule', () async {
+      // Pitch is judged on the absolute angle, at the same 15 deg as the yaw: a
+      // head held down at a phone in the lap and a head held up at a screen across
+      // the room are the same evidence, and the two detectors do not even agree on
+      // which one is positive. The asymmetric 25 / 18 pair this replaces made the
+      // tolerance depend on the direction of the tilt as well as on the axis.
       final engine = clocked();
       final seen = <GazeSignal>[];
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
       const down = FaceFrameResult(faceCount: 1, pitchDegrees: 25);
+      const up = FaceFrameResult(faceCount: 1, pitchDegrees: -25);
+
+      // One frame either way is neither: the sustain, not the sign, decides.
       engine.handleResult(down);
+      engine.handleResult(up);
       await pumpEventQueue();
       expect(
         seen.where((signal) => signal == GazeSignal.lookingAway),
         isEmpty,
       );
 
+      // Held for two seconds, a chin down is a look-away...
       hold(engine, down, duration: const Duration(seconds: 2));
       await pumpEventQueue();
       expect(
         seen.where((signal) => signal == GazeSignal.lookingAway),
         hasLength(1),
+      );
+
+      // ...and so is a chin up, once a centred frame has re-armed the episode.
+      engine.handleResult(const FaceFrameResult(faceCount: 1));
+      await pumpEventQueue();
+      engine.handleResult(up);
+      hold(engine, up, duration: const Duration(seconds: 2));
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(2),
       );
     });
 
@@ -506,8 +524,9 @@ void main() {
   group('engine defaults', () {
     test('match the documented throttle / threshold / sustain contract', () {
       expect(engine.inferenceInterval, const Duration(milliseconds: 150));
-      // A look-away is a head turned past 25 deg (or 18 deg of pitch), held for
-      // two seconds across consecutive frames. See `proctoring_thresholds.dart`.
+      // A look-away is a head turned past 15 deg of yaw or 15 deg of pitch - the
+      // same angle on both axes, in either direction - held for two seconds across
+      // consecutive frames. See `proctoring_thresholds.dart`.
       expect(engine.offCenterThresholdDegrees, lookAwayYawDegrees);
       expect(engine.pitchThresholdDegrees, lookAwayPitchDegrees);
       expect(engine.lookAwaySustain, lookAwaySustain);

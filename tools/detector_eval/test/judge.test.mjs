@@ -51,14 +51,32 @@ test('looking_away waits for the sustain, and pose: past the immediate angle doe
   // skipped rather than filled.
   const immediate = createJudge(rules({ sustainMs: 300, immediateYawDegrees: 30 }));
   assert.equal(immediate.feed('pose:45,0', 0), 'looking_away');
-  // Just over the look-away angle but under the immediate one still waits.
-  const nearly = createJudge(rules({ yawDegrees: 25, immediateYawDegrees: 30 }));
-  assert.equal(nearly.feed('pose:26,0', 0), null);
-  assert.equal(nearly.feed('pose:26,0', 300), 'looking_away');
+  // Just over the look-away angle but under the immediate one still waits - 20 deg
+  // against the app's 15 / 30 pair.
+  const nearly = createJudge(rules({ immediateYawDegrees: 30 }));
+  assert.equal(nearly.feed('pose:20,0', 0), null);
+  assert.equal(nearly.feed('pose:20,0', 300), 'looking_away');
+});
+
+test('the pose gate is symmetric on both axes', () => {
+  // `Math.abs()` on the yaw and the pitch, like the Dart: how far the head went is
+  // the evidence, which way it went is not. The 15 / 15 pair is what makes "either
+  // way" the same rule rather than two rules 7 degrees apart.
+  for (const [there, back] of [
+    ['pose:20,0', 'pose:-20,0'],
+    ['pose:0,20', 'pose:0,-20'],
+  ]) {
+    const judge = createJudge(rules({ sustainMs: 300 }));
+    assert.equal(judge.feed(there, 0), null);
+    assert.equal(judge.feed(there, 300), 'looking_away', `${there} should report`);
+    const mirrored = createJudge(rules({ sustainMs: 300 }));
+    assert.equal(mirrored.feed(back, 0), null);
+    assert.equal(mirrored.feed(back, 300), 'looking_away', `${back} should report`);
+  }
 });
 
 test('a pose inside the box ends the episode and re-arms it', () => {
-  const judge = createJudge(rules({ pitchDegrees: 18 }));
+  const judge = createJudge(rules());
   assert.equal(judge.feed('pose:40,0', 0), 'looking_away');
   assert.equal(judge.feed('pose:40,0', 100), null);
   // Centred again: the episode is over, so the next turn is a new one.

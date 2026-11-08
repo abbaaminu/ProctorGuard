@@ -17,6 +17,11 @@ import {
   toJsonReport,
 } from '../lib/report.mjs';
 
+// Deliberately *not* the app's pair (15 / 15): this is a formatter fixture, and the
+// assertion below is that whatever numbers a run was scored under come back out
+// labelled with the right axis. Distinct values keep that check honest - a
+// `describeRules` that printed the yaw twice would pass on an equal pair. The real
+// numbers are `DEFAULT_RULES` in `judge.mjs`, read from the Dart.
 const RULES = {
   yawDegrees: 25,
   pitchDegrees: 18,

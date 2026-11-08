@@ -1389,7 +1389,8 @@ It reports `looking_away` only from a **measured** pose, never from a bounding
 box: the MediaPipe landmarks give yaw (how far the nose has swung from the
 midpoint between the eyes) and pitch (its drop below the eye line), smoothed over
 a few ticks and judged by `WebFacePresenceMonitor` with the phone build's own
-tolerances (`15°` yaw / `18°` pitch, and a turn past `30°` yaw at once). A count
+tolerances (`15°` yaw / `15°` pitch, absolute on both axes so either direction
+counts the same, and a turn past `30°` yaw at once). A count
 with no angle stays a count. A host running a different detector (WASM/WebGPU, or
 a remote service) keeps using the bridge below and can say `looking_away` or
 `pose:<yaw>,<pitch>` itself.
@@ -1406,7 +1407,7 @@ window.proctorGuardFaceSignal('centered');
 | `looking_away` | face visible, head turned away | `looking_away`, if it holds for 300ms |
 | `no_face` | nothing in frame | `no_face`, if it holds for 300ms |
 | `multiple_faces` | a second person in frame | `multiple_faces`, at once (latched 30s) |
-| `pose:<yaw>,<pitch>` | head pose in degrees, instead of a verdict | this app applies the same tolerances as the phone build (`15°` yaw / `18°` pitch, and a turn past `30°` yaw at once) |
+| `pose:<yaw>,<pitch>` | head pose in degrees, instead of a verdict | this app applies the same tolerances as the phone build (`15°` yaw / `15°` pitch on the absolute angle, and a turn past `30°` yaw at once) |
 
 `WebFacePresenceMonitor` (`web_face_presence.dart`) is the judgement, not the
 detection: it sustains a condition before reporting it (a measured `pose:` turned
@@ -1650,7 +1651,7 @@ the weighted strike rule:
 
 | Detector | Signal | `action_type` |
 | --- | --- | --- |
-| ML Kit face detection | no face (three consecutive frames) / several faces / head pose off-axis (a turn past 25 deg yaw or 18 deg pitch, **held for two seconds** across consecutive frames) | `no_face`, `multiple_faces`, `looking_away` |
+| ML Kit face detection | no face (three consecutive frames) / several faces / head pose off-axis (a turn or a tilt past 15 deg on either axis, either direction, **held for two seconds** across consecutive frames) | `no_face`, `multiple_faces`, `looking_away` |
 | `web/proctor_face_detector.js` (Chrome/Edge) | the preview's camera track ended, is muted/disabled, is paused or hidden, a preview that has shown nothing for five seconds, or the frame carries no picture (featureless whatever its brightness, dim and near-featureless, blown out, or the same thumbnail for three ticks running) → `no_face`; a face count and head pose from the Shape Detection API or the shipped MediaPipe model, so a look-away becomes `looking_away` too ([details above](#face-signals-on-the-web-the-host-page-bridge)) | `no_face`, `multiple_faces`, `looking_away` |
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
@@ -1658,12 +1659,24 @@ the weighted strike rule:
 | `AudioMonitor` + `AudioNoiseDetector` | a `record` capture session streams dBFS samples; the room's own floor is measured first, then speech sustained above it ([details below](#microphone-proctoring-levels-not-recordings)) | `audio_noise` |
 
 Camera signals are **counted in frames**, not measured in seconds: `looking_away`
-is reported only once the head has stayed past 25 deg of yaw or 18 deg of pitch for
+is reported only once the head has stayed past 15 deg of yaw or 15 deg of pitch for
 two seconds of consecutive frames (`proctoring_thresholds.dart`:
 `lookAwayYawDegrees`, `lookAwayPitchDegrees`, `lookAwaySustain`), because a single
 frame past a tolerance is a blink, a notification or one bad Euler estimate — the
 earlier rule turned every one of those into a strike, and a student warned for
-glancing at their own keyboard learns to ignore the warning. `no_face` still waits
+glancing at their own keyboard learns to ignore the warning. Both tolerances are
+compared on the **absolute** angle, so the rule is symmetric: 15 deg left counts
+exactly as 15 deg right, and a chin raised 15 deg as a chin dropped 15 deg. That is
+deliberate. The pair used to be asymmetric — 25 deg of yaw against 18 of pitch —
+which put the yaw gate past the point where the paper is still readable, and made
+the verdict depend on *which way* a student was off-task instead of whether they
+were on it. The cost is real and is the number to watch in a pilot: with the gate at
+15 deg, a held turn is a strike sooner, so a candidate who works with the laptop
+low, or who reads a printed answer sheet on the desk, is the case to check the
+false-positive rate against before trusting a timer-driven disqualification. The
+two-second sustain is what has to carry that weight — it is long enough that no
+reading position holds it, and short enough that a student working from a second
+screen is caught while they are still doing it. `no_face` still waits
 for three consecutive frames without a face (`missingFaceFrameThreshold`), because
 that is the one signal a working detector also produces by accident (a blink
 behind glasses, a hand across the lens). Frames are the honest unit here —
@@ -1672,10 +1685,13 @@ how much wall time a frame stands for and is throttling, not evidence. Any frame
 back in the tolerated pose resets the counters, so only an unbroken run counts, and
 each episode reports once: a sustained look-away is one strike, not one per
 inference. `multiple_faces` is the exception: two people in frame needs no
-measuring, so it reports immediately and is latched per episode instead. There is
-one other: a head turned past ~30 deg yaw (`immediateAwayThresholdDegrees`) is past
-the point where anything on the screen could still be read, so it is reported even
-if the frame count is raised for a noisier detector. Browsers get the same rule from
+measuring, so it reports immediately and is latched per episode instead. There is no
+second exception on the phone — a near-sideways head is held like any other turn,
+because a 60 deg estimate can come from one bad frame, so it is unambiguous about
+the *frame*, not about the student. The browser monitor does keep one,
+`immediateAwayYawDegrees` (`30`): a `pose:` message past it is reported without
+waiting out its 300 ms, on the grounds that a host detector reporting angles has
+already done the measuring. Browsers get the same rule from
 the other side of the stack — `web_face_presence.dart` reports a `no_face` or a
 look-away that holds for 300 ms, which is the shortest interval a browser face
 detector can be asked for without depending on its frame rate, and the shipped

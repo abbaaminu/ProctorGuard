@@ -74,23 +74,31 @@ class MediaPipeProctoringService {
   final Duration inferenceInterval;
 
   /// Yaw (left/right head turn) tolerance in degrees - [thresholds.lookAwayYawDegrees]
-  /// (25) unless a device needs its own.
+  /// (15) unless a device needs its own.
   ///
-  /// It was tightened to 15 by the audit, and on the evidence that is where it
-  /// stayed wrong: a 15 degree turn is a student glancing at their own keyboard or
-  /// at a clock, and flagging it is what taught them to ignore the warning. 25
-  /// still catches "looking at a second screen beside the laptop" (a 25-45 degree
-  /// turn at a normal viewing distance) while leaving the reading position alone.
-  /// Anything past it now also has to be *held* - see [lookAwaySustain].
+  /// 15 degrees is where the head has visibly stopped facing the screen, and it is
+  /// what stops a second screen beside the laptop from being free (that is a 25-45
+  /// degree turn at a normal viewing distance, comfortably past this). The false
+  /// positives that a strict angle brings in - a glance at the keyboard, a nod - are
+  /// answered by the *duration*, not by loosening the angle: anything past this has
+  /// to be *held* for [lookAwaySustain] before it is reported. An earlier version
+  /// widened the angle to 25 instead while keeping a single frame as a strike,
+  /// which flagged turns a student could not explain and taught them to ignore the
+  /// warning.
+  ///
+  /// Judged on the absolute angle, so a turn to either side is one rule.
   final double offCenterThresholdDegrees;
 
   /// Pitch (up/down head tilt) tolerance in degrees -
-  /// [thresholds.lookAwayPitchDegrees] (18).
+  /// [thresholds.lookAwayPitchDegrees] (15), the same angle as the yaw.
   ///
-  /// Judged separately from the yaw and a little wider on the down side: reading
-  /// the question on screen and typing both lower the chin a few degrees, while a
-  /// head down at a phone in the lap or notes on the desk is 25-40 degrees, so this
-  /// sits above the first and well below the second.
+  /// Equal to the yaw on purpose, and absolute in both directions. Reading the
+  /// question on screen and typing both lower the chin a few degrees, so a 15
+  /// degree tilt down is ordinary exam behaviour - which is exactly what
+  /// [lookAwaySustain] is for. The asymmetric pair this replaced (25 yaw, 18 pitch)
+  /// judged a tilt down differently from a tilt up, and which direction a detector
+  /// calls "down" differs between ML Kit and the web's FaceLandmarker, so two
+  /// tolerances also meant two verdicts for one head.
   final double pitchThresholdDegrees;
 
   /// How long a head has to stay past [offCenterThresholdDegrees] /
