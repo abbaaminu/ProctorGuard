@@ -1652,8 +1652,18 @@ create policy "logs_select_own_or_supervisor"
 --   * No row for a type  is scored as (1, counted) by `register_violation()`: a
 --                       type the constraint accepts can never be a free pass.
 --
--- The upgrade migration is `migrations/20261104090000_violation_weights.sql`; keep
--- the seed below in step with it and with `ViolationType` in the mobile app
+-- `looking_away` and `audio_noise` were seeded at 0 / not counted and are counted
+-- now (1 point each): a candidate reading a second screen and a candidate talking
+-- the answers through with somebody in the room are exactly the two signals a
+-- camera-and-microphone proctor is good at, and neither used to move the score.
+-- `migrations/20261108090000_looking_away_and_noise_count.sql` is the upgrade for
+-- a project that already carries the old values; re-running this file cannot undo
+-- a tuned weight (see the `on conflict` note below), so that migration is the way
+-- those two rows change on a live database.
+--
+-- The upgrade migrations are `migrations/20261104090000_violation_weights.sql`
+-- and `migrations/20261108090000_looking_away_and_noise_count.sql`; keep the seed
+-- below in step with them and with `ViolationType` in the mobile app
 -- (`schema_contract_test.dart` fails if either drifts).
 create table if not exists public.violation_weights (
   action_type      text primary key,
@@ -1675,9 +1685,13 @@ insert into public.violation_weights (action_type, weight, counts_toward_dq) val
   ('devtools_detected',            1, true),
   ('secondary_display_detected',   1, true),
   ('virtual_camera_detected',      1, true),
+  -- Counted since 20261108090000: a sustained glance off screen and a room that
+  -- stays above its own floor. Both are client-side rules with their own
+  -- 2-second windows (`proctoring_thresholds.dart`, `AudioNoiseDetector`), so one
+  -- cough or one glance-and-return is not a point.
+  ('looking_away',                 1, true),
+  ('audio_noise',                  1, true),
   -- Soft: stored, shown to a supervisor, never automatically fatal.
-  ('looking_away',                 0, false),
-  ('audio_noise',                  0, false),
   ('copy_paste_attempt',           0, false),
   ('right_click_blocked',          0, false),
   ('idle_afk',                     0, false)
@@ -2210,8 +2224,9 @@ end $$;
 -- ---------------------------------------------------------------------
 -- One log row is one piece of evidence, and evidence is not the same as a strike.
 -- `public.violation_weights` (section 5a) says how much each `action_type` counts:
--- the six identity-breaking signals weigh 1 and the five soft ones weigh 0. Three
--- weighted points close the sitting as `flagged_for_review` - the student is told a
+-- eight signals weigh 1 - the six identity-breaking ones plus `looking_away` and
+-- `audio_noise` - and three weigh 0. Three weighted points close the sitting as
+-- `flagged_for_review` - the student is told a
 -- supervisor will review it - and `resolve_flagged_attempt()` (below) is the human
 -- decision. The rule used to be `count(*) >= 3` and `status = 'disqualified'`,
 -- which made three right-clicks equal to three second faces and left no record of

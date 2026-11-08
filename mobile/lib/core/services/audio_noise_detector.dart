@@ -1,6 +1,8 @@
 import 'dart:collection';
 import 'dart:math' as math;
 
+import 'proctoring_thresholds.dart';
+
 /// Turns a stream of loudness samples (dBFS) into `audio_noise` rulings.
 ///
 /// This is the *rules* half of audio proctoring and it is deliberately pure Dart:
@@ -8,7 +10,7 @@ import 'dart:math' as math;
 /// student should be warned. The platform half lives in `audio_monitor.dart`, and
 /// the two are joined by `AudioMonitoringNotifier`.
 ///
-/// Three rules keep a cough from costing a strike:
+/// Four rules keep a cough from costing a strike:
 ///
 ///  1. **Calibration.** The first [calibrationWindow] of the session measures the
 ///     room, and the threshold becomes *that room's* floor plus [speechMarginDb]
@@ -22,22 +24,26 @@ import 'dart:math' as math;
 ///     television, a second voice, traffic, a generator) still do. Nothing can be
 ///     logged before calibration finishes, which doubles as the start-of-session
 ///     grace period.
-///  2. **Sustained, not instantaneous.** The level has to add up to [sustain]
-///     above the threshold; a dip only ends the episode once it has lasted longer
-///     than [releaseGrace] *and* gone more than [hysteresisDb] under the
-///     threshold. Bridging that dip is what makes the rule catch *talking* rather
-///     than only an unbroken shout: at four samples a second, a real sentence dips
-///     below the threshold between words, so a rule that reset on any one low
-///     sample never reached its window at all. The hysteresis band is the second
-///     half of that: a quietly spoken syllable two or three decibels under the
-///     threshold is the middle of the same sentence, not a room that went quiet,
-///     so it must not start the [releaseGrace] clock at all. A cough, a chair
-///     creak or the student drawing breath is still far too brief to add up, and
-///     a room that has genuinely gone quiet ends the episode within
-///     [releaseGrace]. A crescendo shorter than [sustain] is reported through
-///     [isNoisy] for the indicator, and never logged.
-///  3. **Cooldown.** After a strike the detector ignores the level for [cooldown],
-///     so one long outburst is one strike rather than one every sample.
+///  2. **Sustained, not instantaneous.** The level has to stay above the threshold
+///     for [sustain] - **two seconds, continuously**. A single sample below the
+///     threshold ends the episode and the next over-threshold sample starts the
+///     window again from zero; the shipped [releaseGrace] and [hysteresisDb] are
+///     both zero, so there is no bridging of the gaps between words. This is the
+///     rule the product asked for ("sustained for 2 seconds; a dip resets the
+///     timer"), and the price is the one it accepts: a student talking in short
+///     bursts may never fill the window, and a room that is loud in spikes rather
+///     than steadily is not reported. A cough, a chair creak or a keystroke is far
+///     too brief to fill it either. A crescendo shorter than [sustain] is still
+///     reported through [isNoisy] for the indicator, and never logged.
+///  3. **One episode, one strike.** The first sample that fills the window is the
+///     strike, and the detector then *latches*: nothing is reported again until a
+///     sample comes back below the threshold. A room that stays loud for a minute
+///     is one `audio_noise`, not one every couple of seconds. The latch is released
+///     by a real dip, so a genuine second episode - talk, quiet, talk again - is a
+///     second strike.
+///  4. **Cooldown.** After a strike the detector ignores the level for [cooldown]
+///     as well, so two episodes a second apart (a door slamming, then a voice) do
+///     not stack. It is the minimum interval; the latch is what bounds an episode.
 ///
 /// The median (not the mean) is what calibration reads, so a student who talks
 /// through the first seconds of an exam cannot drag the room floor up to their
@@ -50,13 +56,13 @@ import 'dart:math' as math;
 class AudioNoiseDetector {
   AudioNoiseDetector({
     this.calibrationWindow = const Duration(seconds: 3),
-    this.sustain = const Duration(milliseconds: 750),
-    this.releaseGrace = const Duration(milliseconds: 400),
-    this.hysteresisDb = 3,
+    this.sustain = audioNoiseSustain,
+    this.releaseGrace = audioNoiseReleaseGrace,
+    this.hysteresisDb = audioNoiseHysteresisDb,
     this.cooldown = const Duration(seconds: 10),
-    this.speechMarginDb = 6,
-    this.minThresholdDb = -50,
-    this.maxThresholdDb = -32,
+    this.speechMarginDb = audioNoiseMarginDb,
+    this.minThresholdDb = audioNoiseMinThresholdDb,
+    this.maxThresholdDb = audioNoiseMaxThresholdDb,
     this.defaultThresholdDb = -30,
     this.minCalibrationSamples = 5,
     this.maxCalibrationSamples = 128,
@@ -100,78 +106,66 @@ class AudioNoiseDetector {
   /// does not move the floor, and the floor is only ever read once.
   final Duration calibrationWindow;
 
-  /// How long the level must add up to above the threshold before it is a strike.
+  /// How long the level must stay **continuously** above the threshold before it
+  /// is a strike.
   ///
-  /// 750 ms - three of `AudioMonitor`'s 250 ms samples of room for a fourth to
-  /// close - is the shortest thing that is *speech* rather than an accident: "hey
-  /// you", "stop that", a name called across the room, a question read aloud. It
-  /// was a full second, and a second is a long time to hold a warning back from a
-  /// student who is clearly talking; 750 ms is the same rule, measured against the
-  /// sampling interval rather than against the clock, so it fires one sample
-  /// earlier without changing what counts.
+  /// Two seconds ([audioNoiseSustain]), matching the look-away rule: an ambient
+  /// signal gets the same "sustained, not instantaneous" standard on both senses,
+  /// so neither a glance nor a cough can cost a strike on its own.
   ///
-  /// It was 500 ms before that, on the strength of an audit finding against an
-  /// earlier 1.5 s window that needed most of a sentence; live testing on web and
-  /// desktop showed the other end of that trade - the browsers' peak-reading meters
-  /// make a keyboard, a mouse click, a chair or a single cough land over the line
-  /// for several samples in a row, so a half-second window logged `audio_noise` for
-  /// noise that was not a voice at all. The gap between 500 ms and a second is what
-  /// that testing bought, and this sits inside it: still four consecutive
-  /// over-threshold samples (a cough is one, a keystroke is one, a chair creak is
-  /// one), which is the property the false positives were about.
+  /// It was 750 ms, chosen against `AudioMonitor`'s 250 ms sampling interval to
+  /// fire one sample after four consecutive over-threshold samples, and it was
+  /// bridged across the gaps between words by [releaseGrace] and [hysteresisDb].
+  /// The rule is now "two seconds of continuous level": a single sample under the
+  /// threshold restarts the window from zero, because that is what the product
+  /// asked for and because the "reading a question aloud" case it used to protect
+  /// is indistinguishable from "talking the paper through with somebody in the
+  /// room". The cost is written down where a reviewer will find it: speech that
+  /// dips between words may never fill the window, and an honest student in a
+  /// genuinely noisy room can reach the threshold - which is why reaching it ends
+  /// the *sitting* for a human to decide, never an automatic disqualification.
   ///
-  /// A cough, a chair creak, a door or a keystroke is shorter than this. At four
-  /// samples a second a 300 ms one-off contributes at most one over-threshold
-  /// sample, which cannot fill the window; the burst has to keep crossing the line
-  /// across three sampling intervals. [releaseGrace] and [hysteresisDb] are what
-  /// keep the gap *between* two words from restarting the window, so a sentence is
-  /// one episode rather than none.
-  ///
-  /// Kept below the length of the noise it is meant to catch on purpose: the
-  /// samples are a meter, not a recording, so a burst that starts just after one
-  /// only contributes its remainder. A short window is what makes that offset
-  /// harmless instead of hiding half a sentence.
+  /// Kept as a constructor argument, so a deployment that wants the old window
+  /// back can pass one.
   final Duration sustain;
 
   /// How much of a dip below the threshold is bridged instead of ending the
   /// episode.
   ///
-  /// Must be longer than the sampling interval (`AudioMonitor` asks for a level
-  /// every 250 ms): the point is that one low sample in the middle of a sentence
-  /// is not evidence that the room went quiet. Anything quieter for longer than
-  /// this restarts the window from scratch, which is what keeps one cough from
-  /// being added to the next one.
+  /// **Zero by default** ([audioNoiseReleaseGrace]): a dip resets the timer.
+  /// Anything quieter than the threshold, for any length of time, restarts the
+  /// window - which is the strict form of "sustained for two seconds" and the
+  /// reason one cough cannot be added to the next one.
+  ///
+  /// The knob is kept for hosts that want the tolerant rule back: with a grace
+  /// longer than the sampling interval (`AudioMonitor` asks for a level every
+  /// 250 ms) a single low sample in the middle of a sentence is bridged, and
+  /// anything quieter for longer than the grace restarts the window.
   final Duration releaseGrace;
 
   /// What to do with a sentence's quiet syllables.
   ///
-  /// The threshold is a line a *sustained* level has to cross, not a line every
-  /// single sample has to stay above. Speech at conversation volume swings several
-  /// decibels between syllables, and a sample taken mid-syllable can land just
-  /// under the threshold even though the student is still talking. Counting that
-  /// as a dip starts [releaseGrace] early, and a second quiet syllable a few
-  /// hundred milliseconds later is then enough to throw away the part of the
-  /// sentence that had already accumulated.
+  /// **Zero by default** ([audioNoiseHysteresisDb]): a sample even a fraction of a
+  /// decibel under the threshold is a dip, so the window only fills on a level that
+  /// never leaves the line. That is the strict reading of the rule, and it is
+  /// deliberate.
   ///
-  /// So a sample within this many decibels *below* the threshold is treated as
-  /// part of the episode rather than as a dip. It does not add to [sustain] (only a
-  /// sample over the line does), and it keeps the amber indicator on. 3 dB is
-  /// about the smallest change a listener hears as "half as loud", which is large
-  /// enough to cover syllable-to-syllable swing and far too small to mistake a
-  /// room that actually went quiet (typically 10-20 dB under the room floor) for
-  /// speech.
-  ///
-  /// Zero restores the strict rule - every sample under the threshold starts the
-  /// release clock - and is what a host that wants the old behaviour can pass.
+  /// Larger values restore the old tolerance: a sample within this many decibels
+  /// *below* the threshold is treated as part of the episode rather than as a dip.
+  /// It never adds to [sustain] and it keeps the amber indicator on. 3 dB is about
+  /// the smallest change a listener hears as "half as loud", which is enough to
+  /// cover syllable-to-syllable swing and far too small to mistake a room that
+  /// actually went quiet (typically 10-20 dB under the room floor) for speech.
   final double hysteresisDb;
 
-  /// How long after a strike the level is ignored.
+  /// How long after a strike the level is ignored entirely.
   ///
-  /// Ten seconds, so one continued outburst is one strike. It was five, which was
-  /// long enough to stop one *sample* being one strike but not long enough to stop
-  /// a room that stays loud for half a minute from climbing the strike ladder on
-  /// its own - and the escalation is the server's (`ProctoringNotifier`). A student
-  /// who genuinely talks twice, ten seconds apart, still earns two strikes.
+  /// Ten seconds, so two episodes a moment apart (a raised voice, then a door)
+  /// cannot stack into two strikes. It is a *minimum interval*; the latch
+  /// ([_latched]) is what bounds one episode, and it is what keeps a room that
+  /// stays loud for half a minute from climbing the strike ladder on its own. A
+  /// student who genuinely talks twice, ten seconds apart, with the room quiet in
+  /// between, still earns two strikes.
   final Duration cooldown;
 
   /// How far above the measured room floor counts as human noise rather than the
@@ -252,6 +246,16 @@ class AudioNoiseDetector {
   double? _peakDb;
   double _thresholdDb;
   bool _noisy = false;
+
+  /// True from the sample that fills [sustain] until a sample comes back under the
+  /// threshold: one episode is one strike, however long the room stays loud.
+  ///
+  /// This is the rule the release asked for ("one episode = one strike, latch until
+  /// the level drops back below"). It is a separate flag rather than a consequence
+  /// of [cooldown], because a cooldown bounds how *often* a strike can land while
+  /// this bounds how many a single episode can produce.
+  bool _latched = false;
+
   int _samples = 0;
 
   /// True once the room floor has been measured: before that the detector is
@@ -316,33 +320,39 @@ class AudioNoiseDetector {
       return false;
     }
 
+    // Where a sample has to be to count as speech. Anything under this is a real
+    // dip; the band between it and the threshold is a quiet syllable (an empty band
+    // with the shipped [hysteresisDb] of zero).
+    final dipFloor = _thresholdDb - hysteresisDb;
+
+    // A genuine dip - under the threshold with the shipped settings - ends the
+    // episode for good: it releases the one-strike latch and, once it has lasted
+    // longer than [releaseGrace], restarts the window. The amber "something is
+    // building" state goes off with it, because this sample is not the noise.
+    if (level < dipFloor) {
+      _latched = false;
+      _belowSince ??= now;
+      _noisy = false;
+      return false;
+    }
+
     if (isCoolingDown) {
-      // Dead zone: the strike for this outburst has already been logged.
+      // Dead zone: the strike for this episode has already been logged, and two
+      // episodes a moment apart must not stack into two strikes.
       _aboveSince = null;
       _belowSince = null;
       _noisy = false;
       return false;
     }
 
-    // Where a sample has to be to count as speech. Anything under this is a real
-    // dip; the band between it and the threshold is a quiet syllable.
-    final dipFloor = _thresholdDb - hysteresisDb;
+    // One episode, one strike. Nothing reports again until a sample comes back under
+    // the threshold (above), so a room that stays loud for a minute is one
+    // `audio_noise` rather than one every [cooldown].
+    if (_latched) return false;
 
-    if (level < dipFloor) {
-      // Genuinely quiet: more than [hysteresisDb] under the line, so this really
-      // is a break in the sound rather than a soft syllable. Whether it *ends* the
-      // episode is decided by the next sample that comes back over the line: a dip
-      // shorter than [releaseGrace] - the gap between two words - is bridged, a
-      // longer quiet stretch restarts the window from scratch. Either way the amber
-      // "something is building" state is off: this sample is not the noise.
-      _belowSince ??= now;
-      _noisy = false;
-      return false;
-    }
-
-    // Over the threshold, or close enough under it to be the same sentence. A dip
-    // that was already open is bridged if it was short enough, so that talking
-    // (which is not one unbroken tone) still adds up to [sustain].
+    // Over the threshold, or close enough under it to be the same utterance. A dip
+    // that was already open is bridged if it was short enough (never, with the
+    // shipped zero grace), so that a level that only wobbles still fills [sustain].
     final belowSince = _belowSince;
     if (belowSince != null) {
       if (now.difference(belowSince) >= releaseGrace) _aboveSince = null;
@@ -364,6 +374,8 @@ class AudioNoiseDetector {
     _aboveSince = null;
     _noisy = false;
     _lastStrikeAt = now;
+    // Latched: one episode, one strike (rule 3 in the class docs).
+    _latched = true;
     return true;
   }
 
@@ -405,7 +417,7 @@ class AudioNoiseDetector {
     return (sorted[middle - 1] + sorted[middle]) / 2;
   }
 
-  /// Forgets the room, the episode and the cooldown.
+  /// Forgets the room, the episode, the latch and the cooldown.
   ///
   /// Called when the microphone comes back after an interruption: the student may
   /// have moved rooms, plugged in a headset or changed device, so the old floor is
@@ -419,6 +431,7 @@ class AudioNoiseDetector {
     _roomFloorDb = null;
     _peakDb = null;
     _noisy = false;
+    _latched = false;
     _samples = 0;
     _thresholdDb = defaultThresholdDb;
   }

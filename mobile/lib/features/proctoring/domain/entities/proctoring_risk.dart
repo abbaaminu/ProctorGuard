@@ -60,7 +60,10 @@ enum RiskBand {
 /// `public.violation_weights` ([ViolationType.weight] /
 /// [ViolationType.countsTowardDisqualification] mirror it for display):
 /// [disqualificationThreshold] weighted points closes the sitting as
-/// `flagged_for_review`, which no combination of soft signals can reach. The index
+/// `flagged_for_review`. A blocked paste, a suppressed right-click and an idle
+/// device cannot reach it however many are logged; a glance off screen and a
+/// sustained noisy room can, since `looking_away` and `audio_noise` became counted
+/// signals (one point each). The index
 /// deliberately keeps counting *every* signal, because a supervisor looking at the
 /// grid is asking "who needs me first", not "who has already been punished".
 class ProctoringRisk {
@@ -95,7 +98,10 @@ class ProctoringRisk {
   /// pins the pair).
   ///
   /// Three, with every counted signal at [ViolationType.weight] = 1: any three
-  /// identity-breaking signals, and never a soft one however many are logged.
+  /// counted signals - the six identity-breaking ones, plus `looking_away` and
+  /// `audio_noise` - close the sitting. The three uncounted types (a blocked paste,
+  /// a suppressed right-click, an idle device) never add up, however many are
+  /// logged.
   static const int disqualificationThreshold = 3;
 
   /// The weighted score a list of signals adds up to, by the server's weights.

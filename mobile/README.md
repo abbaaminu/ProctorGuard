@@ -1748,26 +1748,33 @@ sound as `record`'s −160 dBFS sentinel, so a student silent through the calibr
 window would otherwise calibrate at −160 and pin the threshold to the bottom of the
 band, where a mouse click or a chair is a violation. The sentinel is clamped to
 `silenceFloorDb` (−100) before the median sees it, and the clamp floor is −50. The
-level must then add up to 750 ms above it
-(`sustain`) — a spoken phrase ("hey you", a question read aloud), not two syllables —
-and a gap below the threshold ends the
-episode only once it has lasted longer than 400 ms (`releaseGrace`). That gap allowance
-is what makes the rule catch **talking** rather than only an unbroken shout: at four
-samples a second a real sentence drops below the threshold between words, so a rule
-that reset on any single low sample never filled its window and logged nothing at all.
-750 ms is four consecutive 250 ms samples and well below the two to three seconds a
-supervisor would call talking on purpose, and the meter is read every 250 ms, so a burst
-that starts just after a sample contributes only its remainder — which is why the
-window is kept short instead of absorbing the offset with headroom. A one-off shorter
-than the window (a cough, a chair,
-a door, a keystroke) cannot fill it at all; the grace and the 3 dB hysteresis are what
-keep the gap between two words from restarting it.
-A cough, a chair creak or a breath is still far too brief to add up, a room that has
-genuinely gone quiet ends the episode inside the grace, and after a strike the detector
-ignores the level for 10s (`cooldown`), so one long outburst is one strike rather than
-one every sample — and a room staying loud cannot climb the weighted ladder on its
-own (a noise strike weighs 0). Calibration doubles as the start-of-session grace
-period: nothing can be logged
+level must then stay above that threshold for **two seconds without a single sample
+below it** (`audioNoiseSustain`; a dip resets the timer — the shipped
+`releaseGrace` and `hysteresisDb` are both zero), and **one episode is one strike**:
+the detector latches from the sample that fills the window until the level comes back
+under the threshold, so a room that stays loud for a minute is one `audio_noise` and
+not one every ten seconds. That is stricter than the 750 ms window with a 400 ms /
+3 dB release this used to ship, and the trade is deliberate:
+
+ * a cough, a chair, a door, a keystroke or a short "hey you" still cannot fill the
+   window, and now a sentence that breaks up between words may not either — the
+   error in that direction is silence;
+ * a room that is genuinely loud for two unbroken seconds **is** a counted strike
+   now (`looking_away` and `audio_noise` both weigh 1 in `violation_weights`), so
+   an honest student in a corridor, a hall or beside a television can reach three
+   and have the sitting closed — for a **human** to review, never an automatic
+   disqualification, and `resolve_flagged_attempt('clear')` restores it;
+ * neither direction has been measured with a real microphone in a real room; see
+   the root README's "What is *not* verified".
+
+After a strike the detector also ignores the level for 10 s (`cooldown`), which is
+the minimum interval between strikes, so a raised voice and a slamming door a moment
+apart do not stack. The three de-duplication layers in order: the detector's window +
+latch + cooldown (per episode), `ProctoringNotifier`'s 2 s per-type debounce
+(`_dedupeWindow`, so two events of the same type in the same instant are one row),
+and `register_violation`'s `client_event_id` uniqueness, which is idempotency rather
+than a cooldown — a replayed delivery inserts nothing. Calibration doubles as the
+start-of-session grace period: nothing can be logged
 before it finishes.
 
 Kiosk bridge contract — MethodChannel `lock_task_channel`:

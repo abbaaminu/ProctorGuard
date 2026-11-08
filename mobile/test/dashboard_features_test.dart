@@ -260,6 +260,99 @@ void main() {
     });
   });
 
+  testWidgets('the unlock is on a flagged attempt, above everything else, and only '
+      'for the review tier', (tester) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    // One attempt waiting on a person, and one still being sat. The flagged row is
+    // second in the stream on purpose: the grid has to lead with the work.
+    final repository = _FakeDashboardRepository();
+    final overrides = [
+      examSubmissionsStreamProvider('exam-1').overrideWith(
+        (ref) => Stream.value([
+          {
+            'id': 'attempt-live',
+            'student_id': 'student-live',
+            'status': 'ongoing',
+            'score': null,
+          },
+          {
+            'id': 'attempt-flagged',
+            'student_id': 'student-waiting',
+            'status': 'flagged_for_review',
+            'score': null,
+          },
+        ]),
+      ),
+      liveViolationFeedProvider(
+        'exam-1',
+      ).overrideWith((ref) => Stream.value(<Map<String, dynamic>>[])),
+      accountNamesProvider.overrideWith(
+        (ref) => Stream.value({
+          'student-live': 'Aisha Bello',
+          'student-waiting': 'Musa Ibrahim',
+        }),
+      ),
+      dashboardRepositoryProvider.overrideWithValue(repository),
+    ];
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: overrides,
+        child: const MaterialApp(
+          home: SupervisorDashboardPage(examId: 'exam-1', examTitle: 'Biology'),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // The unlock (the 'clear' decision) and the disqualify are both offered on a
+    // flagged attempt...
+    expect(find.byKey(const Key('resolve-clear-attempt-flagged')), findsOneWidget);
+    expect(
+      find.byKey(const Key('resolve-disqualify-attempt-flagged')),
+      findsOneWidget,
+    );
+    // ...and on nothing else, because there is nothing to decide on a live paper.
+    expect(find.byKey(const Key('resolve-clear-attempt-live')), findsNothing);
+
+    // The row waiting on a person is painted first, whatever order the stream
+    // arrived in.
+    final flaggedY = tester.getTopLeft(find.text('Musa Ibrahim')).dy;
+    final liveY = tester.getTopLeft(find.text('Aisha Bello')).dy;
+    expect(flaggedY, lessThan(liveY));
+
+    // The tooltip is the word "Unlock": a supervisor reading the icon list should
+    // not have to guess whether the padlock clears the flag or the mark.
+    final unlock = tester.widget<IconButton>(
+      find.byKey(const Key('resolve-clear-attempt-flagged')),
+    );
+    expect(unlock.tooltip, contains('Unlock'));
+
+    // A lecturer looking at somebody else's paper gets neither control: the RPC
+    // refuses them, so offering the icon would only produce "the server did
+    // nothing".
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: overrides,
+        child: const MaterialApp(
+          home: SupervisorDashboardPage(
+            examId: 'exam-1',
+            examTitle: 'Biology',
+            canResetThisExam: false,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('resolve-clear-attempt-flagged')), findsNothing);
+  });
+
   testWidgets('reset controls are supervisor-only', (tester) async {
     tester.view.physicalSize = const Size(1200, 800);
     tester.view.devicePixelRatio = 1;

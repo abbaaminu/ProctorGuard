@@ -168,12 +168,17 @@ void main() {
       // score, which only sums the types carrying `counts_toward_dq`. The chip used
       // to read the row count, so three right-clicks could announce "3 of 3
       // warnings" on an attempt the server would never close.
+      //
+      // The pair below is a blocked paste and a suppressed context menu - both still
+      // weight 0. `audio_noise` used to sit here and no longer does: since
+      // `20261108090000_looking_away_and_noise_count.sql` it is a counted strike
+      // (weight 1), which the next test covers from the counted side.
       final repo = _RecordingProctoringRepository(disqualifyAfter: 100);
       final notifier = _notifier(proctoringRepo: repo);
       addTearDown(notifier.dispose);
 
       notifier.reportRightClickBlocked();
-      notifier.reportAudioNoise();
+      notifier.reportCopyPasteAttempt();
       await pumpEventQueue();
 
       expect(notifier.state.warningCount, 2, reason: 'two rows were logged');

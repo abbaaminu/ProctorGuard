@@ -22,6 +22,15 @@ Where it landed: `supabase/migrations/20261104090000_violation_weights.sql`,
 domain/entities/violation.dart` (the mirrors) and `supabase/tests/
 weighted_strikes_check.sql`. Tuning is a README section, not a migration.
 
+**Later change (20261108090000):** two of the five "soft, weight 0" rows below were
+re-priced — `looking_away` and `audio_noise` are counted strikes at weight 1, so
+three glances off screen or three sustained noisy-room episodes close the sitting
+for review exactly as three faces in frame do. `copy_paste_attempt`,
+`right_click_blocked` and `idle_afk` stay at 0. The threshold (3), the ending
+(`flagged_for_review`) and the human decision (`resolve_flagged_attempt`) are
+unchanged. The prose below is the original proposal and is kept as written, except
+that its weight table now describes the *first* seed rather than the current one.
+
 ## Problem
 
 The current 3-strike rule in `register_violation` (`supabase/schema.sql` §5)

@@ -108,11 +108,17 @@ class ProctoringState {
   /// weighted by [ViolationType.weight], against
   /// [ProctoringRisk.disqualificationThreshold]. Deliberately *not* derived from
   /// [warningCount]: the server's `warning_count` is how many rows the attempt has
-  /// logged, soft signals included, while the ending is decided by the weighted
-  /// score. Showing the row count meant three right-clicks or three noisy minutes
-  /// read "3 of 3 warnings" on an attempt that was never going to close - a
-  /// promise the paper then failed to keep. The soft ones are still evidence, and
+  /// logged, uncounted signals included, while the ending is decided by the weighted
+  /// score. Showing the row count meant three right-clicks read "3 of 3 warnings"
+  /// on an attempt that was never going to close - a promise the paper then failed
+  /// to keep. The uncounted ones are still evidence, and
   /// are counted by [notedWarnings] rather than hidden.
+  ///
+  /// A glance off screen and a sustained noisy room *are* counted (one point each,
+  /// since `20261108090000_looking_away_and_noise_count.sql`), so three of either
+  /// reads "3 of 3 warnings" and closes the sitting for review - which is why the
+  /// client-side gates matter: one frame is not a glance and one sample is not a
+  /// noisy room.
   ///
   /// This is the evidence *this device* has seen, because it is derived from
   /// [violationTypes]. A device that reloads mid-attempt starts from an empty list
@@ -122,8 +128,7 @@ class ProctoringState {
   int get countedWarnings => ProctoringRisk.weightedScoreOf(violationTypes);
 
   /// Signals logged on this attempt that are **not** counted by
-  /// [countedWarnings] - a glance away, noise in the room, a blocked paste or
-  /// right-click, an idle device.
+  /// [countedWarnings] - a blocked paste, a suppressed right-click, an idle device.
   ///
   /// Shown beside the counted number ("1 of 3 warnings · 4 noted") so a student can
   /// see that the four are on the record without being told they are four fifths of

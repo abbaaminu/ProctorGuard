@@ -935,10 +935,11 @@ select set_config('request.jwt.claims', '', true);
 -- The three strikes on `sub_a` ((k)i, (k)iii and (k)iv) are all weight-1 types -
 -- `multiple_faces`, `no_face`, `app_minimized` - on purpose. Escalation is weighted
 -- now: `register_violation` sums `violation_weights.weight` for the types whose
--- `counts_toward_dq` is true, so three *soft* signals (the `looking_away` this
--- block used to send) are stored and reported but never reach the threshold, and
--- the third one would not end the attempt. (k)ii keeps the soft type on an attempt
--- of its own, precisely because a soft strike must still be stored as a row.
+-- `counts_toward_dq` is true, so this block names the signals it means rather than
+-- relying on "three rows" - and the third row is what ends the attempt. (k)ii sends
+-- `looking_away` twice on an attempt of its own, deliberately keeping it under three
+-- points (it has weighed 1 since 20261108090000), precisely because a *stored*
+-- strike must still be a row whether or not it is the one that crossed the line.
 set local role authenticated;
 select set_config('request.jwt.claims',
   format('{"sub": "%s", "role": "authenticated", "email": "student.a@test.local"}',

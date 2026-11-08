@@ -25,6 +25,11 @@ class ViolationOverlay extends StatelessWidget {
   /// screen has to say that rather than "disqualified" - the student has not been
   /// found guilty of anything yet, and the appeal starts from what this screen told
   /// them.
+  ///
+  /// It also has to say **who unlocks it** (a supervisor, the paper's lecturer or
+  /// an administrator - the three tiers `resolve_flagged_attempt()` accepts) and
+  /// that the lock is per attempt, so the student knows their other exams are
+  /// unaffected and that signing out is not the way to fix it.
   final bool underReview;
 
   /// The attempt's index so far, recomputed from the session's own violation
@@ -123,8 +128,11 @@ class ViolationOverlay extends StatelessWidget {
                           : underReview
                               ? 'Your session has been stopped and sent to a '
                                 'supervisor for review. Your answers are saved. '
-                                'Nothing has been decided yet - you will be told '
-                                'the outcome, and you can close this screen now.'
+                                'Nothing has been decided yet - a supervisor, the '
+                                'lecturer who set this paper, or an administrator '
+                                'must unlock this attempt before you can sit it '
+                                'again. Your other exams are not affected, so you '
+                                'can close this screen now.'
                               : _message(type),
                       style: const TextStyle(color: Colors.white70, fontSize: 16),
                       textAlign: TextAlign.center,
@@ -160,7 +168,7 @@ class ViolationOverlay extends StatelessWidget {
                           backgroundColor:
                               isFinal ? Colors.redAccent : Colors.orangeAccent,
                         ),
-                        onPressed: onDismiss, // routes back to login/home
+                        onPressed: onDismiss, // back to the exam list, still signed in
                         child: const Padding(
                           padding: EdgeInsets.symmetric(
                             horizontal: 24,

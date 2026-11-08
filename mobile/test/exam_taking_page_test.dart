@@ -920,10 +920,13 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('0 of 3 warnings'), findsNothing);
 
-      // A suppressed context menu and a noisy room: two rows, no counted signals.
+      // A suppressed context menu and a blocked paste: two rows, no counted
+      // signals. Both still weigh 0 - a glance off screen and a noisy room do not
+      // any more (they are counted strikes since `20261108090000`), so they are
+      // deliberately not the pair used to prove the chip ignores rows.
       notifierOf(tester).reportRightClickBlocked();
       await tester.pump();
-      notifierOf(tester).reportAudioNoise();
+      notifierOf(tester).reportCopyPasteAttempt();
       await tester.pumpAndSettle();
 
       expect(proctoring.violations, hasLength(2));

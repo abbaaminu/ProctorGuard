@@ -346,7 +346,7 @@ class SupervisorDashboardPage extends ConsumerWidget {
             title: Text(
               disqualify
                   ? 'Disqualify $studentName?'
-                  : 'Clear $studentName’s attempt?',
+                  : 'Unlock $studentName’s attempt?',
             ),
             content: Column(
               mainAxisSize: MainAxisSize.min,
@@ -357,9 +357,12 @@ class SupervisorDashboardPage extends ConsumerWidget {
                       ? 'The attempt is marked disqualified and does not count. '
                           'The evidence stays on the record, and the student '
                           'cannot start this paper again without a reset.'
-                      : 'The attempt is restored to submitted and marked from '
-                          'the answers already saved. Subjective answers can be '
-                          'marked afterwards as usual.',
+                      : 'The review flag is cleared and the attempt is restored '
+                          'to submitted, marked from the answers already saved. '
+                          'Subjective answers can be marked afterwards as usual. '
+                          'The student can sit this paper again only if you also '
+                          'reset the attempt; until then this one is their '
+                          'attempt.',
                 ),
                 const SizedBox(height: 12),
                 TextField(
@@ -382,7 +385,7 @@ class SupervisorDashboardPage extends ConsumerWidget {
               FilledButton(
                 key: Key('resolve-confirm-$submissionId'),
                 onPressed: () => Navigator.pop(dialogContext, true),
-                child: Text(disqualify ? 'Disqualify' : 'Clear'),
+                child: Text(disqualify ? 'Disqualify' : 'Unlock'),
               ),
             ],
           ),
@@ -402,7 +405,7 @@ class SupervisorDashboardPage extends ConsumerWidget {
         if (!context.mounted) return;
         final message = switch (outcome) {
           'disqualified' => 'Attempt disqualified.',
-          'submitted' => 'Attempt cleared and restored for marking.',
+          'submitted' => 'Attempt unlocked and restored for marking.',
           // The RPC is idempotent: an attempt somebody else already resolved
           // answers with the status it holds rather than a second decision.
           '' => 'Attempt resolved.',
@@ -592,18 +595,30 @@ class SupervisorDashboardPage extends ConsumerWidget {
                                             return Row(
                                               mainAxisSize: MainAxisSize.min,
                                               children: [
+                                                // The unlock: the control that
+                                                // makes the student's exam
+                                                // attempt usable again. The RPC
+                                                // is `resolve_flagged_attempt`
+                                                // with 'clear', which restores the
+                                                // attempt to 'submitted' and marks
+                                                // it from the answers already
+                                                // saved - so the word on the
+                                                // console is "unlock", and the
+                                                // tooltip says what that means.
                                                 IconButton(
                                                   key: Key(
                                                     'resolve-clear-${row['id']}',
                                                   ),
-                                                  tooltip: 'Clear: restore to '
-                                                      'submitted for marking',
+                                                  tooltip: 'Unlock: clear the '
+                                                      'review flag and restore '
+                                                      'the attempt to submitted '
+                                                      'for marking',
                                                   onPressed: () => resolveAttempt(
                                                     row,
                                                     'clear',
                                                   ),
                                                   icon: const Icon(
-                                                    Icons.task_alt,
+                                                    Icons.lock_open_outlined,
                                                     color: Colors.green,
                                                   ),
                                                 ),

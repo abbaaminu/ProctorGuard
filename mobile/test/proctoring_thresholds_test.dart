@@ -1,20 +1,23 @@
 import 'dart:async';
 
+import 'package:proctorguard/core/services/audio_noise_detector.dart';
 import 'package:proctorguard/core/services/mediapipe_proctoring_service.dart';
 import 'package:proctorguard/core/services/proctoring_thresholds.dart';
 import 'package:proctorguard/core/services/web_face_presence.dart';
 import 'package:proctorguard/core/services/web_face_signal_source.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// Pins the look-away rule, and the relationship between its two halves.
+/// Pins the look-away rule, the audio rule, and the relationship between their
+/// halves.
 ///
-/// The numbers live in `proctoring_thresholds.dart` so that the rule can be
+/// The numbers live in `proctoring_thresholds.dart` so that each rule can be
 /// stated in one sentence and changed in one place; these tests are what stops a
 /// future edit from quietly turning a glance into a strike again (or a real
-/// look-away into silence). They also check that the engine's defaults really are
-/// those constants - a copy of the number in the constructor would pass the
-/// behaviour tests below while drifting from the file a reviewer reads - and that
-/// the browser monitor quotes the same ones instead of keeping its own.
+/// look-away into silence), and the same for a noisy room. They also check that the
+/// engine's and the detector's defaults really are those constants - a copy of the
+/// number in a constructor would pass the behaviour tests below while drifting from
+/// the file a reviewer reads - and that the browser monitor quotes the same ones
+/// instead of keeping its own.
 void main() {
   group('look-away rule', () {
     test('one angle, absolute, on both axes', () {
@@ -78,6 +81,50 @@ void main() {
       // time against its own window instead of counting frames.
       // `web_face_presence.dart` explains the difference.
       expect(web.sustain, isNot(lookAwaySustain));
+    });
+  });
+
+  group('audio noise rule', () {
+    test('the window is two seconds, and it is the same two as the look-away', () {
+      expect(audioNoiseSustain, const Duration(seconds: 2));
+      // The release asked for exactly this: "audio noise must be sustained for 2
+      // seconds before it is reported". Long enough that a cough, a keystroke, a
+      // chair or a door cannot fill it; the same standard the glance rule uses, so
+      // the two ambient signals are not two different ideas of "sustained".
+      expect(audioNoiseSustain, lookAwaySustain);
+    });
+
+    test('a dip below the threshold resets the window', () {
+      // No bridging and no hysteresis band: the level has to stay above the line
+      // for the whole two seconds. This is the strict reading of the rule and it is
+      // what makes "sustained" mean one continuous episode rather than a total.
+      expect(audioNoiseReleaseGrace, Duration.zero);
+      expect(audioNoiseHysteresisDb, 0.0);
+    });
+
+    test('how loud is unchanged: a measured floor plus 6 dB, clamped', () {
+      // "Do not change the noise level threshold itself" - so these three numbers
+      // are pinned as they were, and only the window around them moved.
+      expect(audioNoiseMarginDb, 6.0);
+      expect(audioNoiseMinThresholdDb, -50.0);
+      expect(audioNoiseMaxThresholdDb, -32.0);
+      // A clamp, not a fixed threshold: a quiet room ends up at the bottom of the
+      // band (sensitive), a loud one is pinned below its own floor so its steady
+      // background is itself the finding.
+      expect(audioNoiseMinThresholdDb, lessThan(audioNoiseMaxThresholdDb));
+    });
+
+    test('the detector ships those constants, not copies of them', () {
+      // The same complaint as the look-away test above: a number written into the
+      // constructor would pass the behaviour tests in `audio_monitoring_test.dart`
+      // while drifting from the file a reviewer reads.
+      final detector = AudioNoiseDetector();
+      expect(detector.sustain, audioNoiseSustain);
+      expect(detector.releaseGrace, audioNoiseReleaseGrace);
+      expect(detector.hysteresisDb, audioNoiseHysteresisDb);
+      expect(detector.speechMarginDb, audioNoiseMarginDb);
+      expect(detector.minThresholdDb, audioNoiseMinThresholdDb);
+      expect(detector.maxThresholdDb, audioNoiseMaxThresholdDb);
     });
   });
 }

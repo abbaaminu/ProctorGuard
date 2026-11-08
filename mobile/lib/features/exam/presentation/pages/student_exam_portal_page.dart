@@ -10,6 +10,7 @@ import '../../domain/entities/exam.dart';
 import '../../domain/entities/exam_submit_result.dart';
 import '../../domain/entities/submission.dart';
 import '../providers/exam_providers.dart';
+import '../widgets/attempt_under_review_dialog.dart';
 import '../widgets/exam_instructions_dialog.dart';
 import '../widgets/mobile_exam_only.dart';
 import '../widgets/published_exam_list.dart';
@@ -203,13 +204,29 @@ class _StudentExamPortalPageState extends ConsumerState<StudentExamPortalPage> {
       if (!mounted) return;
 
       if (submission.status != SubmissionStatus.ongoing) {
+        // Under review is the one state with something to *say* rather than a
+        // sentence in a snack bar that scrolls away: the attempt is locked, the
+        // answers are safe, and a person has to unlock it. Everything else is a
+        // statement of fact about a finished paper.
+        if (submission.status == SubmissionStatus.flaggedForReview) {
+          // The tile stops spinning first: the dialog is the answer to the tap, and
+          // a progress indicator turning behind it would say "still opening" for as
+          // long as the student reads (the `finally` below clears this too, which is
+          // why clearing it twice is harmless).
+          setState(() => _openingExamId = null);
+          await showAttemptUnderReviewDialog(context, examTitle: exam.title);
+          return;
+        }
+        // The `flaggedForReview` arm below is unreachable - the dialog branch above
+        // returned - but a switch expression over an enum has to be exhaustive, and
+        // leaving it out would make the compiler ask a question this code should not
+        // have to answer twice.
         _showMessage(switch (submission.status) {
           SubmissionStatus.disqualified =>
             'Your "${exam.title}" attempt was disqualified. '
                 'Speak to your supervisor before retaking it.',
           SubmissionStatus.flaggedForReview =>
-            'Your "${exam.title}" attempt is under review by a supervisor. '
-                'Your answers are saved; you will be told the outcome.',
+            '$attemptUnderReviewBody $attemptUnderReviewWhoCanUnlock',
           SubmissionStatus.submitted =>
             'You have already submitted "${exam.title}".',
           SubmissionStatus.ongoing => '', // handled above

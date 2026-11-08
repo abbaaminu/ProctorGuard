@@ -58,9 +58,10 @@ enum ViolationType {
   ///
   /// The softer types - a glance away, noise in the room, a paste, leaving the tab,
   /// an idle device - are still strikes, still recorded and still cost the student
-  /// a warning, but they weigh 0 towards the server's threshold and therefore can
-  /// never end an attempt on their own ([weight]). They are simply not evidence
-  /// that the
+  /// a warning. Two of them ([lookingAway], [audioNoise]) weigh 1 towards the
+  /// server's threshold since `20261108090000_looking_away_and_noise_count.sql`;
+  /// the rest weigh 0 and cannot add up to an ending ([weight]). None of them is
+  /// evidence that the
   /// *identity* of the candidate has broken, so they keep the full budget for the
   /// photograph that a human will later look at.
   bool get isCritical => switch (this) {
@@ -89,19 +90,27 @@ enum ViolationType {
   /// explanation can say *why* a signal did or did not count, and so
   /// `schema_contract_test.dart` can fail when the two drift apart.
   ///
-  /// One point for the six identity-breaking signals, zero for the five that are
-  /// recorded and reviewed but never automatically fatal. Three points closes the
-  /// attempt as `flagged_for_review`.
+  /// One point for the eight counted signals, zero for the three that are recorded
+  /// and reviewed but never automatically fatal. Three points closes the attempt as
+  /// `flagged_for_review`.
+  ///
+  /// [lookingAway] and [audioNoise] are **counted** (they were weight 0 until
+  /// `20261108090000_looking_away_and_noise_count.sql`): three glances off screen,
+  /// or three sustained noisy-room episodes, close the sitting exactly as three
+  /// faces in frame do. Both keep their own client-side gate, so what counts is
+  /// never a single frame or a single sample - see [lookAwaySustain] /
+  /// [lookAwayYawDegrees] in `proctoring_thresholds.dart` and
+  /// [audioNoiseSustain] in the same file.
   int get weight => switch (this) {
         ViolationType.multipleFaces ||
         ViolationType.noFace ||
         ViolationType.appMinimized ||
         ViolationType.devtoolsDetected ||
         ViolationType.secondaryDisplayDetected ||
-        ViolationType.virtualCameraDetected =>
-          1,
+        ViolationType.virtualCameraDetected ||
         ViolationType.lookingAway ||
-        ViolationType.audioNoise ||
+        ViolationType.audioNoise =>
+          1,
         ViolationType.copyPasteAttempt ||
         ViolationType.rightClickBlocked ||
         ViolationType.idleAfk =>
@@ -109,9 +118,9 @@ enum ViolationType {
       };
 
   /// The server's `counts_toward_dq` column: whether this type may contribute at
-  /// all. False for every soft signal - it is still stored, still shown to a
-  /// supervisor, and still costs the student a warning; it just cannot end the
-  /// attempt by itself.
+  /// all. False for the three soft signals - a blocked paste, a suppressed
+  /// right-click and an idle device are still stored, still shown to a supervisor,
+  /// and still cost the student a warning; they just cannot add up to an ending.
   bool get countsTowardDisqualification => weight > 0;
 
   ///

@@ -265,6 +265,59 @@ void main() {
       await letSnackBarExpire(tester);
     });
 
+    testWidgets('a flagged attempt is locked behind the under-review screen', (
+      tester,
+    ) async {
+      // Three counted strikes closed this sitting. The attempt cannot be reopened -
+      // the server refuses every write to it (see (h) in
+      // `supabase/tests/weighted_strikes_check.sql`) - so the portal must not offer
+      // the paper, and it must say who unlocks it and how the student gets out of
+      // this screen. Not a sign-out: the lock is per attempt, and their other papers
+      // are still theirs to sit.
+      exams.submissions[cs101Id] = const Submission(
+        id: 'sub-cs',
+        studentId: aishaId,
+        examId: cs101Id,
+        answers: <String, dynamic>{},
+        status: SubmissionStatus.flaggedForReview,
+      );
+      var opened = 0;
+
+      await tester.pumpWidget(
+        portal(
+          builder: (_, _) {
+            opened++;
+            return const SizedBox.shrink();
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('exam-$cs101Id')));
+      await tester.pumpAndSettle();
+
+      expect(opened, 0, reason: 'the server owns that state');
+      expect(find.byKey(const Key('attempt-under-review-dialog')), findsOneWidget);
+      expect(find.text('Attempt under review'), findsOneWidget);
+      expect(
+        find.textContaining('A supervisor, the lecturer who set this exam, or an '
+            'administrator has to unlock it'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('Your other exams are not affected'),
+        findsOneWidget,
+      );
+
+      // The one action, and it leaves the student on the exam list - signed in.
+      await tester.tap(find.byKey(const Key('attempt-under-review-exit')));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('attempt-under-review-dialog')), findsNothing);
+      expect(find.text('Student Exam Portal'), findsOneWidget);
+      expect(find.byKey(const Key('exam-$mat201Id')), findsOneWidget);
+    });
+
     testWidgets('an objective paper is marked the moment it is handed in', (
       tester,
     ) async {

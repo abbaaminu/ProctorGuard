@@ -102,8 +102,9 @@ rather than left to be mistaken for more than it is.
   it cannot tell a student apart from a similarly-shaped stand-in, and there is
   no liveness challenge (no blink / turn / read-a-phrase prompt).
 - **Audio is loudness, not content.** The microphone is sampled for level
-  (dBFS) only; sustained energy above the room's measured floor raises
-  `audio_noise`. **No audio is recorded, transmitted or stored** — only the
+  (dBFS) only; energy above the room's measured floor, held for **two seconds
+  without dropping below it**, raises `audio_noise` — and one continuous episode is
+  one strike. **No audio is recorded, transmitted or stored** — only the
   decibel numbers the detector reads, in memory. It flags "someone is talking",
   not *what* was said, and cannot separate speech from a television at a similar
   loudness.
@@ -164,7 +165,7 @@ rather than left to be mistaken for more than it is.
 | --- | --- | --- |
 | Impersonation / a stand-in on camera | Face detection is not face recognition and has no liveness check | Supervisor review of the attempt's evidence; add an identity-match + liveness step where the stakes require it |
 | A helper off-camera or on another device | The camera only sees in front of the lens; audio is level-only | `multiple_faces`, `no_face`, `looking_away`, `idle_afk` and `secondary_display_detected` signals, plus supervisor judgement |
-| Sound that is not plain talking (TV, music, a second speaker) | Loudness cannot be attributed to a person or separated from other sound | Sustained-threshold rules (a median-calibrated room floor plus a 6 dB speech margin, a 750 ms window, and a 0.4 s / 3 dB release that tolerates the gaps between words) keep one-offs out; content is deliberately never captured |
+| Sound that is not plain talking (TV, music, a second speaker) | Loudness cannot be attributed to a person or separated from other sound | Sustained-threshold rules (a median-calibrated room floor plus a 6 dB speech margin, held for 2 s with no dip below the line, one episode = one strike) keep one-offs out; content is deliberately never captured. A noisy room **can** reach three counted strikes and close the sitting for review — the rule is strict on purpose and the review is a human's |
 | A microphone that fails mid-session (unplugged, grant revoked, another app took the input) | Level is the only audio signal, so a dead mic stops speech being detected at all | The chip reports `Mic lost` / `Mic unavailable` / `Mic blocked` — **never a false "quiet"** — and the paper is held shut behind the opaque equipment block, with **Reconnect** / **Open settings** / **Leave** (the `unavailable` case stays on the indicator: a barrier nobody can clear would strand the student). A lost mic is an **unproctored gap, not a strike**, so no attempt is ended for it — but nothing can be read or typed behind the block either, so the gap cannot pass as a clean run |
 | Escape from the locked exam surface | Screen pinning (no Device Owner) and browser fullscreen can be left | An escape or a fullscreen exit becomes an `app_minimized` strike; the kiosk badge shows whether pinning is enforced or best-effort |
 | Detector evasion (rooted/virtualised device, camera spoof) | Client-side detectors can be defeated by a determined, technically capable student | Treat the client as untrusted: grading and the weighted strike rule are enforced **server-side** (`register_violation`, `submit_exam`, `resolve_flagged_attempt`) |
@@ -183,6 +184,16 @@ kind of detail a pilot finds out the hard way:
   false-positive rate: a candidate who works with the laptop low, or who reads a
   printed answer sheet on the desk, is the case to measure before a
   timer-driven disqualification is trusted.
+- **The audio threshold has never been measured in a real room either.** The rule is
+  a median-calibrated floor plus 6 dB, clamped to −50…−32 dBFS, held for two seconds
+  continuously (`AudioNoiseDetector`, `proctoring_thresholds.dart`). It is unit-
+  tested at the meter's real 250 ms rate, but no corridor, hall, fan, television or
+  busy canteen has been used to check it. Two errors are possible and only one of
+  them is quiet: a room loud enough to clear the line for two unbroken seconds now
+  earns a **counted** strike (three of those close the sitting for review — never an
+  automatic disqualification, and a supervisor can clear it), while speech that dips
+  between words may never fill the window at all. Measure both directions before a
+  pilot relies on either.
 - **The sign of the pitch a browser detector reports is unverified.** The shipped
   FaceLandmarker path reads a rotation matrix, a host page sends `pose:` degrees,
   and the two need not agree on which direction is "up". The app therefore compares
@@ -347,6 +358,7 @@ operator's decision. See
    supabase db query --linked -f supabase/migrations/retention_policy.sql
    supabase db query --linked -f supabase/migrations/20261106090000_proctoring_consents.sql
    supabase db query --linked -f supabase/migrations/20261106090100_snapshot_retention.sql
+   supabase db query --linked -f supabase/migrations/20261108090000_looking_away_and_noise_count.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -589,6 +601,17 @@ Things worth knowing before you turn it on:
   author is around), because nothing resolves a review automatically. Neither file
   rewrites a `proctoring_logs` row or re-reads an existing attempt: see
   [Tuning the violation weights](#tuning-the-violation-weights).
+- Apply `supabase/migrations/20261108090000_looking_away_and_noise_count.sql` after
+  those two, on every project. It is one `UPDATE` that turns `looking_away` and
+  `audio_noise` from "recorded for review only" (weight 0) into counted strikes
+  (weight 1), so three of either now closes the sitting for review. It is safe to
+  re-run, and it is the only way those two rows change on a live database:
+  re-applying `schema.sql` or `20261104090000` will not push the new values into a
+  table that already holds the old ones (`on conflict … do nothing`). Verify with
+  `select action_type, weight, counts_toward_dq from public.violation_weights where
+  action_type in ('looking_away','audio_noise');` — expect `1 / true` twice. Nothing
+  is backfilled: existing evidence keeps its rows and existing attempts keep their
+  status.
 - Apply `supabase/migrations/optional_question_shuffling.sql` before the first
   paper that has question-order shuffling enabled. Until it runs, the
   `shuffle_questions` column does not exist: the authoring console reports the
@@ -709,17 +732,52 @@ supervisor's decision. The seeded policy:
 
 | Weight | Counts | Signals |
 |--------|--------|---------|
-| 1 | yes | `multiple_faces`, `no_face`, `app_minimized`, `devtools_detected`, `secondary_display_detected`, `virtual_camera_detected` |
-| 0 | no | `looking_away`, `audio_noise`, `copy_paste_attempt`, `right_click_blocked`, `idle_afk` |
+| 1 | yes | `multiple_faces`, `no_face`, `app_minimized`, `devtools_detected`, `secondary_display_detected`, `virtual_camera_detected`, **`looking_away`**, **`audio_noise`** |
+| 0 | no | `copy_paste_attempt`, `right_click_blocked`, `idle_afk` |
+
+**Three glances off screen close the sitting, and so do three sustained noisy-room
+episodes.** Both signals count now
+(`supabase/migrations/20261108090000_looking_away_and_noise_count.sql`), because a
+candidate reading a second screen and a candidate talking the paper through with
+somebody in the room are exactly what a camera-and-microphone proctor is good at —
+and neither used to move the score at all. Neither is a single frame or a single
+sample: the client only reports a look-away after 15° of yaw **and** 15° of pitch
+have been held for 2 seconds, and a noisy room only after the level has stayed above
+the room's own measured threshold for 2 seconds continuously (a dip resets the
+timer, and one episode is one strike). The old values, for a project comparing
+notes with an older install:
+
+| Signal | Before 20261108090000 | Now |
+|--------|----------------------|-----|
+| `looking_away` | weight 0, not counted | weight 1, counted |
+| `audio_noise` | weight 0, not counted | weight 1, counted |
+| everything else | unchanged | unchanged |
 
 Every signal is still stored in `proctoring_logs` and still shown to the
 supervisor; the weight only decides which ones may end an attempt on their own.
 
+**Two of these numbers have not been tested with real people.** The 15° / 2 s
+look-away rule and the audio threshold (the room's median floor plus 6 dB, clamped
+to −50…−32 dBFS, held for 2 s) are unit-tested and pinned, but no real head has been
+put in front of one here and no real room behind the other. The rate that decides
+whether they are safe is the false-positive rate, and it has not been measured. Two
+consequences to go in with your eyes open:
+
+- a student who works with the laptop low, reads a printed sheet on the desk, or
+  sits in a corridor, a hall or beside a television **can reach three counted
+  strikes and lose the sitting** — which is why the third strike produces
+  `flagged_for_review` and never an automatic disqualification: a human reads it,
+  and `resolve_flagged_attempt('clear')` puts the attempt back in the marking queue;
+- the audio rule is strict on purpose (a dip below the threshold restarts the 2 s
+  window), so speech that breaks up between words may never fill it. That direction
+  of error is silence, not a false strike; the noisy room above is the other one.
+
 Change one with a single statement — no migration, no redeploy:
 
 ```sql
--- One pasted line is now worth half a strike (not enough to flag on its own, but
--- it counts towards the three), and a blocked right-click still counts for nothing.
+-- A blocked paste becomes a counted strike: a full point, so it can be the third
+-- one that closes a sitting. (It is uncounted today, and it stays uncounted here
+-- for a blocked right-click.)
 update public.violation_weights
    set weight = 1, counts_toward_dq = true
  where action_type = 'copy_paste_attempt';

@@ -28,12 +28,20 @@ void main() {
   ///
   /// The window is pinned wide (2 s) on purpose: these tests step a full second
   /// at a time and are about the *band*, so the measured value is the band's
-  /// effect on the window rather than the shipped 750 ms window firing early and
-  /// hiding it.
-  AudioNoiseDetector measured({double hysteresisDb = 3}) {
+  /// effect on the window rather than the window itself firing early and hiding
+  /// it.
+  ///
+  /// [releaseGrace] defaults to the shipped zero - a dip resets the timer - and is
+  /// only raised by the one test that proves the knob still bridges a word gap when
+  /// a host asks it to.
+  AudioNoiseDetector measured({
+    double hysteresisDb = 3,
+    Duration releaseGrace = Duration.zero,
+  }) {
     final detector = AudioNoiseDetector(
       calibrationWindow: Duration.zero,
       sustain: const Duration(seconds: 2),
+      releaseGrace: releaseGrace,
       hysteresisDb: hysteresisDb,
       minCalibrationSamples: 1,
       clock: () => now,
@@ -122,8 +130,12 @@ void main() {
       expect(sensor.add(-45), isTrue);
     });
 
-    test('a short dropout is bridged instead of restarting the window', () {
-      final sensor = measured();
+    test('a short dropout is bridged - when a host asks for the grace', () {
+      // The bridging rule is still available (`releaseGrace`), and this is what it
+      // buys: a 100 ms word gap does not restart the window. The *shipped* value is
+      // zero, so an app that never passes one gets the strict rule - see
+      // `proctoring_thresholds_test.dart` and the "shipped sensitivity" group below.
+      final sensor = measured(releaseGrace: const Duration(milliseconds: 400));
 
       sensor.add(-45); // t0
       now = now.add(const Duration(seconds: 1));
@@ -133,6 +145,27 @@ void main() {
 
       now = now.add(const Duration(seconds: 1));
       expect(sensor.add(-45), isTrue); // 2.1 s of it: one strike, not two
+    });
+
+    test('the shipped zero grace restarts the window on that same 100 ms gap', () {
+      // The other half of the trade, asserted rather than assumed: with the defaults
+      // an app actually ships, the same 100 ms dip costs the whole window. This is
+      // the price of "a dip below resets the timer", and it is the reason a noisy
+      // room can end an honest student's sitting - for a human to review, never an
+      // automatic disqualification.
+      final sensor = measured();
+
+      sensor.add(-45); // t0
+      now = now.add(const Duration(seconds: 1));
+      sensor.add(-60); // the 100 ms gap
+      now = now.add(const Duration(milliseconds: 100));
+      expect(sensor.add(-45), isFalse);
+      expect(sensor.isNoisy, isTrue, reason: 'a fresh window opens here');
+
+      now = now.add(const Duration(seconds: 1));
+      expect(sensor.add(-45), isFalse, reason: 'only 1.1 s into the new window');
+      now = now.add(const Duration(seconds: 1));
+      expect(sensor.add(-45), isTrue);
     });
   });
 
@@ -258,59 +291,125 @@ void main() {
       return strikes;
     }
 
-    test('two seconds of meter noise is one strike, not none and not two', () {
+    test('two and a quarter seconds of meter noise is one strike, not two', () {
+      // The window is 2 s and the meter reports every 250 ms, so the shortest burst
+      // that can fill it is nine samples: one opens the window and the ninth lands
+      // exactly 2 s later. Eight samples (2 s of noise) is one sample short, which
+      // the sampling-offset test below pins as "not yet".
       final sensor = calibrated();
+      expect(sensor.sustain, const Duration(seconds: 2));
 
       expect(
-        sustainedNoise(sensor, const Duration(seconds: 2)),
+        sustainedNoise(sensor, const Duration(milliseconds: 2250)),
         1,
-        reason: 'the cooldown has to keep one burst to one strike even though the '
-            'window closes long before the noise does',
+        reason: 'the latch and the cooldown have to keep one burst to one strike '
+            'even though the window closes long before the noise does',
+      );
+
+      // ...and a burst that keeps going for a minute is still one strike.
+      expect(
+        sustainedNoise(sensor, const Duration(seconds: 60)),
+        0,
+        reason: 'one episode, one strike: nothing more is reported until the level '
+            'drops back below the threshold',
       );
     });
 
-    test('a phrase of a second is a strike, and two seconds is still one', () {
-      // At AudioMonitor's real 250 ms rate the shortest burst that can close the
-      // shipped 750 ms window is four samples: one opens it and the fourth lands
-      // exactly 750 ms later. That is a spoken phrase - "hey you", a question read
-      // aloud, an answer to somebody in the room - which is what the rule is for,
-      // and it is heard a sample earlier than the full second it used to take.
-      final phrase = calibrated();
-      expect(sustainedNoise(phrase, const Duration(milliseconds: 1000)), 1);
+    test('anything shorter than two seconds never reports', () {
+      // The requirement, at the real sampling rate: a cough, a keystroke, a chair,
+      // a door and a short "hey you" all come and go inside the window, and none of
+      // them is an `audio_noise`.
+      for (final duration in <Duration>[
+        const Duration(milliseconds: 250),
+        const Duration(milliseconds: 500),
+        const Duration(milliseconds: 1000),
+        const Duration(milliseconds: 1750),
+      ]) {
+        final sensor = calibrated();
+        expect(
+          sustainedNoise(sensor, duration),
+          0,
+          reason: '${duration.inMilliseconds} ms is under the 2 s window',
+        );
+        expect(
+          sensor.isNoisy,
+          isTrue,
+          reason: 'still amber on the chip - suspicious, not a violation',
+        );
+      }
+    });
 
-      // ...and a burst that keeps going is still one strike: the cooldown, not the
-      // window, is what keeps one episode to one warning.
-      final outburst = calibrated();
-      expect(sustainedNoise(outburst, const Duration(seconds: 2)), 1);
+    test('a dip below the threshold restarts the two-second timer', () {
+      // Eight loud samples, then the room drops for one sample, then eight more:
+      // twenty-four hundredths of a second of evidence that a totalising rule would
+      // count as two seconds and a half. The window starts over instead, so the
+      // strike lands only once the level has held for 2 s *without* leaving the line.
+      final sensor = calibrated();
+
+      for (var i = 0; i < 8; i++) {
+        now = now.add(const Duration(milliseconds: 250));
+        expect(sensor.add(-40), isFalse, reason: 'sample ${i + 1}: 1.75 s, no strike');
+      }
+
+      now = now.add(const Duration(milliseconds: 250));
+      expect(sensor.add(-70), isFalse); // the dip
+      expect(sensor.isNoisy, isFalse);
+
+      for (var i = 0; i < 8; i++) {
+        now = now.add(const Duration(milliseconds: 250));
+        expect(
+          sensor.add(-40),
+          isFalse,
+          reason: 'sample ${i + 1} of the new window: the first 1.75 s is not 2 s',
+        );
+      }
+      now = now.add(const Duration(milliseconds: 250));
+      expect(sensor.add(-40), isTrue); // 2 s unbroken: one strike
     });
 
     test('a cough, a keystroke or a chair is still not enough', () {
       final sensor = calibrated();
 
-      // Loud, but over before the window can add up. A browser reports the peak of
-      // a short analyser window, so a keyboard, a mouse click, a chair or a single
-      // cough all clear the line for a sample or two - which is exactly why the
-      // window is three quarters of a second and not half of one: at 500 ms these
-      // were strikes, and `audio_noise` on a student who was only typing is the
-      // false positive live testing found on web and desktop. Three samples of
-      // noise are still three samples; the window needs a fourth.
+      // Loud, but over before the window can fill. A browser reports the peak of a
+      // short analyser window, so a keyboard, a mouse click, a chair or a single
+      // cough all clear the line for a sample or two - three samples of noise are
+      // still three samples, and the window needs nine.
       expect(sustainedNoise(sensor, const Duration(milliseconds: 750)), 0);
       expect(sensor.isNoisy, isTrue, reason: 'suspicious, not a violation');
     });
 
-    test('the sampling offset cannot swallow a short burst', () {
+    test('the sampling offset cannot swallow the shortest real episode', () {
       // A burst that starts just after a sample only contributes its remainder to
-      // the window: 1000 ms of noise yields the 750 ms of evidence the window
-      // needs. It is sized so the shortest audible phrase still lands inside that
-      // remainder.
+      // the window: 2250 ms of noise yields the 2000 ms of evidence the window needs,
+      // because the meter is read every 250 ms. That is the shortest burst the rule
+      // can hear, and it is the honest lower bound - the rule really is "two seconds
+      // of continuous level", measured at the meter's resolution.
       final sensor = calibrated();
-      expect(sensor.sustain, const Duration(milliseconds: 750));
-      expect(sustainedNoise(sensor, const Duration(milliseconds: 1000)), 1);
+      expect(sensor.sustain, const Duration(seconds: 2));
+      expect(sustainedNoise(sensor, const Duration(milliseconds: 2250)), 1);
 
-      // One sample less and nothing accrues: the window is not so short that the
-      // 250 ms sampling interval alone closes it.
+      // One sample less and nothing accrues.
       final tooShort = calibrated();
-      expect(sustainedNoise(tooShort, const Duration(milliseconds: 750)), 0);
+      expect(sustainedNoise(tooShort, const Duration(seconds: 2)), 0);
+    });
+
+    test('one continuous episode is one strike, however long it lasts', () {
+      // The latch rule, on the shipped tuning: the same 30 s of noise is one
+      // `audio_noise` even though the 10 s cooldown expires twice inside it. A room
+      // that stays loud cannot climb the weighted ladder on its own - which matters
+      // now that a noise strike counts towards the threshold.
+      final sensor = calibrated();
+      expect(sustainedNoise(sensor, const Duration(seconds: 30)), 1);
+
+      // The level drops back below the threshold, then the room is loud again: a
+      // second episode, and a second strike.
+      now = now.add(const Duration(milliseconds: 250));
+      expect(sensor.add(-70), isFalse);
+      expect(
+        sustainedNoise(sensor, const Duration(seconds: 12)),
+        1,
+        reason: 'a genuinely new episode after the room went quiet',
+      );
     });
   });
 }

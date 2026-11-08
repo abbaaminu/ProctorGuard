@@ -146,6 +146,96 @@ void main() {
     });
   });
 
+  /// The client's mirror of `public.violation_weights`, exercised as the two
+  /// questions the student's chip actually asks: how much does this signal count,
+  /// and how close is the attempt to the server's threshold?
+  ///
+  /// `looking_away` and `audio_noise` became counted strikes
+  /// (`20261108090000_looking_away_and_noise_count.sql`), so three glances off
+  /// screen or three sustained noisy-room episodes now close the sitting exactly as
+  /// three faces in frame do. The three uncounted signals still cannot, however
+  /// many are logged. `schema_contract_test.dart` is what keeps these numbers equal
+  /// to the ones in `schema.sql`; these tests are what make the *rule* explicit.
+  group('counted strikes', () {
+    int counted(List<ViolationType> types) => ProctoringRisk.weightedScoreOf(types);
+
+    test('two look-aways are two points, and the third is the threshold', () {
+      expect(ViolationType.lookingAway.weight, 1);
+      expect(ViolationType.lookingAway.countsTowardDisqualification, isTrue);
+
+      expect(counted(List.filled(1, ViolationType.lookingAway)), 1);
+      expect(
+        counted(List.filled(2, ViolationType.lookingAway)),
+        2,
+        reason: 'two glances must not end an attempt',
+      );
+      expect(
+        counted(List.filled(3, ViolationType.lookingAway)),
+        ProctoringRisk.disqualificationThreshold,
+        reason: 'the third closes the sitting for review',
+      );
+    });
+
+    test('two noisy-room strikes are two points, and the third is the threshold',
+        () {
+      expect(ViolationType.audioNoise.weight, 1);
+      expect(ViolationType.audioNoise.countsTowardDisqualification, isTrue);
+
+      expect(counted(List.filled(2, ViolationType.audioNoise)), 2);
+      expect(
+        counted(List.filled(3, ViolationType.audioNoise)),
+        ProctoringRisk.disqualificationThreshold,
+      );
+    });
+
+    test('mixed: the counted signals add up across types', () {
+      // A glance, a noisy room and a second face: three different kinds of evidence,
+      // three points, one ending.
+      expect(
+        counted(const <ViolationType>[
+          ViolationType.lookingAway,
+          ViolationType.audioNoise,
+          ViolationType.multipleFaces,
+        ]),
+        ProctoringRisk.disqualificationThreshold,
+      );
+
+      // The same three points reached a different way.
+      expect(
+        counted(const <ViolationType>[
+          ViolationType.lookingAway,
+          ViolationType.audioNoise,
+          ViolationType.lookingAway,
+        ]),
+        ProctoringRisk.disqualificationThreshold,
+      );
+    });
+
+    test('the uncounted signals still count for nothing, however many', () {
+      for (final type in <ViolationType>[
+        ViolationType.copyPasteAttempt,
+        ViolationType.rightClickBlocked,
+        ViolationType.idleAfk,
+      ]) {
+        expect(type.weight, 0, reason: '${type.dbValue} must stay weight 0');
+        expect(type.countsTowardDisqualification, isFalse);
+        expect(counted(List.filled(10, type)), 0);
+      }
+
+      // ...and they do not tip a two-point attempt over either.
+      expect(
+        counted(const <ViolationType>[
+          ViolationType.lookingAway,
+          ViolationType.audioNoise,
+          ViolationType.copyPasteAttempt,
+          ViolationType.rightClickBlocked,
+          ViolationType.idleAfk,
+        ]),
+        2,
+      );
+    });
+  });
+
   group('risk index chip', () {
     testWidgets('names the band and the score, and explains it in the tooltip', (
       tester,

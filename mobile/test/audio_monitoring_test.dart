@@ -134,14 +134,15 @@ void main() {
     test('the shipped defaults are the documented window and margin', () {
       final sensor = AudioNoiseDetector();
 
-      // Three quarters of a second of speech above the room's own floor is a
-      // strike: a spoken phrase (a student reading a question aloud, or answering
-      // somebody in the room) still counts, while a cough, a door, a chair or a
-      // keyboard does not - those are one sample (250 ms) or two, and the level has
-      // to keep crossing the line for four samples in a row before the window
-      // closes. The 400 ms grace carries the window across the gaps between words.
-      expect(sensor.sustain, const Duration(milliseconds: 750));
-      expect(sensor.releaseGrace, const Duration(milliseconds: 400));
+      // Two seconds of a level that never drops below the threshold is a strike
+      // (`audioNoiseSustain`), and the window is not bridged: the shipped
+      // `releaseGrace` is zero and the hysteresis band is empty, so a single sample
+      // under the line restarts it. That is the rule the release asked for - "a dip
+      // below resets the timer" - and it is stricter than the 750 ms window plus a
+      // 400 ms / 3 dB grace this used to ship.
+      expect(sensor.sustain, const Duration(seconds: 2));
+      expect(sensor.releaseGrace, Duration.zero);
+      expect(sensor.hysteresisDb, 0);
       // The room is measured for three seconds and nothing can be logged before
       // that: the calibration window is the start-of-session delay, so it is kept
       // as short as a median of real samples allows.
@@ -149,7 +150,8 @@ void main() {
       expect(sensor.cooldown, const Duration(seconds: 10));
       // The margin the threshold sits above the measured room floor: wide enough
       // that the room's own flutter (and a browser's peak-reading meter) does not
-      // clear it, narrow enough that quiet speech still does.
+      // clear it, narrow enough that quiet speech still does. Unchanged by the
+      // window change on purpose - how loud is a different question from how long.
       expect(sensor.speechMarginDb, 6);
       // The band the threshold is clamped into, and the floor a "nothing to
       // report" sentinel is pushed up to before it can be the room's floor.
@@ -238,10 +240,47 @@ void main() {
       now = now.add(const Duration(seconds: 1));
       expect(sensor.add(-10), isFalse); // still shouting, already counted
 
-      now = now.add(const Duration(seconds: 10));
+      // A new outburst: the room has to go quiet first. The latch is what makes
+      // that the definition - a level that stays above the threshold is the *same*
+      // episode however long it lasts, so "one episode, one strike" would otherwise
+      // be "one strike per cooldown" for a room that never quiets down.
+      now = now.add(const Duration(seconds: 11));
+      expect(sensor.add(-70), isFalse); // the room drops back below the threshold
+      now = now.add(const Duration(seconds: 1));
       sensor.add(-10);
       now = now.add(const Duration(seconds: 1));
       expect(sensor.add(-10), isTrue); // a new outburst is a new strike
+    });
+
+    test('one continuous episode is one strike, however long it lasts', () {
+      // The rule the release asked for, on its own: "latch until the level drops
+      // back below". Sixty seconds of an unbroken loud room is one `audio_noise`,
+      // not six - three of those would have closed the sitting on a television the
+      // student cannot switch off. `cooldown` alone could not express this: it is a
+      // minimum interval between strikes, not an episode boundary.
+      final sensor = detector(
+        sustain: const Duration(seconds: 2),
+        cooldown: const Duration(milliseconds: 500),
+      );
+      sensor.add(-60); // calibrates in one sample: threshold -50
+
+      var strikes = 0;
+      for (var i = 0; i < 60 * 4; i++) {
+        now = now.add(const Duration(milliseconds: 250));
+        if (sensor.add(-30)) strikes++;
+      }
+      expect(strikes, 1, reason: 'a minute of noise is one episode');
+      expect(sensor.isNoisy, isFalse, reason: 'and nothing more is building');
+
+      // The level drops back below the threshold: the latch releases, and the next
+      // episode is a strike of its own.
+      now = now.add(const Duration(milliseconds: 250));
+      expect(sensor.add(-70), isFalse);
+      for (var i = 0; i < 4 * 4; i++) {
+        now = now.add(const Duration(milliseconds: 250));
+        if (sensor.add(-30)) strikes++;
+      }
+      expect(strikes, 2);
     });
 
     test('a misbehaving source cannot corrupt the calibration', () {

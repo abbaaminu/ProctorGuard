@@ -85,6 +85,20 @@ void main() {
       find.textContaining('sent to a supervisor for review'),
       findsOneWidget,
     );
+    // ...and who gets them out of it. The three tiers are the ones
+    // `resolve_flagged_attempt()` accepts, and the sentence has to name all of them:
+    // "ask your supervisor" is not actionable in a department that has none on duty.
+    // It also says the lock is per attempt, so a student does not sign out of an app
+    // that still holds their other papers.
+    expect(
+      find.textContaining('a supervisor, the lecturer who set this paper, or an '
+          'administrator must unlock this attempt'),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('Your other exams are not affected'),
+      findsOneWidget,
+    );
     // Still no way back into the paper - only out of it.
     expect(find.text('I understand, continue'), findsNothing);
     expect(find.text('Exit'), findsOneWidget);

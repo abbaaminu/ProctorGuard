@@ -3130,6 +3130,79 @@ void main() {
         );
       }
     });
+    test('the migration that counts the glance and the noise says so, and is safe '
+        'to re-run', () {
+      // `looking_away` and `audio_noise` are counted strikes now. The upgrade for a
+      // project that already carries the old (0, false) rows is one UPDATE, and it
+      // has to be:
+      //  * exactly those two types - a stray third would silently re-price a signal
+      //    nobody asked about;
+      //  * an UPDATE, not an INSERT or a rewrite of `proctoring_logs`, so it can run
+      //    twice and so no evidence changes;
+      //  * present in the apply lists, or an operator following the README would
+      //    never run it.
+      final migration = File(
+        '../supabase/migrations/20261108090000_looking_away_and_noise_count.sql',
+      );
+      expect(
+        migration.existsSync(),
+        isTrue,
+        reason: 'the live project needs a file to run, not just a schema.sql edit',
+      );
+      final sql = migration.readAsStringSync().replaceAll('\r\n', '\n');
+
+      expect(
+        sql,
+        contains(
+          'update public.violation_weights\n'
+          '   set weight = 1,\n'
+          '       counts_toward_dq = true\n'
+          " where action_type in ('looking_away', 'audio_noise');",
+        ),
+        reason: 'the migration is the single statement the plan specifies',
+      );
+      // Only those two types, and it must not touch evidence or attempts.
+      expect(sql, isNot(contains("'copy_paste_attempt'")));
+      expect(sql, isNot(contains("'right_click_blocked'")));
+      expect(sql, isNot(contains("'idle_afk'")));
+      expect(sql, isNot(contains('update public.proctoring_logs')));
+      expect(sql, isNot(contains('update public.exam_submissions')));
+      expect(sql, isNot(contains('insert into public.violation_weights')));
+
+      // Every header section the repository's migrations carry, so the file explains
+      // itself to whoever is about to run it on a live project.
+      for (final section in <String>[
+        '-- WHY THIS FILE EXISTS',
+        '-- WHAT CHANGES',
+        '-- WHAT IT DOES NOT DO',
+        '-- SAFETY',
+        '-- APPLY ORDER',
+        '-- Verify',
+      ]) {
+        expect(sql, contains(section), reason: 'missing section: $section');
+      }
+
+      // The client mirror has to agree with the new values, and the seeding
+      // migration keeps its historical (0, false) rows - which is why this UPDATE
+      // exists rather than an edit in place.
+      expect(ViolationType.lookingAway.weight, 1);
+      expect(ViolationType.audioNoise.weight, 1);
+      expect(ViolationType.lookingAway.countsTowardDisqualification, isTrue);
+      expect(ViolationType.audioNoise.countsTowardDisqualification, isTrue);
+
+      // And the two apply scripts list it, or it is a file nobody runs.
+      for (final script in <String>['../apply_in_order.ps1', '../apply_live_cli.ps1']) {
+        final file = File(script);
+        if (!file.existsSync()) continue;
+        expect(
+          file.readAsStringSync(),
+          contains('20261108090000_looking_away_and_noise_count'),
+          reason: '$script does not apply the new migration',
+        );
+      }
+    });
+
+
 
     test('register_violation scores through the table and flags, never disqualifies',
         () {

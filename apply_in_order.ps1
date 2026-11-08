@@ -23,7 +23,8 @@ $files = @(
  '20261105090000_proctor_heartbeats',
  'retention_policy',
  '20261106090000_proctoring_consents',
- '20261106090100_snapshot_retention'
+ '20261106090100_snapshot_retention',
+ '20261108090000_looking_away_and_noise_count'
 )
 $i = 0
 foreach ($f in $files) {
