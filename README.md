@@ -171,6 +171,35 @@ rather than left to be mistaken for more than it is.
 | A fabricated heartbeat series | A beat is the client's own claim: a patched build can report "camera up, monitor running" while nothing is running, and no app attestation (Play Integrity / App Attest) verifies the build yet | The series is a **positive** signal only - an attempt that never checked in, or went quiet, is shown as *not reporting*, never as clean. Writes go through `record_heartbeat()` alone (the table has no insert policy), on the server clock, idempotent per `client_event_id` and rate-limited to one stored beat per 8 s, so a client can neither backfill history nor rewrite it - and `proctoring_coverage()` can only flag an attempt for a human, never end one |
 | Evidence retention / privacy | Snapshots in `proctor-snapshots` are personal data, and no scheduled job deletes them unless an operator sets one up | The bucket is **private**: a still is only ever readable through a 10-minute signed URL, and only the owning student or staff can mint one. A `proctor_snapshots` window (30 days) lives in `public.retention_policies`, enforced by the `purge-snapshots` Edge Function - the one route that also removes the *file*, and the only one that runs on hosted Supabase, where `storage.protect_delete()` refuses a SQL delete with `42501` (a self-hosted project without that guard can use `public.purge_expired_snapshots()` instead). Both keep the incident row and null its pointer, and a reset deletes an attempt's stills immediately, which `session_reset_logs` records. The photograph has a lifetime now; see [Scheduling the snapshot purge](#scheduling-the-snapshot-purge) for the job itself, which is deliberately left to the operator |
 
+**What is *not* verified — read this before trusting a number**
+
+Four things are written down here rather than left implicit, because each is the
+kind of detail a pilot finds out the hard way:
+
+- **The look-away gate has never been measured on a device.** The rule (15 deg of
+  yaw and 15 deg of pitch, absolute, held for two seconds) is unit-tested against
+  both engines, including the boundary and the symmetry, but no real head has been
+  put in front of it here. The number that decides whether it is safe is the
+  false-positive rate: a candidate who works with the laptop low, or who reads a
+  printed answer sheet on the desk, is the case to measure before a
+  timer-driven disqualification is trusted.
+- **The sign of the pitch a browser detector reports is unverified.** The shipped
+  FaceLandmarker path reads a rotation matrix, a host page sends `pose:` degrees,
+  and the two need not agree on which direction is "up". The app therefore compares
+  the **absolute** pitch, so a wrong sign costs nothing — and keeps no rule that
+  would depend on one.
+- **A web-only "a chin 20 deg down counts sooner than 20 deg up" rule was requested
+  and is deferred**, for exactly the reason above: it is asymmetric in a way the
+  phone build is not, and shipping it before the sign is confirmed on real devices
+  would flag one direction of head movement and ignore the other. Pitch stays
+  symmetric at 15 deg until that is measured.
+- **Whether a browser has really handed the lens back cannot be observed.** The
+  device check stops every `MediaStreamTrack` it opened before the exam route is
+  pushed, and the phone build's release is awaited, but "the OS has finished
+  releasing the device" is not something a page can query: the exam screen therefore
+  re-opens its own session **once** on `NotReadableError` (the "another app or tab
+  is already using the camera" case) rather than assuming the handover was instant.
+
 The client is never the authority: **grading and the strike rule live on the
 server** (see `supabase/schema.sql`), so a modified or compromised client can
 lose proctoring signals but cannot change a result.

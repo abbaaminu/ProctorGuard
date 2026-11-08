@@ -157,7 +157,22 @@ class WebFacePresenceMonitor {
   /// looking down at notes and a keyboard is normal exam behaviour.
   ///
   /// Must be at least [offCenterYawDegrees] (asserted): this may only shorten the
-  /// wait for a clearly turned head, never flag a glance.
+  /// wait for a clearly turned head, never flag a glance. It stays *well* above the
+  /// gate (`30` against `15`, twice the tolerance), because the shortcut is only
+  /// honest for a head that is round enough that nothing is being read off the
+  /// screen; at or near [offCenterYawDegrees] it would fire on exactly the glance
+  /// the sustain exists to forgive, and the rule would be the ordinary one wearing
+  /// a different name.
+  ///
+  /// **Pitch is symmetric, deliberately.** A web-only "a chin 20 degrees down counts
+  /// sooner than 20 degrees up" rule was requested and is **deferred**, not
+  /// implemented: it is asymmetric in a way the phone build is not, and it needs the
+  /// *sign* of the pitch a browser detector reports (the shipped FaceLandmarker's
+  /// matrix Euler angles, or a host page's `pose:` message) to be verified on real
+  /// devices first - the sign is the one thing a unit test cannot settle, and a rule
+  /// that guesses it would flag one direction of head movement and ignore the other.
+  /// Until then pitch stays absolute at [offCenterPitchDegrees] on both platforms.
+  /// The deferral is listed under "not verified" in the root README.
   final double immediateAwayYawDegrees;
 
   final WebFaceSignalSource _source;

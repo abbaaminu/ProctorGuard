@@ -1676,8 +1676,19 @@ low, or who reads a printed answer sheet on the desk, is the case to check the
 false-positive rate against before trusting a timer-driven disqualification. The
 two-second sustain is what has to carry that weight — it is long enough that no
 reading position holds it, and short enough that a student working from a second
-screen is caught while they are still doing it. `no_face` still waits
-for three consecutive frames without a face (`missingFaceFrameThreshold`), because
+screen is caught while they are still doing it.
+
+A web-only "a chin 20 deg **down** counts sooner than a chin 20 deg up" rule was
+asked for and is deliberately **not** implemented: it is asymmetric in a way the
+phone build is not, and it depends on the sign a browser detector gives pitch (the
+shipped FaceLandmarker reads a matrix, a host page sends `pose:` degrees), which
+is not yet verified on real hardware. Pitch therefore stays symmetric — absolute
+15 deg, both directions, both platforms — and the deferral is listed under
+[not verified](../README.md#proctoring-boundaries-and-risk-register) in the root
+README.
+
+`no_face` still waits for three consecutive frames without a face
+(`missingFaceFrameThreshold`), because
 that is the one signal a working detector also produces by accident (a blink
 behind glasses, a hand across the lens). Frames are the honest unit here —
 `inferenceInterval` decides
