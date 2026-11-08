@@ -126,29 +126,51 @@ class ExamKioskBadge extends StatelessWidget {
 /// away from disqualification with nothing on screen saying so, and a roaming
 /// supervisor looking over a shoulder saw a paper that looked untouched.
 ///
-/// Rendered only once the server has confirmed a warning (`count > 0`), so an
+/// Counts the way the server closes the attempt, not the way it logs rows. The two
+/// differ: `register_violation()` writes a row for every signal (a glance away, a
+/// noisy room, a blocked right-click) but only sums the types with
+/// `counts_toward_dq` towards its threshold, so a chip that read "3 of 3" off the
+/// row count announced an ending that three soft signals could never produce. The
+/// soft ones are still on the record and are shown beside the counted number
+/// ([noted]) instead of being dressed up as progress towards disqualification.
+///
+/// Rendered only once a signal has been logged (`count > 0 || noted > 0`), so an
 /// untouched attempt's header is unchanged.
 class ExamWarningChip extends StatelessWidget {
-  const ExamWarningChip({super.key, required this.count, this.total = 3});
+  const ExamWarningChip({
+    super.key,
+    required this.count,
+    this.total = 3,
+    this.noted = 0,
+  });
 
-  /// Confirmed warnings on this attempt, counted the way the overlay and the
-  /// supervisor's grid count them (1-based: the first strike is "1 of 3").
+  /// Counted warnings on this attempt (1-based: the first strike is "1 of 3") —
+  /// `ProctoringState.countedWarnings`.
   final int count;
 
   /// The count that closes the attempt — `register_violation` in `schema.sql`
-  /// disqualifies on the third.
+  /// flags the attempt once the *weighted* score reaches three
+  /// (`ProctoringRisk.disqualificationThreshold`).
   final int total;
+
+  /// Signals recorded but **not** counted towards [total]: a glance away, noise
+  /// in the room, a blocked paste or right-click, an idle device
+  /// (`ProctoringState.notedWarnings`).
+  ///
+  /// A note rather than a second fraction, because they cannot end the attempt
+  /// however many there are - and a student who sees four of them counted as
+  /// "4 of 3" would be told something untrue twice over.
+  final int noted;
 
   @override
   Widget build(BuildContext context) {
-    // The last warning before disqualification is the one that has to look
+    // The last warning before the attempt closes is the one that has to look
     // different: it is the only one a student can still act on.
     final lastOne = count >= total - 1;
     final color = lastOne ? Colors.redAccent : Colors.amber.shade800;
 
     return Tooltip(
-      message: 'Every failed proctoring check is a warning. '
-          'The attempt closes at $total.',
+      message: _tooltip,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Row(
@@ -157,7 +179,7 @@ class ExamWarningChip extends StatelessWidget {
             Icon(Icons.warning_amber_rounded, size: 18, color: color),
             const SizedBox(width: 4),
             Text(
-              '$count of $total warnings',
+              '$count of $total warnings${noted == 0 ? '' : ' · $noted noted'}',
               style: Theme.of(context).textTheme.labelMedium?.copyWith(
                     color: color,
                     fontWeight: lastOne ? FontWeight.w700 : null,
@@ -167,6 +189,18 @@ class ExamWarningChip extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  /// What the two numbers mean: the counted ones are the only ones that can close
+  /// the attempt, and the noted ones are on the record regardless.
+  String get _tooltip {
+    final base = 'Only the checks the attempt is closed on count here, and it '
+        'closes at $total.';
+    if (noted == 0) return base;
+    final plural = noted == 1 ? '' : 's';
+    final verb = noted == 1 ? 'is' : 'are';
+    return '$base The $noted noted signal$plural $verb recorded for the '
+        'supervisor but never count.';
   }
 }
 

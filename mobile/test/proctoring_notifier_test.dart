@@ -160,6 +160,68 @@ void main() {
     });
   });
 
+  group('what a warning is worth', () {
+    test('a soft signal is noted, and never counted towards the threshold',
+        () async {
+      // `register_violation()` counts an attempt two ways at once: `warning_count`
+      // is how many rows it has logged, while the ending is decided by the weighted
+      // score, which only sums the types carrying `counts_toward_dq`. The chip used
+      // to read the row count, so three right-clicks could announce "3 of 3
+      // warnings" on an attempt the server would never close.
+      final repo = _RecordingProctoringRepository(disqualifyAfter: 100);
+      final notifier = _notifier(proctoringRepo: repo);
+      addTearDown(notifier.dispose);
+
+      notifier.reportRightClickBlocked();
+      notifier.reportAudioNoise();
+      await pumpEventQueue();
+
+      expect(notifier.state.warningCount, 2, reason: 'two rows were logged');
+      expect(
+        notifier.state.countedWarnings,
+        0,
+        reason: 'neither weighs anything towards the server threshold',
+      );
+      expect(notifier.state.notedWarnings, 2);
+      expect(notifier.state.underReview, isFalse);
+
+      // A counted signal moves all three numbers - it is the only kind that can
+      // bring the attempt closer to closing.
+      notifier.reportAppMinimized();
+      await pumpEventQueue();
+
+      expect(notifier.state.warningCount, 3);
+      expect(notifier.state.countedWarnings, 1);
+      expect(notifier.state.notedWarnings, 2);
+      expect(notifier.state.underReview, isFalse);
+    });
+
+    test('the counted number is the one that ends the attempt', () async {
+      // Three counted signals, and the flag lands on the third: a chip reading
+      // "3 of 3" is a promise about the ending, so it has to be right about when
+      // the ending happens.
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(
+          disqualifyAfter: 100,
+          flagAfter: 3,
+        ),
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportAppMinimized(); // counted, 1 of 3
+      notifier.reportDevtoolsDetected(); // counted, 2 of 3
+      notifier.reportVirtualCameraDetected(); // counted, 3 of 3 -> flagged
+      await pumpEventQueue();
+
+      expect(
+        notifier.state.countedWarnings,
+        ProctoringRisk.disqualificationThreshold,
+      );
+      expect(notifier.state.notedWarnings, 0);
+      expect(notifier.state.underReview, isTrue);
+    });
+  });
+
   group('camera gate', () {
     test('gaze signals are ignored while the camera feed is offline',
         () async {

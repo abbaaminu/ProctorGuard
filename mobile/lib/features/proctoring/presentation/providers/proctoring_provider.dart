@@ -100,6 +100,38 @@ class ProctoringState {
         serverStrikes: warningCount,
       );
 
+  /// The number of signals on this attempt that actually count towards the
+  /// server's threshold - the "x" in the student's "x of 3 warnings".
+  ///
+  /// Summed the way `register_violation()` sums it: only the types whose
+  /// `counts_toward_dq` is set ([ViolationType.countsTowardDisqualification]),
+  /// weighted by [ViolationType.weight], against
+  /// [ProctoringRisk.disqualificationThreshold]. Deliberately *not* derived from
+  /// [warningCount]: the server's `warning_count` is how many rows the attempt has
+  /// logged, soft signals included, while the ending is decided by the weighted
+  /// score. Showing the row count meant three right-clicks or three noisy minutes
+  /// read "3 of 3 warnings" on an attempt that was never going to close - a
+  /// promise the paper then failed to keep. The soft ones are still evidence, and
+  /// are counted by [notedWarnings] rather than hidden.
+  ///
+  /// This is the evidence *this device* has seen, because it is derived from
+  /// [violationTypes]. A device that reloads mid-attempt starts from an empty list
+  /// and therefore under-states how close the server thinks the attempt is; it can
+  /// never over-state it, because the ending arrives as a ruling ([underReview] /
+  /// [disqualified]) rather than being predicted here.
+  int get countedWarnings => ProctoringRisk.weightedScoreOf(violationTypes);
+
+  /// Signals logged on this attempt that are **not** counted by
+  /// [countedWarnings] - a glance away, noise in the room, a blocked paste or
+  /// right-click, an idle device.
+  ///
+  /// Shown beside the counted number ("1 of 3 warnings · 4 noted") so a student can
+  /// see that the four are on the record without being told they are four fifths of
+  /// the way to losing the paper.
+  int get notedWarnings => violationTypes
+      .where((type) => !type.countsTowardDisqualification)
+      .length;
+
   ProctoringState copyWith({
     int? warningCount,
     bool? showViolationOverlay,
@@ -617,6 +649,10 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     if (state.disqualified) return; // already locked out: one strike, one exit
 
     state = state.copyWith(disqualified: true, showViolationOverlay: true);
+    // Stopped before the write rather than after it: `mark_disqualified` is a
+    // network call, and a camera that keeps streaming through it is capture
+    // nobody is ever going to read.
+    _haltTracking();
 
     try {
       await _examRepo.markDisqualified(submissionId);
@@ -650,7 +686,34 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     if (state.ended) return;
 
     state = state.copyWith(underReview: true, showViolationOverlay: true);
+    _haltTracking();
     _onForceExit();
+  }
+
+  /// Stops every camera-derived path for good, once the attempt has ended.
+  ///
+  /// The `ended` gates in [_registerViolation] and [_handleGazeSignal] are what
+  /// make a closed paper safe; this is what stops the work behind them. Pausing the
+  /// camera gate hands the frame counters back ([ProctoringNotifier.setCameraActive]
+  /// clears the half-counted episode) so the engine stops judging frames for a paper
+  /// nobody is sitting, and the subscription goes with it: afterwards the engine has
+  /// no listener left, so a frame that slips through costs nothing at all. The page
+  /// stops the *device* on its own side - the image stream, the controller and the
+  /// microphone - because shutting them down needs the capture session, which this
+  /// notifier deliberately does not own.
+  ///
+  /// One-way on purpose. There is no resume: a flagged or disqualified attempt
+  /// cannot be reopened, and a retake gets a new notifier (`proctoringProvider` is
+  /// `autoDispose` and keyed by submission).
+  void _haltTracking() {
+    // Also reports the feed as down to the liveness series: from here the client is
+    // alive but not watching, which is exactly what `proctoring_coverage()` should
+    // say about a decided attempt.
+    setCameraActive(false);
+
+    final gazeSub = _gazeSub;
+    _gazeSub = null;
+    if (gazeSub != null) unawaited(gazeSub.cancel());
   }
 
   void dismissOverlay() {

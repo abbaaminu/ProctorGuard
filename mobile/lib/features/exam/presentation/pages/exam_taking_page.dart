@@ -30,6 +30,7 @@ import '../../../../core/services/web_face_signal_source.dart';
 import '../../../../core/services/web_guards.dart';
 import '../../../../core/utils/proctor_log.dart';
 import '../../../../core/widgets/responsive_layout.dart';
+import '../../../proctoring/domain/entities/proctoring_risk.dart';
 import '../../../proctoring/presentation/providers/audio_monitoring_provider.dart';
 import '../../../proctoring/presentation/providers/proctoring_provider.dart';
 import '../../../proctoring/presentation/widgets/audio_monitor_indicator.dart';
@@ -204,6 +205,14 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// the camera is reopening, and a second tap must not start a second pipeline on
   /// a lens the first one is already holding.
   bool _recoveringCamera = false;
+
+  /// Set once the attempt has ended — flagged for review or disqualified — and the
+  /// capture pipeline was stopped for good (see [_haltProctoring]).
+  ///
+  /// Read by [_recoverCamera]: nothing may reopen a lens for an attempt that has
+  /// already been decided, even if a tap on the restart button was already in
+  /// flight when the ruling landed.
+  bool _proctoringHalted = false;
 
   /// Wakes the queue when the OS brings the exam back to the foreground - the
   /// mobile equivalent of the browser's `online` event, and the moment a
@@ -796,6 +805,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// controller, and a failed one still holds the lens it was handed.
   Future<void> _recoverCamera() async {
     if (_recoveringCamera) return;
+    // A ruling that landed while the button was being tapped: there is nothing to
+    // reopen for an attempt that has already been decided (see [_haltProctoring]).
+    if (_proctoringHalted) return;
     _recoveringCamera = true;
     try {
       final camera = _cameraController;
@@ -861,6 +873,67 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     }
   }
 
+  /// Releases the microphone session, contained like every other teardown step.
+  ///
+  /// The provider is `autoDispose` and this page watches it, so leaving the screen
+  /// releases the microphone anyway - but between the ruling and the student's Exit
+  /// tap the page is still mounted, and a capture session that keeps listening to a
+  /// room nobody is being tested in is exactly what a closed attempt must not do.
+  Future<void> _stopAudioMonitoring() async {
+    if (!mounted) return;
+    try {
+      await ref
+          .read(audioMonitoringProvider(widget.submissionId).notifier)
+          .stop();
+    } catch (error) {
+      proctorLog('ProctorGuard: releasing the microphone failed: $error');
+    }
+  }
+
+  /// Stops capture once the attempt has ended — whichever way it ended.
+  ///
+  /// A ruling closes the paper: a flagged attempt is `status =
+  /// 'flagged_for_review'` and a disqualified one is `'disqualified'`, and neither
+  /// can be reopened from this screen. From that moment no frame can change any
+  /// outcome, so continuing to record is a camera light on a student whose exam is
+  /// over, a microphone listening to a room nobody is being tested in, and evidence
+  /// nobody will read — while the page sits on the review overlay until the student
+  /// taps Exit.
+  ///
+  /// So: the image stream and the controller (through [_releaseCamera], which closes
+  /// the stream *before* handing the lens back — the order Android needs), the
+  /// microphone session, and the session watchers ([_releaseSessionWatchers]: the
+  /// browser's detector bridge, the idle window, the pointer route and the integrity
+  /// poll). The notifier stops its own half — frame intake, gaze subscription and
+  /// the camera gate — because that is where the judging lives (see
+  /// `ProctoringNotifier._haltTracking`).
+  ///
+  /// Deliberately **not** stopped: the kiosk pin and the browser's DOM guards. Those
+  /// are the lockdown rather than the observation, and an attempt that has been
+  /// decided but not yet exited is still an attempt the student must not be able to
+  /// wander out of; [dispose] releases both as before.
+  ///
+  /// Idempotent, and safe when nothing was ever opened: a mock session has no
+  /// camera, and a blocking state may never have opened one.
+  void _haltProctoring() {
+    if (_proctoringHalted) return;
+    _proctoringHalted = true;
+
+    final camera = _cameraController;
+    _cameraController = null;
+    // Before the release: this is also what closes the notifier's camera gate, so
+    // the last frames of a stream that is being torn down are not judged.
+    _setCameraStreaming(false);
+    if (camera != null) {
+      camera.removeListener(_onCameraValueChanged);
+      unawaited(_releaseCamera(camera));
+    }
+
+    _releaseSessionWatchers();
+
+    unawaited(_stopAudioMonitoring());
+  }
+
   /// Leaves the attempt from a blocking overlay.
   ///
   /// Imperative `pop` rather than `maybePop`: the equipment block refuses the
@@ -895,6 +968,13 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     ProctoringState proctoringState,
     AudioMonitoringState audioState,
   ) {
+    // A decided attempt has no equipment to fix. The ruling closed the paper, so
+    // asking a student to restart a camera (or reconnect a microphone) would be
+    // asking them to repair a session that cannot be resumed - and this block is
+    // painted above the review overlay, so it would also cover the one thing left
+    // to say. Capture has already stopped by then ([_haltProctoring]).
+    if (proctoringState.ended) return null;
+
     if (!widget.mockMode && _cameraWasLive && !_cameraStreaming) {
       return EquipmentBlockOverlay(
         key: const Key('equipment-block-camera'),
@@ -1453,6 +1533,17 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       ref.read(forceExitSignalProvider.notifier).state = null;
     });
 
+    // A ruling — either one — ends the attempt, and capture stops with it
+    // ([_haltProctoring]). Watched on the state rather than on the exit signal
+    // above, because a disqualification's exit waits for a `mark_disqualified`
+    // round-trip and the camera must not keep running through it.
+    ref.listen<ProctoringState>(proctoringProvider(widget.submissionId), (
+      prev,
+      next,
+    ) {
+      if (next.ended) _haltProctoring();
+    });
+
     // Audio proctoring for this attempt. Watching it is what keeps the
     // `autoDispose` microphone session alive for as long as the exam screen is
     // (see `audioMonitoringProvider`); the question pane's header renders it.
@@ -1599,7 +1690,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                   session,
                   question,
                   audioState,
-                  warningCount: proctoringState.warningCount,
+                  proctoring: proctoringState,
                 );
 
                 return Column(
@@ -1717,6 +1808,11 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
       if (proctoringState.showViolationOverlay)
         ViolationOverlay(
           type: proctoringState.lastViolation,
+          // The ordinal of the warning just shown — "Warning 3" for the third
+          // signal — not the counted score. This overlay is about the event; the
+          // chip behind it is what says how close the attempt is to closing, and
+          // counts only the signals the server counts
+          // (see `ProctoringState.countedWarnings`).
           warningCount: proctoringState.warningCount,
           isFinal: proctoringState.disqualified,
           // The weighted threshold: the paper is closed and a supervisor decides.
@@ -1774,7 +1870,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     ExamSessionState session,
     Question question,
     AudioMonitoringState audioState, {
-    required int warningCount,
+    required ProctoringState proctoring,
   }) {
     final theme = Theme.of(context);
     final gutter = ResponsiveSizing.horizontalPadding(context);
@@ -1811,8 +1907,17 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                 ),
               if (_kioskStatus != null) ExamKioskBadge(status: _kioskStatus!),
               // Stays on screen after the warning overlay is dismissed, so the
-              // student can see how close the attempt is to closing.
-              if (warningCount > 0) ExamWarningChip(count: warningCount),
+              // student can see how close the attempt is to closing - counted the
+              // way the server closes it, not the way it logs rows: only the
+              // signals with `counts_toward_dq` move the "x of 3", and the soft
+              // ones are shown beside it so the evidence is not hidden
+              // (see `ProctoringState.countedWarnings`).
+              if (proctoring.countedWarnings > 0 || proctoring.notedWarnings > 0)
+                ExamWarningChip(
+                  count: proctoring.countedWarnings,
+                  total: ProctoringRisk.disqualificationThreshold,
+                  noted: proctoring.notedWarnings,
+                ),
               // Always present, in every build: "the microphone is being
               // monitored" is part of the exam's state rather than an optional
               // extra, and its absence is the one silent failure this screen must

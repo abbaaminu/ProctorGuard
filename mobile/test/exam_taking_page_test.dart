@@ -740,6 +740,44 @@ void main() {
       expect(find.byKey(const Key('equipment-block-face')), findsNothing);
     });
 
+    testWidgets('a decided attempt stops watching, and stops asking', (
+      tester,
+    ) async {
+      // The first signal is already the ruling (see `flagAt`): the attempt ends
+      // `flagged_for_review`, and from that moment a frame cannot change anything.
+      proctoring.flagAt = 1;
+      await openPastGrace(tester);
+
+      // A covered lens, held for a tick (see the test above), which now also ends
+      // the attempt.
+      faces.emit('no_face');
+      await tester.pump();
+      now = now.add(const Duration(milliseconds: 350));
+      faces.emit('no_face');
+      await tester.pump();
+      await tester.pumpAndSettle();
+
+      expect(proctoring.violations, hasLength(1));
+      expect(find.text('Session Under Review'), findsOneWidget);
+
+      // Capture is off, not merely idle: the detector bridge is released, so no
+      // further frame is judged for a paper nobody is sitting, and the notifier's
+      // camera gate is shut.
+      final notifier = ProviderScope.containerOf(
+        tester.element(find.byType(ExamTakingPage)),
+      ).read(proctoringProvider('sub-1').notifier);
+      expect(faces.disposed, isTrue);
+      expect(notifier.state.cameraPaused, isTrue);
+
+      // And the equipment block cannot come back over the review screen: a decided
+      // attempt has no camera to restart, and "fix your camera or leave" painted on
+      // top of "a supervisor will review this" would be two contradictory endings.
+      faces.emit('no_face');
+      await tester.pump();
+      expect(find.byKey(const Key('equipment-block-face')), findsNothing);
+      expect(find.text('Session Under Review'), findsOneWidget);
+    });
+
     testWidgets('nothing is judged while the page has no detector', (tester) async {
       // Android, iOS, desktop, and a browser whose host page ships no detector:
       // the source says so, the page releases it, and the attempt is proctored
@@ -869,6 +907,35 @@ void main() {
       // the count has to outlive the dialog that announced it.
       expect(find.text('Warning 1'), findsNothing);
       expect(find.text('1 of 3 warnings'), findsOneWidget);
+    });
+
+    testWidgets('the chip counts only the signals the server counts',
+        (tester) async {
+      // `warning_count` is a row count; the ending is decided by the weighted
+      // score. Reading the row count here let two soft signals announce "2 of 3"
+      // on an attempt they could never end, and three of them announce a full "3
+      // of 3" with the paper still open.
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+      expect(find.text('0 of 3 warnings'), findsNothing);
+
+      // A suppressed context menu and a noisy room: two rows, no counted signals.
+      notifierOf(tester).reportRightClickBlocked();
+      await tester.pump();
+      notifierOf(tester).reportAudioNoise();
+      await tester.pumpAndSettle();
+
+      expect(proctoring.violations, hasLength(2));
+      // Still nothing counted, and the two rows say so rather than vanishing: the
+      // student is not one step from losing the attempt, but the signals were real.
+      expect(find.text('0 of 3 warnings · 2 noted'), findsOneWidget);
+      expect(find.text('2 of 3 warnings'), findsNothing);
+
+      // A counted signal is what moves the fraction.
+      notifierOf(tester).reportAppMinimized();
+      await tester.pumpAndSettle();
+      expect(find.text('1 of 3 warnings · 2 noted'), findsOneWidget);
     });
 
     testWidgets('back acknowledges the warning instead of abandoning the attempt',
