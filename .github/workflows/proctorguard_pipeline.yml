@@ -69,6 +69,11 @@ jobs:
       - name: Type-check the Edge Functions
         run: npm run typecheck
 
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/sample-index
+          df -h 
+
   build_web:
     name: build (web release)
     needs: analyze_and_test
