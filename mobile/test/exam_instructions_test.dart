@@ -198,6 +198,11 @@ class _VerifiedHardware implements HardwareVerifier {
 
   @override
   Future<void> openSettings() async {}
+
+  /// Nothing is opened here, so there is nothing to give back; the gate still
+  /// awaits it on the way out (`ExamHardwareGatePage._startExam`).
+  @override
+  Future<void> releasePreview() async {}
 }
 
 /// An exam repository with nothing published: the portal's list is not this

@@ -150,6 +150,20 @@ abstract class HardwareVerifier {
 
   /// Opens the OS settings page for a permission the student must change there.
   Future<void> openSettings();
+
+  /// Releases whatever the check opened, before the caller leaves this screen.
+  ///
+  /// **The ordering rule this exists for:** no pre-exam capture session may
+  /// outlive the device check. The gate awaits this before it pops, and the exam
+  /// screen's own session is therefore the first thing to open the lens — which is
+  /// what stops the recorded attempt from being greeted with `NotReadableError`
+  /// ("another app or tab is already using the camera") on a working camera.
+  ///
+  /// Idempotent and total: calling it twice, or on a check that never opened
+  /// anything (a mock build, a refused permission, a browser probe), is a no-op,
+  /// and it never throws — a release that failed is worth a log line, not a
+  /// student stranded on the gate.
+  Future<void> releasePreview();
 }
 
 /// The camera plugin's error codes, worded for a student: the raw code
@@ -227,15 +241,18 @@ ImageFormatGroup proctorImageFormatGroup() {
 /// covers the microphone in the same step: on Android the plugin asks for
 /// `RECORD_AUDIO` as part of the session and reports `audioAccess` when the
 /// student refuses. That, plus the permission status, is what "verified" means
-/// here — the session is released again immediately, because the exam screen
-/// opens its own for the duration of the attempt.
+/// here — the session is released again before the gate pops, because the exam
+/// screen opens its own for the duration of the attempt ([releasePreview] is the
+/// lever that does it, and the gate awaits it on the way out).
 ///
 /// The **web** takes the other branch on purpose. There is no camera plugin
 /// status to read and no session worth opening (see [_webReport]): the browser
 /// probe's own `getUserMedia` calls are the answer, one per device, which is
 /// exactly the question this class exists to answer — and it is also the only way
 /// to ask it without the second open that Chromium reports as "another app or tab
-/// is already using the camera".
+/// is already using the camera". That probe stops **every track it opened** inside
+/// `probe()` itself (`WebCameraPermission` -> `_open`), which is the same rule from
+/// the browser side: no pre-exam `MediaStreamTrack` survives the route.
 class DeviceHardwareVerifier implements HardwareVerifier {
   DeviceHardwareVerifier({
     PermissionService? permissions,
@@ -251,6 +268,16 @@ class DeviceHardwareVerifier implements HardwareVerifier {
   final Duration timeout;
   final PermissionService _permissions;
   final WebCameraPermission _browserProbe;
+
+  /// The capture session a **verified** check is holding, waiting for
+  /// [releasePreview].
+  ///
+  /// Held rather than disposed as soon as the report is built, because the release
+  /// is a step the caller has to be able to order: the gate awaits it before it
+  /// pops, so the exam screen's own session is the first thing to open the lens.
+  /// Nothing is retained on a failure — a probe that could not produce a frame
+  /// closes its own session in `_probe`'s `finally`.
+  CameraController? _preview;
 
   /// What the gate shows on the documented no-hardware path.
   static HardwareReport mockReport() => const HardwareReport(
@@ -280,6 +307,12 @@ class DeviceHardwareVerifier implements HardwareVerifier {
 
   /// The probe itself: permissions, then a live capture session.
   Future<HardwareReport> _probe() async {
+    // One session at a time, first: a "Check again" that arrives while the last
+    // verdict is still holding the lens would otherwise be the second open that
+    // fails with "another app or tab is already using the camera" - and the student
+    // would be asked to fix a camera that was working.
+    await releasePreview();
+
     // Explicit opt-in only (`--dart-define=MOCK_CAMERA=true`). Not a fallback:
     // without the define this branch is dead code, so a real build can never end
     // up "verifying" simulated hardware.
@@ -361,6 +394,10 @@ class DeviceHardwareVerifier implements HardwareVerifier {
             message: 'the camera opened but produced no frames');
       }
 
+      // Handed to the caller, not released here: the gate owns the session until it
+      // pops, and gives it back through [releasePreview]. The `finally` below only
+      // closes the sessions that were never verified.
+      _preview = controller;
       return const HardwareReport(
         camera: DeviceProbe.verified(ProbeDevice.camera,
             message: 'Live video is streaming.'),
@@ -376,12 +413,46 @@ class DeviceHardwareVerifier implements HardwareVerifier {
       proctorLog('ProctorGuard hardware: capture session failed: $error');
       return _cameraFailure(null, message: 'the camera could not be opened');
     } finally {
-      // Released here: the exam screen opens its own session for the attempt.
-      try {
-        await controller.dispose();
-      } catch (error) {
-        proctorLog('ProctorGuard hardware: releasing the probe failed: $error');
+      // The failure path, and only the failure path. A verified session was handed
+      // to [_preview] above and is released by [releasePreview] when the screen is
+      // done with it; anything else is closed here, because a probe that could not
+      // produce a frame is holding a lens nobody is going to ask it for.
+      if (!identical(_preview, controller)) {
+        try {
+          await controller.dispose();
+        } catch (error) {
+          proctorLog('ProctorGuard hardware: releasing the probe failed: $error');
+        }
       }
+    }
+  }
+
+  /// Releases the verified probe session, so the exam screen can open its own.
+  ///
+  /// Awaited by the gate **before** it pops (see [HardwareVerifier.releasePreview]
+  /// for the rule): once the exam route is on screen it opens the capture session
+  /// that is actually recorded, and a preview still holding the lens is the
+  /// `NotReadableError` students see as "another app or tab is already using the
+  /// camera" on a device that is working perfectly.
+  ///
+  /// Idempotent, and total on purpose: no session (a mock build, a refused
+  /// permission, the browser branch), a second call, or a `dispose()` that throws
+  /// all end here with nothing left to do and nothing thrown at the caller. The
+  /// web holds no stream to give back - the browser probe stops every track it
+  /// opens inside `probe()` - so this is a no-op there by construction rather than
+  /// by omission.
+  @override
+  Future<void> releasePreview() async {
+    final preview = _preview;
+    _preview = null;
+    if (preview == null) return;
+
+    try {
+      await preview.dispose();
+    } catch (error) {
+      // A release that failed is a log line, not a student stranded on the gate:
+      // the next open retries the lens anyway (see `ExamTakingPage._openCamera`).
+      proctorLog('ProctorGuard hardware: releasing the preview failed: $error');
     }
   }
 

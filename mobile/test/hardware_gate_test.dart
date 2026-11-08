@@ -417,6 +417,85 @@ void main() {
     });
   });
 
+  group('the preview is released before the exam route is pushed', () {
+    // The rule this page keeps: **no device-check capture session outlives the
+    // gate**. The exam screen opens the session that is actually recorded, and a
+    // preview still holding the lens is the `NotReadableError` ("another app or tab
+    // is already using the camera") students used to meet on a camera that worked.
+
+    testWidgets('Start Exam waits for the release before it pops',
+        (tester) async {
+      final verifier = _FakeVerifier(const [verified]);
+
+      final (host, _) = await pushGate(tester, verifier);
+      expect(startEnabled(tester), isTrue);
+      // Only the way *out* waits: the initial check must still be able to run.
+      verifier.releaseGate = Completer<void>();
+
+      await tapKey(tester, const Key('gate-start-exam'));
+
+      expect(verifier.trace, ['release', 'verify', 'release'],
+          reason: 'released once before the check opens anything, once on the way '
+              'out');
+      expect(startEnabled(tester), isFalse,
+          reason: 'a second tap must not push the exam route twice');
+      expect(
+        host.popped,
+        isFalse,
+        reason: 'the exam route must not open while the check still holds the lens',
+      );
+
+      verifier.releaseGate!.complete();
+      await tester.pumpAndSettle();
+
+      expect(host.popped, isTrue);
+      expect(host.result, isTrue, reason: 'a verified student still gets in');
+    });
+
+    testWidgets('a re-check gives the lens back before it opens it again',
+        (tester) async {
+      final verifier = _FakeVerifier(const [verified, verified]);
+
+      await pushGate(tester, verifier);
+      expect(verifier.trace, ['release', 'verify']);
+
+      await tapKey(tester, const Key('gate-check-again'));
+
+      expect(verifier.trace, ['release', 'verify', 'release', 'verify'],
+          reason: 'one session at a time: the lens the first verdict is holding '
+              'comes back before the second open');
+    });
+
+    testWidgets('backing out of the gate gives the lens back too',
+        (tester) async {
+      final verifier = _FakeVerifier(const [verified]);
+
+      final (host, _) = await pushGate(tester, verifier);
+      await tapKey(tester, const Key('gate-cancel'));
+
+      expect(host.result, isFalse);
+      expect(verifier.releases, 2,
+          reason: 'dispose releases as well: leaving the gate must not leave a '
+              'capture session behind');
+      expect(verifier.trace.last, 'release');
+    });
+
+    test('the real verifier hands back a preview it never opened', () async {
+      final verifier = DeviceHardwareVerifier(
+        browserProbe: const _FakeBrowserProbe(WebCameraAccess.refused()),
+      );
+
+      // Twice, around a check that opened nothing: a release has to be a no-op
+      // rather than an exception on the path where there is nothing to give back.
+      await verifier.releasePreview();
+      final report = await verifier.verify();
+      await verifier.releasePreview();
+      await verifier.releasePreview();
+
+      expect(report.isVerified, isFalse);
+    });
+  });
+
   test('the real verifier blocks instead of throwing when the platform has no '
       'camera plugin', () async {
     // No plugin is registered in a test run — the same shape as a device whose
@@ -442,9 +521,18 @@ class _FakeVerifier implements HardwareVerifier {
   final List<HardwareReport> _responses;
   int calls = 0;
   int settingsOpened = 0;
+  int releases = 0;
+
+  /// Every step the gate took, in order, so "released before x" is assertable.
+  final List<String> trace = <String>[];
+
+  /// When set, [releasePreview] waits on it: the test's way of seeing that the
+  /// gate really does wait for the release instead of popping and hoping.
+  Completer<void>? releaseGate;
 
   @override
   Future<HardwareReport> verify() async {
+    trace.add('verify');
     final index = calls < _responses.length ? calls : _responses.length - 1;
     calls++;
     return _responses[index];
@@ -452,17 +540,29 @@ class _FakeVerifier implements HardwareVerifier {
 
   @override
   Future<void> openSettings() async => settingsOpened++;
+
+  @override
+  Future<void> releasePreview() async {
+    releases++;
+    trace.add('release');
+    await releaseGate?.future;
+  }
 }
 
 /// Never answers until the test completes it, so the "pending" UI can be seen.
 class _PendingVerifier implements HardwareVerifier {
   final Completer<HardwareReport> completer = Completer<HardwareReport>();
 
+  int releases = 0;
+
   @override
   Future<HardwareReport> verify() => completer.future;
 
   @override
   Future<void> openSettings() async {}
+
+  @override
+  Future<void> releasePreview() async => releases++;
 }
 
 /// Stands in for the browser probe, which only exists in a web build.

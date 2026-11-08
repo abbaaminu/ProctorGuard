@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../../../core/services/crash_reporting.dart';
 import '../../../../core/services/hardware_verification_service.dart';
+import '../../../../core/utils/proctor_log.dart';
 import '../../../../core/widgets/responsive_layout.dart';
 import '../../domain/entities/exam.dart';
 import '../widgets/exam_instructions_dialog.dart';
@@ -39,13 +42,44 @@ class _ExamHardwareGatePageState extends State<ExamHardwareGatePage> {
   /// "Check again", or a retry while the camera is still opening).
   bool _checking = true;
 
+  /// True while the preview is being released on the way out, so a second tap on
+  /// "Start Exam" cannot pop the route twice.
+  bool _releasing = false;
+
   @override
   void initState() {
     super.initState();
     _runCheck();
   }
 
+  @override
+  void dispose() {
+    // Backing out of the gate is a way out too, and nothing may keep the lens: a
+    // student who returns to the exam list must not leave a capture session behind
+    // for the next attempt (or the next app) to trip over. Not awaited - `dispose`
+    // is synchronous - and a no-op when the session was already given back.
+    unawaited(_releasePreview());
+    super.dispose();
+  }
+
+  /// Gives the capture session back, whatever state the check is in.
+  ///
+  /// [HardwareVerifier.releasePreview] is documented as total, but the gate is the
+  /// one that promised the release: an injected verifier that throws must not be
+  /// able to strand the student here, so the failure is logged and swallowed.
+  Future<void> _releasePreview() async {
+    try {
+      await _verifier.releasePreview();
+    } catch (error) {
+      proctorLog('ExamHardwareGatePage: releasing the preview failed: $error');
+    }
+  }
+
   Future<void> _runCheck() async {
+    if (!mounted) return;
+    // Before a second session is opened: the lens the last verdict is holding has
+    // to come back first (see [DeviceHardwareVerifier._probe]).
+    await _releasePreview();
     if (!mounted) return;
     setState(() {
       _checking = true;
@@ -83,6 +117,23 @@ class _ExamHardwareGatePageState extends State<ExamHardwareGatePage> {
       _checking = false;
       _report = report;
     });
+  }
+
+  /// Stops the preview, **then** tells the caller the student may start.
+  ///
+  /// The order is the whole point: the exam route opens the capture session that
+  /// is actually recorded, and a device-check session still holding the lens is
+  /// the `NotReadableError` ("another app or tab is already using the camera") a
+  /// student meets on a camera that works. So the release is awaited here, while
+  /// this screen is still on top, and only then does the route pop — the exam
+  /// screen's own `initialize()` is the first open of the lens after it.
+  Future<void> _startExam() async {
+    if (_releasing) return;
+    setState(() => _releasing = true);
+
+    await _releasePreview();
+    if (!mounted) return;
+    Navigator.of(context).pop(true);
   }
 
   @override
@@ -140,6 +191,7 @@ class _ExamHardwareGatePageState extends State<ExamHardwareGatePage> {
               const SizedBox(height: 24),
               _GateActions(
                 checking: _checking,
+                starting: _releasing,
                 verified: verified,
                 settingsHint: report.settingsHint,
                 onCheckAgain: _runCheck,
@@ -149,7 +201,8 @@ class _ExamHardwareGatePageState extends State<ExamHardwareGatePage> {
                 // kiosk/browser rules are all about to become live.
                 onInstructions: () =>
                     showExamInstructions(context, exam: widget.exam),
-                onStart: () => Navigator.of(context).pop(true),
+                // Releases the preview before the route pops — see [_startExam].
+                onStart: _startExam,
                 onCancel: () => Navigator.of(context).pop(false),
               ),
             ],
@@ -351,6 +404,7 @@ class _BlockingWarning extends StatelessWidget {
 class _GateActions extends StatelessWidget {
   const _GateActions({
     required this.checking,
+    required this.starting,
     required this.verified,
     required this.settingsHint,
     required this.onCheckAgain,
@@ -361,6 +415,11 @@ class _GateActions extends StatelessWidget {
   });
 
   final bool checking;
+
+  /// The preview is being released on the way out. "Start Exam" is disabled while
+  /// it is, so a second tap cannot pop the route twice (see `_startExam`).
+  final bool starting;
+
   final bool verified;
   final bool settingsHint;
   final VoidCallback onCheckAgain;
@@ -377,8 +436,9 @@ class _GateActions extends StatelessWidget {
   Widget build(BuildContext context) {
     final start = FilledButton.icon(
       key: const Key('gate-start-exam'),
-      // Disabled until *both* devices are verified — the hard gate.
-      onPressed: verified ? onStart : null,
+      // Disabled until *both* devices are verified — the hard gate — and while the
+      // preview is still being handed back, so the exam route is never pushed twice.
+      onPressed: verified && !starting ? onStart : null,
       icon: const Icon(Icons.play_arrow),
       label: const Text('Start Exam'),
     );

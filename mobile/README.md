@@ -1018,6 +1018,20 @@ inside the tabs, and that **both** pre-exam screens actually reach the dialog (t
 portal with no paper chosen, the gate with its checklist still passed when the
 dialog closes).
 
+### The handover from the device check to the exam session
+
+No pre-exam capture session outlives the gate. `ExamHardwareGatePage._startExam`
+**awaits** `HardwareVerifier.releasePreview()` and only then pops the route, and
+`DeviceHardwareVerifier` keeps the session it verified until that call — so the
+exam screen's own `initialize()` is the first thing to open the lens afterwards,
+instead of racing a preview for it. The gate releases on every exit: `dispose()`
+covers "Back to exams", and a "Check again" releases before it re-opens, because
+one session at a time is what keeps the second open from being Chromium's *"another
+app or tab is already using the camera"* on a camera that is working. On the web the
+same rule lives inside the probe: one `getUserMedia` per device, and **every
+`MediaStreamTrack` it opened is stopped** in a `finally` before the verdict is
+returned.
+
 ### The exam session screen
 
 `ExamTakingPage` owns one attempt end to end, and every way it can fail ends
