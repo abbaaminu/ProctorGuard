@@ -22,13 +22,16 @@
 --      (paper, supervisor), written only by an administrator, readable by the
 --      supervisor it names and by administrators. `guard_supervisor_assignment()`
 --      refuses a row whose `supervisor_id` is not a `supervisor` account.
---   2. Two new predicates:
+--   2. Three new predicates:
 --        is_supervisor_only()      role = 'supervisor' - the one staff label this
 --                                  file narrows (admin and lecturer are not
 --                                  "supervisor only", so nothing about them moves);
 --        can_supervise_exam(uuid)  an administrator, or a supervisor assigned to
 --                                  that paper. The answer to "may this account
---                                  intervene in *this* sitting?".
+--                                  intervene in *this* sitting?";
+--        can_read_profile(uuid)    may this supervisor read *this person's* profile
+--                                  row - the per-person half of the same scope,
+--                                  asked by the profiles read policy.
 --   3. Every policy and RPC that asked `is_exam_supervisor()` now asks
 --      `can_supervise_exam(<the paper the row belongs to>)`:
 --        exams_select, exam_allowed_students_select, questions_select_supervisor,
@@ -40,12 +43,25 @@
 --        attempt_review_logs_select_staff, question_grades_select_staff,
 --        and proctoring_coverage(), proctoring_coverage_for_exam(),
 --        resolve_flagged_attempt(), submit_exam().
+--   4. `profiles_select_own_or_staff` - the one policy that asked no per-paper
+--      question at all, and therefore the widest hole of the set: a supervisor read
+--      **every** profile row in the institution (name, matriculation number,
+--      faculty, department, level, photograph) by being `is_staff()` - assigned or
+--      not, sitting or not, with nothing recorded to justify it. Its supervisor arm
+--      now asks `can_read_profile(id)`: the students who sat a paper the supervisor
+--      runs, who were granted one, or whom a labelled paper of theirs is aimed at.
 --
 -- WHAT IT DOES NOT DO
 --   * **A lecturer keeps exactly what they had.** Every `owns_exam()` arm is
 --     untouched, `is_staff()`'s roster read is untouched for lecturers, and
 --     `is_attempt_resetter()` still names all three staff roles. The lecturer
 --     console reads the same rows before and after this file.
+--   * **A supervisor loses a roster read they never used.** Their console prints a
+--     name only for a student on a paper they run - an attempt, a borrow-list row or
+--     a labelled paper's cohort (`can_read_profile()`), which is exactly what the
+--     monitor, its reset dialog and its review dialog render. Another member of
+--     staff's row becomes unreadable, and nothing a supervisor's screens render
+--     comes from one: the author of a paper is a uuid the console never resolves.
 --   * An **administrator** keeps every paper: `can_supervise_exam()` is true for
 --     `role = 'admin'` without an assignment, so the admin console's monitor,
 --     analytics and reset controls are unchanged.
@@ -103,7 +119,7 @@
 --         from public.supervisor_exam_assignments order by assigned_at desc;
 --       select proname from pg_proc
 --        where pronamespace = 'public'::regnamespace
---          and proname in ('is_supervisor_only', 'can_supervise_exam');
+--          and proname in ('is_supervisor_only', 'can_supervise_exam', 'can_read_profile');
 -- =====================================================================
 
 -- ---------------------------------------------------------------------
@@ -214,12 +230,14 @@ grant select, insert, delete on table public.supervisor_exam_assignments to auth
 grant all on table public.supervisor_exam_assignments to service_role;
 
 -- ---------------------------------------------------------------------
--- 2. THE TWO PREDICATES
+-- 2. THE THREE PREDICATES
 -- ---------------------------------------------------------------------
 -- `is_supervisor_only()` is the one staff label this file narrows; admin and
 -- lecturer answer false, which is what leaves their policies exactly as they were.
 -- `can_supervise_exam(uuid)` is the per-paper question that replaces the tier
--- question in every policy below. Both are copied from `supabase/schema.sql`
+-- question in every policy below; `can_read_profile(uuid)` is the per-person twin
+-- of it, which is the question the profiles read policy asks ("may this supervisor
+-- read *this* student's row?"). All three are copied from `supabase/schema.sql`
 -- character for character.
 
 create or replace function public.is_supervisor_only()
@@ -268,6 +286,66 @@ comment on function public.can_supervise_exam(uuid) is
 revoke execute on function public.can_supervise_exam(uuid) from public, anon;
 grant execute on function public.can_supervise_exam(uuid) to authenticated, service_role;
 
+-- "May this supervisor read *this person's* profile row?" - the per-person twin of
+-- `can_supervise_exam()`: the students who sat a paper the caller runs, who were
+-- granted one, or whom a *labelled* one of their papers is aimed at. The full
+-- reasoning - including why a paper that names no cohort reaches its audience
+-- through the first two answers only - is in `supabase/schema.sql` section 1; the
+-- two copies are the same function, character for character.
+create or replace function public.can_read_profile(p_profile_id uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select p_profile_id is not null
+     and (
+       exists (
+         select 1
+         from public.exam_submissions s
+         join public.supervisor_exam_assignments a on a.exam_id = s.exam_id
+         where s.student_id = p_profile_id
+           and a.supervisor_id = auth.uid()
+       )
+       or exists (
+         select 1
+         from public.exam_allowed_students t
+         join public.supervisor_exam_assignments a on a.exam_id = t.exam_id
+         where t.student_id = p_profile_id
+           and a.supervisor_id = auth.uid()
+       )
+       or exists (
+         select 1
+         from public.profiles p
+         join public.supervisor_exam_assignments a on a.supervisor_id = auth.uid()
+         join public.exams e on e.id = a.exam_id
+         where p.id = p_profile_id
+           and p.role = 'student'
+           and (
+             nullif(btrim(e.faculty), '') is not null
+             or nullif(btrim(e.department), '') is not null
+             or nullif(btrim(e.level), '') is not null
+           )
+           and (nullif(btrim(e.faculty), '') is null
+                or (nullif(btrim(p.faculty), '') is not null
+                    and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
+           and (nullif(btrim(e.department), '') is null
+                or (nullif(btrim(p.department), '') is not null
+                    and lower(btrim(p.department)) = lower(btrim(e.department))))
+           and (nullif(btrim(e.level), '') is null
+                or (nullif(btrim(p.level), '') is not null
+                    and lower(btrim(p.level)) = lower(btrim(e.level))))
+       )
+     );
+$$;
+
+comment on function public.can_read_profile(uuid) is
+  'Per-person scope for the profiles read: true for a student who sat, was granted or is aimed at a paper the caller is assigned to. The read policy asks it only of a supervisor - an administrator and a lecturer are not is_supervisor_only() - so it answers false for another member of staff by design.';
+
+revoke execute on function public.can_read_profile(uuid) from public, anon;
+grant execute on function public.can_read_profile(uuid) to authenticated, service_role;
+
 -- ---------------------------------------------------------------------
 -- 3. THE POLICIES (each dropped by name, then recreated)
 -- ---------------------------------------------------------------------
@@ -276,7 +354,10 @@ grant execute on function public.can_supervise_exam(uuid) to authenticated, serv
 -- fresh install and an upgraded project would enforce different predicates.
 -- Only the supervisor arm changed - `is_exam_supervisor()` became
 -- `can_supervise_exam(<the paper the row belongs to>)` - and every student, author
--- and lecturer arm is the sentence it was before.
+-- and lecturer arm is the sentence it was before - with one addition: `profiles`
+-- has no paper to ask about, so its supervisor arm asks
+-- `can_read_profile(<the person the row names>)` instead of the tier.
+
 
 drop policy if exists "exams_select" on public.exams;
 create policy "exams_select"
@@ -431,6 +512,30 @@ create policy "question_grades_select_staff"
         select 1 from public.exam_submissions s
         where s.id = submission_id and public.can_supervise_exam(s.exam_id)
       )
+    )
+  );
+
+-- The roster read: the one policy in this file that asked no per-paper question at
+-- all, and so the widest of them. `id = auth.uid()` keeps everybody's own row;
+-- `is_staff()` used to mean "and everybody else's" for a supervisor too - every
+-- name, matriculation number, faculty, department, level and photograph in the
+-- institution, whether or not they had ever been put on a paper. The supervisor arm
+-- now asks `can_read_profile(id)`. The administrator and lecturer arms are unchanged
+-- because neither is `is_supervisor_only()`.
+--
+-- This is what the supervisor console's names come from (`accountNamesProvider` in
+-- supervisor_dashboard_page.dart), and it stays satisfied for every row that console
+-- can render: the monitor's roster is students with an attempt on an assigned paper,
+-- plus the cohort a labelled paper names and a paper's borrow list.
+drop policy if exists "profiles_select_own_or_staff" on public.profiles;
+create policy "profiles_select_own_or_staff"
+  on public.profiles for select
+  to authenticated
+  using (
+    id = auth.uid()
+    or (
+      public.is_staff()
+      and (not public.is_supervisor_only() or public.can_read_profile(id))
     )
   );
 
@@ -909,9 +1014,9 @@ begin
   select count(*) into v_count
   from pg_proc
   where pronamespace = 'public'::regnamespace
-    and proname in ('is_supervisor_only', 'can_supervise_exam');
-  if v_count <> 2 then
-    raise exception 'FAIL: the two predicates were not installed (found %)', v_count;
+    and proname in ('is_supervisor_only', 'can_supervise_exam', 'can_read_profile');
+  if v_count <> 3 then
+    raise exception 'FAIL: the three predicates were not installed (found %)', v_count;
   end if;
 
   -- No policy may still ask the tier question: every table below can name the paper
@@ -943,5 +1048,18 @@ begin
     raise exception 'FAIL: questions_public still asks the tier question';
   end if;
 
-  raise notice 'supervisor scope installed: % policies and the question feed ask can_supervise_exam()', v_count;
+  -- The roster read is narrowed as well: a project that kept the old profiles policy
+  -- would still let any supervisor - assigned or not - enumerate every account in
+  -- the institution, which is the read this file removes.
+  if not exists (
+    select 1 from pg_policies
+     where schemaname = 'public'
+       and tablename = 'profiles'
+       and policyname = 'profiles_select_own_or_staff'
+       and coalesce(qual, '') like '%can_read_profile%'
+  ) then
+    raise exception 'FAIL: profiles_select_own_or_staff still reads every row for a supervisor';
+  end if;
+
+  raise notice 'supervisor scope installed: % policies and the question feed ask can_supervise_exam(), and the profiles read asks can_read_profile()', v_count;
 end $$;

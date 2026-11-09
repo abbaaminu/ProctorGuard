@@ -12,10 +12,11 @@ import 'analytics_page.dart';
 
 /// Streams `proctoring_logs` and `exam_submissions` for a given exam via
 /// Supabase Realtime, so supervisors see violations and status changes as
-/// they happen — no polling. RLS is what scopes the rows: a supervisor may read
-/// every attempt and every log (see `submissions_select_own_or_supervisor` and
-/// `profiles_select_own_or_staff` in `supabase/schema.sql`), a student only their
-/// own.
+/// they happen — no polling. RLS is what scopes the rows: since
+/// `20261109090000_supervisor_exam_assignments.sql` a supervisor reads the
+/// attempts and the logs of the papers they were assigned
+/// (`submissions_select_own_or_supervisor` → `can_supervise_exam()` in
+/// `supabase/schema.sql`), a student only their own.
 final examSubmissionsStreamProvider =
     StreamProvider.family<List<Map<String, dynamic>>, String>((ref, examId) {
   return SupabaseService.instance.client
@@ -35,7 +36,14 @@ final examSubmissionsStreamProvider =
 /// not exist`, so the monitor showed a raw uuid for a whole exam and said
 /// nothing about why - the fallback label is built from the id, e.g.
 /// `Student <uuid>`. `profiles_select_own_or_staff` is what a supervisor's
-/// session reads through, so the names are all there.
+/// session reads through, and since
+/// `20261109090000_supervisor_exam_assignments.sql` that read is scoped to the
+/// people a supervisor is accountable for (`can_read_profile()`): a student with
+/// an attempt on one of their papers, one on a paper's borrow list, or one a
+/// labelled paper of theirs is aimed at. Those are exactly the ids this map is
+/// asked about, so the roster still names every row it shows - another account's
+/// profile is not readable at all, where it used to be readable
+/// institution-wide.
 final accountNamesProvider = StreamProvider<Map<String, String>>((ref) {
   return SupabaseService.instance.client.from('profiles').stream(
         primaryKey: ['id'],

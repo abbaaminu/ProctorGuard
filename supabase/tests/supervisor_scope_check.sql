@@ -56,6 +56,12 @@
 --   (j) demoting the supervisor to lecturer removes the reach on the instant the
 --       role changes - `can_supervise_exam()` asks the role as well as the row - and
 --       re-promoting restores the sittings it was trusted with.
+--   (k) the roster read (`profiles_select_own_or_staff`): the supervisor reads the
+--       name of every student on a paper they run - one who sat it, one on its
+--       borrow list, one a labelled paper of theirs is aimed at - and, with no
+--       assignment, exactly their own row. Another paper's student and another
+--       member of staff stay unreadable, and the lecturer and the administrator keep
+--       the whole roster.
 begin;
 
 -- =====================================================================
@@ -643,6 +649,166 @@ begin
 end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);
+
+-- =====================================================================
+-- (k)  the roster read: profiles_select_own_or_staff
+-- =====================================================================
+-- The one supervisor arm that asked no per-paper question at all, and the widest
+-- hole in the set: `is_staff()` let any supervisor read *every* profile row in the
+-- institution - name, matriculation number, faculty, department, level, photograph -
+-- assigned or not, sitting or not. The supervisor console's names come from exactly
+-- this read (`accountNamesProvider` in supervisor_dashboard_page.dart), so the
+-- narrowing has to be proved against the rows that console can render.
+--
+-- Fixtures on top of the ones above: a labelled paper assigned to the same
+-- supervisor, a student that paper is aimed at (no attempt), and a student on the
+-- assigned paper's borrow list (no attempt).
+do $$
+declare
+  v_targeted uuid := gen_random_uuid();
+  v_borrower uuid := gen_random_uuid();
+  v_lab      uuid := gen_random_uuid();
+begin
+  insert into public.profiles (id, role, full_name, email, faculty, department, level) values
+    (v_targeted, 'student', 'Student Five', 'scope.s5@test.local', 'Science', 'Physics', '300'),
+    (v_borrower, 'student', 'Student Six',  'scope.s6@test.local', null, null, null);
+
+  insert into public.exams (id, title, created_by, duration_minutes, is_published,
+                            faculty, department, level) values
+    (v_lab, 'Labelled sitting', current_setting('test.lecturer')::uuid, 60, true,
+     'Science', 'Physics', '300');
+
+  insert into public.supervisor_exam_assignments (exam_id, supervisor_id, assigned_by) values
+    (v_lab, current_setting('test.supervisor')::uuid, current_setting('test.admin')::uuid);
+
+  -- A borrow-list row on the *unlabelled* assigned paper: the other way onto a paper.
+  insert into public.exam_allowed_students (exam_id, student_id, created_by) values
+    (current_setting('test.mine')::uuid, v_borrower, current_setting('test.admin')::uuid);
+
+  perform set_config('test.targeted', v_targeted::text, false);
+  perform set_config('test.borrower', v_borrower::text, false);
+end $$;
+
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.supervisor@test.local"}',
+         current_setting('test.supervisor')), true);
+do $$
+begin
+  -- The monitor's roster: a name for every student with an attempt on a paper this
+  -- supervisor runs. Without this the grid prints "Student <uuid>" instead.
+  if (select full_name from public.profiles
+       where id = current_setting('test.s1')::uuid) is null then
+    raise exception 'FAIL (k): the supervisor cannot read a student who sat their paper';
+  end if;
+
+  -- A student granted the paper, and a student a labelled paper is aimed at: both
+  -- can appear in a roster before an attempt exists.
+  if (select full_name from public.profiles
+       where id = current_setting('test.borrower')::uuid) is null then
+    raise exception 'FAIL (k)ii: the supervisor cannot read a student granted their paper';
+  end if;
+  if (select full_name from public.profiles
+       where id = current_setting('test.targeted')::uuid) is null then
+    raise exception 'FAIL (k)iii: the supervisor cannot read a student their labelled paper is aimed at';
+  end if;
+
+  -- Always their own row - the role gate reads it to route the console.
+  if (select full_name from public.profiles
+       where id = current_setting('test.supervisor')::uuid) is null then
+    raise exception 'FAIL (k)iv: the supervisor cannot read their own row';
+  end if;
+
+  -- ...and nobody else. `test.mine` names no cohort, so an unlabelled paper must not
+  -- stand in for "aimed at everybody in the institution".
+  if exists (select 1 from public.profiles
+              where id = current_setting('test.s2')::uuid) then
+    raise exception 'FAIL (k)v: the supervisor read a student on a paper they do not run';
+  end if;
+  if exists (select 1 from public.profiles
+              where id in (current_setting('test.lecturer')::uuid,
+                           current_setting('test.admin')::uuid)) then
+    raise exception 'FAIL (k)vi: the supervisor read a colleague''s profile row';
+  end if;
+
+  raise notice 'PASS (k): the supervisor reads the students on the papers they run, and only those';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- A supervisor with no assignment at all reads exactly one row: their own.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.peer@test.local"}',
+         current_setting('test.peer')), true);
+do $$
+declare
+  v_visible int;
+begin
+  select count(*) into v_visible from public.profiles;
+
+  if v_visible <> 1 then
+    raise exception 'FAIL (k)vii: a supervisor with no assignment read % profile rows, expected only their own', v_visible;
+  end if;
+  raise notice 'PASS (k)vii: a supervisor with no assignment sees only their own row';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+
+-- ...and the two roles that were never narrowed keep the whole roster. This is the
+-- "unchanged" half, and it is the read the marking queue (`_namesFor()` in
+-- question_authoring_repository_impl.dart) and the admin console go through.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.lecturer@test.local"}',
+         current_setting('test.lecturer')), true);
+do $$
+declare
+  v_visible int;
+begin
+  select count(*) into v_visible
+  from public.profiles
+  where id in (current_setting('test.s1')::uuid,
+               current_setting('test.s2')::uuid,
+               current_setting('test.peer')::uuid,
+               current_setting('test.admin')::uuid,
+               current_setting('test.borrower')::uuid,
+               current_setting('test.targeted')::uuid);
+
+  if v_visible <> 6 then
+    raise exception 'FAIL (k)viii: a lecturer reads % of the 6 other rows, expected all of them', v_visible;
+  end if;
+  raise notice 'PASS (k)viii: a lecturer keeps the whole roster (unchanged)';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.admin@test.local"}',
+         current_setting('test.admin')), true);
+do $$
+declare
+  v_visible int;
+begin
+  select count(*) into v_visible
+  from public.profiles
+  where id in (current_setting('test.s1')::uuid,
+               current_setting('test.s2')::uuid,
+               current_setting('test.peer')::uuid,
+               current_setting('test.lecturer')::uuid,
+               current_setting('test.borrower')::uuid,
+               current_setting('test.targeted')::uuid);
+
+  if v_visible <> 6 then
+    raise exception 'FAIL (k)ix: an administrator reads % of the 6 other rows, expected all of them', v_visible;
+  end if;
+  raise notice 'PASS (k)ix: an administrator keeps the whole roster (no assignment needed)';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
 
 -- Nothing here persists: every fixture above is rolled back.
 rollback;

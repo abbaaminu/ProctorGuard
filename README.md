@@ -55,7 +55,11 @@ every policy that used to ask the role tier (`is_exam_supervisor()`) now asks th
 question with the paper the row belongs to — so a supervisor's console lists their
 own sittings, and their reads, resets, review decisions and snapshot access are
 confined to them, while an administrator needs no row and still reaches every
-paper. That tier used to read *every*
+paper. The same scope decides whose **names** the console can print: a supervisor
+reads the profile of a student who sat, was granted or is aimed at a paper they run
+(`can_read_profile()`), where `is_staff()` used to hand them every profile row in the
+institution — name, matriculation number, faculty, department, level and photograph —
+assigned or not. That tier used to read *every*
 paper's evidence — the incident feed and the reset audit. A lecturer reads the
 evidence recorded on their **own** papers and nothing else's: those two policies
 ask `owns_exam()` (`exams.created_by = auth.uid()`) as well as the scope
@@ -626,14 +630,21 @@ Things worth knowing before you turn it on:
   row of `proctoring_logs`, `exam_submissions`, `proctor_heartbeats`,
   `proctoring_consents`, `session_reset_logs` or `attempt_review_logs` is rewritten.
   Lecturers keep exactly what they had (`owns_exam()` and the `is_staff()` roster
-  read are untouched) and administrators need no row. It is safe to re-run, and it
+  read are untouched) and administrators need no row. The one read it narrows that is
+  not about a paper's evidence is the roster itself: `profiles_select_own_or_staff`
+  let **any** supervisor read **every** profile row in the institution — name,
+  matriculation number, faculty, department, level and photograph — by being
+  `is_staff()`, assigned or not, and it now asks `can_read_profile(id)`: the students
+  who sat a paper the supervisor runs, who were granted one, or whom a labelled paper
+  of theirs is aimed at. The monitor's names still resolve, because they are exactly
+  those students. It is safe to re-run, and it
   **does not backfill**: a supervisor who existed before it runs sees an empty console
   until an administrator assigns them a sitting on the admin console's **Assign
   supervisors** screen, which is the deliberate fail-closed default. It refuses to
   report success if any policy still asks the tier question, and
   `supabase/tests/supervisor_scope_check.sql` proves the scope end to end (assigned
-  vs unassigned paper, roster, incident feed, stills, review decision, reset, the RPCs
-  and the demotion path). Verify with
+  vs unassigned paper, roster, incident feed, stills, review decision, reset, the RPCs,
+  the demotion path and the profile roster read). Verify with
   `select exam_id, supervisor_id from public.supervisor_exam_assignments;`.
 - Apply `supabase/migrations/20261108090000_looking_away_and_noise_count.sql` after
   those two, on every project. It is one `UPDATE` that turns `looking_away` and

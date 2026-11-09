@@ -4286,6 +4286,9 @@ void main() {
         'PASS (g)',
         'PASS (i)iii',
         'PASS (j)',
+        'PASS (k)',
+        'PASS (k)vii',
+        'PASS (k)ix',
       ]) {
         expect(sql, contains(marker), reason: 'the check stopped proving $marker');
       }
@@ -4336,6 +4339,58 @@ void main() {
       );
       // No update policy: the row is a fact, and re-aiming it is another assignment.
       expect(sql, isNot(contains('"supervisor_assignments_update')));
+    });
+
+    test('the roster read is narrowed for a supervisor, unchanged for staff', () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      // Own row first, then the staff tier with only the supervisor arm narrowed:
+      // the question is asked of the *person* the row is, not of a paper.
+      expect(
+        _policyUsing(sql, 'profiles_select_own_or_staff'),
+        'id = auth.uid() or ( public.is_staff() and '
+        '(not public.is_supervisor_only() or public.can_read_profile(id)) )',
+      );
+
+      final body = _functionBody(sql, 'can_read_profile');
+      expect(
+        body,
+        isNotNull,
+        reason: 'the roster read asks a predicate that is not in the file',
+      );
+      // The three answers: an attempt on an assigned paper (the monitor's roster), a
+      // borrow-list row on one, and the cohort a *labelled* paper names. Without the
+      // last two a supervisor could not print a name before the first attempt.
+      expect(body, contains('public.exam_submissions'));
+      expect(body, contains('public.exam_allowed_students'));
+      expect(body, contains('public.supervisor_exam_assignments'));
+      // ...and a paper that names no cohort must not stand in for "everybody in the
+      // institution", which is the hole this predicate exists to close.
+      expect(body, contains("nullif(btrim(e.faculty), '') is not null"));
+      expect(body, contains("p.role = 'student'"));
+      // Never another member of staff: no screen a supervisor can reach prints a
+      // colleague's name, and the author of a paper is a uuid the console ignores.
+      expect(body, isNot(contains("'admin'")));
+      expect(body, isNot(contains("'lecturer'")));
+
+      // The same policy and the same function on an upgraded project: the migration
+      // runs last there, so *it* is what a linked database ends up enforcing.
+      final scope = File(
+        '../supabase/migrations/20261109090000_supervisor_exam_assignments.sql',
+      );
+      if (!scope.existsSync()) return; // a checkout without ../supabase
+      final scopeSql = scope.readAsStringSync().replaceAll('\r\n', '\n');
+      expect(
+        _functionBody(scopeSql, 'can_read_profile'),
+        body,
+        reason: 'the scope migration and the full schema disagree about the roster read',
+      );
+      expect(
+        _policyUsing(scopeSql, 'profiles_select_own_or_staff'),
+        _policyUsing(sql, 'profiles_select_own_or_staff'),
+        reason: 'the scope migration and the full schema disagree about the roster read',
+      );
     });
   });
 

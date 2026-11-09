@@ -615,9 +615,10 @@ exam list themselves when they come back from a session or a monitor.
 `mobile/test/refresh_on_resume_test.dart` drives the real `flutter/lifecycle`
 messages through the binding, so the rule is pinned without a device.
 
-Lecturers and supervisors share `is_staff()` in the database, which is what lets
-both read every attempt on the monitor roster
-(`submissions_select_own_or_supervisor`), but what was recorded *inside* a sitting
+Lecturers and supervisors share `is_staff()` in the database, which is what lets a
+lecturer read every attempt on the monitor roster
+(`submissions_select_own_or_supervisor`) and a supervisor the roster of the papers
+they were assigned; but what was recorded *inside* a sitting
 is scoped more tightly: the incident feed (`proctoring_logs`) and the reset audit
 (`session_reset_logs`) are readable for the papers the reader supervises
 (`can_supervise_exam()`) and — for the paperwork a lecturer is accountable for —
@@ -2180,7 +2181,12 @@ written-down opt-out for a throwaway demo build and never for one a student runs
   in `supervisor_exam_assignments` for that paper": every policy that used to grant
   the intervention tier the whole institution now asks it with the paper the row
   belongs to, and `is_supervisor_only()` is the complement that leaves a lecturer's
-  `is_staff()` arms exactly as they were. `owns_exam()` scopes the
+  `is_staff()` arms exactly as they were. `can_read_profile(id)` is the same question
+  asked of a **person** rather than a paper, because `profiles` has no paper to ask
+  about: `profiles_select_own_or_staff` lets a supervisor read the profile of a
+  student who sat, was granted or is aimed at a paper they run — which is what the
+  monitor's names come from — and no longer the whole institution's roster, while a
+  lecturer and an administrator keep it. `owns_exam()` scopes the
   incident feed and the reset audit to the papers the reader wrote. RLS cannot
   restrict a *column*, so the
   `profiles_guard_role_change` trigger raises `42501`

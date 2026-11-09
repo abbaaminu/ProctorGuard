@@ -509,14 +509,115 @@ drop policy if exists "profiles_insert_self_student" on public.profiles;
 drop policy if exists "profiles_update_self" on public.profiles;
 drop policy if exists "profiles_admin_all" on public.profiles;
 
--- Read: your own row, or every row when you are staff — the staff roster,
--- the admin console's account list and live exam monitor both render
--- other people's names and roles. Deliberately NOT "any authenticated user": a
--- student must not be able to enumerate the roster of the whole institution.
+-- "May this supervisor read *this person's* profile row?" - the per-person twin of
+-- `can_supervise_exam()` (§2d), and the reason a supervisor's monitor can print
+-- "Aisha Bello" without a supervisor being able to enumerate the student body.
+--
+-- Three questions, in order:
+--   * did this person *sit* a paper the caller runs - an `exam_submissions` row on
+--     an assigned paper. This is the roster the monitor renders, and the only place
+--     a supervisor strictly needs somebody's name;
+--   * was this person *granted* one of those papers - an `exam_allowed_students`
+--     row (§2b), the "may this person sit it" answer the console shows before an
+--     attempt exists;
+--   * is this person *aimed at* by one of those papers - the paper names at least
+--     one of faculty/department/level and the student's row matches every label it
+--     names (the same blank-label reading `student_can_access_exam()` uses). A paper
+--     that names no cohort is offered to everybody, and "aimed at everybody" would
+--     turn this branch into "every student in the institution" - so the branch
+--     requires the paper to name something. An untargeted paper reaches its
+--     audience through the two answers above, which is the audience a console can
+--     actually display.
+--
+-- Not a staff question. Another member of staff's row - the paper's author
+-- included - is not readable through this, and nothing a supervisor's screens
+-- render comes from one: the roster prints students, the reset and review dialogs
+-- name the student, and the author of a paper is a uuid the console never resolves.
+--
+-- SECURITY DEFINER for the reason every predicate here is: a policy on `profiles`
+-- may not re-enter the policies on `profiles`, and this one reads
+-- `supervisor_exam_assignments` (§2c), `exam_allowed_students` (§2b),
+-- `exam_submissions` (§4) and `exams` - tables it has to answer for a caller who may
+-- read none of them. It sits here, above the policy that calls it, and section 0a is
+-- what lets it name tables created further down this file.
+create or replace function public.can_read_profile(p_profile_id uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select p_profile_id is not null
+     and (
+       exists (
+         select 1
+         from public.exam_submissions s
+         join public.supervisor_exam_assignments a on a.exam_id = s.exam_id
+         where s.student_id = p_profile_id
+           and a.supervisor_id = auth.uid()
+       )
+       or exists (
+         select 1
+         from public.exam_allowed_students t
+         join public.supervisor_exam_assignments a on a.exam_id = t.exam_id
+         where t.student_id = p_profile_id
+           and a.supervisor_id = auth.uid()
+       )
+       or exists (
+         select 1
+         from public.profiles p
+         join public.supervisor_exam_assignments a on a.supervisor_id = auth.uid()
+         join public.exams e on e.id = a.exam_id
+         where p.id = p_profile_id
+           and p.role = 'student'
+           and (
+             nullif(btrim(e.faculty), '') is not null
+             or nullif(btrim(e.department), '') is not null
+             or nullif(btrim(e.level), '') is not null
+           )
+           and (nullif(btrim(e.faculty), '') is null
+                or (nullif(btrim(p.faculty), '') is not null
+                    and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
+           and (nullif(btrim(e.department), '') is null
+                or (nullif(btrim(p.department), '') is not null
+                    and lower(btrim(p.department)) = lower(btrim(e.department))))
+           and (nullif(btrim(e.level), '') is null
+                or (nullif(btrim(p.level), '') is not null
+                    and lower(btrim(p.level)) = lower(btrim(e.level))))
+       )
+     );
+$$;
+
+comment on function public.can_read_profile(uuid) is
+  'Per-person scope for the profiles read: true for a student who sat, was granted or is aimed at a paper the caller is assigned to. The read policy asks it only of a supervisor - an administrator and a lecturer are not is_supervisor_only() - so it answers false for another member of staff by design.';
+
+revoke execute on function public.can_read_profile(uuid) from public, anon;
+grant execute on function public.can_read_profile(uuid) to authenticated, service_role;
+
+-- Read: your own row; every row when you are staff - the staff roster, the admin
+-- console's account list and live exam monitor all render other people's names and
+-- roles. Deliberately NOT "any authenticated user": a student must not be able to
+-- enumerate the roster of the whole institution.
+--
+-- The supervisor is the one staff role whose read is narrowed. Until
+-- `20261109090000_supervisor_exam_assignments.sql` any supervisor read every
+-- profile row by being `is_staff()` - every matriculation number, faculty,
+-- department, level and photograph in the institution, with no assignment and no
+-- sitting - because the tier read was the only question this policy asked.
+-- `can_read_profile()` above is the per-person narrowing: the students who sat,
+-- were granted, or are aimed at a paper the supervisor runs. An administrator and a
+-- lecturer are not `is_supervisor_only()`, so their roster read is the sentence it
+-- always was.
 create policy "profiles_select_own_or_staff"
   on public.profiles for select
   to authenticated
-  using (id = auth.uid() or public.is_staff());
+  using (
+    id = auth.uid()
+    or (
+      public.is_staff()
+      and (not public.is_supervisor_only() or public.can_read_profile(id))
+    )
+  );
 
 -- Self-service provisioning may only ever create a STUDENT row. Without the
 -- role check, anyone who can sign up (public anon key) could insert
@@ -896,6 +997,12 @@ grant all on table public.supervisor_exam_assignments to service_role;
 -- the instant the role changed rather than when somebody remembers to clear up the
 -- assignments. Re-promoting them restores the sittings they were trusted with,
 -- which is the outcome a department wants.
+--
+-- `can_read_profile()` in section 1 is the same question asked about a *person*
+-- rather than a paper - "may this supervisor read this student's profile row" - and
+-- it is the other half of the scope: this predicate decides which sittings a
+-- supervisor can open, and that one decides whose names the console can print
+-- inside them.
 --
 -- SECURITY DEFINER with `set search_path`, exactly like `owns_exam()`: a policy
 -- that calls it must not re-enter the policies on `supervisor_exam_assignments` (or
