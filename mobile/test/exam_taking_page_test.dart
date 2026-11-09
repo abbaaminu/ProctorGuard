@@ -740,6 +740,70 @@ void main() {
       expect(find.byKey(const Key('equipment-block-face')), findsNothing);
     });
 
+    testWidgets('a browser that can only count faces says so', (tester) async {
+      await openPastGrace(tester);
+      // A page that has not answered is assumed to be measuring: no note sits
+      // over a normal sitting waiting for news.
+      expect(find.byKey(const Key('exam-head-turn-unavailable')), findsNothing);
+
+      // The page's second channel (`WebFaceSignalSource.analysis`): it can see a
+      // face, it cannot tell which way the head is pointing.
+      faces.emitAnalysis(false);
+      await tester.pump();
+      await tester.pump();
+
+      expect(
+        find.byKey(const Key('exam-head-turn-unavailable')),
+        findsOneWidget,
+        reason:
+            'the student is told their head turns are not judged, instead of the '
+            'sitting silently looking fully watched',
+      );
+      expect(
+        proctoring.violations,
+        isEmpty,
+        reason: 'a weaker sensor is not something a student did',
+      );
+      final notifier = ProviderScope.containerOf(
+        tester.element(find.byType(ExamTakingPage)),
+      ).read(proctoringProvider('sub-1').notifier);
+      expect(
+        notifier.faceAnalysisAvailable,
+        isFalse,
+        reason: 'the heartbeat has to be able to say it too',
+      );
+
+      // A model that arrived with the next load takes the note away again: the
+      // note states a present fact, not a past one.
+      faces.emitAnalysis(true);
+      await tester.pump();
+      await tester.pump();
+      expect(find.byKey(const Key('exam-head-turn-unavailable')), findsNothing);
+    });
+
+    testWidgets('a count-only page still catches a second person', (
+      tester,
+    ) async {
+      // The note qualifies the sitting, it does not suspend it: counting is
+      // still monitoring, and two faces need nothing measured.
+      await openPastGrace(tester);
+      faces.emitAnalysis(false);
+      await tester.pump();
+      await tester.pump();
+
+      faces.emit('multiple_faces');
+      await tester.pump();
+      await tester.pump();
+
+      expect(proctoring.violations.single.type.dbValue, 'multiple_faces');
+      expect(find.text('Warning 1'), findsOneWidget);
+      expect(
+        find.byKey(const Key('exam-head-turn-unavailable')),
+        findsOneWidget,
+        reason: 'the note is a standing fact about the sensor, not an event',
+      );
+    });
+
     testWidgets('a decided attempt stops watching, and stops asking', (
       tester,
     ) async {
@@ -1952,12 +2016,21 @@ class _FakeFaceSource implements WebFaceSignalSource {
   final StreamController<String> controller =
       StreamController<String>.broadcast();
 
+  /// What the page says about its own face sensor (`false` = it can count
+  /// faces but not measure a head angle). One per attempt, like the real hook.
+  final StreamController<bool> analysisController =
+      StreamController<bool>.broadcast();
+
   /// Whether the exam page released the hook. A source left installed is a
   /// detector still reporting into an attempt that has already ended.
   bool disposed = false;
 
   void emit(String message) {
     if (!controller.isClosed) controller.add(message);
+  }
+
+  void emitAnalysis(bool available) {
+    if (!analysisController.isClosed) analysisController.add(available);
   }
 
   @override
@@ -1967,9 +2040,13 @@ class _FakeFaceSource implements WebFaceSignalSource {
   Stream<String> get messages => controller.stream;
 
   @override
+  Stream<bool> get analysis => analysisController.stream;
+
+  @override
   void dispose() {
     disposed = true;
     if (!controller.isClosed) controller.close();
+    if (!analysisController.isClosed) analysisController.close();
   }
 }
 

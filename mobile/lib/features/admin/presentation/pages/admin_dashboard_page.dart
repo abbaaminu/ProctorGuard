@@ -7,6 +7,7 @@ import '../../../../core/widgets/home_button.dart';
 import '../../../../core/widgets/responsive_layout.dart';
 import '../../../dashboard/presentation/pages/analytics_page.dart';
 import '../../../dashboard/presentation/pages/supervisor_exam_picker_page.dart';
+import '../../../supervision/presentation/pages/assign_supervisors_page.dart';
 import '../../../auth/domain/entities/user_profile.dart';
 import '../../domain/entities/managed_account.dart';
 import '../../domain/entities/profile_labels.dart';
@@ -450,6 +451,19 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
           // console's own button - the affordance stays put so it is in the same
           // place on every screen of this console.
           const HomeButton(key: Key('admin-home')),
+          // Who runs which paper: the table `can_supervise_exam()` reads, and the
+          // reason a supervisor's console lists only their assigned sittings. Next to
+          // the exam monitor because both are the exam-side tools of this console.
+          IconButton(
+            key: const Key('admin-assign-supervisors'),
+            tooltip: 'Assign supervisors',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const AssignSupervisorsPage(),
+              ),
+            ),
+            icon: const Icon(Icons.assignment_ind_outlined),
+          ),
           IconButton(
             key: const Key('admin-exam-monitor'),
             tooltip: 'Exam monitor',

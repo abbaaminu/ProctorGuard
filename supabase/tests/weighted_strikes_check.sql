@@ -108,6 +108,13 @@ begin
   insert into public.exams (id, title, created_by, duration_minutes, is_published)
     values (v_exam, 'Weighted strikes paper', v_lecturer_a, 60, true);
 
+  -- `20261109090000_supervisor_exam_assignments.sql`: a supervisor reaches the
+  -- papers an administrator assigned to them - (f) has the supervisor rewrite and
+  -- resolve attempts on this paper, and (f)viii has the administrator unlock the
+  -- same one without an assignment (an admin needs none).
+  insert into public.supervisor_exam_assignments (exam_id, supervisor_id, assigned_by)
+    values (v_exam, v_supervisor, v_admin);
+
   insert into public.questions (exam_id, question_text, question_type, points)
     values (v_exam, 'Q1', 'subjective', 1);
   -- A multiple-choice question too, so (h) can try to write an option answer to a

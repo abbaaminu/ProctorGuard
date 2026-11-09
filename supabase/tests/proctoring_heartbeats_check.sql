@@ -87,6 +87,13 @@ begin
   insert into public.exams (id, title, created_by, duration_minutes, is_published)
     values (v_exam, 'Heartbeat paper', v_lecturer, 60, true);
 
+  -- `20261109090000_supervisor_exam_assignments.sql`: a supervisor reaches the
+  -- papers an administrator assigned to them. This file's (f) block reads the
+  -- coverage report *as the supervisor*, so the fixture paper is assigned to them.
+  -- The scope itself is proven in `supervisor_scope_check.sql`.
+  insert into public.supervisor_exam_assignments (exam_id, supervisor_id, assigned_by)
+    values (v_exam, v_supervisor, v_lecturer);
+
   insert into public.questions (exam_id, question_text, question_type, points)
     values (v_exam, 'Q1', 'subjective', 1);
 

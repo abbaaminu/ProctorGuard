@@ -291,12 +291,14 @@ function summarize(result) {
     const v = (state.verdicts || []).slice(-3).map((x) => x.v);
     return v.length ? v.join(',') : '(nothing)';
   };
+  const analyses = (after.analyses || []).map((x) => (x.v ? 'angles' : 'count-only'));
   const s = after.stats || {};
   const d = after.diag || {};
   return [
     (result.ok ? 'PASS' : 'FAIL') + ' ' + result.scenario.padEnd(22),
     'before=' + tail(before).padEnd(22),
     'after=' + tail(after).padEnd(22),
+    'analysis=' + (analyses.length ? analyses[analyses.length - 1] : 'unspoken'),
     'reason=' + String(d.reason).padEnd(13),
     'model=' + String(d.faceModel) + '/' + String(d.modelState),
     'mean=' + s.mean + ' spread=' + s.spread + ' dark=' + s.darkFraction,
@@ -340,7 +342,16 @@ async function main() {
   const only = process.argv[2];
   const scenarios = [
     // A lit room with a student in it: the only shape that may pass as `centered`.
-    { name: 'canvas', actions: [], settle: 1500, expect: 'centered' },
+    // No Shape Detection API and no model in this scenario, so the page is a pixel
+    // judge: it must say so (`expectAnalysis: false`) rather than leave the app
+    // believing it watches head turns.
+    {
+      name: 'canvas',
+      actions: [],
+      settle: 1500,
+      expect: 'centered',
+      expectAnalysis: false
+    },
     // The bug this lab exists for: a hand, a sticker or a closed shutter. Dim and
     // featureless, but auto-exposure lifts it well off black.
     {
@@ -421,7 +432,10 @@ async function main() {
       name: 'pose',
       actions: [{ js: 'window.__look(0); true', wait: 900 }],
       expectRegex: /^pose:/,
-      expectPose: { yaw: 0, pitch: 0, tolerance: 3 }
+      expectPose: { yaw: 0, pitch: 0, tolerance: 3 },
+      // A native detector that hands back landmarks *is* a head-turn sensor, and
+      // that is the one native shape allowed to say so.
+      expectAnalysis: true
     },
     {
       name: 'pose',
@@ -442,6 +456,46 @@ async function main() {
       actions: [{ js: 'window.__faces(0); true', wait: 900 }],
       expect: 'no_face'
     },
+    // The failure task 2 was written for. This browser *has* a `FaceDetector`, and
+    // all it returns is a bounding box: no landmarks, so no angle, and (with no
+    // model in reach) no other sensor to ask. Before, the page reported a face
+    // model and head-turn monitoring and answered `centered` for a student facing
+    // the wall - a sitting indistinguishable, on the wire, from a proctored one.
+    // It still has to answer `centered` (a count is all it knows, and accusing a
+    // student of a turn it did not measure is worse), but it has to say that it
+    // cannot measure.
+    {
+      name: 'pose+blind',
+      actions: [{ js: 'window.__look(40); true', wait: 900 }],
+      expect: 'centered',
+      expectAnalysis: false,
+      expectDiag: { faceModel: 'native', analysis: false }
+    },
+    // The same blunt detector with the shipped model behind it: a count is not an
+    // angle, so the frame goes to the model and the turn comes back measured. This
+    // is the whole of the fix on the sensor side.
+    {
+      name: 'mediapipe+blind',
+      actions: [{ js: 'window.__look(40, 10); true', wait: 900 }],
+      waitFor: 'window.__stubFrames > 0',
+      waitForMs: 15000,
+      settle: 1500,
+      expectRegex: /^pose:/,
+      expectPose: { yaw: 40, pitch: 10, tolerance: 2 },
+      expectAnalysis: true
+    },
+    // ...and counting stays the native detector's own answer even then: the model
+    // behind it sees one face, the browser sees two, and two people are two people.
+    {
+      name: 'mediapipe+blind',
+      label: 'mediapipe+blindTwo',
+      actions: [{ js: 'window.__nativeFaces(2); true', wait: 900 }],
+      waitFor: 'window.__stubFrames > 0',
+      waitForMs: 15000,
+      settle: 1500,
+      expect: 'multiple_faces',
+      expectAnalysis: true
+    },
     // ---- The model the app ships, on a browser that has none --------------
     //
     // MediaPipe's FaceLandmarker, WebAssembly and all, out of `web/mediapipe/`:
@@ -460,6 +514,7 @@ async function main() {
       expectRegex: /^pose:/,
       expectPose: { yaw: 0, pitch: 0, tolerance: 15 },
       expectDiag: { faceModel: 'mediapipe', modelState: 'ready' },
+      expectAnalysis: true,
       expectNoErrors: true
     },
     // ...and the same load under the policy index.html actually serves, which is
@@ -477,6 +532,7 @@ async function main() {
       expectRegex: /^pose:/,
       expectPose: { yaw: 0, pitch: 0, tolerance: 15 },
       expectDiag: { faceModel: 'mediapipe', modelState: 'ready' },
+      expectAnalysis: true,
       expectNoErrors: true
     },
     // A model that is not on the server at all - an air-gapped deployment, a host
@@ -492,6 +548,10 @@ async function main() {
       settle: 2500,
       expect: 'centered',
       expectDiag: { faceModel: 'none', modelState: 'failed' },
+      // The production case for a school that never served `web/mediapipe/`: the
+      // page keeps every check it had (a live frame is `centered`, a covered lens is
+      // `no_face`) and tells the app that head turns are not being judged.
+      expectAnalysis: false,
       expectNoErrors: true
     },
     // A head turned 40 degrees and tipped 10, through the pose matrix: the angles
@@ -647,6 +707,21 @@ async function main() {
         if (errors.length) {
           result.ok = false;
           result.failure = 'the page raised: ' + errors.join('; ');
+        }
+      }
+      // What the page told Dart about its own sensors, asserted on the hook rather
+      // than on `diagnostics()`: this is the wire `WebFaceSignalSource` reads, and
+      // the value the student's notice and the heartbeat's `monitoring_ok` are set
+      // from. A page that never says anything is `null` here, not `false` - it has
+      // not claimed anything either way.
+      if (result.ok && item.expectAnalysis !== undefined) {
+        const analyses = result.after.analyses || [];
+        const published = analyses.length ? analyses[analyses.length - 1].v : null;
+        if (published !== item.expectAnalysis) {
+          result.ok = false;
+          result.failure =
+            `wanted the page to publish analysis: ${item.expectAnalysis}, got ` +
+            (published === null ? 'nothing' : String(published));
         }
       }
       const reason = (result.after.diag || {}).reason;

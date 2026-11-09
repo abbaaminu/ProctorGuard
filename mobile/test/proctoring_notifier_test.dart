@@ -961,6 +961,58 @@ void main() {
       expect(repo.heartbeats.last, 'sub-1 camera=true monitoring=true');
     });
 
+    test('a browser that can only count faces reports a weaker sitting',
+        () async {
+      // `monitoring_ok = camera && analysis` (see
+      // `WebFaceSignalSource.analysis`). The camera is up and absence is still
+      // caught, but a page with no head-pose sensor cannot support "watched" for
+      // anything the student does with their head - and `monitoring_ok` is the
+      // only column that can say so, because the beat itself keeps coming.
+      final repo = _RecordingProctoringRepository();
+      final service = ProctoringHeartbeatService(repo);
+      final notifier = _notifier(proctoringRepo: repo, heartbeats: service);
+      addTearDown(notifier.dispose);
+      await pumpEventQueue();
+      expect(repo.heartbeats.last, 'sub-1 camera=true monitoring=true');
+
+      notifier.setFaceAnalysisAvailable(false);
+      expect(notifier.faceAnalysisAvailable, isFalse);
+      // A weaker sensor is not something the student did: no strike, no flag.
+      expect(notifier.state.warningCount, 0);
+      await service.beatNow();
+      expect(repo.heartbeats.last, 'sub-1 camera=true monitoring=false');
+
+      // And a page that got its model back (a reload that found the assets) is
+      // reported too, rather than leaving the sitting red for its whole length.
+      notifier.setFaceAnalysisAvailable(true);
+      await service.beatNow();
+      expect(repo.heartbeats.last, 'sub-1 camera=true monitoring=true');
+    });
+
+    test('a feed that comes back does not claim head-turn monitoring', () async {
+      // The two are tracked separately on purpose: `setCameraActive` recomputes
+      // `monitoring_ok` from both, so recovering the camera cannot quietly turn a
+      // count-only sitting back into a measured one.
+      final repo = _RecordingProctoringRepository();
+      final service = ProctoringHeartbeatService(repo);
+      final notifier = _notifier(proctoringRepo: repo, heartbeats: service);
+      addTearDown(notifier.dispose);
+      await pumpEventQueue();
+
+      notifier.setFaceAnalysisAvailable(false);
+      notifier.setCameraActive(false);
+      await service.beatNow();
+      expect(repo.heartbeats.last, 'sub-1 camera=false monitoring=false');
+
+      notifier.setCameraActive(true);
+      await service.beatNow();
+      expect(repo.heartbeats.last, 'sub-1 camera=true monitoring=false');
+
+      notifier.setFaceAnalysisAvailable(true);
+      await service.beatNow();
+      expect(repo.heartbeats.last, 'sub-1 camera=true monitoring=true');
+    });
+
     test('leaving the exam stops the series', () async {
       // A beat after the page is gone would claim a session is being watched
       // when nothing is - the one lie the client can still tell cheaply.

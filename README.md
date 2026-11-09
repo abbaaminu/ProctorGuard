@@ -29,12 +29,14 @@ supabase/     Schema, migrations, seed data, and Edge Functions
   **optional**: a new paper has no window and can be sat as soon as it is
   published, while a start and/or end time confines it — enforced on the attempt
   insert and by `attempt_deadline()`, not by the client.
-- **Supervisors and lecturers** can choose a published exam, monitor attempts and
-  incidents in real time, and reset an attempt. A supervisor's monitor reads
-  every paper's evidence; a lecturer's reads the evidence recorded on the papers
-  they wrote. Reset removes the submission and cascaded incident records so the
-  student can start over; associated snapshots are removed through Supabase
-  Storage.
+- **Supervisors and lecturers** can choose an exam they are responsible for, monitor
+  attempts and incidents in real time, and reset an attempt. A supervisor's picker
+  offers the papers an administrator **assigned to them**
+  (`supervisor_exam_assignments`, read by `can_supervise_exam()`) and shows that
+  paper's evidence; a lecturer's reads the evidence recorded on the papers they
+  wrote, on any sitting's roster. Reset removes the submission and cascaded incident
+  records so the student can start over; associated snapshots are removed through
+  Supabase Storage.
 - **Administrators, supervisors, and lecturers** can review analytics and
   submission activity. Server-side row-level security remains authoritative for
   every operation.
@@ -46,12 +48,18 @@ share the sitting's tools — the live monitor and the attempt reset — because
 `is_attempt_resetter()` names `admin`, `supervisor` **and** `lecturer`: the paper's
 author is the one who has to repair a wrong answer key or a disqualification
 aimed at the wrong candidate. The narrower tier that remains is
-`is_exam_supervisor()`, which still guards writing into somebody else's attempt
-row in place (a status change, an after-the-fact re-grade) and reads *every*
+**Who may intervene in a given paper** is the assignment table, not the tier:
+`supervisor_exam_assignments` lists the supervisor each sitting was handed to,
+`can_supervise_exam(exam_id)` answers "an administrator, or that supervisor", and
+every policy that used to ask the role tier (`is_exam_supervisor()`) now asks that
+question with the paper the row belongs to — so a supervisor's console lists their
+own sittings, and their reads, resets, review decisions and snapshot access are
+confined to them, while an administrator needs no row and still reaches every
+paper. That tier used to read *every*
 paper's evidence — the incident feed and the reset audit. A lecturer reads the
 evidence recorded on their **own** papers and nothing else's: those two policies
-ask `owns_exam()` (`exams.created_by = auth.uid()`) as well as the intervention
-tier, so the roster a lecturer may see is wider than the logs they may read for
+ask `owns_exam()` (`exams.created_by = auth.uid()`) as well as the scope
+predicate, so the roster a lecturer may see is wider than the logs they may read for
 it. See [mobile/README.md](./mobile/README.md), "Role routing (post-login)".
 Only admins can manage accounts.
 
@@ -124,7 +132,13 @@ rather than left to be mistaken for more than it is.
   It reports camera presence, covered or frozen frame, face count and 3D head pose
   (yaw/pitch) on every polling tick. If the WASM binary or model files fail to load,
   the detector degrades gracefully to presence-only checks (pixel-level covered/blank
-  detection) and logs a warning. The same detector listens for a host page's
+  detection) and logs a warning. A page reduced to counting does not claim to judge
+  head turns: it publishes `false` on a second hook
+  (`window.proctorGuardFaceAnalysis`), the exam screen tells the student that head
+  turns are not being checked in that browser, and the heartbeat records
+  `monitoring_ok = false` for the sitting — reported, not punished (see
+  [mobile/README.md](./mobile/README.md#face-signals-on-the-web-the-host-page-bridge)).
+  The same detector listens for a host page's
   own signals through the `window.proctorGuardFaceSignal` bridge (see
   [mobile/README.md](./mobile/README.md#face-signals-on-the-web-the-host-page-bridge)),
   so the app's proctoring works equally well with the shipped model and with an
@@ -273,7 +287,8 @@ record. It is a record now.
   The refusal lives in the same place as every other "you may not start this".
 - the record is write-once: `record_consent()` is the only writer, acceptance has
   no UPDATE or DELETE policy and no grant, and the student can read their own
-  rows while the intervention tier (admin, supervisor) can read them too. A
+  rows, and an administrator or the supervisor **of the paper the acceptance names**
+  can read them too (a general acceptance is its subject's alone either way). A
   consent record its subject can rewrite is not a record.
 - **what this does not do**: it records that a notice was accepted, not that it
   was *read*, and it is not legal advice. The wording is plain-language
@@ -359,6 +374,7 @@ operator's decision. See
    supabase db query --linked -f supabase/migrations/20261106090000_proctoring_consents.sql
    supabase db query --linked -f supabase/migrations/20261106090100_snapshot_retention.sql
    supabase db query --linked -f supabase/migrations/20261108090000_looking_away_and_noise_count.sql
+supabase db query --linked -f supabase/migrations/20261109090000_supervisor_exam_assignments.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -412,9 +428,9 @@ operator's decision. See
    attempt-aware, and a lecturer no longer reads another lecturer's drafts),
    `…090400_submissions_insert_own_ongoing` (an attempt can be started only for a
    paper the student may sit, inside its window), `…090500_snapshot_read_policy` (a
-   still is readable by the owning student, the paper's author or the intervention
+   still is readable by the owning student, the paper's author or the supervisor of
    tier — not by every employee), `…090600_submissions_delete_supervisor` ("Reset
-   attempt" is the intervention tier or the paper's author),
+   attempt" is the supervisor of that paper or its author),
    `…090700_register_violation_snapshot_path` (a stored `snapshot_url` must be this
    attempt's own `<action_type>_<epoch-ms>.(jpg|png)` object, or it is stored as
    `NULL` and the strike still counts) and
@@ -601,6 +617,24 @@ Things worth knowing before you turn it on:
   author is around), because nothing resolves a review automatically. Neither file
   rewrites a `proctoring_logs` row or re-reads an existing attempt: see
   [Tuning the violation weights](#tuning-the-violation-weights).
+- Apply `supabase/migrations/20261109090000_supervisor_exam_assignments.sql` **last**,
+  on every project. It creates `public.supervisor_exam_assignments` (one
+  `(paper, supervisor)` row per sitting), the `can_supervise_exam()` /
+  `is_supervisor_only()` predicates, and re-creates every policy and RPC that used to
+  ask the role tier `is_exam_supervisor()` so that the supervisor arm asks the scope
+  question instead. It changes **who may read and write**, never what is stored: no
+  row of `proctoring_logs`, `exam_submissions`, `proctor_heartbeats`,
+  `proctoring_consents`, `session_reset_logs` or `attempt_review_logs` is rewritten.
+  Lecturers keep exactly what they had (`owns_exam()` and the `is_staff()` roster
+  read are untouched) and administrators need no row. It is safe to re-run, and it
+  **does not backfill**: a supervisor who existed before it runs sees an empty console
+  until an administrator assigns them a sitting on the admin console's **Assign
+  supervisors** screen, which is the deliberate fail-closed default. It refuses to
+  report success if any policy still asks the tier question, and
+  `supabase/tests/supervisor_scope_check.sql` proves the scope end to end (assigned
+  vs unassigned paper, roster, incident feed, stills, review decision, reset, the RPCs
+  and the demotion path). Verify with
+  `select exam_id, supervisor_id from public.supervisor_exam_assignments;`.
 - Apply `supabase/migrations/20261108090000_looking_away_and_noise_count.sql` after
   those two, on every project. It is one `UPDATE` that turns `looking_away` and
   `audio_noise` from "recorded for review only" (weight 0) into counted strikes

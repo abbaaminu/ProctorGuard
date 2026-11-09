@@ -53,6 +53,18 @@
 
   window.__look(yaw, pitch) and window.__faces(count) drive the stand-in, which is
   why the model scenarios need no face in front of the camera.
+
+  The page also answers whether it can measure a head angle at all, on the second
+  hook (`window.proctorGuardFaceAnalysis`), and that is what `expectAnalysis` in
+  lab.js checks:
+
+    pose+blind              a Shape Detection API that counts a face and returns no
+                            landmarks, and no model to fall back on: `centered`
+                            forever, and the page must say so (`analysis: false`)
+                            instead of claiming head-turn monitoring
+    mediapipe+blind         the same blunt detector with the model available: the
+                            count becomes a measured `pose:...` (analysis: true),
+                            and counting stays the native detector's answer
 -->
 <body style="margin:0;background:#101010;color:#ddd;font:12px monospace">
 <pre id="log"></pre>
@@ -136,6 +148,18 @@
   window.proctorGuardFaceSignal = function (message) {
     window.__verdicts.push({ t: Math.round(performance.now()), v: String(message) });
     note('hook <- ' + message);
+  };
+
+  // ---- The second hook ----------------------------------------------------
+  // `proctorGuardFaceAnalysis(true|false)`: whether this page can measure a head
+  // *angle* at all, told once (and again on a change). A `centered` from a page
+  // that can only count faces is the message that made an unproctored sitting look
+  // proctored, so the lab records this beside the verdicts and the scenarios
+  // assert on it (`expectAnalysis` in lab.js).
+  window.__analyses = [];
+  window.proctorGuardFaceAnalysis = function (state) {
+    window.__analyses.push({ t: Math.round(performance.now()), v: !!state });
+    note('analysis <- ' + (state ? 'angles' : 'count-only'));
   };
 
   // ---- Which model may load (see the header) ------------------------------
@@ -356,23 +380,47 @@
     };
   }
 
-  if (scenario === 'pose') {
-    window.__look = function (degrees) {
-      lookDegrees = degrees;
-    };
-    window.__faces = function (count) {
+  /// A face as a *count-only* build of the Shape Detection API returns it: a box
+  /// and no landmarks. Several Chromium builds answer exactly this, and it is the
+  /// shape that used to be reported as head-turn monitoring:
+  /// `window.FaceDetector` existed, so the page claimed a face model while every
+  /// frame - a student staring at the wall included - came back `centered`.
+  function bluntFace() {
+    return { boundingBox: { x: 240, y: 130, width: 160, height: 220 } };
+  }
+
+  // The names a scenario uses to ask for the blunt stub: `pose+blind` (no model,
+  // so counting is all this page will ever do) and `mediapipe+blind` (the shipped
+  // model, which has to turn the count into a measurement).
+  var blunted = scenario === 'pose+blind' || scenario === 'mediapipe+blind';
+
+  if (scenario === 'pose' || blunted) {
+    // A `mediapipe*` scenario has already defined `__look` for the model, and that
+    // is the only head a `mediapipe+blind` run has: the native stub has no
+    // landmarks to turn.
+    if (!window.__look) {
+      window.__look = function (degrees) {
+        lookDegrees = degrees;
+      };
+    }
+    // `mediapipe+blind` already has a `__faces` for the model (see the config
+    // above), so the native counter gets a name of its own: that lets a scenario
+    // say "the browser counts two, the model sees one" - counting is the native
+    // detector's answer even when the model supplies the angle.
+    window.__nativeFaces = function (count) {
       faceCount = count;
     };
+    if (!window.__faces) window.__faces = window.__nativeFaces;
     window.FaceDetector = function () {
       this.detect = function () {
         var faces = [];
-        for (var i = 0; i < faceCount; i++) faces.push(stubFace());
+        for (var i = 0; i < faceCount; i++) faces.push(blunted ? bluntFace() : stubFace());
         return Promise.resolve(faces);
       };
     };
   }
 
-  if (scenario.indexOf('mediapipe') === 0 || scenario === 'frozen' || scenario === 'canvas' || scenario === 'pose') {
+  if (scenario.indexOf('mediapipe') === 0 || scenario === 'frozen' || scenario === 'canvas' || scenario === 'pose' || blunted) {
     startCanvasCamera();
   } else if (scenario === 'capture') {
     // A real camera whose <video> is never in the document: the app opened the
@@ -468,7 +516,10 @@
       stub: window.__stubOptions || null,
       stubFrames: window.__stubFrames || 0,
       errors: window.__errors.slice(),
-      verdicts: window.__verdicts.slice()
+      verdicts: window.__verdicts.slice(),
+      // What the page told Dart about its own sensors, in order: `true` = it can
+      // measure a head angle, `false` = it can only count faces.
+      analyses: window.__analyses.slice()
     };
   };
 })();

@@ -212,7 +212,10 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     _heartbeats?.start(
       submissionId,
       cameraOk: _cameraActive,
-      monitoringOk: _cameraActive,
+      // A monitor can be up and still be watching less than it claims: a browser
+      // page that can only count faces is monitored, but not for head turns (see
+      // [setFaceAnalysisAvailable]).
+      monitoringOk: _cameraActive && _faceAnalysisAvailable,
     );
   }
 
@@ -292,6 +295,19 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
   /// offline camera cannot silently accumulate disqualification flags.
   bool _cameraActive = true;
 
+  /// Whether the camera's signals are being *measured*, or only counted.
+  ///
+  /// True by default, and true for every platform that does not report
+  /// otherwise: a phone's ML Kit engine measures a head angle on every frame, so
+  /// there is nothing to admit to. The browser is the one place that can lose
+  /// the ability - `WebFaceSignalSource.analysis` is how it says so - and the
+  /// difference matters: a page that can only count faces reports a face for a
+  /// student staring at the wall, and its `centered` is indistinguishable from a
+  /// student looking at the screen. That attempt is still monitored (absence and
+  /// a second person are still seen), so it is **not** a violation and never a
+  /// strike; it is a weaker sitting, and the heartbeat says so.
+  bool _faceAnalysisAvailable = true;
+
   /// Hands over the page's still-frame grabber, so violations can attach
   /// evidence. Call once, right after `startImageStream`.
   void attachSnapshotSource(SnapshotSource capture) {
@@ -314,7 +330,7 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
     // really monitoring (`monitoring_ok = false`). Without this a coverage report
     // cannot tell "watched a student who behaved" from "watched nothing".
     _heartbeats?.noteCamera(active);
-    _heartbeats?.noteMonitoring(active);
+    _heartbeats?.noteMonitoring(active && _faceAnalysisAvailable);
     // A resume must not inherit a stale dedupe stamp or a half-counted frame
     // episode from before the camera dropped out.
     _lastLoggedAt.clear();
@@ -329,6 +345,35 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
 
   /// Whether camera-derived signals are currently being evaluated.
   bool get cameraActive => _cameraActive;
+
+  /// Whether this device can measure a head *angle* right now (see
+  /// [_faceAnalysisAvailable]).
+  ///
+  /// Read by the exam page to decide whether the student needs to be told that
+  /// head turns are not being judged in their browser. False never stops an
+  /// attempt and never logs a violation: the paper is still proctored, by a
+  /// sensor that sees less.
+  bool get faceAnalysisAvailable => _faceAnalysisAvailable;
+
+  /// Records what the page says about its own face sensor
+  /// (`WebFaceSignalSource.analysis`).
+  ///
+  /// The heartbeat is the point of this method. A browser that lost its model is
+  /// still beating - the camera is up, absence and a second person are still
+  /// detected - so the beat alone cannot show that head turns stopped being
+  /// judged; `monitoring_ok = false` is the only column that can say it, and
+  /// `proctoring_coverage()` is what a supervisor reads afterwards. Deliberately
+  /// *not* a violation: a student cannot choose their browser's WASM support, and
+  /// nothing they did is being alleged.
+  ///
+  /// Idempotent, like [setCameraActive] - the page re-sends its answer for every
+  /// attempt that starts, and only a change is worth a beat.
+  void setFaceAnalysisAvailable(bool available) {
+    if (!mounted) return;
+    if (_faceAnalysisAvailable == available) return;
+    _faceAnalysisAvailable = available;
+    _heartbeats?.noteMonitoring(_cameraActive && available);
+  }
 
   /// A face signal that was classified off the main isolate's camera pipeline:
   /// today, a browser page's own detector (see `WebFacePresenceMonitor`).

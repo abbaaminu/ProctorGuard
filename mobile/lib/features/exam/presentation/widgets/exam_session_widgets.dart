@@ -232,6 +232,54 @@ class ExamCameraOfflineNotice extends StatelessWidget {
   }
 }
 
+/// A quiet strip above the paper for the one student who needs it: this
+/// browser cannot measure a head angle, so looking away is not being judged.
+///
+/// Deliberate in what it is *not*: not an error, not a violation, and not
+/// dismissible - nothing has gone wrong with the student's paper, and nothing
+/// they do can turn the sensor on. It is the honest counterpart to the "camera
+/// offline" tile: that one says a guard is missing, this one says a guard is
+/// half-blind, and an attempt under either must not look like an attempt under
+/// neither to the person sitting it. The supervisor sees the same fact in the
+/// heartbeat (`monitoring_ok`).
+///
+/// Rendered only when the page reports it cannot measure angles
+/// (`ProctoringNotifier.faceAnalysisAvailable == false`), which is a browser
+/// whose face model is off, unsupported or missing - a phone never shows it.
+class ExamHeadTurnUnavailableNotice extends StatelessWidget {
+  const ExamHeadTurnUnavailableNotice({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final background = theme.colorScheme.surfaceContainerHighest;
+    final foreground = theme.colorScheme.onSurfaceVariant;
+    return Container(
+      key: const Key('exam-head-turn-unavailable'),
+      width: double.infinity,
+      color: background,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Row(
+        children: [
+          Icon(Icons.remove_red_eye_outlined, size: 18, color: foreground),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Head turns are not being checked in this browser. Your camera '
+              'and microphone are still monitored - keep your face toward the '
+              'screen.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: foreground,
+                height: 1.3,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// Sits where the camera self-view would be on the only path with no real
 /// hardware: `flutter run --dart-define=MOCK_CAMERA=true`. It is unreachable
 /// without that compile-time flag (a failed real camera blocks the session

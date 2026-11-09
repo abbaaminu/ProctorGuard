@@ -30,8 +30,10 @@ WebFaceSignalSource createWebFaceSignalSource() => WebFaceSignalSourceImpl();
 class WebFaceSignalSourceImpl implements WebFaceSignalSource {
   WebFaceSignalSourceImpl() {
     _sink = _handleMessage.toJS;
+    _analysisSink = _handleAnalysis.toJS;
     try {
       _window.setProperty(WebFaceSignalSource.globalName.toJS, _sink);
+      _window.setProperty(WebFaceSignalSource.analysisGlobalName.toJS, _analysisSink);
       _installed = true;
     } catch (_) {
       // A host page that has frozen `window` (or runs the app inside something
@@ -48,10 +50,18 @@ class WebFaceSignalSourceImpl implements WebFaceSignalSource {
   final StreamController<String> _messages =
       StreamController<String>.broadcast();
 
+  /// The page's own account of its eyesight (see
+  /// [WebFaceSignalSource.analysis]). Broadcast like the messages, and a caller
+  /// that subscribes late misses only the answers of an attempt that has ended.
+  final StreamController<bool> _analysis = StreamController<bool>.broadcast();
+
   /// The exported Dart callback, kept so [dispose] removes exactly this one
   /// (an anonymous `.toJS` could not be un-set, and a second session would
   /// export a second closure).
   late final JSFunction _sink;
+
+  /// The same, for the sensor-capability hook.
+  late final JSFunction _analysisSink;
 
   bool _installed = false;
   bool _disposed = false;
@@ -61,6 +71,9 @@ class WebFaceSignalSourceImpl implements WebFaceSignalSource {
 
   @override
   Stream<String> get messages => _messages.stream;
+
+  @override
+  Stream<bool> get analysis => _analysis.stream;
 
   /// One host call: `proctorGuardFaceSignal('no_face')`.
   ///
@@ -79,6 +92,20 @@ class WebFaceSignalSourceImpl implements WebFaceSignalSource {
     _messages.add(text);
   }
 
+  /// One host call: `proctorGuardFaceAnalysis(false)`.
+  ///
+  /// Typed as `JSAny?` for the same reason as [_handleMessage]: a detector that
+  /// sends `'false'` (a string, or nothing at all) is a detector with a bug, and
+  /// guessing at it here would turn a broken host into a confident answer about
+  /// a student's browser. Only a real boolean is a statement about the sensor —
+  /// and only the page can make it, so it says nothing about the student.
+  void _handleAnalysis(JSAny? value) {
+    if (_disposed || !value.isA<JSBoolean>()) return;
+    final available = (value as JSBoolean).toDart;
+    if (_analysis.isClosed) return;
+    _analysis.add(available);
+  }
+
   @override
   void dispose() {
     if (_disposed) return;
@@ -86,11 +113,13 @@ class WebFaceSignalSourceImpl implements WebFaceSignalSource {
     if (_installed) {
       try {
         _window.setProperty(WebFaceSignalSource.globalName.toJS, null);
+        _window.setProperty(WebFaceSignalSource.analysisGlobalName.toJS, null);
       } catch (_) {
         // Same as the constructor: not ours to insist on.
       }
       _installed = false;
     }
     unawaited(_messages.close());
+    unawaited(_analysis.close());
   }
 }

@@ -25,6 +25,8 @@ import 'features/dashboard/presentation/providers/dashboard_providers.dart';
 import 'features/exam/data/repositories/consent_repository_impl.dart';
 import 'features/exam/data/repositories/exam_repository_impl.dart';
 import 'features/proctoring/data/repositories/proctoring_repository_impl.dart';
+import 'features/supervision/data/repositories/supervision_repository_impl.dart';
+import 'features/supervision/presentation/providers/supervision_providers.dart';
 
 /// Boot order is deliberate on web: `--dart-define` values are compiled into
 /// the build, so the Supabase client can be built before the first frame — but
@@ -131,6 +133,12 @@ Future<void> boot() async {
           if (client != null)
             questionAuthoringRepositoryProvider
                 .overrideWithValue(QuestionAuthoringRepositoryImpl(client)),
+          // The admin console's "Assign supervisors" screen: the table that decides
+          // which papers a supervisor may supervise at all
+          // (`can_supervise_exam()`), written only by an administrator.
+          if (client != null)
+            supervisionRepositoryProvider
+                .overrideWithValue(SupervisionRepositoryImpl(client)),
         ],
         child: ExamProctorApp(supabaseStatus: supabaseStatus),
       ),

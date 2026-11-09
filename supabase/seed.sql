@@ -171,7 +171,29 @@ insert into public.exams (id, title, created_by, duration_minutes, is_published,
 on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------
--- 3. QUESTIONS  (public.questions) - 5 per exam, 10 points each paper.
+-- 2b. SUPERVISOR ASSIGNMENTS  (public.supervisor_exam_assignments)
+--
+-- A supervisor reaches exactly the papers an administrator assigned to them
+-- (`can_supervise_exam()`); the demo supervisor therefore has to be assigned to the
+-- two papers it invigilates, or `supervisor@proctor.test` would sign in to an empty
+-- console. `assigned_by` is the demo administrator, and it is written explicitly
+-- because this file runs as `postgres` - the column's `auth.uid()` default is only
+-- meaningful for a request that carries a session, which a seed does not.
+--
+-- GES301 is deliberately NOT assigned: it belongs to the lecturer, and the demo
+-- supervisor being unable to open its monitor is the behaviour this table exists
+-- for (an administrator still can, and the lecturer runs it through the authoring
+-- console).
+-- ---------------------------------------------------------------------
+insert into public.supervisor_exam_assignments (exam_id, supervisor_id, assigned_by) values
+  ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
+   '11111111-1111-4111-8111-111111111111',
+   '44444444-4444-4444-8444-444444444444'),
+  ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2',
+   '11111111-1111-4111-8111-111111111111',
+   '44444444-4444-4444-8444-444444444444')
+on conflict (exam_id, supervisor_id) do nothing;
+
 --
 -- Two shapes are seeded so both code paths are exercised end to end:
 --   * 'multiple_choice'   - `options` is a jsonb array and `correct_option` is

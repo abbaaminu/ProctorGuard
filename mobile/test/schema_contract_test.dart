@@ -837,17 +837,20 @@ void main() {
         UserRole.supervisor,
       });
 
-      // The two steps that *follow* the delete still ask the reset predicate: the
-      // Storage purge of the snapshots and the audit row. The DELETE itself is
-      // narrower - asserted below - because deleting an attempt is a repair of a
-      // paper you wrote, while `is_attempt_resetter()` (every lecturer) let any
-      // lecturer delete any attempt in the institution. The console reads "zero
-      // rows deleted" and stops before purging or auditing.
+      // The two steps that *follow* the delete still ask the reset predicate for the
+      // Storage purge (and its orphan-read companion): the purge must keep working
+      // for the caller the DELETE just allowed. The audit row no longer does - since
+      // `20261109090000_supervisor_exam_assignments.sql` it asks the same
+      // `can_supervise_exam(exam_id) or owns_exam(exam_id)` question the DELETE does,
+      // so a reset that could not happen cannot be recorded as one either.
       expect(sql, contains('and public.is_attempt_resetter()'));
       expect(
-        sql,
+        sql.replaceAll('\r\n', '\n'),
         contains(
-          'with check (public.is_attempt_resetter() and actor_id = auth.uid())',
+          'with check (\n'
+          '    (public.can_supervise_exam(exam_id) or public.owns_exam(exam_id))\n'
+          '    and actor_id = auth.uid()\n'
+          '  )',
         ),
       );
 
@@ -856,7 +859,7 @@ void main() {
       // lecturer, so any lecturer could clear any attempt in the institution.
       expect(
         _policyUsing(sql, 'submissions_delete_supervisor'),
-        'public.is_exam_supervisor() or public.owns_exam(exam_id)',
+        'public.can_supervise_exam(exam_id) or public.owns_exam(exam_id)',
       );
 
       // ...while the update policy is the one that keeps the narrower tier.
@@ -865,21 +868,20 @@ void main() {
       expect(
         sql.replaceAll('\r\n', '\n'),
         contains(
-          'using (public.is_exam_supervisor())\n'
-          '  with check (public.is_exam_supervisor());',
+          'using (public.can_supervise_exam(exam_id))\n'
+          '  with check (public.can_supervise_exam(exam_id));',
         ),
       );
 
-      // Exactly four mentions: the definition plus the three policies that follow
-      // the delete (the snapshot purge, its companion orphan-read policy that lets
-      // the purge's DELETE ... WHERE see the rows, and the audit row). A fifth
-      // would be a policy somebody left on the old predicate - the DELETE used to
-      // be one.
+      // Exactly three mentions now: the definition, the snapshot purge, and its
+      // companion orphan-read policy that lets the purge's DELETE ... WHERE see the
+      // rows. The audit row used to be a fourth and now asks the scope question
+      // instead; the DELETE itself never asked this predicate.
       expect(
         RegExp(r'public\.is_attempt_resetter\(\)').allMatches(sql).length,
-        4,
-        reason: 'the function definition, the snapshot purge, the orphan-read '
-            'companion and the audit row',
+        3,
+        reason: 'the function definition, the snapshot purge and the orphan-read '
+            'companion',
       );
     });
 
@@ -990,14 +992,17 @@ void main() {
 
       final predicate = predicateOf(sql, 'logs_select_own_or_supervisor');
       expect(predicate, isNotNull, reason: 'the policy left schema.sql');
-      // The student's own rows, the paper's author, the intervention tier.
+      // The student's own rows, the paper's author, the supervisor of that paper.
       expect(predicate, contains('s.student_id = auth.uid()'));
       expect(predicate, contains('public.owns_exam(s.exam_id)'));
-      expect(predicate, contains('public.is_exam_supervisor()'));
+      // The supervisor arm is the *scope* question now: since
+      // `20261109090000_supervisor_exam_assignments.sql` a supervisor reaches the
+      // incidents of the papers they were assigned, not every paper's.
+      expect(predicate, contains('public.can_supervise_exam(s.exam_id)'));
+      expect(predicate, isNot(contains('is_exam_supervisor')));
       // The staff tier is exactly what this policy dropped, and dropping it is
       // what stops one lecturer reading the incidents gathered on another
-      // teacher's paper. (`is_exam_supervisor()` does not contain `is_staff`, so
-      // this really is the staff arm.)
+      // teacher's paper.
       expect(predicate, isNot(contains('is_staff')));
     });
 
@@ -1008,58 +1013,83 @@ void main() {
       final predicate = predicateOf(schema, 'session_reset_logs_select_staff');
       expect(
         predicate,
-        'public.is_exam_supervisor() or public.owns_exam(exam_id)',
+        contains('public.can_supervise_exam(exam_id)'),
         reason:
-            'the reset row carries its exam id as plain evidence, so this '
-            'policy can ask owns_exam() directly instead of hopping through '
-            'the attempt the way the incident feed does',
+            'the reset row carries its exam id as plain evidence, so the '
+            'supervisor arm is the scope question asked of that id directly '
+            'instead of hopping through the attempt the way the incident feed '
+            'does',
       );
+      expect(predicate, contains('public.owns_exam(exam_id)'));
 
-      // The file that introduced the table carries the identical sentence.
+      // The file that introduced the table carries the *historical* sentence - it
+      // runs first, and the scope migration re-creates the policy - so what has to
+      // agree with schema.sql is the last definition, asserted below.
       final introduced = File('../supabase/migrations/session_reset_logs.sql');
       if (introduced.existsSync()) {
         final sql = introduced.readAsStringSync().replaceAll('\r\n', '\n');
-        expect(predicateOf(sql, 'session_reset_logs_select_staff'), predicate);
+        expect(
+          predicateOf(sql, 'session_reset_logs_select_staff'),
+          'public.is_exam_supervisor() or public.owns_exam(exam_id)',
+          reason: 'the introducing file is history: rewriting it would change what '
+              'an operator who already ran it has',
+        );
         expect(
           functionBody(sql, r'owns_exam\(p_exam_id uuid\)'),
           ownerIsAuthor,
         );
       }
 
-      // The upgrade file assembles the policy inside an `execute`, so what has to
-      // hold there is that the literal it concatenates contains this exact
-      // predicate - the same sentence, not a paraphrase of it.
+      // The scope migration is the current definition of this policy, and it must
+      // match the file a fresh install runs.
+      final scope = File(
+        '../supabase/migrations/20261109090000_supervisor_exam_assignments.sql',
+      );
+      if (scope.existsSync()) {
+        final sql = scope.readAsStringSync().replaceAll('\r\n', '\n');
+        expect(predicateOf(sql, 'session_reset_logs_select_staff'), predicate);
+      }
+
+      // The upgrade file assembles the incident-feed policy inside an `execute`, so
+      // what has to hold there is that the literal it concatenates is the sentence
+      // that file shipped - the same words, not a paraphrase.
       final upgrade = File(
         '../supabase/migrations/lecturer_scoped_log_reads.sql',
       );
       if (upgrade.existsSync()) {
         final sql = upgrade.readAsStringSync().replaceAll('\r\n', '\n');
-        expect(sql, contains(predicate!));
+        expect(
+          sql,
+          contains('public.is_exam_supervisor() or public.owns_exam(exam_id)'),
+        );
       }
 
-      // Writes are a different question and are untouched: who may *clear* an
-      // attempt is still `is_attempt_resetter()`, whoever may read the row it
-      // leaves behind.
+      // Writes ask the scope question too, in the caller's own name: a reset that
+      // could not happen must not be recordable as one.
       expect(
         schema,
         contains(
-          'with check (public.is_attempt_resetter() and actor_id = auth.uid())',
+          '(public.can_supervise_exam(exam_id) or public.owns_exam(exam_id))',
         ),
       );
     });
 
-    test('the roster stays staff-wide: only the evidence was narrowed', () {
+    test('the roster is staff-wide except for the assigned supervisor', () {
       final sql = schemaSql();
       if (sql == null) return;
 
       // A lecturer may watch any sitting - "WHAT IT DOES NOT CHANGE" in
-      // lecturer_scoped_log_reads.sql - so the attempts keep the wide read. If
-      // this ever gains the ownership arm, a monitor opened on another teacher's
-      // paper would show an empty roster instead of the students in the room.
-      expect(
-        predicateOf(sql, 'submissions_select_own_or_supervisor'),
-        'student_id = auth.uid() or public.is_staff()',
-      );
+      // lecturer_scoped_log_reads.sql - so the attempts keep the wide staff read for
+      // them. Since `20261109090000_supervisor_exam_assignments.sql` the one staff
+      // label that is narrowed is `supervisor`, and only to the papers an
+      // administrator assigned it. If the ownership arm ever replaced the staff one,
+      // a lecturer's monitor on another teacher's paper would show an empty roster.
+      final predicate = predicateOf(sql, 'submissions_select_own_or_supervisor');
+      expect(predicate, contains('student_id = auth.uid()'));
+      expect(predicate, contains('public.is_staff()'));
+      expect(predicate, contains('not public.is_supervisor_only()'));
+      expect(predicate, contains('public.can_supervise_exam(exam_id)'));
+      expect(predicate, isNot(contains('is_exam_supervisor')));
     });
 
     test('every copy of owns_exam() is the same pinned definition', () {
@@ -1128,14 +1158,25 @@ void main() {
         ),
       );
 
-      // Both copies of the incident-feed policy agree, so re-running this file
-      // cannot land a different tier than a fresh schema.sql install gets.
+      // The file's own copy is the historical sentence; the *current* definition is
+      // the scope migration's, and that is the one that has to agree with a fresh
+      // schema.sql install - it runs last on an upgraded project.
+      expect(
+        predicateOf(sql, 'logs_select_own_or_supervisor'),
+        contains('public.is_exam_supervisor()'),
+        reason: 'the introducing file is history; rewriting it would change what an '
+            'operator who already ran it has',
+      );
       final schema = schemaSql();
-      if (schema != null) {
+      final scope = File(
+        '../supabase/migrations/20261109090000_supervisor_exam_assignments.sql',
+      );
+      if (schema != null && scope.existsSync()) {
+        final scopeSql = scope.readAsStringSync().replaceAll('\r\n', '\n');
         expect(
-          predicateOf(sql, 'logs_select_own_or_supervisor'),
+          predicateOf(scopeSql, 'logs_select_own_or_supervisor'),
           predicateOf(schema, 'logs_select_own_or_supervisor'),
-          reason: 'the upgrade path and the full schema disagree',
+          reason: 'the scope migration and the full schema disagree',
         );
       }
 
@@ -1276,9 +1317,12 @@ void main() {
       // deliberately never sends the column.
       expect(sql, contains('actor_id        uuid not null default auth.uid()'));
       expect(
-        sql,
+        sql.replaceAll('\r\n', '\n'),
         contains(
-          'with check (public.is_attempt_resetter() and actor_id = auth.uid())',
+          'with check (\n'
+          '    (public.can_supervise_exam(exam_id) or public.owns_exam(exam_id))\n'
+          '    and actor_id = auth.uid()\n'
+          '  )',
         ),
       );
       // No foreign keys: the attempt this row describes has just been deleted by
@@ -2611,7 +2655,7 @@ void main() {
       // A student must not learn who *else* holds an exception.
       expect(
         selectPredicate(sql, 'exam_allowed_students_select'),
-        'student_id = auth.uid() or public.is_staff()',
+        contains('student_id = auth.uid()'),
       );
       // `owns_exam()` is SECURITY DEFINER, so the write check does not re-enter
       // `exams_select` - the policy that reads this very table.
@@ -2869,7 +2913,7 @@ void main() {
       expect(view, isNot(contains('correct_option')));
       expect(view, isNot(contains('correct_text_answer')));
       // The four audiences, and nothing as wide as `is_staff()`.
-      expect(view, contains('public.is_exam_supervisor()'));
+      expect(view, contains('public.can_supervise_exam(e.id)'));
       expect(view, contains('e.created_by = auth.uid()'));
       expect(view, contains('public.student_can_access_exam(e.id)'));
       expect(view, contains('e.starts_at'));
@@ -2988,13 +3032,13 @@ void main() {
       // readable just because they are employed.
       expect(
         _policyUsing(sql, 'questions_select_supervisor'),
-        'public.is_exam_supervisor() or public.owns_exam(exam_id)',
+        'public.can_supervise_exam(exam_id) or public.owns_exam(exam_id)',
       );
 
       // Signing a URL is a SELECT, so this predicate is the read gate on the
       // evidence itself.
       final storage = _policyUsing(sql, 'Proctor snapshots read access');
-      expect(storage, contains('public.is_exam_supervisor()'));
+      expect(storage, contains('public.can_supervise_exam(s.exam_id)'));
       expect(storage, contains('public.owns_exam(s.exam_id)'));
       expect(storage, isNot(contains('is_staff')));
     });
@@ -3331,7 +3375,7 @@ void main() {
       // (every lecturer) and never the student under review.
       expect(
         fn,
-        contains('public.is_exam_supervisor() or public.owns_exam(v_exam)'),
+        contains('public.can_supervise_exam(v_exam) or public.owns_exam(v_exam)'),
       );
       expect(fn, isNot(contains('is_staff()')));
       // The audit row, and an actor the database decides rather than the request.
@@ -3363,7 +3407,7 @@ void main() {
       );
       final using = _policyUsing(sql, 'attempt_review_logs_select_staff');
       expect(using, isNotNull, reason: 'the audit trail needs a read policy');
-      expect(using, contains('public.is_exam_supervisor()'));
+      expect(using, contains('public.can_supervise_exam(exam_id)'));
       expect(using, contains('public.owns_exam(exam_id)'));
       expect(
         sql,
@@ -3429,7 +3473,7 @@ void main() {
       final read = _policyUsing(sql, 'heartbeats_select_own_or_supervisor');
       expect(read, contains('s.student_id = auth.uid()'));
       expect(read, contains('public.owns_exam(s.exam_id)'));
-      expect(read, contains('public.is_exam_supervisor()'));
+      expect(read, contains('public.can_supervise_exam(s.exam_id)'));
 
       // The write side is deliberately absent, and that absence *is* the control:
       // a client-insertable heartbeat table would let a tampered client backfill
@@ -3543,7 +3587,7 @@ void main() {
       // applied has to be spelled out - and it names the same three audiences.
       expect(body, contains('v_sub.student_id = auth.uid()'));
       expect(body, contains('public.owns_exam(v_sub.exam_id)'));
-      expect(body, contains('public.is_exam_supervisor()'));
+      expect(body, contains('public.can_supervise_exam(v_sub.exam_id)'));
 
       // The exam-wide wrapper filters visibility *before* the lateral call, so a
       // student asking about their own paper gets their row instead of an
@@ -3606,15 +3650,36 @@ void main() {
       // explains the same function to a different reader), but a definition that
       // drifted would enforce something different in a fresh project than in an
       // upgraded one, and nothing else in the repository would notice.
-      for (final name in <String>[
-        'record_heartbeat',
-        'proctoring_coverage',
-        'proctoring_coverage_for_exam',
-      ]) {
+      //
+      // `record_heartbeat` is still this file's own definition. The two coverage
+      // readers and the read policy were re-created by
+      // `20261109090000_supervisor_exam_assignments.sql` (their supervisor arm is the
+      // scope question now), so *that* is the file a fresh install has to agree with.
+      expect(
+        _functionBody(upgrade, 'record_heartbeat'),
+        _functionBody(sql, 'record_heartbeat'),
+        reason: 'record_heartbeat differs between schema.sql and its migration',
+      );
+
+      final scope = File(
+        '../supabase/migrations/20261109090000_supervisor_exam_assignments.sql',
+      );
+      if (scope.existsSync()) {
+        final scopeSql = scope.readAsStringSync();
+        for (final name in <String>[
+          'proctoring_coverage',
+          'proctoring_coverage_for_exam',
+        ]) {
+          expect(
+            _functionBody(scopeSql, name),
+            _functionBody(sql, name),
+            reason: '$name differs between schema.sql and the scope migration',
+          );
+        }
         expect(
-          _functionBody(upgrade, name),
-          _functionBody(sql, name),
-          reason: '$name differs between schema.sql and the upgrade migration',
+          _policyUsing(scopeSql, 'heartbeats_select_own_or_supervisor'),
+          _policyUsing(sql, 'heartbeats_select_own_or_supervisor'),
+          reason: 'the scope migration and schema.sql disagree about the read policy',
         );
       }
 
@@ -3622,11 +3687,6 @@ void main() {
       // added to a project that already had `exam_submissions`.
       expect(sql, contains('last_heartbeat_at timestamptz'));
       expect(upgrade, contains('add column if not exists last_heartbeat_at'));
-      expect(
-        _policyUsing(upgrade, 'heartbeats_select_own_or_supervisor'),
-        _policyUsing(sql, 'heartbeats_select_own_or_supervisor'),
-        reason: 'the two definitions of the read policy disagree',
-      );
     });
 
     test('the client sends the argument names the RPC declares', () async {
@@ -3692,11 +3752,15 @@ void main() {
         contains('student_id = auth.uid()'),
       );
 
-      // Read: own rows, or the intervention tier. Not `is_staff()` - a lecturer
-      // reads the evidence of a sitting, not a person's agreement.
+      // Read: own rows, or the supervisor of the paper the acceptance names. Not
+      // `is_staff()` - a lecturer reads the evidence of a sitting, not a person's
+      // agreement - and not the tier any more: a supervisor reads the acceptances of
+      // the papers assigned to them (`can_supervise_exam()`), which is why a general
+      // acceptance (`exam_id IS NULL`) is not in this arm at all.
       final read = _policyUsing(sql, 'consents_select_own_or_supervisor');
       expect(read, contains('student_id = auth.uid()'));
-      expect(read, contains('public.is_exam_supervisor()'));
+      expect(read, contains('exam_id is not null'));
+      expect(read, contains('public.can_supervise_exam(exam_id)'));
       expect(read, isNot(contains('is_staff')));
 
       // The absence *is* the control: no UPDATE or DELETE policy, and no grant
@@ -4057,10 +4121,22 @@ void main() {
         _policyWithCheck(upgrade, 'consents_insert_own'),
         _policyWithCheck(sql, 'consents_insert_own'),
       );
-      expect(
-        _policyUsing(upgrade, 'consents_select_own_or_supervisor'),
-        _policyUsing(sql, 'consents_select_own_or_supervisor'),
+      // The read policy was re-created by the scope migration (a supervisor reads the
+      // acceptances of the papers assigned to them, and a general acceptance is their
+      // subject's alone), so that is the file a fresh install has to agree with.
+      final scope = File(
+        '../supabase/migrations/20261109090000_supervisor_exam_assignments.sql',
       );
+      if (scope.existsSync()) {
+        expect(
+          _policyUsing(
+            scope.readAsStringSync(),
+            'consents_select_own_or_supervisor',
+          ),
+          _policyUsing(sql, 'consents_select_own_or_supervisor'),
+          reason: 'the scope migration and schema.sql disagree about the consent read',
+        );
+      }
     });
 
     test('the client sends the argument names the RPC declares', () async {
@@ -4136,6 +4212,130 @@ void main() {
         ]).id,
         'c-4',
       );
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // The supervisor scope (`20261109090000_supervisor_exam_assignments.sql`):
+  // a supervisor reaches the papers an administrator assigned to them, an
+  // administrator needs no row, and a lecturer keeps exactly what they had.
+  // ---------------------------------------------------------------------
+  group('supervisor scope', () {
+    File? scopeMigration() {
+      final file = File(
+        '../supabase/migrations/20261109090000_supervisor_exam_assignments.sql',
+      );
+      return file.existsSync() ? file : null;
+    }
+
+    test('the migration exists, explains itself and is in both apply lists', () {
+      final migration = scopeMigration();
+      if (migration == null) {
+        fail('the live project needs a file to run, not just a schema.sql edit');
+      }
+      final sql = migration.readAsStringSync().replaceAll('\r\n', '\n');
+
+      for (final section in <String>[
+        '-- WHY THIS FILE EXISTS',
+        '-- WHAT CHANGES',
+        '-- WHAT IT DOES NOT DO',
+        '-- SAFETY',
+        '-- APPLY ORDER',
+        '-- 5. VERIFY',
+      ]) {
+        expect(sql, contains(section), reason: 'missing section: $section');
+      }
+
+      // Every policy it re-creates is dropped by name first, or re-running it on a
+      // project that already has the policy is a 42710.
+      expect(
+        sql,
+        contains(
+          'drop policy if exists "submissions_delete_supervisor" '
+          'on public.exam_submissions;',
+        ),
+      );
+
+      for (final script in <String>[
+        '../apply_in_order.ps1',
+        '../apply_live_cli.ps1',
+      ]) {
+        final file = File(script);
+        if (!file.existsSync()) continue;
+        expect(
+          file.readAsStringSync(),
+          contains('20261109090000_supervisor_exam_assignments'),
+          reason: '$script does not apply the scope migration',
+        );
+      }
+    });
+
+    test('the scope test file exists and names what it proves', () {
+      final file = File('../supabase/tests/supervisor_scope_check.sql');
+      if (!file.existsSync()) {
+        fail('the scope has no RLS check of its own');
+      }
+      final sql = file.readAsStringSync().replaceAll('\r\n', '\n');
+      expect(sql, contains('begin;'));
+      expect(sql, contains('rollback;'));
+      for (final marker in <String>[
+        'PASS (a)ii',
+        'PASS (c)',
+        'PASS (e)',
+        'PASS (f)',
+        'PASS (g)',
+        'PASS (i)iii',
+        'PASS (j)',
+      ]) {
+        expect(sql, contains(marker), reason: 'the check stopped proving $marker');
+      }
+    });
+
+    test('schema.sql carries the table, the predicates and the write policies', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      expect(
+        sql,
+        contains(
+          'create table if not exists public.supervisor_exam_assignments',
+        ),
+      );
+      expect(sql, contains('primary key (exam_id, supervisor_id)'));
+      expect(
+        sql,
+        contains('create or replace function public.can_supervise_exam('),
+      );
+      expect(
+        sql,
+        contains('create or replace function public.is_supervisor_only()'),
+      );
+
+      // An administrator answers true without a row; a supervisor only through the
+      // table; a null paper answers false for everybody.
+      final body = _functionBody(sql, 'can_supervise_exam');
+      expect(body, isNotNull);
+      expect(body, contains('p_exam_id is not null'));
+      expect(body, contains("role = 'admin'"));
+      expect(body, contains('public.supervisor_exam_assignments'));
+      expect(body, contains("p.role = 'supervisor'"));
+
+      // Only an administrator writes it, in their own name, and only for a
+      // supervisor account (the guard).
+      expect(
+        _policyWithCheck(sql, 'supervisor_assignments_insert_admin'),
+        'public.is_admin() and assigned_by = auth.uid()',
+      );
+      expect(
+        _policyUsing(sql, 'supervisor_assignments_select_own_or_admin'),
+        'supervisor_id = auth.uid() or public.is_admin()',
+      );
+      expect(
+        _functionBody(sql, 'guard_supervisor_assignment'),
+        contains("v_role <> 'supervisor'"),
+      );
+      // No update policy: the row is a fact, and re-aiming it is another assignment.
+      expect(sql, isNot(contains('"supervisor_assignments_update')));
     });
   });
 

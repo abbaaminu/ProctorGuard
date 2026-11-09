@@ -524,6 +524,13 @@ class _FakeFaceSource implements WebFaceSignalSource {
   final StreamController<String> controller =
       StreamController<String>.broadcast();
 
+  /// What the page says about its own face sensor (see
+  /// `WebFaceSignalSource.analysis`). Unused by the monitor's rules - it is the
+  /// page that shows this and the notifier that beats it - so it only has to
+  /// exist here.
+  final StreamController<bool> analysisController =
+      StreamController<bool>.broadcast();
+
   /// How many times the monitor released the hook; a session that leaves the
   /// global installed is a session a finished page can keep reporting into.
   int disposes = 0;
@@ -539,9 +546,13 @@ class _FakeFaceSource implements WebFaceSignalSource {
   Stream<String> get messages => controller.stream;
 
   @override
+  Stream<bool> get analysis => analysisController.stream;
+
+  @override
   void dispose() {
     disposes++;
     if (!controller.isClosed) controller.close();
+    if (!analysisController.isClosed) analysisController.close();
   }
 }
 

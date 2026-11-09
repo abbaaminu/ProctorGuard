@@ -185,6 +185,10 @@ class _SilentSource implements WebFaceSignalSource {
   @override
   Stream<String> get messages => _messages.stream;
 
+  /// No page, no opinion: these tests are about the rule.
+  @override
+  Stream<bool> get analysis => const Stream<bool>.empty();
+
   @override
   void dispose() => _messages.close();
 }

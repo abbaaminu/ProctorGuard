@@ -48,6 +48,16 @@
   invents an angle: with no landmarks there is no pose, and `centered` is the most
   this script claims.
 
+  One more thing is said, once, on a second hook
+  (`window.proctorGuardFaceAnalysis`, `WebFaceSignalSource.analysisGlobalName`):
+  whether this page can measure a head angle at all. A `centered` from a browser
+  with no working face model and a `centered` from a student looking at the screen
+  are the same message, so the app could neither tell a proctor which sitting they
+  were reviewing nor tell the student that their head turns were not being judged.
+  `false` says "this page counts faces and nothing more" - it is never a
+  violation, and it is re-stated for each attempt because each attempt installs a
+  new listener (see [publishAnalysis]).
+
   Where the camera is: the preview `camera_web` renders is a `<video>` inside
   Flutter's platform-view DOM, so it is searched for through shadow roots. When no
   element in the document carries a live track - a self-view drawn as a canvas, a
@@ -60,7 +70,10 @@
   (`window.FaceDetector`, i.e. Chromium on ChromeOS and Android), and otherwise
   the model this build ships - MediaPipe's `FaceLandmarker`, compiled to
   WebAssembly and run on the GPU - for every desktop browser that has none:
-  Windows, macOS and Linux Chromium, Firefox, Safari. The model is loaded lazily
+  Windows, macOS and Linux Chromium, Firefox, Safari. "Otherwise" includes the
+  browser that *counts* a face and hands back no landmarks to measure it from: a
+  bounding box is not an angle, so that answer goes to the model rather than out
+  as `centered` (see [inspect]). The model is loaded lazily
   (only once a camera is live) from `web/mediapipe/`, i.e. from this app's own
   origin, so no CDN is trusted with an exam's page and the build works offline.
   When it cannot load at all - an air-gapped deployment without the assets, a
@@ -90,6 +103,16 @@
   // removed when it ends. Absent means nothing is listening: this script stays
   // quiet and cheap rather than detecting into a closed attempt.
   var HOOK = 'proctorGuardFaceSignal';
+
+  // The second wire: installed by the same source, and called once whenever this
+  // page learns whether it can measure a head *angle* at all - `true` for a
+  // sensor that reports landmarks or a solved pose, `false` for a page that can
+  // only count faces (no `window.FaceDetector`, and no model: a host that turned
+  // it off, a browser without WebAssembly, assets that are not on the server).
+  // It exists because a `centered` from a page that cannot measure an angle and
+  // a `centered` from a student looking at the screen are the same message, and
+  // the app has to be able to tell a proctor which one it is running.
+  var ANALYSIS_HOOK = 'proctorGuardFaceAnalysis';
 
   // The vocabulary of `WebFaceMessages`. Kept as literals so a contract test can
   // hold them against the Dart constants.
@@ -232,6 +255,13 @@
   var faceDetector = null;
   var faceDetectorChecked = false;
 
+  // Whether the browser's own detector has ever handed back something an angle
+  // can be measured from. A `FaceDetector` is not automatically a head-turn
+  // sensor: several builds return bounding boxes and no landmarks, and one of
+  // those is a counter. Announcement of head-turn monitoring waits for this (see
+  // [analysisState]) - a page that cannot measure must not claim it can.
+  var nativeMeasured = false;
+
   // The stream the page itself asked the browser for, and the element this script
   // watches it with when no preview in the document carries it (see
   // [capturedVideo]). Both stay null on a page that never opens a camera.
@@ -277,6 +307,11 @@
   // built is then visible in a phone's remote devtools instead of silent.
   var warnedNoPreview = false;
 
+  // What this page last told Dart about its ability to measure an angle: `null`
+  // until it knows, then `true` or `false` (see [publishAnalysis]). Kept so the
+  // hook hears about a *change* rather than once per tick.
+  var lastAnalysis = null;
+
   // --- Talking to Dart ------------------------------------------------------
 
   function drainHook() {
@@ -309,6 +344,60 @@
       hook(message);
     } catch (error) {
       // A host that broke its own hook still gets a working page.
+    }
+  }
+
+  /// Whether this page can measure a head *angle*, as far as it knows.
+  ///
+  /// Three answers, because two would lie during the few seconds a model takes to
+  /// arrive: `true` when a sensor has actually measured an angle or the model is
+  /// loaded, `false` when the page has been reduced to counting pixels and faces,
+  /// and `null` while it is still finding out (the model is idle or loading, or a
+  /// native detector exists but has not had a frame to measure yet). Only the first
+  /// two are ever published - a page that says "not yet" every tick would be noise,
+  /// and the interesting event is the change.
+  ///
+  /// A native `FaceDetector` on its own is *not* evidence of head-turn detection:
+  /// it is the evidence the app used to be fooled by, because a count-only build of
+  /// it answered `centered` for every frame and its presence read as "we measure
+  /// angles". Only [nativeMeasured] - a landmark set [measurePose] could actually
+  /// use - or a loaded model makes this `true`.
+  function analysisState() {
+    var engine = detector();
+    var native = !!(engine && typeof engine.detect === 'function');
+    if (mediaPipe.state === 'ready') return true;
+    if (native && nativeMeasured) return true;
+    // Nothing has looked yet: a page with a camera that has not delivered a frame,
+    // a model that is still downloading, and a native detector that has only seen
+    // empty frames are all "not yet", not "cannot".
+    if (mediaPipe.state === 'idle' || mediaPipe.state === 'loading') return null;
+    // `failed` and `off`, with no measured pose from either sensor: this page can
+    // count faces and nothing more.
+    return false;
+  }
+
+  /// Tells Dart, once, whether this page can measure an angle.
+  ///
+  /// A `centered` from a page with no head-pose sensor and a `centered` from a
+  /// student looking at the screen are the same string: without this, an exam on a
+  /// browser that lost its model looks exactly like an exam being watched, and
+  /// nobody - student, proctor or reviewer - can tell which one is running. Dart
+  /// turns `false` into a visible note for the student and a `monitoring_ok = false`
+  /// on the next heartbeat; it never turns it into a violation, and nothing here
+  /// can stop an attempt.
+  function publishAnalysis() {
+    var state = analysisState();
+    if (state === null || state === lastAnalysis) return;
+    var hook = window[ANALYSIS_HOOK];
+    // Nothing is listening yet (a page that loads this script before the app has
+    // installed its hook): the next tick asks again rather than remembering an
+    // answer nobody heard.
+    if (typeof hook !== 'function') return;
+    lastAnalysis = state;
+    try {
+      hook(state);
+    } catch (error) {
+      // As with the verdict hook: a broken listener is the host's problem.
     }
   }
 
@@ -697,12 +786,71 @@
   /// or null when this page has no model that can look at all.
   ///
   /// Two providers, in the order they are trusted: the browser's own Shape
-  /// Detection API ([inspectNative]) and, for every browser that ships none, the
-  /// model this build carries ([inspectWithMediaPipe]). A page never runs both.
+  /// Detection API ([inspectNative]) and the model this build carries
+  /// ([inspectWithMediaPipe]). The model is not only the fallback for a browser
+  /// with no detector of its own - it is also what measures the head when the
+  /// native one counts a face without the landmarks an angle needs
+  /// ([withMediaPipePose]), because a count is not a pose.
   function inspect(element) {
     var engine = detector();
-    if (engine && typeof engine.detect === 'function') return inspectNative(engine, element);
-    return inspectWithMediaPipe(element);
+    if (!engine || typeof engine.detect !== 'function') return inspectWithMediaPipe(element);
+    return withMediaPipePose(inspectNative(engine, element), element);
+  }
+
+  /// The native reading, with the shipped model's angle where the native one gave
+  /// none.
+  ///
+  /// `window.FaceDetector` reports `landmarks` beside its bounding boxes, but not
+  /// on every build of it and not for every face. A reading that carries a box and
+  /// nothing to measure is a *count*: a page that stopped there answered
+  /// `centered` for a student staring at the wall behind their screen, and never
+  /// a `looking_away` - the browser had no head-turn detection at all while its
+  /// diagnostics said it had a face model. Handing that frame to the shipped model
+  /// is what turns the count into a measurement.
+  ///
+  /// Counting stays the native detector's own business: it is cheaper, it is what
+  /// `multiple_faces` comes from, and it is never overruled here. One face with no
+  /// angle is still one face; two faces are still two people.
+  function withMediaPipePose(reading, element) {
+    // A native detector that threw did not look, and the model may still be able
+    // to.
+    if (!reading || typeof reading.then !== 'function') return inspectWithMediaPipe(element);
+    return reading.then(
+      function (native) {
+        if (!native) return inspectWithMediaPipe(element);
+        // Exactly one face and no angle: the one shape a model can answer better
+        // than the native detector did. Everything else is already the whole
+        // answer. (Asking for a pose costs a frame of the model's attention and,
+        // the first time, a download - so it is asked for only where it is the
+        // difference between a measurement and a count.)
+        if (native.faces !== 1 || (native.yaw !== null && native.pitch !== null)) return native;
+        var measured = inspectWithMediaPipe(element);
+        // Null while the model is still loading, after it gave up, and on a page
+        // that turned it off: the count stands, exactly as it did before the model
+        // existed.
+        if (!measured) return native;
+        return measured.then(
+          function (pose) {
+            // Two people is two people, even when only one of them was measured.
+            if (pose && pose.faces > 1) return pose;
+            // No pose, no face, or a disagreement about the count: the native
+            // reading is what this page actually knows.
+            if (!pose || pose.faces !== 1 || pose.yaw === null || pose.pitch === null) {
+              return native;
+            }
+            return pose;
+          },
+          function () {
+            return native;
+          }
+        );
+      },
+      function () {
+        // A rejected detection is a detector that did not look: no evidence from
+        // it, and no reason to deny the frame to the model.
+        return inspectWithMediaPipe(element);
+      }
+    );
   }
 
   /// A promise for what the Shape Detection API saw in this frame.
@@ -722,6 +870,9 @@
         function (faces) {
           if (!faces) return { faces: 0, yaw: null, pitch: null };
           var pose = faces.length === 1 ? measurePose(faces[0]) : null;
+          // This build of the native detector handed back landmarks an angle can
+          // be measured from: the page really can judge a head turn ([analysisState]).
+          if (pose) nativeMeasured = true;
           return {
             faces: faces.length,
             yaw: pose ? pose.yaw : null,
@@ -1182,6 +1333,11 @@
     mediaPipe.latestAt = 0;
     mediaPipe.element = null;
     mediaPipe.frameAt = -1;
+    // What the last attempt was told about this page's sensors goes too: the next
+    // attempt installs a fresh hook, and if this page still cannot measure an angle
+    // it has to say so again rather than assume the previous attempt's listener is
+    // still there.
+    lastAnalysis = null;
   }
 
   /// Says, once per page session, that an attempt is running with no preview in
@@ -1220,6 +1376,10 @@
     busy = false;
     if (!running) return;
     if (message) report(message);
+    // Said after the verdict, so a student whose page cannot measure an angle
+    // hears "centered" (the truth: a face is there) and then, once, that head
+    // turns are not being judged in this browser.
+    publishAnalysis();
     schedule();
   }
 
@@ -1418,14 +1578,18 @@
     /// found, `reason` names the state the preview is in, and `lastVerdict` says
     /// what the page last told the app.
     ///
-    /// `faceModel` names the sensor that measured the head - `native` for the
-    /// browser's Shape Detection API, `mediapipe` for the shipped model, `none` for
-    /// a page that can count nothing but pixels - and `modelState`/`modelError` say
-    /// why the shipped model is not ready when it is not (`idle` until a camera is
-    /// live, `loading`, `off` for a host that disabled it, `failed` with the reason
-    /// it gave up). `model: false` with `faceModel: 'none'` is the page that can
-    /// only say "a picture, not a blank one"; `captured` says the camera came from
-    /// the page's own request because no preview in the document carried it.
+    /// `faceModel` names the sensor this page measures heads with - `native` for
+    /// the browser's Shape Detection API, `mediapipe` for the shipped model, `none`
+    /// for a page that can count nothing but pixels - and `modelState`/`modelError`
+    /// say why the shipped model is not ready when it is not (`idle` until a camera
+    /// is live, `loading`, `off` for a host that disabled it, `failed` with the
+    /// reason it gave up). `model: false` with `faceModel: 'none'` is the page that
+    /// can only say "a picture, not a blank one"; `captured` says the camera came
+    /// from the page's own request because no preview in the document carried it.
+    ///
+    /// `analysis` is the question `model` cannot answer: whether head *turns* are
+    /// being judged here at all - `true`, `false` for a page reduced to counting
+    /// faces, `null` while the model is still loading and only the count is known.
     diagnostics: function () {
       var element = findVideo();
       var sample = element && !inactiveReason(element) ? sampleFrame(element, false) : null;
@@ -1458,10 +1622,11 @@
         sample: sample
           ? { mean: Math.round(sample.mean), spread: Math.round(sample.spread), frozen: sample.frozen }
           : null,
-        model: native || mediaPipe.state === 'ready',
+        model: analysisState() === true,
         faceModel: native ? 'native' : mediaPipe.state === 'ready' ? 'mediapipe' : 'none',
         modelState: mediaPipe.state,
         modelError: mediaPipe.error,
+        analysis: analysisState(),
         captured: capturedStream
           ? capturedStream.getVideoTracks().length
           : 0,

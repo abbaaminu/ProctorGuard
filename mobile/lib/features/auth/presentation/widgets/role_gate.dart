@@ -26,15 +26,17 @@ import '../providers/profile_provider.dart';
 ///   `admin`                 -> [AdminDashboardPage]        (create accounts,
 ///                              manage roles)
 ///
-/// Lecturers and supervisors share `is_staff()` in the database, which is what
-/// lets both read every attempt (the roster of any sitting, so a monitor can be
-/// opened for any exam). They differ where the work differs: a lecturer owns the
-/// papers they wrote - only the author may edit a question, award marks on an
-/// essay (`grade_submission()` re-checks it) or read the evidence recorded on
-/// that paper (the `owns_exam()` arm of `logs_select_own_or_supervisor` and of
-/// the reset audit policy) - while a supervisor runs any sitting and reads every
-/// paper's evidence. Lecturers therefore land on the authoring console, and reach
-/// the monitor through it.
+/// Lecturers and supervisors share `is_staff()` in the database, but not their
+/// reach. A lecturer owns the papers they wrote - only the author may edit a
+/// question, award marks on an essay (`grade_submission()` re-checks it) or read the
+/// evidence recorded on that paper (the `owns_exam()` arm of
+/// `logs_select_own_or_supervisor` and of the reset audit policy) - and may still
+/// watch any sitting's roster, which is what makes their monitor work on a paper
+/// they did not write. A supervisor runs the papers **an administrator assigned to
+/// them** (`supervisor_exam_assignments`, read by `can_supervise_exam()`): their
+/// console lists those papers, and their reads, resets and review decisions are
+/// scoped to them by the policies that used to name the tier. Lecturers therefore
+/// land on the authoring console, and reach the monitor through it.
 ///
 /// The reset control is not one of the differences: `canResetAttempts` is the
 /// schema's own rule — `is_attempt_resetter()` names `admin`, `supervisor` **and

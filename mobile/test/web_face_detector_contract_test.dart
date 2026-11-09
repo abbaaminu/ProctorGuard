@@ -237,6 +237,92 @@ void main() {
         reason: 'a window of one sample is no smoothing at all',
       );
     });
+
+    test('it says what it can measure, on a hook of its own', () {
+      // The second channel, and the whole of Task 2: on a page that can only
+      // count faces, `centered` is what a student staring at the wall and a
+      // student reading the screen both produce, so the page's *capability* has
+      // to be said out loud. Dart turns it into a note for the student and
+      // `monitoring_ok = false` on the next beat - never into a violation.
+      final js = detector();
+      expect(
+        js,
+        contains(
+          "var ANALYSIS_HOOK = '${WebFaceSignalSource.analysisGlobalName}'",
+        ),
+        reason:
+            'the script publishes to a global other than '
+            '"${WebFaceSignalSource.analysisGlobalName}", so Dart can never learn '
+            'that head turns are not being judged',
+      );
+      expect(
+        js,
+        contains('function publishAnalysis()'),
+        reason:
+            'nothing announces the capability, so a count-only sitting is '
+            'indistinguishable from a measured one',
+      );
+      expect(
+        js,
+        contains('function analysisState()'),
+        reason:
+            'the page has no single place that answers "can I measure an '
+            'angle", so the hook and `diagnostics` can drift apart',
+      );
+      // `null` is "not yet": publishing it would be a page that says "I do not
+      // know" on every tick, and the event worth reporting is the change.
+      expect(
+        js,
+        contains('if (state === null || state === lastAnalysis) return'),
+        reason:
+            'an unknown capability is being published as an answer, or the hook '
+            'is called on every tick instead of when the answer changes',
+      );
+      // A native `FaceDetector` on its own is a counter. This is the bug the fix
+      // is about: several builds of the Shape Detection API return bounding
+      // boxes and no landmarks, and their mere presence used to read as "we
+      // measure angles".
+      expect(
+        js,
+        contains('if (native && nativeMeasured) return true'),
+        reason:
+            'the presence of a native detector is being taken as proof of '
+            'head-turn detection, which is exactly what a count-only build is '
+            'not',
+      );
+      expect(
+        js,
+        contains('if (pose) nativeMeasured = true'),
+        reason:
+            'nothing ever sets the flag that a native pose was measured, so a '
+            'browser that does hand back landmarks is reported as blind',
+      );
+    });
+
+    test('diagnostics can explain a page that only counts faces', () {
+      // `diagnostics()` is what a phone's remote devtools reads when an exam
+      // looks proctored and is not. `analysis` is the same answer the hook
+      // publishes, so the two cannot disagree about this sitting.
+      final js = detector();
+      expect(
+        js,
+        contains('analysis: analysisState()'),
+        reason:
+            'diagnostics cannot say whether this page can measure an angle, so '
+            'a blind sitting has to be inferred from a verdict that never came',
+      );
+      // And a new attempt asks again: the next attempt installs a fresh hook, so
+      // the answer the previous attempt heard must not suppress this one.
+      expect(
+        RegExp(
+          r'function resetEpisode\(\) \{[\s\S]*?lastAnalysis = null;',
+        ).hasMatch(js),
+        isTrue,
+        reason:
+            'the capability answer survives the attempt that heard it, so a '
+            'page that found its model between attempts stays silent',
+      );
+    });
   });
 
   group('a camera that is not delivering is no_face', () {
@@ -1001,6 +1087,9 @@ class _SilentSource implements WebFaceSignalSource {
 
   @override
   Stream<String> get messages => const Stream<String>.empty();
+
+  @override
+  Stream<bool> get analysis => const Stream<bool>.empty();
 
   @override
   void dispose() {}

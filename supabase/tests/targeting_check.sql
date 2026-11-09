@@ -127,6 +127,15 @@ begin
        'Science', 'CS', '300'),
       (v_draft, 'Lecturer A draft', v_lecturer_a, 60, false, 'Science', 'CS', '300');
 
+  -- `20261109090000_supervisor_exam_assignments.sql`: a supervisor reaches the
+  -- papers an administrator assigned to them. This file's supervisor assertions are
+  -- (h)iii - it reads the draft's questions - and (i) - it reads the untargeted
+  -- paper's snapshots and deletes its attempts - so those two are assigned. The
+  -- scope itself (no row, no reach) is proven in `supervisor_scope_check.sql`.
+  insert into public.supervisor_exam_assignments (exam_id, supervisor_id, assigned_by)
+    values (v_draft, v_supervisor, v_lecturer_a),
+           (v_untargeted, v_supervisor, v_lecturer_a);
+
   -- The consent gate (`20261106090000_proctoring_consents.sql`) makes an attempt
   -- impossible without an acceptance, and this file is about the cohort rule, the
   -- window and the schedule - not about consent. So every student fixture accepts

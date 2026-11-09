@@ -292,6 +292,17 @@ $$;
 -- status change or an after-the-fact re-grade) and who may read the incident
 -- feed. Deliberately not the same question as "who may reset one" - see
 -- is_attempt_resetter() below.
+--
+-- This is a *tier* question and only a tier question: "is this account an admin
+-- or a supervisor". It says nothing about *which* paper, and since
+-- `migrations/20261109090000_supervisor_exam_assignments.sql` no policy in this
+-- file asks it any more - the per-paper question is `can_supervise_exam(exam_id)`
+-- (§2c), because a supervisor is accountable for the sittings an administrator
+-- assigned to them and an administrator is accountable for all of them. The
+-- function stays defined for two reasons: the tier is still the right question for
+-- *identity* actions (the Edge Functions name it), and a database that has not
+-- re-run its older files still carries policies that call it - re-running this
+-- file must not leave those undefined.
 create or replace function public.is_exam_supervisor()
 returns boolean
 language sql
@@ -304,6 +315,32 @@ as $$
     where id = auth.uid() and role in ('admin', 'supervisor')
   );
 $$;
+
+-- role = 'supervisor' exactly - the one staff label whose reach the assignment
+-- scope narrows.
+--
+-- Written as its own predicate rather than as `not is_admin() and not ...` at each
+-- call site because the *compliment* is what the policies need to express: "staff,
+-- except that a supervisor is limited to the papers they were assigned". An
+-- administrator and a lecturer answer false here, which is exactly why the two of
+-- them keep the reach they had on the day before this predicate existed. Stated
+-- once, a policy cannot accidentally narrow a lecturer while trying to narrow a
+-- supervisor.
+create or replace function public.is_supervisor_only()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role = 'supervisor'
+  );
+$$;
+
+comment on function public.is_supervisor_only() is
+  'True only for a supervisor account - the staff label whose reach supervisor_exam_assignments narrows. Admin and lecturer are false, which is what keeps their policies unchanged.';
 
 -- The *reset* tier: who may clear a student's attempt and the evidence that
 -- went with it.
@@ -323,8 +360,10 @@ $$;
 -- The snapshot purge and the reset audit row ask this predicate - the two steps
 -- that follow the delete and must keep working for the caller the delete has just
 -- allowed. The delete itself is narrower by design:
--- `submissions_delete_supervisor` asks `is_exam_supervisor() or owns_exam(exam_id)`,
--- because deleting an attempt is a repair of a paper you wrote, while
+-- `submissions_delete_supervisor` asks
+-- `can_supervise_exam(exam_id) or owns_exam(exam_id)` - the supervisor of that
+-- paper, or its author, because deleting an attempt is a repair of a paper you are
+-- accountable for, while
 -- `is_attempt_resetter()` (every lecturer) would let any lecturer delete any
 -- attempt in the institution. `UserRole.canResetAttempts` in the Flutter app is
 -- this list (admin, supervisor, lecturer), and the console gates the *control* per
@@ -351,8 +390,9 @@ $$;
 -- was recorded *inside* a sitting is a different question: the incident rows in
 -- `proctoring_logs` and the reset audit rows in `session_reset_logs` name
 -- students, timings and sometimes the member of staff who acted. A lecturer sees
--- those for the papers they wrote; the intervention tier
--- (`is_exam_supervisor()`) sees them for every paper.
+-- those for the papers they wrote; the supervisors of a paper - an administrator,
+-- or the supervisor assigned to it (`can_supervise_exam()`) - see them for that
+-- paper.
 --
 -- Asked with the evidence row's own exam id - `proctoring_logs` reaches it
 -- through `exam_submissions.exam_id`, `session_reset_logs` carries it as plain
@@ -720,6 +760,180 @@ comment on column public.exams.ends_at is
 alter table public.exams enable row level security;
 
 -- ---------------------------------------------------------------------
+-- 2c. SUPERVISOR EXAM ASSIGNMENTS (which sitting a supervisor may run)
+-- ---------------------------------------------------------------------
+-- `is_exam_supervisor()` says *what* an account is (admin or supervisor). This
+-- table answers the question the policies actually needed: **which** paper is this
+-- supervisor accountable for. One row per (paper, supervisor).
+--
+-- Why a table rather than `exams.supervisor_id`: a sitting is run by whoever is
+-- free that morning, a department has more than one invigilator, and the same
+-- person is routinely on two papers in a week. A single column would be a lie the
+-- first week it was used, and the second invigilator would need a second column.
+--
+-- Why the row carries `assigned_by`: "who put this person on this paper" is part
+-- of the record - the same reason `session_reset_logs.actor_id` exists. It
+-- defaults to `auth.uid()` and the insert policy re-checks it, so it is the
+-- database's answer rather than a client's claim, and the Flutter console
+-- deliberately never sends the column.
+--
+-- Both foreign keys cascade. An assignment to a paper or an account that no longer
+-- exists grants nothing, and keeping the row would only make the admin screen
+-- claim a grant that does not exist.
+--
+-- Deliberately NOT backfilled by the migration that introduces it: guessing "this
+-- existing supervisor keeps all 400 papers" would recreate exactly the hole the
+-- table closes. A supervisor with no row sees an empty console that says so.
+create table if not exists public.supervisor_exam_assignments (
+  exam_id       uuid not null references public.exams(id) on delete cascade,
+  supervisor_id uuid not null references public.profiles(id) on delete cascade,
+  assigned_by   uuid not null default auth.uid(),
+  assigned_at   timestamptz not null default now(),
+  -- One row per pair: assigning the same supervisor twice is a no-op rather than a
+  -- second grant an unassign would have to guess between.
+  primary key (exam_id, supervisor_id)
+);
+
+comment on table public.supervisor_exam_assignments is
+  'Which supervisor may run which paper. Read by can_supervise_exam(), written only by an administrator. No row = no reach: a supervisor sees, reads and intervenes in exactly the papers listed here.';
+
+-- The primary key already serves "who runs this paper" (its `exam_id` prefix);
+-- this index serves the supervisor's own console ("which papers are mine") and the
+-- cascade when an account is deleted.
+create index if not exists idx_supervisor_assignments_supervisor
+  on public.supervisor_exam_assignments(supervisor_id);
+
+-- Nothing but a supervisor account may be assigned. `can_supervise_exam()` asks
+-- the role as well as the row, so this is not the guard that makes the scope hold -
+-- it is the guard that keeps the *table* honest, so the admin screen cannot record
+-- a grant that will never do anything and a later reader cannot mistake it for one.
+-- SECURITY DEFINER like the role predicates above: the check must not depend on
+-- whether the caller may read the account's `profiles` row.
+create or replace function public.guard_supervisor_assignment()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_role public.user_role;
+begin
+  select p.role into v_role
+  from public.profiles p
+  where p.id = new.supervisor_id;
+
+  if v_role is null then
+    raise exception 'supervisor assignment: no account with id %', new.supervisor_id
+      using errcode = '23503';
+  end if;
+
+  if v_role <> 'supervisor' then
+    raise exception 'supervisor assignment: % is a %, and only a supervisor account may be assigned to a paper',
+      new.supervisor_id, v_role
+      using errcode = '23514';
+  end if;
+
+  return new;
+end $$;
+
+comment on function public.guard_supervisor_assignment() is
+  'Refuses a supervisor_exam_assignments row whose supervisor_id is not a supervisor account. can_supervise_exam() asks the role too, so this keeps the table honest rather than carrying the scope.';
+
+drop trigger if exists guard_supervisor_assignment on public.supervisor_exam_assignments;
+create trigger guard_supervisor_assignment
+  before insert or update on public.supervisor_exam_assignments
+  for each row execute function public.guard_supervisor_assignment();
+
+alter table public.supervisor_exam_assignments enable row level security;
+
+drop policy if exists "supervisor_assignments_select_own_or_admin" on public.supervisor_exam_assignments;
+drop policy if exists "supervisor_assignments_insert_admin" on public.supervisor_exam_assignments;
+drop policy if exists "supervisor_assignments_delete_admin" on public.supervisor_exam_assignments;
+
+-- Read: the supervisor the row names, and administrators (who assign them). A
+-- lecturer reads nothing here: their reach comes from `owns_exam()`, and who else
+-- was put on a paper is the administrator's business.
+create policy "supervisor_assignments_select_own_or_admin"
+  on public.supervisor_exam_assignments for select
+  to authenticated
+  using (supervisor_id = auth.uid() or public.is_admin());
+
+-- Write: administrators only, and only in their own name.
+create policy "supervisor_assignments_insert_admin"
+  on public.supervisor_exam_assignments for insert
+  to authenticated
+  with check (public.is_admin() and assigned_by = auth.uid());
+
+-- Unassigning is a DELETE of the pair. There is deliberately NO update policy: the
+-- row is a fact ("this person runs this paper"), and changing either half of it is
+-- a different assignment, not an edit.
+create policy "supervisor_assignments_delete_admin"
+  on public.supervisor_exam_assignments for delete
+  to authenticated
+  using (public.is_admin());
+
+revoke all on table public.supervisor_exam_assignments from anon;
+revoke update, truncate on table public.supervisor_exam_assignments from authenticated;
+grant select, insert, delete on table public.supervisor_exam_assignments to authenticated;
+grant all on table public.supervisor_exam_assignments to service_role;
+
+-- ---------------------------------------------------------------------
+-- 2d. "MAY THIS ACCOUNT SUPERVISE *THIS* PAPER?"
+-- ---------------------------------------------------------------------
+-- The per-paper question every policy below now asks where it used to ask the tier
+-- question. Three sentences, in this order:
+--   * an administrator may supervise any paper - they assign the supervisors and
+--     are accountable for the deployment, so scoping them would leave nobody able
+--     to open a monitor on a paper whose invigilator resigned;
+--   * a supervisor may supervise the papers `supervisor_exam_assignments` names -
+--     the practice the table records;
+--   * everybody else (a lecturer, a student, an account with no profile row) may
+--     not. `p_exam_id` null answers false: a consent record that is not aimed at a
+--     paper (`exam_id IS NULL`) is nobody's to supervise.
+--
+-- The role is asked here *and* by the guard on the table, on purpose: a supervisor
+-- demoted to lecturer keeps their rows, and this predicate stops answering true on
+-- the instant the role changed rather than when somebody remembers to clear up the
+-- assignments. Re-promoting them restores the sittings they were trusted with,
+-- which is the outcome a department wants.
+--
+-- SECURITY DEFINER with `set search_path`, exactly like `owns_exam()`: a policy
+-- that calls it must not re-enter the policies on `supervisor_exam_assignments` (or
+-- on `profiles`) to answer, and it must work for a caller who may read neither.
+create or replace function public.can_supervise_exam(p_exam_id uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select p_exam_id is not null
+     and (
+       exists (
+         select 1 from public.profiles
+         where id = auth.uid() and role = 'admin'
+       )
+       or exists (
+         select 1
+         from public.profiles p
+         join public.supervisor_exam_assignments a on a.supervisor_id = p.id
+         where p.id = auth.uid()
+           and p.role = 'supervisor'
+           and a.exam_id = p_exam_id
+       )
+     );
+$$;
+
+comment on function public.can_supervise_exam(uuid) is
+  'True when the caller may supervise this paper: an administrator, or a supervisor assigned to it in supervisor_exam_assignments. False for a supervisor with no assignment, for a lecturer (who reaches their own papers through owns_exam()) and for a null paper.';
+
+revoke execute on function public.can_supervise_exam(uuid) from public, anon;
+grant execute on function public.can_supervise_exam(uuid) to authenticated, service_role;
+
+revoke execute on function public.guard_supervisor_assignment() from public, anon;
+grant execute on function public.guard_supervisor_assignment() to authenticated, service_role;
+
+-- ---------------------------------------------------------------------
 -- 2b. BORROWED-COURSE ACCESS
 -- ---------------------------------------------------------------------
 -- A paper is aimed at a cohort by the three columns above, but a cohort is not
@@ -756,7 +970,13 @@ drop policy if exists "exam_allowed_students_delete_owner" on public.exam_allowe
 create policy "exam_allowed_students_select"
   on public.exam_allowed_students for select
   to authenticated
-  using (student_id = auth.uid() or public.is_staff());
+  using (
+    student_id = auth.uid()
+    or (
+      public.is_staff()
+      and (not public.is_supervisor_only() or public.can_supervise_exam(exam_id))
+    )
+  );
 
 -- Write: only the paper's author. `owns_exam()` is SECURITY DEFINER, so this
 -- check does not re-enter `exams_select` — which is the policy that reads this
@@ -776,9 +996,17 @@ drop policy if exists "exams_insert_supervisor_only" on public.exams;
 drop policy if exists "exams_update_owner" on public.exams;
 drop policy if exists "exams_delete_owner" on public.exams;
 
--- Read: staff see every paper, published or not — an invigilator opens a sitting
--- in any department, and the console's monitor roster depends on it; the author
--- always sees their own drafts.
+-- Read: staff see their papers, published or not - an invigilator opens a sitting
+-- in the department they were assigned to, and the console's monitor list depends
+-- on it; the author always sees their own drafts.
+--
+-- Who "their papers" means, exactly: an administrator and a lecturer see every
+-- paper (unchanged - the lecturer's monitor and the authoring console lean on it),
+-- while a **supervisor** sees the papers an administrator assigned to them
+-- (`can_supervise_exam()`, section 2d). That is what makes the supervisor console's
+-- list the sittings they are responsible for instead of the whole institution's,
+-- and it is the read half of the scope the other policies enforce: hiding the row
+-- here means an unassigned paper's title, schedule and roster are not even offered.
 --
 -- Students see a **published** paper only when it is aimed at them:
 --     every column the paper names must match their own `profiles` row. A paper
@@ -798,7 +1026,10 @@ create policy "exams_select"
   on public.exams for select
   to authenticated
   using (
-    public.is_staff()
+    (
+      public.is_staff()
+      and (not public.is_supervisor_only() or public.can_supervise_exam(id))
+    )
     or created_by = auth.uid()
     or public.student_can_access_exam(id)
   );
@@ -935,7 +1166,7 @@ create policy "questions_select_supervisor"
   on public.questions for select
   to authenticated
   using (
-    public.is_exam_supervisor()
+    public.can_supervise_exam(exam_id)
     or public.owns_exam(exam_id)
   );
 
@@ -1116,9 +1347,14 @@ create policy "consents_insert_own"
   to authenticated
   with check (student_id = auth.uid());
 
--- Read: your own acceptances, or the intervention tier (admin + supervisor).
--- Deliberately not `is_staff()`: a lecturer reads the evidence of a sitting;
--- "did this person agree, and to what wording?" is a supervisory question.
+-- Read: your own acceptances, or the supervisor of the paper it names (admin and
+-- the assigned supervisor - `can_supervise_exam()`, section 2d). Deliberately not
+-- `is_staff()`: a lecturer reads the evidence of a sitting; "did this person agree,
+-- and to what wording?" is a supervisory question.
+--
+-- A general acceptance (`exam_id IS NULL`) is readable by its subject only. There is
+-- no paper to be assigned to, so no supervisor is accountable for it - and the row
+-- says when a person agreed to a notice, which is not a sitting's evidence.
 --
 -- And again the control is an absence - no UPDATE policy, no DELETE policy, and
 -- `select, insert` as the only grants (the schema's default privileges hand every
@@ -1130,7 +1366,7 @@ create policy "consents_select_own_or_supervisor"
   to authenticated
   using (
     student_id = auth.uid()
-    or public.is_exam_supervisor()
+    or (exam_id is not null and public.can_supervise_exam(exam_id))
   );
 
 revoke all on table public.proctoring_consents from anon;
@@ -1249,13 +1485,26 @@ drop policy if exists "submissions_update_own_ongoing" on public.exam_submission
 drop policy if exists "submissions_update_supervisor" on public.exam_submissions;
 drop policy if exists "submissions_delete_supervisor" on public.exam_submissions;
 
--- Read: your own attempt, or any attempt when you are a supervisor. The console
+-- Read: your own attempt, or any attempt of a paper you may supervise. The console
 -- roster/audit and the mobile live monitor both need the wide read, and
 -- `exams_select` already grants it for the exam rows themselves.
+--
+-- "Any attempt" is admin-anywhere, lecturer-anywhere (unchanged: a lecturer may
+-- watch any sitting - `lecturer_scoped_log_reads.sql`'s "what it does not change"),
+-- and supervisor-only-on-assigned-papers (`can_supervise_exam()`, section 2d). The
+-- roster is the one table where the scope is visible as an *absence* rather than a
+-- refusal: an unassigned paper's attempts are not streamed to the console at all, so
+-- the monitor cannot be opened on a sitting nobody asked this account to run.
 create policy "submissions_select_own_or_supervisor"
   on public.exam_submissions for select
   to authenticated
-  using (student_id = auth.uid() or public.is_staff());
+  using (
+    student_id = auth.uid()
+    or (
+      public.is_staff()
+      and (not public.is_supervisor_only() or public.can_supervise_exam(exam_id))
+    )
+  );
 
 -- A start row can only ever be a fresh attempt: the student's own id, ongoing
 -- status, empty answers, no score or submit time, and the database's start
@@ -1312,8 +1561,8 @@ create policy "submissions_insert_own_ongoing"
 create policy "submissions_update_supervisor"
   on public.exam_submissions for update
   to authenticated
-  using (public.is_exam_supervisor())
-  with check (public.is_exam_supervisor());
+  using (public.can_supervise_exam(exam_id))
+  with check (public.can_supervise_exam(exam_id));
 
 -- Resetting one attempt (the staff app's "Reset attempt" control)
 -- is a DELETE of this row: the score, the stored answers, the roster card and -
@@ -1323,8 +1572,9 @@ create policy "submissions_update_supervisor"
 -- the evidence go with the attempt.
 --
 -- The reset tier - wider than the update policy above by exactly one role. It is
--- `is_exam_supervisor() or owns_exam(exam_id)`: the intervention tier can clear
--- any sitting, and the lecturer who wrote *this* paper can clear an attempt on it -
+-- `can_supervise_exam(exam_id) or owns_exam(exam_id)`: the supervisor of that paper
+-- - an administrator, or the supervisor assigned to it - can clear any attempt on
+-- it, and the lecturer who wrote *this* paper can clear an attempt on it -
 -- which is the repair the control exists for (the wrong answer key, the mis-aimed
 -- disqualification). It used to be `is_attempt_resetter()`, which is every
 -- lecturer, so any lecturer could delete any student's attempt on any paper in the
@@ -1344,7 +1594,7 @@ create policy "submissions_delete_supervisor"
   on public.exam_submissions for delete
   to authenticated
   using (
-    public.is_exam_supervisor()
+    public.can_supervise_exam(exam_id)
     or public.owns_exam(exam_id)
   );
 
@@ -1422,7 +1672,8 @@ create trigger submissions_guard_immutability
 -- Student-safe view: strips both answer keys (`correct_option` and
 -- `correct_text_answer`) so students never receive them, and returns one row per
 -- *audience* instead of every published row:
---   1. an admin or supervisor (`is_exam_supervisor()`);
+--   1. the supervisor of the paper - an administrator, or the supervisor assigned to
+--      it (`can_supervise_exam(e.id)`);
 --   2. the paper's author (`e.created_by = auth.uid()`), who authored these rows;
 --   3. a student the paper is aimed at, **while its window is open** -
 --      `student_can_access_exam(e.id)` plus `starts_at` / `ends_at`;
@@ -1463,7 +1714,7 @@ create view public.questions_public as
   left join public.exam_submissions s
          on s.exam_id = e.id
         and s.student_id = auth.uid()
-  where public.is_exam_supervisor()
+  where public.can_supervise_exam(e.id)
      or e.created_by = auth.uid()
      or (
        public.student_can_access_exam(e.id)
@@ -1607,9 +1858,10 @@ alter table public.proctoring_logs enable row level security;
 drop policy if exists "logs_select_own_or_supervisor" on public.proctoring_logs;
 drop policy if exists "logs_insert_own_ongoing" on public.proctoring_logs;
 
--- Read: your own attempt; the incident feed of *any* sitting for the
--- intervention tier; and - for the lecturer who wrote the paper - the incidents
--- recorded on their own exam.
+-- Read: your own attempt; the incident feed of any sitting you may supervise -
+-- every sitting for an administrator, the assigned ones for a supervisor
+-- (`can_supervise_exam()`, section 2d); and - for the lecturer who wrote the paper -
+-- the incidents recorded on their own exam.
 --
 -- The third arm is what makes a lecturer's monitor show violations instead of an
 -- empty feed, and it is scoped by `owns_exam()` rather than by the staff tier on
@@ -1624,9 +1876,12 @@ create policy "logs_select_own_or_supervisor"
     exists (
       select 1 from public.exam_submissions s
       where s.id = submission_id
-        and (s.student_id = auth.uid() or public.owns_exam(s.exam_id))
+        and (
+          s.student_id = auth.uid()
+          or public.owns_exam(s.exam_id)
+          or public.can_supervise_exam(s.exam_id)
+        )
     )
-    or public.is_exam_supervisor()
   );
 
 -- There is deliberately NO insert policy. `register_violation()` is the single
@@ -1820,9 +2075,12 @@ create policy "heartbeats_select_own_or_supervisor"
     exists (
       select 1 from public.exam_submissions s
       where s.id = submission_id
-        and (s.student_id = auth.uid() or public.owns_exam(s.exam_id))
+        and (
+          s.student_id = auth.uid()
+          or public.owns_exam(s.exam_id)
+          or public.can_supervise_exam(s.exam_id)
+        )
     )
-    or public.is_exam_supervisor()
   );
 
 -- Again, deliberately NO insert/update/delete policy. `record_heartbeat()` is
@@ -1879,21 +2137,26 @@ drop policy if exists "Proctor snapshots supervisor purge" on storage.objects;
 -- could sign a ten-minute URL to a photograph of any student in any sitting. The
 -- evidence tier is narrower than the roster tier for the same reason
 -- `proctoring_logs` is (`owns_exam()`), except that here the evidence is a face.
--- The supervisor arm is deliberately *outside* the EXISTS so the intervention tier
--- can still read an object whose folder no longer resolves to a submission - the
--- state between deleting an attempt and purging its stills.
+-- The supervisor arm used to sit *outside* the EXISTS so the intervention tier
+-- could still read an object whose folder no longer resolves to a submission - the
+-- state between deleting an attempt and purging its stills. It is inside now,
+-- because the question "may this account supervise it" needs the paper the folder
+-- resolves to; the orphaned window is covered by the purge policies below, which
+-- ask `is_attempt_resetter()` (the tier that is allowed to delete an attempt at
+-- all) and only match once the folder resolves to nothing.
 create policy "Proctor snapshots read access"
   on storage.objects for select
   to authenticated
   using (
     bucket_id = 'proctor-snapshots'
-    and (
-      public.is_exam_supervisor()
-      or exists (
-        select 1 from public.exam_submissions s
-        where s.id::text = (storage.foldername(name))[1]
-          and (s.student_id = auth.uid() or public.owns_exam(s.exam_id))
-      )
+    and exists (
+      select 1 from public.exam_submissions s
+      where s.id::text = (storage.foldername(name))[1]
+        and (
+          s.student_id = auth.uid()
+          or public.owns_exam(s.exam_id)
+          or public.can_supervise_exam(s.exam_id)
+        )
     )
   );
 
@@ -1931,7 +2194,8 @@ create policy "Proctor snapshots upload own ongoing session"
 --     sitting was still running - the evidence gone, the attempt untouched, no
 --     audit row anywhere, because no attempt row was ever deleted;
 --   * the reset tier could purge evidence of an attempt it could not delete
---     (`submissions_delete_supervisor` asks `is_exam_supervisor()` or the author),
+--     (`submissions_delete_supervisor` asks `can_supervise_exam(exam_id)` or the
+--     author),
 --     so the destructive half of a reset was reachable without the repair half.
 --
 -- Without `is_attempt_resetter()` the `not exists` arm would be a hole rather than
@@ -2040,15 +2304,22 @@ drop policy if exists "session_reset_logs_insert_supervisor" on public.session_r
 create policy "session_reset_logs_select_staff"
   on public.session_reset_logs for select
   to authenticated
-  using (public.is_exam_supervisor() or public.owns_exam(exam_id));
+  using (public.can_supervise_exam(exam_id) or public.owns_exam(exam_id));
 
--- Write: exactly the tier that may delete an attempt in the first place
--- (`is_attempt_resetter()` is what `submissions_delete_supervisor` and the
--- snapshot-purge policy use), and only in the caller's own name.
+-- Write: exactly the tier that may delete an attempt in the first place - the
+-- supervisor of the paper or its author, in the caller's own name. It used to be
+-- `is_attempt_resetter()` (every lecturer), which was wider than the DELETE the row
+-- describes: a lecturer could record a reset of an attempt on somebody else's paper
+-- that the DELETE policy had just refused, and a supervisor could record one for a
+-- paper they are not assigned to. The insert can only ever follow a successful
+-- delete, so this narrows nothing that ever worked.
 create policy "session_reset_logs_insert_supervisor"
   on public.session_reset_logs for insert
   to authenticated
-  with check (public.is_attempt_resetter() and actor_id = auth.uid());
+  with check (
+    (public.can_supervise_exam(exam_id) or public.owns_exam(exam_id))
+    and actor_id = auth.uid()
+  );
 
 -- There is deliberately NO update policy and NO delete policy. A record its own
 -- author can rewrite or remove is not a record; if one is ever wrong, the
@@ -2096,7 +2367,7 @@ drop policy if exists "attempt_review_logs_select_staff" on public.attempt_revie
 create policy "attempt_review_logs_select_staff"
   on public.attempt_review_logs for select
   to authenticated
-  using (public.is_exam_supervisor() or public.owns_exam(exam_id));
+  using (public.can_supervise_exam(exam_id) or public.owns_exam(exam_id));
 
 -- No insert policy, and no update or delete one. The row is written inside
 -- `resolve_flagged_attempt()`, a SECURITY DEFINER function that has already
@@ -2151,7 +2422,16 @@ drop policy if exists "question_grades_select_staff" on public.question_grades;
 create policy "question_grades_select_staff"
   on public.question_grades for select
   to authenticated
-  using (public.is_staff());
+  using (
+    public.is_staff()
+    and (
+      not public.is_supervisor_only()
+      or exists (
+        select 1 from public.exam_submissions s
+        where s.id = submission_id and public.can_supervise_exam(s.exam_id)
+      )
+    )
+  );
 
 -- There is deliberately NO insert and NO update policy, the shape
 -- `proctoring_logs` uses: `grade_submission()` is SECURITY DEFINER and re-checks
@@ -2794,7 +3074,7 @@ begin
   if not (
     v_sub.student_id = auth.uid()
     or public.owns_exam(v_sub.exam_id)
-    or public.is_exam_supervisor()
+    or public.can_supervise_exam(v_sub.exam_id)
   ) then
     raise exception 'proctoring_coverage: attempt % is not yours to read', p_submission_id
       using errcode = '42501';
@@ -2913,7 +3193,7 @@ as $$
     and (
       s.student_id = auth.uid()
       or public.owns_exam(s.exam_id)
-      or public.is_exam_supervisor()
+      or public.can_supervise_exam(s.exam_id)
     )
   order by c.risk_flag desc, c.last_beat_at nulls first;
 $$;
@@ -2932,7 +3212,8 @@ comment on function public.proctoring_coverage_for_exam(uuid) is
 -- replaces: the student would have no outcome and the paper would never be marked.
 --
 -- WHO MAY CALL IT: the tier that may already delete an attempt on this paper -
--- `is_exam_supervisor()` (admin, supervisor) anywhere and `owns_exam(exam_id)` for
+-- `can_supervise_exam(v_exam)` (an administrator, or the supervisor assigned to the
+-- paper) anywhere and `owns_exam(exam_id)` for
 -- the lecturer who wrote it. A lecturer on somebody else's paper is refused, and so
 -- is the student: the account under review does not get a vote.
 --
@@ -2992,7 +3273,7 @@ begin
   -- flagged is not something an unauthorised caller should learn from an error
   -- message, and the refusal has to be identical for every attempt they may not
   -- touch.
-  if not (public.is_exam_supervisor() or public.owns_exam(v_exam)) then
+  if not (public.can_supervise_exam(v_exam) or public.owns_exam(v_exam)) then
     raise exception 'only a supervisor, or the lecturer who wrote this paper, may resolve a flagged attempt'
       using errcode = '42501';
   end if;
@@ -3192,7 +3473,7 @@ begin
       using errcode = 'P0002';
   end if;
 
-  if v_student <> auth.uid() and not public.is_exam_supervisor() then
+  if v_student <> auth.uid() and not public.can_supervise_exam(v_exam) then
     raise exception 'submission % does not belong to the caller', p_submission_id
       using errcode = '42501';
   end if;

@@ -22,6 +22,12 @@ class UnsupportedWebFaceSignalSource implements WebFaceSignalSource {
   @override
   Stream<String> get messages => const Stream<String>.empty();
 
+  /// Empty for the same reason. A phone does not need this channel: its head
+  /// turns are measured by ML Kit through `MediaPipeProctoringService`, so there
+  /// is nothing to admit to — the absence of a browser is not a blind sensor.
+  @override
+  Stream<bool> get analysis => const Stream<bool>.empty();
+
   @override
   void dispose() {}
 }

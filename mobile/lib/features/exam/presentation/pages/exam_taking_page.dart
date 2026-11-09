@@ -241,6 +241,20 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// finished session can cancel it rather than hold the monitor alive.
   StreamSubscription<GazeSignal>? _facePresenceSub;
 
+  /// The page's own account of whether it can measure a head angle, forwarded to
+  /// the notifier (see [ProctoringNotifier.setFaceAnalysisAvailable]).
+  StreamSubscription<bool>? _faceAnalysisSub;
+
+  /// What the browser last said about its face sensor: false renders the
+  /// head-turn notice above the paper.
+  ///
+  /// Starts true because every platform but the web measures angles for real,
+  /// and a notice that appears for a heartbeat and then disappears is worse than
+  /// one that arrives a few seconds late - a student who sees "head turns are not
+  /// judged here" for a second learns to ignore it. Only a page that says
+  /// `false` ever sets it, which is the page that knows.
+  bool _faceAnalysisAvailable = true;
+
   /// Whether this session's pointer route is registered on
   /// [GestureBinding.pointerRouter]. Tracked because removing a route that was
   /// never added *asserts* in debug builds: a bootstrap that failed before it got
@@ -1218,6 +1232,16 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     // strike ladder, disqualification); the monitor has already decided that a
     // detection was sustained enough to be a signal.
     _facePresenceSub = monitor.signals.listen(notifier.reportGazeSignal);
+    // The second channel: not what the page saw, but what it can see. A browser
+    // whose model is missing still reports faces - it simply cannot tell a head
+    // turned to the wall from one reading the paper - so without this the attempt
+    // looks fully watched while head turns are never judged. It is reported, not
+    // punished: nothing here logs a violation.
+    _faceAnalysisSub = source.analysis.listen((available) {
+      notifier.setFaceAnalysisAvailable(available);
+      if (!mounted || _faceAnalysisAvailable == available) return;
+      setState(() => _faceAnalysisAvailable = available);
+    });
   }
 
   /// Releases the idle watcher, the browser's face bridge and the
@@ -1236,6 +1260,11 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     _facePresenceSub = null;
     _facePresence?.dispose();
     _facePresence = null;
+    // The next attempt asks its own page again: a re-run bootstrap on a browser
+    // that has since lost its model must not start out looking fully watched.
+    unawaited(_faceAnalysisSub?.cancel());
+    _faceAnalysisSub = null;
+    _faceAnalysisAvailable = true;
     // Guarded: this also runs for a bootstrap that never reached the registration
     // below, and `removeGlobalRoute` asserts on a route it does not know (see
     // [_pointerRouteAttached]).
@@ -1698,6 +1727,11 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                     // Above the question, so "your work is safe, it just has not
                     // reached the server yet" is the first thing on screen.
                     ExamSyncBanner(service: sync),
+                    // Directly under it, and for the same reason: a sitting where
+                    // head turns are not judged must not look like one where they
+                    // are. Silent on every platform that measures angles.
+                    if (!_faceAnalysisAvailable)
+                      const ExamHeadTurnUnavailableNotice(),
                     Expanded(
                       child: wide
                           // Desktop / tablet landscape: the self-view sits

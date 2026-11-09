@@ -401,7 +401,11 @@ stores one row in `proctor_heartbeats` and stamps
   exam page record the camera track and the detector loop, so a beat reads
   "running but blind" (`camera_ok`/`monitoring_ok` false) instead of looking
   identical to a healthy one. That is the case an empty violation feed used to
-  hide completely.
+  hide completely. `monitoring_ok` is `camera && analysis`, where `analysis` is
+  the browser's own answer to "can you measure a head angle at all"
+  (`WebFaceSignalSource.analysis`): a web attempt whose face model is missing
+  keeps beating — absence and a second person are still caught — but it does not
+  claim the sitting was measured ([below](#face-signals-on-the-web-the-host-page-bridge)).
 - **Lifecycle.** `proctoringHeartbeatProvider` owns one instance; the exam
   notifier starts it with the attempt and calls `stop()` in `dispose()`. A
   resumed attempt simply starts a new series in the same table, and the gap
@@ -615,8 +619,8 @@ Lecturers and supervisors share `is_staff()` in the database, which is what lets
 both read every attempt on the monitor roster
 (`submissions_select_own_or_supervisor`), but what was recorded *inside* a sitting
 is scoped more tightly: the incident feed (`proctoring_logs`) and the reset audit
-(`session_reset_logs`) are readable for every paper by the intervention tier
-(`is_exam_supervisor()`) and — for the paperwork a lecturer is accountable for —
+(`session_reset_logs`) are readable for the papers the reader supervises
+(`can_supervise_exam()`) and — for the paperwork a lecturer is accountable for —
 by the author of the paper the log belongs to (`owns_exam()` →
 `exams.created_by = auth.uid()`). Those stay *evidence* reads: a student still
 reads the incidents recorded on their own attempt, and the reset audit has no
@@ -624,10 +628,24 @@ student tier at all, because a reset row names the member of staff who ran it. T
 two roles do different work:
 a lecturer owns the papers they wrote — only the author may edit a question or
 award the marks on an essay, and `grade_submission()` re-checks that — while a
-supervisor runs the sitting and is the tier `is_exam_supervisor()` names for
-resetting an attempt. Lecturers therefore land on the authoring console and reach
+supervisor runs the sitting, and reaches the papers an administrator assigned to
+them (`supervisor_exam_assignments`, read by `can_supervise_exam()`), which is the
+tier that may reset an attempt there. Lecturers therefore land on the authoring
+console and reach
 the monitor through it, rather than sharing one screen that only fits one of the
 two jobs.
+
+That assignment is written on the admin console's **Assign supervisors** screen
+(`AssignSupervisorsPage`, app-bar action `admin-assign-supervisors`): one list of
+papers, drafts included, each showing who runs it, and a tick-list of supervisor
+accounts. Each tick is written immediately (`supervisionRepositoryProvider` →
+`supervisor_exam_assignments`; the client never sends `assigned_by`, which defaults
+to `auth.uid()` and is re-checked by the insert policy), because a "Save" an
+administrator closes by accident would be a silent revoke. A lecturer is
+deliberately not offered in that list and the database would refuse the row anyway
+(`guard_supervisor_assignment()`). A supervisor with no row sees the picker's empty
+state — "No exam has been assigned to you yet" — which is a state only an
+administrator can end, so the screen says so rather than looking broken.
 
 A failed lookup (offline, no row, unrecognised role) renders a retryable error
 with a **Sign out** escape hatch instead of guessing a role — an unknown
@@ -784,14 +802,14 @@ asked together: the **role**, `UserRole.canResetAttempts` — `admin`, `supervis
 and the **paper**, `canResetThisExam`, which the monitor answers from
 `exams.created_by` unless the caller is admin/supervisor. That second question is
 the delete policy's own: `submissions_delete_supervisor` is
-`is_exam_supervisor() or owns_exam(exam_id)`, so a lecturer may clear an attempt
+`can_supervise_exam(exam_id) or owns_exam(exam_id)`, so a lecturer may clear an attempt
 on the papers they wrote and not on anybody else's — the control is hidden where
 the server would refuse, rather than offering an icon whose only outcome is "the
 server deleted nothing". Lecturers reach
 this same console from their own home (the app bar's Monitor action) and can watch
 a sitting; what the lecturer's monitor shows *less* of is evidence — its incident
 feed comes back scoped to the papers they wrote (`owns_exam()`), where a
-supervisor's reads every paper's. `AdminDashboardPage` mounts its picker with both
+supervisor's reads the papers they were assigned. `AdminDashboardPage` mounts its picker with both
 flags set, because only an admin can reach that screen.
 
 A reset deletes the attempt with its cascaded incident rows, purges the snapshot
@@ -923,11 +941,11 @@ second monitor screen, and its reset control is asked of the role
 with the signed-in account) so this screen, the role gate and the policy cannot
 disagree — `is_attempt_resetter()` does name `lecturer`, because the paper's author
 is the one who repairs a wrong answer key, but the DELETE itself is
-`is_exam_supervisor() or owns_exam(exam_id)`: a lecturer clears attempts on their
+`can_supervise_exam(exam_id) or owns_exam(exam_id)`: a lecturer clears attempts on their
 own papers. A lecturer can watch a sitting and read
 every attempt (`is_staff()` on the roster), but what was *recorded* in a sitting
 stays scoped to the papers they wrote (`owns_exam()`) — see "Role routing
-(post-login)" — where the supervisor tier reads every paper's.
+(post-login)" — where the supervisor tier reads the papers they were assigned.
 
 **Seeded to try it on.** `seed.sql` gives the lecturer a published paper of their
 own (`GES301: Software Engineering Midterm`) with one question of each shape, and
@@ -1049,6 +1067,7 @@ mid-exam, so a silent failure would strand them:
 | Camera goes dark mid-session (unplugged, another app took it, the OS revoked the grant) | the paper is covered by an opaque **"Your camera has stopped"** block with **Restart camera** / **Leave** |
 | Microphone lost or refused mid-session | the same opaque block — **"Your microphone was disconnected"** + **Reconnect**, or **"Your microphone is switched off"** + **Try again** / **Open settings** / **Leave** |
 | No face in frame, or the whole face out of shot | **"We cannot see your face"**, which clears itself the moment a face is reported again (no button: the fix is the student being there) |
+| The browser cannot measure a head angle (web only: no native detector and no shipped model) | a quiet **"Head turns are not being checked in this browser"** strip above the paper, which stays for the sitting and clears if a model arrives on a later load (no button: nothing the student does turns it on), while the heartbeat records `monitoring_ok = false` for the attempt |
 
 There is no silent stand-in for a camera that is not working. The self-view shows
 a live preview, the loud **MOCK CAMERA** tile *only* in an explicit `MOCK_CAMERA`
@@ -1269,7 +1288,7 @@ through the web build, in a browser.
 | --- | --- | --- | --- | --- |
 | Android (phone) | `flutter build apk` | ML Kit, on-device | `record` | Lock task / screen pinning + immersive chrome |
 | iOS | `flutter build ios` — scaffolded, unsigned in CI; what is still owed is in [`ios/README.md`](ios/README.md) | ML Kit, on-device | `record` | Best-effort only (`startLock` reports `granted: false`) |
-| Web (Chrome/Edge) | `flutter build web` | `web/proctor_face_detector.js`, shipped with the app: `window.FaceDetector` or MediaPipe FaceLandmarker WASM for face-count and head-pose, pixel-level covered/blank checks, degrading gracefully to presence-only when model files fail ([below](#face-signals-on-the-web-the-host-page-bridge)); a host page may add its own detections through the same `proctorGuardFaceSignal` bridge | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
+| Web (Chrome/Edge) | `flutter build web` | `web/proctor_face_detector.js`, shipped with the app: `window.FaceDetector` or MediaPipe FaceLandmarker WASM for face-count and head-pose, pixel-level covered/blank checks, degrading gracefully to presence-only when model files fail — and **saying so** (`proctorGuardFaceAnalysis`), so the student is told and the heartbeat stops claiming a measured sitting ([below](#face-signals-on-the-web-the-host-page-bridge)); a host page may add its own detections through the same `proctorGuardFaceSignal` bridge | `record` behind `getUserMedia` | HTML5 fullscreen + tab/blur guards |
 | Web (phone/tablet) | the same `flutter build web`, but the app does not render and an exam cannot be sat — see [below](#the-web-build-is-desktop-only) | — | — | — |
 
 ### The web build is desktop-only
@@ -1328,7 +1347,10 @@ build's `MediaPipeProctoringService` — is Android and iOS only. So on the web:
   the same sentences a phone's ML Kit feeds the monitor — presence, a covered or
   frozen frame, face count and head pose are evidence with no host page at all
   ([below](#face-signals-on-the-web-the-host-page-bridge)); a host page may add
-  its own detections through the same `proctorGuardFaceSignal` bridge;
+  its own detections through the same `proctorGuardFaceSignal` bridge — and when
+  the browser has no sensor that can measure a head angle, the page says so on a
+  second hook (`proctorGuardFaceAnalysis`), the student is told above the paper
+  and the heartbeat stops claiming a measured sitting;
 * `MOCK_CAMERA=true` still runs the entire exam screen, so the web build is a
   complete development harness without a webcam.
 
@@ -1378,25 +1400,32 @@ shadow root above it. Per tick:
   `app_minimized` from the web guard, and the browser throttles its timers there;
   charging the same act twice would flag a preview the student could not uncover.
 * **Otherwise a live, non-blank frame.** A face model decides, and this page has
-  two, in the order they are trusted: the browser's own Shape Detection API
-  (`window.FaceDetector`, Chromium only) and, for every browser that ships none,
-  the **MediaPipe FaceLandmarker** this build carries (`web/mediapipe/`:
+  two: the browser's own Shape Detection API
+  (`window.FaceDetector`, Chromium only) and the **MediaPipe FaceLandmarker** this
+  build carries (`web/mediapipe/`:
   `vision_bundle.mjs`, the WASM runtime and `face_landmarker.task`, imported
   lazily from the app's own origin once a camera is live, and moved by a
   `window.proctorGuardMediaPipe` the host page may set before this script loads).
-  A page never runs both. The count decides: `0` → `no_face`, more than one →
-  `multiple_faces`, one → `centered` or a measured `pose:<yaw>,<pitch>` when the
-  landmarks give an angle. When neither model can look — no Shape Detection API
-  and the shipped model still loading, failed to load, or turned off by the host
-  page, which is why the WASM and the `.task` file have to be deployed beside the
-  build — the page says `centered`: never a strike, so a browser that cannot count
-  faces still catches a covered or closed camera and still cannot invent a missing
-  student.
+  The native detector is asked first and its **count** is the page's count — a
+  browser that sees two people is two people, whatever a model says — but its
+  answer is only a pose when it hands back landmarks. A bounding box is not an
+  angle, so a native detector that returns one has the frame handed to the shipped
+  model; that is why a browser can have a `FaceDetector` and still not be its own
+  head-turn sensor. The count decides: `0` → `no_face`, more than one →
+  `multiple_faces`, one → `centered` or a measured `pose:<yaw>,<pitch>` from
+  whichever sensor could measure it. When neither model can look — no Shape
+  Detection API and the shipped model still loading, failed to load, or turned off
+  by the host page, which is why the WASM and the `.task` file have to be deployed
+  beside the build — the page says `centered`: never a strike, so a browser that
+  cannot count faces still catches a covered or closed camera and still cannot
+  invent a missing student.
 
 `ProctorGuardFaceDetector.diagnostics()` in the page console answers "why is
 nothing being flagged" for one sitting: `hook` (is the attempt's Dart side
-listening), `video` (was the preview found), `reason` (which state it is in), and
-`lastVerdict` (what the page last said). A page that never finds a preview warns
+listening), `video` (was the preview found), `reason` (which state it is in),
+`lastVerdict` (what the page last said) and `analysis` (can this page measure a
+head angle at all — the same answer the second hook publishes, so the console and
+the app cannot disagree about a sitting). A page that never finds a preview warns
 once on the console instead of staying silent.
 
 It reports `looking_away` only from a **measured** pose, never from a bounding
@@ -1408,6 +1437,36 @@ counts the same, and a turn past `30°` yaw at once). A count
 with no angle stays a count. A host running a different detector (WASM/WebGPU, or
 a remote service) keeps using the bridge below and can say `looking_away` or
 `pose:<yaw>,<pitch>` itself.
+
+**A page that cannot measure an angle says so.** Everything above is what the page
+*saw*; a second hook carries what it *can see*: `proctorGuardFaceAnalysis`
+(`WebFaceSignalSource.analysisGlobalName`), one boolean, called once per change.
+`true` means the frame goes through a sensor that returns landmarks — the Shape
+Detection API with pose landmarks, or the shipped MediaPipe model — so a head turn
+is measured and `looking_away` is possible. `false` means the page has been reduced
+to counting faces: no `window.FaceDetector` and no model (a host that turned it
+off, a browser without WebAssembly, `web/mediapipe/` not deployed), so its
+`centered` is indistinguishable from a student reading the screen and its head
+turns are never judged. A `FaceDetector` that returns a **bounding box and no
+landmarks** is one of those pages, not a pose sensor — a count is not an angle — so
+that frame is handed to the model instead (the `pose+blind` and `mediapipe+blind`
+scenarios in the lab below), and with no model to hand it to the page publishes
+`false`. The two are different wires on purpose: the verdict channel is evidence
+about a student, this one is the browser describing its own eyesight, and it is
+re-stated for every attempt because each attempt installs a fresh hook.
+
+Nothing about it is a violation: a student cannot choose their browser's WASM
+support, and the page still counts. Two things read it:
+
+* **The student** gets `ExamHeadTurnUnavailableNotice` above the paper ("head turns
+  are not being checked in this browser") because a half-blind sitting must not look
+  like a fully watched one to the person sitting it. It is not dismissible, not an
+  error, and it disappears if a model turns up on a later load.
+* **The supervisor** gets it in the heartbeat: `monitoring_ok` is
+  `camera_ok && analysis`, so `proctoring_coverage()` can tell "watched a student
+  who behaved" from "watched a student whose browser only counts". Counting is
+  still monitoring — absence, a covered lens and a second person are still caught —
+  the beat just stops claiming more than the page can do.
 
 ```js
 // Once per detection, from any page-level detector (WASM, WebGPU, a remote
@@ -1449,8 +1508,11 @@ for a second of evidence the host may never send. Three consequences worth knowi
 The DOM half is type-checked by `flutter analyze` and compiled by the web build;
 the rules are covered on the VM by `test/web_face_presence_test.dart`, the exam
 page's use of them by the "the browser face bridge" group in
-`test/exam_taking_page_test.dart`, and the shipped sensor's own contract (the hook
-name, the vocabulary, and that a stopped/hidden/blank camera is `no_face`) by
+`test/exam_taking_page_test.dart` (including the head-turn notice and that a
+count-only page still catches a second person), and the shipped sensor's own
+contract (both hook names, the vocabulary, that a stopped/hidden/blank camera is
+`no_face`, that a native `FaceDetector` is not by itself a pose sensor, and that
+`diagnostics()` can explain a count-only page) by
 `test/web_face_detector_contract_test.dart`.
 
 **Checking the sensor against a picture, without a phone.** The rules above are
@@ -1458,14 +1520,20 @@ numbers — a spread, a mean, a count of identical ticks — so
 `tool/face_lab/` runs the shipped `web/proctor_face_detector.js` unmodified inside
 a headless Chromium, against the fake platform-view DOM and a synthetic camera it
 can cover, blow out, dim, freeze or fail to deliver, and fails the run if any
-scenario ends in the wrong verdict:
+scenario ends in the wrong verdict **or tells the page the wrong thing about its
+own sensors**: the harness installs both hooks, so a scenario that should publish
+`analysis: false` (a native detector with no landmarks) and one that should publish
+`true` (the model, or a native detector that really measured) are asserted on the
+wire the app reads, not on a log line.
 
 ```
 cd mobile && node tool/face_lab/lab.js
 ```
 
-`all 14 scenarios behaved` is the pass line; a miss prints the verdict it got and
-the reason (`PASS canvas+covered … after=no_face,no_face,no_face mean=39 spread=4`)
+`all 30 scenarios behaved` is the pass line; every row also prints what the page
+told Dart about its own sensors (`analysis=angles` / `analysis=count-only`, or
+`unspoken` when nothing was sampled), and a miss prints the verdict it got and the
+reason (`PASS canvas+covered … after=no_face,no_face,no_face mean=39 spread=4`)
 and writes the full state to `%TEMP%\pg_face_lab_last_run.json`. It needs Node 22+
 (global `WebSocket`) and Edge or Chrome — `PG_LAB_BROWSER` points it at another.
 This is the check that catches the failure this sensor actually had: an
@@ -1666,7 +1734,7 @@ the weighted strike rule:
 | Detector | Signal | `action_type` |
 | --- | --- | --- |
 | ML Kit face detection | no face (three consecutive frames) / several faces / head pose off-axis (a turn or a tilt past 15 deg on either axis, either direction, **held for two seconds** across consecutive frames) | `no_face`, `multiple_faces`, `looking_away` |
-| `web/proctor_face_detector.js` (Chrome/Edge) | the preview's camera track ended, is muted/disabled, is paused or hidden, a preview that has shown nothing for five seconds, or the frame carries no picture (featureless whatever its brightness, dim and near-featureless, blown out, or the same thumbnail for three ticks running) → `no_face`; a face count and head pose from the Shape Detection API or the shipped MediaPipe model, so a look-away becomes `looking_away` too ([details above](#face-signals-on-the-web-the-host-page-bridge)) | `no_face`, `multiple_faces`, `looking_away` |
+| `web/proctor_face_detector.js` (Chrome/Edge) | the preview's camera track ended, is muted/disabled, is paused or hidden, a preview that has shown nothing for five seconds, or the frame carries no picture (featureless whatever its brightness, dim and near-featureless, blown out, or the same thumbnail for three ticks running) → `no_face`; a face count and head pose from the Shape Detection API or the shipped MediaPipe model, so a look-away becomes `looking_away` too — and a page that can only count faces says so on `proctorGuardFaceAnalysis` rather than leave an unmeasured sitting looking proctored ([details above](#face-signals-on-the-web-the-host-page-bridge)) | `no_face`, `multiple_faces`, `looking_away` |
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
 | `WebGuards` (Chrome/Edge) | tab hidden, window blurred, or HTML5 fullscreen left | `app_minimized` |
@@ -2107,7 +2175,12 @@ written-down opt-out for a throwaway demo build and never for one a student runs
   four values (`student`, `lecturer`, `supervisor`, `admin`) come from the
   `public.user_role` enum, and `schema.sql` asks about it through the role
   predicates — `is_staff()`, `is_admin()`, `is_exam_supervisor()`,
-  `is_attempt_resetter()` — and through ownership: `owns_exam()` scopes the
+  `is_attempt_resetter()` — and through the **scope** predicate,
+  `can_supervise_exam(exam_id)`, which is "an administrator, or a supervisor listed
+  in `supervisor_exam_assignments` for that paper": every policy that used to grant
+  the intervention tier the whole institution now asks it with the paper the row
+  belongs to, and `is_supervisor_only()` is the complement that leaves a lecturer's
+  `is_staff()` arms exactly as they were. `owns_exam()` scopes the
   incident feed and the reset audit to the papers the reader wrote. RLS cannot
   restrict a *column*, so the
   `profiles_guard_role_change` trigger raises `42501`

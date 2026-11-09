@@ -105,6 +105,14 @@ begin
     (v_exam_a, 'Consent paper A', v_lecturer, 60, true),
     (v_exam_b, 'Consent paper B', v_lecturer, 60, true);
 
+  -- `20261109090000_supervisor_exam_assignments.sql`: a supervisor now reaches the
+  -- papers an administrator assigned to them, so the supervisor tier this file
+  -- exercises on both papers is assigned to both. The scope itself - a supervisor
+  -- with *no* row reaching nothing - is proven in `supervisor_scope_check.sql`.
+  insert into public.supervisor_exam_assignments (exam_id, supervisor_id, assigned_by)
+    values (v_exam_a, v_supervisor, v_lecturer),
+           (v_exam_b, v_supervisor, v_lecturer);
+
   -- Attempts the insert policy is not under test for: one finished (its still may
   -- expire) and one still running (its still may not). Written as postgres, so no
   -- consent is involved.
