@@ -794,9 +794,13 @@ through this page's harness in `test/role_routing_test.dart`.
 
 ### Supervisor console and staff analytics
 
-`SupervisorExamPickerPage` lists published exams and opens
-`SupervisorDashboardPage`, whose roster and incident feed are Supabase Realtime
-streams. Whether the roster offers the reset control is decided in two questions,
+`SupervisorDashboardPage` is opened from `SupervisorExamPickerPage`, and its roster
+and incident feed are Supabase Realtime streams. The picker is the same
+`PublishedExamList` widget the student portal uses, but not the same rows: since
+`20261109090000_supervisor_exam_assignments.sql` a supervisor lists exactly the
+sittings an administrator assigned to them (`can_supervise_exam()`, projected by
+`exams_select`), so an empty list reads "nobody put you on a paper", not "no papers
+exist". Whether the roster offers the reset control is decided in two questions,
 asked together: the **role**, `UserRole.canResetAttempts` — `admin`, `supervisor`
 **and** `lecturer`, which is `is_attempt_resetter()`'s own list in
 `supabase/schema.sql` read back out of the file by `schema_contract_test.dart` —
@@ -1026,7 +1030,7 @@ nothing in it is a decision to make. Two tabs:
 
 | Tab | What the student is told |
 | --- | --- |
-| `instructions-tab-proctor` | the camera (on for the whole sitting, faces checked on-device, a snapshot kept with each incident, and that a person reviews every snapshot), the microphone (noise above the room's own floor is what counts — about a second of it, so a short phrase is enough and a cough, a chair or a keyboard is not — the indicator shows the level, and a refused or unplugged mic says so instead of passing as fine), staying in the exam (the kiosk pin on a phone, the browser guards — tab/focus/fullscreen, copy/paste, back/reload), and that three confirmed strikes close the attempt as disqualified — including that a wrong one can be reset by the paper's author or a supervisor |
+| `instructions-tab-proctor` | the camera (on for the whole sitting, faces checked on-device, a snapshot kept with each incident, and that a person reviews every snapshot), the microphone (noise above the room's own floor is what counts — the tab's copy rounds that to "about a second", where the detector asks for **two unbroken seconds** or the same noise **returning in bursts** inside a minute, so a cough, a chair or a keyboard is still not a strike; that sentence has not caught up with the burst rule — see [Microphone proctoring](#microphone-proctoring-levels-not-recordings) — and the indicator shows the level, while a refused or unplugged mic says so instead of passing as fine), staying in the exam (the kiosk pin on a phone, the browser guards — tab/focus/fullscreen, copy/paste, back/reload), and that three counted signals **stop the attempt for a supervisor to review** rather than disqualifying it outright — including that a wrong decision can be undone, and that a reset by the paper's author or a supervisor clears the attempt, its incidents and its snapshots. One line of that copy is stale in the same way: it still lists a glance off screen ("Glancing away, background noise … never end the attempt") among the signals that do not count, which `20261108090000_looking_away_and_noise_count.sql` re-priced to a counted strike — see [Tuning the violation weights](../README.md#tuning-the-violation-weights) |
 | `instructions-tab-exam` | the clock (the paper's own duration from the start, a scheduled paper also closing at `ends_at`, answers saved as you go including offline, an unanswered question scoring nothing), when a mark appears (instantly for a paper with no written answers; after the lecturer marks the essays otherwise), one attempt per paper and what a reset clears, what the device check requires (and that a browser flags faces by review, not live), and what to do if something goes wrong |
 
 The wording deliberately matches the screens the student is about to meet — the
@@ -1149,7 +1153,7 @@ Details worth knowing:
   shut, not the student hostage — and it is the one route past the `PopScope`.
   Losing the camera or the microphone is still **not a strike**: it is an
   unproctored gap with a fix, and the strike counter only ever counts sustained
-  speech, faces and escapes.
+  speech, repeated bursts of it, faces and escapes.
 * **The camera is video-only; the microphone belongs to audio proctoring.**
   `CameraController` is created with `enableAudio: false`. The camera plugin's own
   audio capture is not used for anything — nothing here records sound — and asking
@@ -1162,7 +1166,9 @@ Details worth knowing:
   what the room sounds like.** A second, independent capture session
   (`AudioMonitor`, `record`'s `getAmplitude()`) streams dBFS samples into
   `AudioNoiseDetector`, which measures the room's own noise floor first and then
-  treats *sustained* speech above it as `audio_noise`. No audio is ever written to a
+  treats speech above it as `audio_noise` — sustained for two seconds, or repeated
+  in bursts that add up inside a rolling minute ([the rule in
+  full](#microphone-proctoring-levels-not-recordings)). No audio is ever written to a
   file. A lost or refused microphone is **not** a strike — it is an unproctored gap —
   but it does **block** the paper: the page raises the same opaque
   `EquipmentBlockOverlay` the camera does, with **Reconnect** (a device that went
@@ -1739,7 +1745,7 @@ the weighted strike rule:
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
 | `WebGuards` (Chrome/Edge) | tab hidden, window blurred, or HTML5 fullscreen left | `app_minimized` |
-| `AudioMonitor` + `AudioNoiseDetector` | a `record` capture session streams dBFS samples; the room's own floor is measured first, then speech sustained above it ([details below](#microphone-proctoring-levels-not-recordings)) | `audio_noise` |
+| `AudioMonitor` + `AudioNoiseDetector` | a `record` capture session streams dBFS samples; the room's own floor is measured first, then speech above it sustained for 2 s, or repeated in bursts that add up inside a rolling 60 s window ([details below](#microphone-proctoring-levels-not-recordings)) | `audio_noise` |
 
 Camera signals are **counted in frames**, not measured in seconds: `looking_away`
 is reported only once the head has stayed past 15 deg of yaw or 15 deg of pitch for
@@ -1826,8 +1832,7 @@ not one every ten seconds. That is stricter than the 750 ms window with a 400 ms
 3 dB release this used to ship, and the trade is deliberate:
 
  * a cough, a chair, a door, a keystroke or a short "hey you" still cannot fill the
-   window, and now a sentence that breaks up between words may not either — the
-   error in that direction is silence;
+   window — a single one of those is one run, and one run is never a strike;
  * a room that is genuinely loud for two unbroken seconds **is** a counted strike
    now (`looking_away` and `audio_noise` both weigh 1 in `violation_weights`), so
    an honest student in a corridor, a hall or beside a television can reach three
@@ -1836,15 +1841,33 @@ not one every ten seconds. That is stricter than the 750 ms window with a 400 ms
  * neither direction has been measured with a real microphone in a real room; see
    the root README's "What is *not* verified".
 
+**The second way of asking the same question is bursts, and it exists because the
+first one is silent about phrases.** A student who reads the paper out loud — a
+sentence, a pause, a sentence — never holds two unbroken seconds, so the window above
+never fills; every pause resets it. Beside it, and without relaxing it, the detector
+counts *runs*: a run of above-threshold sound lasting at least 300 ms
+(`audioNoiseMinBurst`) is a **burst**, and **three bursts inside a rolling 60-second
+window** (`audioNoiseBurstCount`, `audioNoiseBurstWindow`) are one `audio_noise` — as
+is **4 s of above-threshold sound in that window however it was divided up**
+(`audioNoiseBurstTotal`), which is the shape the count is blind to: syllables each too
+short to be a burst. A run shorter than 300 ms is still measured (it adds to the
+total), it just is not a burst on its own. A burst report goes through the *same*
+latch and cooldown as the 2 s rule, and it **empties the window**, so one
+conversation cannot produce two strikes — but a dip never clears the window, because
+the bursts it holds are exactly what is being counted. The window ages on the clock
+rather than on samples, so a microphone that stops delivering frames cannot keep old
+evidence alive. Four numbers, one rule, all named in `proctoring_thresholds.dart` and
+none of them measured with a real microphone yet.
+
 After a strike the detector also ignores the level for 10 s (`cooldown`), which is
 the minimum interval between strikes, so a raised voice and a slamming door a moment
 apart do not stack. The three de-duplication layers in order: the detector's window +
-latch + cooldown (per episode), `ProctoringNotifier`'s 2 s per-type debounce
-(`_dedupeWindow`, so two events of the same type in the same instant are one row),
-and `register_violation`'s `client_event_id` uniqueness, which is idempotency rather
-than a cooldown — a replayed delivery inserts nothing. Calibration doubles as the
-start-of-session grace period: nothing can be logged
-before it finishes.
+latch + cooldown (per episode, or per burst window), `ProctoringNotifier`'s 2 s
+per-type debounce (`_dedupeWindow`, so two events of the same type in the same instant
+are one row), and `register_violation`'s `client_event_id` uniqueness, which is
+idempotency rather than a cooldown — a replayed delivery inserts nothing. Calibration
+doubles as the start-of-session grace period: nothing can be logged before it
+finishes.
 
 Kiosk bridge contract — MethodChannel `lock_task_channel`:
 
@@ -1875,10 +1898,12 @@ own unpin is not an escape" and "a single inactive blip is tolerated" rules);
 budget (a critical strike overtakes a softer one stuck on the same dead capture, and an
 in-time still is still attached). The audio
 half adds `mobile/test/audio_monitoring_test.dart` (the detector's rules and the
-monitor's state machine), `mobile/test/audio_noise_detector_tuning_test.dart` (the
-hysteresis band, the calibration cap and the shipped sensitivity) and the `audio
-proctoring` group in `mobile/test/exam_taking_page_test.dart` (the chip, driven
-through a fake microphone).
+monitor's state machine), `mobile/test/audio_noise_burst_window_test.dart` (the
+repeated-burst rule: count, total, the rolling window, the strike that empties it),
+`mobile/test/audio_noise_detector_tuning_test.dart` (the hysteresis band, the
+calibration cap and the shipped sensitivity) and the `audio proctoring` group in
+`mobile/test/exam_taking_page_test.dart` (the chip, driven through a fake
+microphone).
 
 ## Microphone proctoring (levels, not recordings)
 
@@ -1888,6 +1913,24 @@ samples — four a second (`sampleInterval`) — to `AudioNoiseDetector`. That s
 **streams PCM and writes no file**: the bytes are drained and thrown away (never
 analysed, never stored), so all that leaves the microphone is a stream of decibel
 numbers. Nothing about the room is recorded, buffered to disk or uploaded.
+
+Those numbers become a strike in exactly two shapes, both measured against the room's
+own floor rather than a fixed number. The first is **two seconds above the threshold
+without a single sample below it** (`audioNoiseSustain`; a dip resets the timer) — the
+rule the product asked for, and one episode is one strike. The second sits beside it
+and is what hears a student reading the paper out in phrases, which never holds two
+unbroken seconds: **three bursts of at least 300 ms, or 4 s of above-threshold sound
+in total, inside a rolling 60-second window** (`audioNoiseMinBurst`,
+`audioNoiseBurstCount`, `audioNoiseBurstTotal`, `audioNoiseBurstWindow`). Either shape
+is one `audio_noise`, both share the latch and the 10 s cooldown, the burst window is
+emptied by the strike it produces, and a dip never clears it — the bursts it holds are
+exactly what is being counted. `mobile/test/audio_noise_burst_window_test.dart` pins
+the window (three phrases in a minute, the two that are not enough, phrases spread
+over ninety seconds, the click too short to be a burst, the four seconds of
+fragments, the window emptying on a report, the cooldown swallowing what follows,
+`reset()`, and the 2 s rule still standing on its own). None of those four numbers has
+been measured with a real microphone in a real room yet — see the root README's
+"What is *not* verified".
 
 The monitor is a small state machine rather than a bag of futures, because every way
 a microphone can fail has to land somewhere the student can act:
@@ -1908,7 +1951,8 @@ Two of those rows are the point of the feature. A device that cannot be opened, 
 that never reports a single level, is reported as `unavailable` instead of looking
 exactly like an empty room — **not listening must never be mistaken for quiet**. And
 losing the microphone is *not* a strike: it is an unproctored gap, so the session's
-violation count only ever counts sustained speech. It is not a prompt the student can
+violation count only ever counts speech the detector heard — a sustained episode or a
+run of bursts. It is not a prompt the student can
 sit through either: `permissionDenied` and `interrupted` both raise the opaque
 `EquipmentBlockOverlay` (see [the exam session screen](#the-exam-session-screen)),
 because a *dismissible* "Mic lost" toast leaves the paper readable and typeable with

@@ -42,30 +42,40 @@ supabase/     Schema, migrations, seed data, and Edge Functions
   every operation.
 
 Roles are stored in the `public.user_role` enum: `student`, `lecturer`,
-`supervisor`, and `admin`. Lecturers own the papers they write: they author its
-questions and award the marks on its essays. Supervisors run the sitting. Both
-share the sitting's tools — the live monitor and the attempt reset — because
-`is_attempt_resetter()` names `admin`, `supervisor` **and** `lecturer`: the paper's
-author is the one who has to repair a wrong answer key or a disqualification
-aimed at the wrong candidate. The narrower tier that remains is
-**Who may intervene in a given paper** is the assignment table, not the tier:
-`supervisor_exam_assignments` lists the supervisor each sitting was handed to,
-`can_supervise_exam(exam_id)` answers "an administrator, or that supervisor", and
-every policy that used to ask the role tier (`is_exam_supervisor()`) now asks that
-question with the paper the row belongs to — so a supervisor's console lists their
-own sittings, and their reads, resets, review decisions and snapshot access are
-confined to them, while an administrator needs no row and still reaches every
-paper. The same scope decides whose **names** the console can print: a supervisor
-reads the profile of a student who sat, was granted or is aimed at a paper they run
-(`can_read_profile()`), where `is_staff()` used to hand them every profile row in the
-institution — name, matriculation number, faculty, department, level and photograph —
-assigned or not. That tier used to read *every*
-paper's evidence — the incident feed and the reset audit. A lecturer reads the
-evidence recorded on their **own** papers and nothing else's: those two policies
-ask `owns_exam()` (`exams.created_by = auth.uid()`) as well as the scope
-predicate, so the roster a lecturer may see is wider than the logs they may read for
-it. See [mobile/README.md](./mobile/README.md), "Role routing (post-login)".
-Only admins can manage accounts.
+`supervisor` and `admin`, and **who may act on a given paper is answered by the
+paper, not by the role**. An administrator needs no row and reaches every paper: the
+admin arms of `is_admin()`, `exams_select` and `profiles_admin_all` are the
+institution-wide ones, and account management is the admin console's alone. A
+supervisor reaches only the sittings an administrator assigned to them:
+`supervisor_exam_assignments` holds one `(paper, supervisor)` row per handover,
+`can_supervise_exam(exam_id)` answers "an administrator, or the supervisor assigned
+to this paper", and every policy that used to ask the role tier
+(`is_exam_supervisor()`) now asks that question with the paper the row belongs to —
+so a supervisor's picker lists their own sittings, and their roster reads, resets,
+review decisions and snapshot access stop at them. The same scope decides whose
+**names** that console can print: `profiles_select_own_or_staff` asks
+`can_read_profile(id)` of a supervisor, so they read the profile of a student who sat
+a paper they run, was granted one through its borrow list, or is aimed at one by a
+labelled paper of theirs — the students the monitor shows — where `is_staff()` used
+to hand every supervisor every profile row in the institution, name, identity number
+and academic labels included, assigned or not. A lecturer keeps exactly the papers
+they wrote: `owns_exam()` (`exams.created_by = auth.uid()`) scopes their edits, the
+incident feed and the reset audit to those papers, while the **roster read** stays
+`is_staff()`-wide, so a lecturer can watch any sitting's roster and see the evidence
+recorded inside only their own papers. The staff repair actions follow the same
+split. `is_attempt_resetter()` (admin, supervisor **and** lecturer) is what the app
+gates the **Reset attempt** control on, but the DELETE itself is
+`can_supervise_exam(exam_id) or owns_exam(exam_id)` — the assigned supervisor, an
+administrator, or the paper's own author, never another sitting's supervisor and
+never another lecturer's paper. A reset deletes the attempt row (its incident rows
+cascade, its stills are purged through the Storage API) and appends an audit row to
+`session_reset_logs`; it is deliberately **not** how a flagged attempt is released.
+That is `resolve_flagged_attempt()`, a supervisor-or-author decision between
+`clear` — the review flag is lifted and the attempt returns to `submitted` for
+marking — and `disqualify`, which stores the decision with the reviewer's note in
+`attempt_review_logs`. Reopening a closed attempt is offered to nobody: to let a
+student sit a paper again, the attempt is reset. See
+[mobile/README.md](./mobile/README.md), "Role routing (post-login)".
 
 An attempt is graded by the same call that closes it. `submit_exam()` computes
 the score from the answers it can grade and answers with
@@ -82,9 +92,11 @@ Students meet the same two rules before an attempt exists. A scheduled paper is
 listed but inert outside its window ("It opens …" / "It closed …"), and **both**
 pre-exam screens — the student portal and the device check — open a two-tab
 instructions dialog: **How the proctor works** (the camera and its snapshots, the
-microphone's noise floor, the kiosk/browser rules, three strikes and the reset
-that can undo one) and **Exam rules** (the clock, when a mark appears, one attempt
-per paper, what the device check requires). See
+microphone's noise floor — two unbroken seconds, or the same noise returning in
+bursts inside a minute — the kiosk/browser rules, and what three counted signals do:
+the attempt stops and goes to a supervisor, whose decision can be undone and whose
+reset clears the attempt) and **Exam rules** (the clock, when a mark appears, one
+attempt per paper, what the device check requires). See
 [mobile/README.md](./mobile/README.md), "Pre-exam instructions (the proctor guide
 and the exam rules)".
 
@@ -114,9 +126,14 @@ rather than left to be mistaken for more than it is.
   it cannot tell a student apart from a similarly-shaped stand-in, and there is
   no liveness challenge (no blink / turn / read-a-phrase prompt).
 - **Audio is loudness, not content.** The microphone is sampled for level
-  (dBFS) only; energy above the room's measured floor, held for **two seconds
-  without dropping below it**, raises `audio_noise` — and one continuous episode is
-  one strike. **No audio is recorded, transmitted or stored** — only the
+  (dBFS) only, and `audio_noise` is raised two ways, both on that level: energy
+  above the room's measured floor held for **two seconds without dropping below
+  it**, and — for speech that keeps stopping and starting, which never fills that
+  window — **three bursts of at least 300 ms, or 4 s of above-floor sound in
+  total, inside a rolling 60-second window**. The two-second rule is neither
+  relaxed nor replaced by the second: an episode of either is **one** strike, and
+  the burst window is emptied by the strike it produces, so a single conversation
+  cannot stack two. **No audio is recorded, transmitted or stored** — only the
   decibel numbers the detector reads, in memory. It flags "someone is talking",
   not *what* was said, and cannot separate speech from a television at a similar
   loudness.
@@ -183,7 +200,7 @@ rather than left to be mistaken for more than it is.
 | --- | --- | --- |
 | Impersonation / a stand-in on camera | Face detection is not face recognition and has no liveness check | Supervisor review of the attempt's evidence; add an identity-match + liveness step where the stakes require it |
 | A helper off-camera or on another device | The camera only sees in front of the lens; audio is level-only | `multiple_faces`, `no_face`, `looking_away`, `idle_afk` and `secondary_display_detected` signals, plus supervisor judgement |
-| Sound that is not plain talking (TV, music, a second speaker) | Loudness cannot be attributed to a person or separated from other sound | Sustained-threshold rules (a median-calibrated room floor plus a 6 dB speech margin, held for 2 s with no dip below the line, one episode = one strike) keep one-offs out; content is deliberately never captured. A noisy room **can** reach three counted strikes and close the sitting for review — the rule is strict on purpose and the review is a human's |
+| Sound that is not plain talking (TV, music, a second speaker) | Loudness cannot be attributed to a person or separated from other sound | Sustained-threshold rules (a median-calibrated room floor plus a 6 dB speech margin, held for 2 s with no dip below the line, one episode = one strike) plus a repeated-burst rule (three bursts of at least 300 ms, or 4 s in total, inside a rolling 60 s window, one strike, window emptied by it) keep one-offs out; content is deliberately never captured. A noisy room **can** reach three counted strikes and close the sitting for review — the rule is strict on purpose and the review is a human's |
 | A microphone that fails mid-session (unplugged, grant revoked, another app took the input) | Level is the only audio signal, so a dead mic stops speech being detected at all | The chip reports `Mic lost` / `Mic unavailable` / `Mic blocked` — **never a false "quiet"** — and the paper is held shut behind the opaque equipment block, with **Reconnect** / **Open settings** / **Leave** (the `unavailable` case stays on the indicator: a barrier nobody can clear would strand the student). A lost mic is an **unproctored gap, not a strike**, so no attempt is ended for it — but nothing can be read or typed behind the block either, so the gap cannot pass as a clean run |
 | Escape from the locked exam surface | Screen pinning (no Device Owner) and browser fullscreen can be left | An escape or a fullscreen exit becomes an `app_minimized` strike; the kiosk badge shows whether pinning is enforced or best-effort |
 | Detector evasion (rooted/virtualised device, camera spoof) | Client-side detectors can be defeated by a determined, technically capable student | Treat the client as untrusted: grading and the weighted strike rule are enforced **server-side** (`register_violation`, `submit_exam`, `resolve_flagged_attempt`) |
@@ -204,14 +221,20 @@ kind of detail a pilot finds out the hard way:
   timer-driven disqualification is trusted.
 - **The audio threshold has never been measured in a real room either.** The rule is
   a median-calibrated floor plus 6 dB, clamped to −50…−32 dBFS, held for two seconds
-  continuously (`AudioNoiseDetector`, `proctoring_thresholds.dart`). It is unit-
-  tested at the meter's real 250 ms rate, but no corridor, hall, fan, television or
-  busy canteen has been used to check it. Two errors are possible and only one of
-  them is quiet: a room loud enough to clear the line for two unbroken seconds now
-  earns a **counted** strike (three of those close the sitting for review — never an
-  automatic disqualification, and a supervisor can clear it), while speech that dips
-  between words may never fill the window at all. Measure both directions before a
-  pilot relies on either.
+  continuously (`AudioNoiseDetector`, `proctoring_thresholds.dart`), with a second
+  way of asking the same question beside it: three bursts of at least 300 ms, or
+  4 s of above-floor time, inside a rolling 60-second window, one strike, and the
+  window emptied by the strike it produces. Every number is a named constant
+  (`audioNoiseSustain`, `audioNoiseMarginDb`, `audioNoiseMinBurst`,
+  `audioNoiseBurstWindow`, `audioNoiseBurstCount`, `audioNoiseBurstTotal`) and is
+  unit-tested at the meter's real 250 ms rate, but no corridor, hall, fan,
+  television or busy canteen has been used to check any of them with a real
+  microphone. Two errors are possible and only one of them is quiet: a room loud
+  enough to clear the line for two unbroken seconds now earns a **counted** strike
+  (three of those close the sitting for review — never an automatic
+  disqualification, and a supervisor can clear it), while a student whose phrases
+  are shorter than a burst and more spaced out than three a minute may still never
+  reach either rule. Measure both directions before a pilot relies on either.
 - **The sign of the pitch a browser detector reports is unverified.** The shipped
   FaceLandmarker path reads a rotation matrix, a host page sends `pose:` degrees,
   and the two need not agree on which direction is "up". The app therefore compares
@@ -378,7 +401,7 @@ operator's decision. See
    supabase db query --linked -f supabase/migrations/20261106090000_proctoring_consents.sql
    supabase db query --linked -f supabase/migrations/20261106090100_snapshot_retention.sql
    supabase db query --linked -f supabase/migrations/20261108090000_looking_away_and_noise_count.sql
-supabase db query --linked -f supabase/migrations/20261109090000_supervisor_exam_assignments.sql
+   supabase db query --linked -f supabase/migrations/20261109090000_supervisor_exam_assignments.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -621,8 +644,19 @@ Things worth knowing before you turn it on:
   author is around), because nothing resolves a review automatically. Neither file
   rewrites a `proctoring_logs` row or re-reads an existing attempt: see
   [Tuning the violation weights](#tuning-the-violation-weights).
-- Apply `supabase/migrations/20261109090000_supervisor_exam_assignments.sql` **last**,
-  on every project. It creates `public.supervisor_exam_assignments` (one
+- Apply `supabase/migrations/20261108090000_looking_away_and_noise_count.sql` after
+  `20261104090100_weighted_strikes_and_flagged_review.sql`, on every project. It is
+  one `UPDATE` that turns `looking_away` and `audio_noise` from "recorded for review
+  only" (weight 0) into counted strikes (weight 1), so three of either now closes the
+  sitting for review. It is safe to re-run, and it is the only way those two rows
+  change on a live database: re-applying `schema.sql` or `20261104090000` will not
+  push the new values into a table that already holds the old ones (`on conflict …
+  do nothing`). Verify with `select action_type, weight, counts_toward_dq from
+  public.violation_weights where action_type in ('looking_away','audio_noise');` —
+  expect `1 / true` twice. Nothing is backfilled: existing evidence keeps its rows
+  and existing attempts keep their status.
+- Apply `supabase/migrations/20261109090000_supervisor_exam_assignments.sql` after it,
+  **last of all**, on every project. It creates `public.supervisor_exam_assignments` (one
   `(paper, supervisor)` row per sitting), the `can_supervise_exam()` /
   `is_supervisor_only()` predicates, and re-creates every policy and RPC that used to
   ask the role tier `is_exam_supervisor()` so that the supervisor arm asks the scope
@@ -633,7 +667,7 @@ Things worth knowing before you turn it on:
   read are untouched) and administrators need no row. The one read it narrows that is
   not about a paper's evidence is the roster itself: `profiles_select_own_or_staff`
   let **any** supervisor read **every** profile row in the institution — name,
-  matriculation number, faculty, department, level and photograph — by being
+  email address, matriculation or staff number and the academic labels — by being
   `is_staff()`, assigned or not, and it now asks `can_read_profile(id)`: the students
   who sat a paper the supervisor runs, who were granted one, or whom a labelled paper
   of theirs is aimed at. The monitor's names still resolve, because they are exactly
@@ -646,17 +680,6 @@ Things worth knowing before you turn it on:
   vs unassigned paper, roster, incident feed, stills, review decision, reset, the RPCs,
   the demotion path and the profile roster read). Verify with
   `select exam_id, supervisor_id from public.supervisor_exam_assignments;`.
-- Apply `supabase/migrations/20261108090000_looking_away_and_noise_count.sql` after
-  those two, on every project. It is one `UPDATE` that turns `looking_away` and
-  `audio_noise` from "recorded for review only" (weight 0) into counted strikes
-  (weight 1), so three of either now closes the sitting for review. It is safe to
-  re-run, and it is the only way those two rows change on a live database:
-  re-applying `schema.sql` or `20261104090000` will not push the new values into a
-  table that already holds the old ones (`on conflict … do nothing`). Verify with
-  `select action_type, weight, counts_toward_dq from public.violation_weights where
-  action_type in ('looking_away','audio_noise');` — expect `1 / true` twice. Nothing
-  is backfilled: existing evidence keeps its rows and existing attempts keep their
-  status.
 - Apply `supabase/migrations/optional_question_shuffling.sql` before the first
   paper that has question-order shuffling enabled. Until it runs, the
   `shuffle_questions` column does not exist: the authoring console reports the
@@ -780,17 +803,24 @@ supervisor's decision. The seeded policy:
 | 1 | yes | `multiple_faces`, `no_face`, `app_minimized`, `devtools_detected`, `secondary_display_detected`, `virtual_camera_detected`, **`looking_away`**, **`audio_noise`** |
 | 0 | no | `copy_paste_attempt`, `right_click_blocked`, `idle_afk` |
 
-**Three glances off screen close the sitting, and so do three sustained noisy-room
-episodes.** Both signals count now
+**Three glances off screen close the sitting, and so do three noisy-room strikes.**
+Both signals count now
 (`supabase/migrations/20261108090000_looking_away_and_noise_count.sql`), because a
 candidate reading a second screen and a candidate talking the paper through with
 somebody in the room are exactly what a camera-and-microphone proctor is good at —
 and neither used to move the score at all. Neither is a single frame or a single
 sample: the client only reports a look-away after 15° of yaw **and** 15° of pitch
-have been held for 2 seconds, and a noisy room only after the level has stayed above
-the room's own measured threshold for 2 seconds continuously (a dip resets the
-timer, and one episode is one strike). The old values, for a project comparing
-notes with an older install:
+have been held for 2 seconds, and a noisy room in one of two ways, both on the
+measured level — the level staying above the room's own threshold for 2 seconds
+continuously (a dip resets the timer, and one episode is one strike), **or** three
+bursts of at least 300 ms, or 4 s of above-threshold sound in total, inside a rolling
+60-second window, which is the shape the 2 s rule cannot see: a student reading the
+paper out in phrases. A burst strike goes through the same latch and cooldown and
+**empties the window**, so one conversation cannot stack a burst strike and a
+sustained one. Every number there is a named constant in
+`proctoring_thresholds.dart` (`audioNoiseSustain`, `audioNoiseMinBurst`,
+`audioNoiseBurstWindow`, `audioNoiseBurstCount`, `audioNoiseBurstTotal`). The old
+values, for a project comparing notes with an older install:
 
 | Signal | Before 20261108090000 | Now |
 |--------|----------------------|-----|
@@ -801,21 +831,24 @@ notes with an older install:
 Every signal is still stored in `proctoring_logs` and still shown to the
 supervisor; the weight only decides which ones may end an attempt on their own.
 
-**Two of these numbers have not been tested with real people.** The 15° / 2 s
-look-away rule and the audio threshold (the room's median floor plus 6 dB, clamped
-to −50…−32 dBFS, held for 2 s) are unit-tested and pinned, but no real head has been
-put in front of one here and no real room behind the other. The rate that decides
-whether they are safe is the false-positive rate, and it has not been measured. Two
-consequences to go in with your eyes open:
+**Some of these numbers have not been tested with real people.** The 15° / 2 s
+look-away rule and the audio rules (the room's median floor plus 6 dB, clamped to
+−50…−32 dBFS, held for 2 s, and the repeated-burst window beside it) are unit-tested
+and pinned, but no real head has been put in front of one here and no real room or
+microphone behind the others. The rate that decides whether they are safe is the
+false-positive rate, and it has not been measured. Two consequences to go in with
+your eyes open:
 
 - a student who works with the laptop low, reads a printed sheet on the desk, or
   sits in a corridor, a hall or beside a television **can reach three counted
   strikes and lose the sitting** — which is why the third strike produces
   `flagged_for_review` and never an automatic disqualification: a human reads it,
   and `resolve_flagged_attempt('clear')` puts the attempt back in the marking queue;
-- the audio rule is strict on purpose (a dip below the threshold restarts the 2 s
-  window), so speech that breaks up between words may never fill it. That direction
-  of error is silence, not a false strike; the noisy room above is the other one.
+- the audio rules are strict on purpose (a dip below the threshold restarts the 2 s
+  window, and the burst window only forgives a single short noise), so quiet,
+  widely-spaced remarks can still go unheard, while a room that is loud in bursts
+  now counts where the 2 s rule alone would have stayed silent. Neither direction has
+  been measured with a real microphone.
 
 Change one with a single statement — no migration, no redeploy:
 

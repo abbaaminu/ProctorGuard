@@ -24,8 +24,12 @@ weighted_strikes_check.sql`. Tuning is a README section, not a migration.
 
 **Later change (20261108090000):** two of the five "soft, weight 0" rows below were
 re-priced — `looking_away` and `audio_noise` are counted strikes at weight 1, so
-three glances off screen or three sustained noisy-room episodes close the sitting
-for review exactly as three faces in frame do. `copy_paste_attempt`,
+three glances off screen or three noisy-room strikes close the sitting
+for review exactly as three faces in frame do (a noisy room reaches a strike either by
+holding above the room's measured floor for two unbroken seconds or by repeating
+bursts of at least 300 ms - three of them, or 4 s in total, inside a rolling
+60-second window; see `mobile/lib/core/services/proctoring_thresholds.dart`).
+`copy_paste_attempt`,
 `right_click_blocked` and `idle_afk` stay at 0. The threshold (3), the ending
 (`flagged_for_review`) and the human decision (`resolve_flagged_attempt`) are
 unchanged. The prose below is the original proposal and is kept as written, except
