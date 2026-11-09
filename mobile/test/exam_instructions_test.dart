@@ -90,6 +90,50 @@ void main() {
       expect(find.textContaining('the screen is pinned'), findsOneWidget);
     });
 
+    testWidgets(
+        'the proctor tab states the audio rule and what a third strike does',
+        (tester) async {
+      await openDialog(tester);
+
+      // The microphone rule is the rule the detector enforces: a level above the
+      // room's own floor for two unbroken seconds OR the same sound coming back in
+      // bursts (three of at least 300 ms, or 4 s in all, inside a rolling minute -
+      // see `proctoring_thresholds.dart`). The copy used to round that to "about a
+      // second", which a student reads either as "one word is a strike" or as "one
+      // word is fine"; neither is the rule.
+      expect(find.textContaining('two unbroken seconds'), findsOneWidget);
+      expect(
+        find.textContaining('three short bursts inside a minute'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('about a second'), findsNothing);
+
+      // The last rule is the consequence. The 20261108090000 migration priced
+      // looking away and background noise at one strike each, so the sentence that
+      // listed them as recorded-but-harmless said the opposite of the rule. Three
+      // counted strikes of any of those kinds close the attempt for a supervisor -
+      // the server writes `flagged_for_review`, never `disqualified` - so the copy
+      // has to promise a review, not a verdict.
+      await tester.scrollUntilVisible(
+        find.textContaining('Nothing is disqualified automatically'),
+        120,
+        scrollable: find.byType(Scrollable).last,
+      );
+      expect(
+        find.textContaining('turned away from the screen for two seconds'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('stop the attempt and hand it to a supervisor'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('never end the attempt'), findsNothing);
+      // The types that genuinely do not count still say so: a blocked paste, a
+      // suppressed right-click and sitting idle are evidence for the reviewer and
+      // nothing else, so the fix cannot read as "everything is a strike now".
+      expect(find.textContaining('none of those counts'), findsOneWidget);
+    });
+
     testWidgets('the exam-rules tab answers when a mark appears', (tester) async {
       await openDialog(tester);
 
