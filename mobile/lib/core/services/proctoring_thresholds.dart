@@ -130,3 +130,53 @@ const double audioNoiseMarginDb = 6.0;
 /// *below* its own floor, that steady background is itself the finding.
 const double audioNoiseMinThresholdDb = -50.0;
 const double audioNoiseMaxThresholdDb = -32.0;
+
+// ---------------------------------------------------------------------
+// The audio rule, second half - the same question asked in a *window*:
+// **brief sound that never lasts two seconds is still sound, when it keeps
+// coming back.**
+// ---------------------------------------------------------------------
+// [audioNoiseSustain] needs one unbroken two seconds, so a student reading the
+// paper out in phrases - a sentence, a pause, a sentence - is never heard: every
+// pause resets the window. These four numbers are the second way of asking the
+// same question, and they are additive: they sit *beside* the two-second rule,
+// which is neither relaxed nor replaced by them.
+
+/// How long a run of above-threshold sound has to last before it counts as one
+/// burst rather than as the room.
+///
+/// 300 ms is longer than every sound the two-second rule exists to forgive - a
+/// cough, a chair, a keystroke, a door - and shorter than a spoken phrase, so the
+/// burst count only moves for sound a listener would call talking. A run shorter
+/// than this is still measured (it counts towards [audioNoiseBurstTotal]), it just
+/// is not counted as a burst on its own.
+const Duration audioNoiseMinBurst = Duration(milliseconds: 300);
+
+/// The window repeated bursts are counted in.
+///
+/// 60 s, because the rule is about *repeated* noise, not about a whole sitting: a
+/// student who says one word a minute for three minutes is not holding a
+/// conversation, and a burst that has fallen out of the window is no longer
+/// evidence for the burst just heard. It slides with the clock rather than with
+/// samples, so a microphone that stops delivering frames cannot keep old evidence
+/// alive.
+const Duration audioNoiseBurstWindow = Duration(seconds: 60);
+
+/// How many bursts inside [audioNoiseBurstWindow] are one `audio_noise`.
+///
+/// Three, which is what "repeated" means in practice and is deliberately above the
+/// two a single word and its echo can produce.
+const int audioNoiseBurstCount = 3;
+
+/// How much above-threshold time inside [audioNoiseBurstWindow] is one
+/// `audio_noise`, however it was divided up.
+///
+/// This is the half of the rule that catches the shape the burst count cannot see:
+/// syllables or fragments each too short to be a burst on their own. Four seconds
+/// inside a sixty-second window is a fifteenth of the minute spent over the line -
+/// short enough that no reading position or passing lorry explains it, long enough
+/// that it cannot be a single cough - and it is exactly what the two-second rule is
+/// blind to. It is also why the count alone is not the rule: someone talking
+/// steadily in fragments never produces three 300 ms bursts, and someone who
+/// coughs three times a minute never reaches four seconds.
+const Duration audioNoiseBurstTotal = Duration(seconds: 4);

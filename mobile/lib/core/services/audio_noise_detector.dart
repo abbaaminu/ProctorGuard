@@ -10,7 +10,7 @@ import 'proctoring_thresholds.dart';
 /// student should be warned. The platform half lives in `audio_monitor.dart`, and
 /// the two are joined by `AudioMonitoringNotifier`.
 ///
-/// Four rules keep a cough from costing a strike:
+/// Five rules keep a cough from costing a strike:
 ///
 ///  1. **Calibration.** The first [calibrationWindow] of the session measures the
 ///     room, and the threshold becomes *that room's* floor plus [speechMarginDb]
@@ -31,10 +31,13 @@ import 'proctoring_thresholds.dart';
 ///     both zero, so there is no bridging of the gaps between words. This is the
 ///     rule the product asked for ("sustained for 2 seconds; a dip resets the
 ///     timer"), and the price is the one it accepts: a student talking in short
-///     bursts may never fill the window, and a room that is loud in spikes rather
-///     than steadily is not reported. A cough, a chair creak or a keystroke is far
-///     too brief to fill it either. A crescendo shorter than [sustain] is still
-///     reported through [isNoisy] for the indicator, and never logged.
+///     bursts never fills *this* window, and a room that is loud in spikes rather
+///     than steadily is not reported *by this rule*. That student is not ignored -
+///     rule 5 is the second way of asking the same question, and it is what hears
+///     phrases separated by pauses. A cough, a chair creak or a keystroke is far
+///     too brief to fill rule 2 *or* to be a burst under rule 5. A crescendo
+///     shorter than [sustain] is still reported through [isNoisy] for the
+///     indicator, and is not logged on its own.
 ///  3. **One episode, one strike.** The first sample that fills the window is the
 ///     strike, and the detector then *latches*: nothing is reported again until a
 ///     sample comes back below the threshold. A room that stays loud for a minute
@@ -44,6 +47,26 @@ import 'proctoring_thresholds.dart';
 ///  4. **Cooldown.** After a strike the detector ignores the level for [cooldown]
 ///     as well, so two episodes a second apart (a door slamming, then a voice) do
 ///     not stack. It is the minimum interval; the latch is what bounds an episode.
+///  5. **Repeated bursts, counted in a window.** Rules 2 and 3 ask whether the
+///     level stayed up; a student reading the paper out in phrases never does -
+///     each phrase is a burst and each pause restarts the window - so the same
+///     question is asked a second way, *beside* rule 2 rather than instead of it.
+///     A run of noise lasting at least [minBurst] is a **burst**, and [burstCount]
+///     bursts inside [burstWindow] are one `audio_noise`; so is [burstTotal] of
+///     above-threshold time in that window, however it was divided up (the shape
+///     the count is blind to: a stream of syllables each too short to be a burst).
+///     Evidence accumulates on the clock, not on the frames, so a microphone that
+///     falls silent for a minute empties the window instead of holding it hostage.
+///     A report goes through the *same* latch and cooldown as rule 2 and empties
+///     the window, so the two rules cannot stack strikes for one conversation; a
+///     dip never clears the window, because the bursts it holds are exactly what is
+///     being counted. The window is reason 5 is here and not in rule 2: rule 2 is
+///     one number a reviewer can check against a sentence of the product spec, and
+///     it stays that.
+///
+/// Constants for all five rules are in `proctoring_thresholds.dart`; this class
+/// takes each as a constructor argument with the constant as its default, so
+/// nothing here can drift from the file a reviewer reads.
 ///
 /// The median (not the mean) is what calibration reads, so a student who talks
 /// through the first seconds of an exam cannot drag the room floor up to their
@@ -67,30 +90,50 @@ class AudioNoiseDetector {
     this.minCalibrationSamples = 5,
     this.maxCalibrationSamples = 128,
     this.silenceFloorDb = -100,
+    this.minBurst = audioNoiseMinBurst,
+    this.burstWindow = audioNoiseBurstWindow,
+    this.burstCount = audioNoiseBurstCount,
+    this.burstTotal = audioNoiseBurstTotal,
     DateTime Function()? clock,
-  })  : assert(sustain > Duration.zero, 'a zero sustain would log every sample'),
-        assert(
-          releaseGrace >= Duration.zero,
-          'a negative grace would end every episode on the first dip',
-        ),
-        assert(
-          hysteresisDb >= 0,
-          'a negative band would make every dip start the release clock',
-        ),
-        assert(
-          minThresholdDb <= maxThresholdDb,
-          'the clamp bounds are the wrong way round',
-        ),
-        assert(
-          maxCalibrationSamples > 0,
-          'a zero cap would leave calibration with no samples at all',
-        ),
-        assert(
-          silenceFloorDb < minThresholdDb,
-          'a silence floor at or above the threshold would make silence a strike',
-        ),
-        _now = clock ?? DateTime.now,
-        _thresholdDb = defaultThresholdDb;
+  }) : assert(sustain > Duration.zero, 'a zero sustain would log every sample'),
+       assert(
+         releaseGrace >= Duration.zero,
+         'a negative grace would end every episode on the first dip',
+       ),
+       assert(
+         hysteresisDb >= 0,
+         'a negative band would make every dip start the release clock',
+       ),
+       assert(
+         minThresholdDb <= maxThresholdDb,
+         'the clamp bounds are the wrong way round',
+       ),
+       assert(
+         maxCalibrationSamples > 0,
+         'a zero cap would leave calibration with no samples at all',
+       ),
+       assert(
+         silenceFloorDb < minThresholdDb,
+         'a silence floor at or above the threshold would make silence a strike',
+       ),
+       assert(
+         minBurst > Duration.zero,
+         'a zero-length burst would make every click a burst',
+       ),
+       assert(
+         burstWindow > Duration.zero,
+         'an empty window would empty itself before the count could reach it',
+       ),
+       assert(
+         burstCount > 0,
+         'a zero burst count would report on every sample',
+       ),
+       assert(
+         burstTotal > Duration.zero,
+         'a zero total would report on the first sample over the line',
+       ),
+       _now = clock ?? DateTime.now,
+       _thresholdDb = defaultThresholdDb;
 
   /// How long the room is measured before any strike can be logged.
   ///
@@ -232,6 +275,31 @@ class AudioNoiseDetector {
   /// reading it can keep, instead of waiting forever for samples it is deleting.
   final int maxCalibrationSamples;
 
+  /// How long a run of above-threshold sound has to last to count as one burst.
+  ///
+  /// [audioNoiseMinBurst] - 300 ms - is the line between "the room" and "a
+  /// phrase": a cough, a chair, a keystroke or a door is shorter, and everything a
+  /// listener would call talking is longer. A run shorter than this is still
+  /// measured for [burstTotal]; it simply is not counted as a burst of its own.
+  final Duration minBurst;
+
+  /// How far back [burstCount] and [burstTotal] look.
+  ///
+  /// [audioNoiseBurstWindow] - 60 s - and it slides on the clock, not on samples:
+  /// evidence that has aged out is dropped on the next sample even if the
+  /// microphone said nothing in between, so a silent minute really does empty the
+  /// window.
+  final Duration burstWindow;
+
+  /// How many bursts inside [burstWindow] are one strike.
+  final int burstCount;
+
+  /// How much above-threshold time inside [burstWindow] is one strike.
+  ///
+  /// [audioNoiseBurstTotal] - 4 s - catches the shape the count cannot: fragments
+  /// each shorter than [minBurst] that still add up to someone talking.
+  final Duration burstTotal;
+
   final DateTime Function() _now;
 
   final ListQueue<double> _calibrationSamples = ListQueue<double>();
@@ -242,6 +310,21 @@ class AudioNoiseDetector {
   /// episode, so the dip can be measured against [releaseGrace].
   DateTime? _belowSince;
   DateTime? _lastStrikeAt;
+
+  /// When the current run of above-threshold sound began, if one is open.
+  ///
+  /// Separate from [_aboveSince] on purpose. [_aboveSince] is the *sustain* timer
+  /// and is reset by rule 2's own bookkeeping (a dip, a strike, a cooldown), while
+  /// this measures every run for the burst window in [burstWindow] - including the
+  /// runs that are too short to be a burst, whose time still counts towards
+  /// [burstTotal].
+  DateTime? _runSince;
+
+  /// The runs that have ended inside the burst window, oldest first. Entries age
+  /// out of the front on the clock (see [_pruneRuns]) and the whole queue is
+  /// emptied by a report and by [reset]. (Named `_runs` rather than
+  /// `_burstWindow`, which would read as the [burstWindow] knob.)
+  final ListQueue<_NoiseBurst> _runs = ListQueue<_NoiseBurst>();
   double? _roomFloorDb;
   double? _peakDb;
   double _thresholdDb;
@@ -286,6 +369,25 @@ class AudioNoiseDetector {
   /// has not filled yet - the difference between "the indicator glows amber" and
   /// "the student is warned".
   bool get isNoisy => _noisy;
+
+  /// How many bursts the rolling window holds right now, counting only the ones
+  /// long enough to be a burst and young enough to still count (older than
+  /// [burstWindow] is out). Exposed for tests and for the same diagnostics the
+  /// audio indicator reads, the way [peakDb] and [samples] are: it is the one
+  /// number that says *why* nothing has been reported yet on a student who keeps
+  /// talking.
+  int get burstCountInWindow => _runs
+      .where(
+        (run) => run.counted && _now().difference(run.endedAt) <= burstWindow,
+      )
+      .length;
+
+  /// How much above-threshold time the rolling window holds right now, including
+  /// the run that is still open, aged the same way as [burstCountInWindow].
+  ///
+  /// Measured against `_now()`, so it is honest between samples: a run that began
+  /// four seconds ago reads as four seconds before any dip closes it.
+  Duration get noiseTimeInWindow => _windowTotal(_now());
 
   /// Whether the detector would ignore a sample right now ([cooldown] after the
   /// last strike). Exposed so the indicator can explain the dead zone instead of
@@ -333,6 +435,17 @@ class AudioNoiseDetector {
       _latched = false;
       _belowSince ??= now;
       _noisy = false;
+      // Rule 5: the run of noise above the line has ended, so its length is now
+      // known - record it if it was long enough to be a burst (or its time if it
+      // was not, since the window totals every run). A dip never *clears* the
+      // window: the bursts it holds are exactly what the count is about.
+      _closeRun(now);
+      // The burst that just ended can be the one that completes the evidence, and
+      // it has to be judged here: the third phrase in a minute is a finding when it
+      // *ends*, and waiting for the next sample over the line would wait for a
+      // fourth phrase that may never come. The cooldown still applies, so this
+      // cannot fire in the dead zone after another strike.
+      if (!isCoolingDown && _windowExceeded(now)) return _report(now);
       return false;
     }
 
@@ -342,6 +455,9 @@ class AudioNoiseDetector {
       _aboveSince = null;
       _belowSince = null;
       _noisy = false;
+      // The level is ignored entirely during the cooldown, so it cannot accrue
+      // time for the burst window either.
+      _runSince = null;
       return false;
     }
 
@@ -367,16 +483,96 @@ class AudioNoiseDetector {
     }
 
     _aboveSince ??= now;
+    _runSince ??= now;
     _noisy = true;
 
-    if (now.difference(_aboveSince!) < sustain) return false;
+    if (now.difference(_aboveSince!) >= sustain) {
+      // Rules 2 and 3: two unbroken seconds, one strike for the episode.
+      return _report(now);
+    }
 
+    // Rule 5: the same question, asked in a window. `_aboveSince` was cleared by
+    // any earlier report, so a run that has not filled [sustain] can still reach
+    // the count or the total - which is the whole point, because a student talking
+    // in phrases never fills [sustain] at all.
+    if (_windowExceeded(now)) return _report(now);
+    return false;
+  }
+
+  /// Whether the rolling window holds enough evidence for a strike at [now].
+  ///
+  /// One place, so the two sites that judge it - a sample over the line, and the dip
+  /// that ends a burst - cannot drift apart.
+  bool _windowExceeded(DateTime now) {
+    _pruneRuns(now);
+    if (_runs.where((run) => run.counted).length >= burstCount) return true;
+    return _windowTotal(now) >= burstTotal;
+  }
+
+  /// Logs the strike for the episode that has just been judged and clears the
+  /// evidence behind it.
+  ///
+  /// Clearing is not tidiness: a report is what the student is told about, so the
+  /// window starts empty again afterwards. Without it the next burst would arrive
+  /// with three already counted and every burst after that would be its own strike,
+  /// which is the stacking [cooldown] exists to prevent.
+  bool _report(DateTime now) {
     _aboveSince = null;
+    _runSince = null;
+    _runs.clear();
     _noisy = false;
     _lastStrikeAt = now;
     // Latched: one episode, one strike (rule 3 in the class docs).
     _latched = true;
     return true;
+  }
+
+  /// Records the run that has just ended at [now] and closes it.
+  ///
+  /// Every run is recorded, not only the ones that qualify as bursts: [burstTotal]
+  /// counts the fragments too, which is how "a stream of syllables, none of them a
+  /// phrase" is caught. The `counted` flag is what [burstCount] reads.
+  void _closeRun(DateTime now) {
+    final startedAt = _runSince;
+    _runSince = null;
+    if (startedAt == null) return;
+    final duration = now.difference(startedAt);
+    if (duration <= Duration.zero) return;
+    _runs.addLast(
+      _NoiseBurst(
+        endedAt: now,
+        duration: duration,
+        counted: duration >= minBurst,
+      ),
+    );
+  }
+
+  /// Drops the runs that have fallen out of [burstWindow].
+  ///
+  /// Pruned on the clock against the sample's timestamp, so it happens whether or
+  /// not the microphone was delivering in between: a burst heard a minute and a
+  /// half ago is not evidence for the one heard now.
+  void _pruneRuns(DateTime now) {
+    while (_runs.isNotEmpty &&
+        now.difference(_runs.first.endedAt) > burstWindow) {
+      _runs.removeFirst();
+    }
+  }
+
+  /// Above-threshold time in the window at [now], including the run still open.
+  ///
+  /// Ages entries by [burstWindow] rather than trusting the queue to be pruned, so
+  /// it is correct for a caller that has not fed a sample since (see
+  /// [noiseTimeInWindow]).
+  Duration _windowTotal(DateTime now) {
+    var total = Duration.zero;
+    for (final run in _runs) {
+      if (now.difference(run.endedAt) > burstWindow) continue;
+      total += run.duration;
+    }
+    final startedAt = _runSince;
+    if (startedAt != null) total += now.difference(startedAt);
+    return total;
   }
 
   void _collectCalibration(double decibels, DateTime now) {
@@ -434,5 +630,33 @@ class AudioNoiseDetector {
     _latched = false;
     _samples = 0;
     _thresholdDb = defaultThresholdDb;
+    // The rolling window goes with the rest of the evidence. The student may be in
+    // another room with another microphone, and bursts counted before the
+    // interruption are not bursts in this one.
+    _runSince = null;
+    _runs.clear();
   }
+}
+
+/// One run of above-threshold sound that has ended, as the burst window keeps it.
+///
+/// [counted] is decided when the run closes (`duration >= minBurst`), so raising or
+/// lowering `minBurst` later does not rewrite evidence already heard - a knob is a
+/// rule for the future.
+class _NoiseBurst {
+  const _NoiseBurst({
+    required this.endedAt,
+    required this.duration,
+    required this.counted,
+  });
+
+  /// When the run stopped being above the threshold: the stamp the window ages
+  /// against.
+  final DateTime endedAt;
+
+  /// How long it lasted, end to end.
+  final Duration duration;
+
+  /// Whether it was long enough to be a burst rather than a fragment.
+  final bool counted;
 }

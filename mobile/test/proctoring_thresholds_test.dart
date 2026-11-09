@@ -126,6 +126,50 @@ void main() {
       expect(detector.minThresholdDb, audioNoiseMinThresholdDb);
       expect(detector.maxThresholdDb, audioNoiseMaxThresholdDb);
     });
+
+    test('repeated short noise is judged in a window, beside the one above', () {
+      // A detector that only asks "two unbroken seconds" hears a student reading the
+      // paper out in phrases and logs nothing, because every pause resets the
+      // window. The second way of asking the same question is a rolling window:
+      // three phrases, or four seconds of fragments, inside a minute.
+      expect(audioNoiseMinBurst, const Duration(milliseconds: 300));
+      expect(audioNoiseBurstWindow, const Duration(seconds: 60));
+      expect(audioNoiseBurstCount, 3);
+      expect(audioNoiseBurstTotal, const Duration(seconds: 4));
+
+      // A burst has to be shorter than the sustain, otherwise the two-second rule
+      // would have reported the run already and the burst rule would never speak.
+      expect(audioNoiseMinBurst, lessThan(audioNoiseSustain));
+      // ...and longer than the room: a keystroke or a cough is tens of
+      // milliseconds, and neither may count as a phrase.
+      expect(
+        audioNoiseMinBurst,
+        greaterThan(const Duration(milliseconds: 100)),
+      );
+      // Three bursts have to fit comfortably inside the window, or a student
+      // talking every couple of seconds could never reach the count.
+      expect(
+        audioNoiseBurstWindow,
+        greaterThan(audioNoiseMinBurst * audioNoiseBurstCount),
+      );
+      // The total is reachable without ever producing one counted burst, which is
+      // the whole reason it exists beside the count...
+      expect(
+        audioNoiseBurstTotal,
+        greaterThan(audioNoiseMinBurst * audioNoiseBurstCount),
+      );
+      // ...and it is still a fraction of the window, so a busy room is not a strike
+      // just for being busy.
+      expect(audioNoiseBurstTotal, lessThan(audioNoiseBurstWindow));
+    });
+
+    test('the detector ships the burst window too', () {
+      final detector = AudioNoiseDetector();
+      expect(detector.minBurst, audioNoiseMinBurst);
+      expect(detector.burstWindow, audioNoiseBurstWindow);
+      expect(detector.burstCount, audioNoiseBurstCount);
+      expect(detector.burstTotal, audioNoiseBurstTotal);
+    });
   });
 }
 
@@ -144,4 +188,3 @@ class _SilentSource implements WebFaceSignalSource {
   @override
   void dispose() => _messages.close();
 }
-
