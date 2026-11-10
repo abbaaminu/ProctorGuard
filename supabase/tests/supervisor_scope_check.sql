@@ -745,10 +745,21 @@ do $$
 declare
   v_visible int;
 begin
-  select count(*) into v_visible from public.profiles;
+  -- Their own row is readable...
+  if not exists (select 1 from public.profiles where id = auth.uid()) then
+    raise exception 'FAIL (k)vii: a supervisor with no assignment cannot read their own row';
+  end if;
 
-  if v_visible <> 1 then
-    raise exception 'FAIL (k)vii: a supervisor with no assignment read % profile rows, expected only their own', v_visible;
+  -- ...and nothing else is. Counted as "rows other than mine" rather than "exactly
+  -- one row in the table": the total is 1 only on a database nobody has used, and a
+  -- live project has as many profile rows as it has - so the question asked is the one
+  -- this check is about, whether any *other* row got through.
+  select count(*) into v_visible
+  from public.profiles
+  where id <> auth.uid();
+
+  if v_visible <> 0 then
+    raise exception 'FAIL (k)vii: a supervisor with no assignment read % other profile row(s)', v_visible;
   end if;
   raise notice 'PASS (k)vii: a supervisor with no assignment sees only their own row';
 end $$;

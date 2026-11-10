@@ -47,6 +47,16 @@
 --       still refuses 'ongoing', so an unlock is `resolve_flagged_attempt()` and a
 --       retake is "Reset attempt".
 --
+-- WHAT THE COUNTS COUNT
+--   Every `count(*)` here is filtered to a fixture id - `test.exam` for the paper's
+--   rows, `test.sub_*` for one attempt's - so the file passes on an empty database and
+--   on a live project that already holds attempts, review rows and evidence of its
+--   own. An unscoped count is a count of the database rather than of the run: it goes
+--   green only on a project nobody has used yet, and red the first time somebody sits
+--   a paper. (a) is the one count that is not about rows at all - it counts the
+--   vocabulary in `proctoring_logs_action_type_check` against the weights answering
+--   it, because `violation_weights` is an operator-editable table.
+--
 -- HOW RLS IS APPLIED
 --   Identical to `targeting_check.sql`: `set local role authenticated` plus a
 --   `request.jwt.claims` carrying the caller's uuid, then `reset role` and a blank
@@ -177,7 +187,8 @@ end $$;
 do $$
 declare
   v_missing text;
-  v_count   int;
+  v_allowed int;
+  v_priced  int;
 begin
   with def as (
     select pg_get_constraintdef(oid) as d
@@ -188,21 +199,38 @@ begin
   ), listed as (
     select distinct (regexp_matches(d, '''([a-z_]+)''', 'g'))[1] as action_type
     from def
+  ), priced as (
+    select l.action_type, w.action_type is not null as has_row
+    from listed l
+    left join public.violation_weights w on w.action_type = l.action_type
   )
-  select coalesce(string_agg(l.action_type, ', ' order by l.action_type), '')
-    into v_missing
-  from listed l
-  where not exists (
-    select 1 from public.violation_weights w where w.action_type = l.action_type
-  );
+  select coalesce(string_agg(action_type, ', ' order by action_type)
+                    filter (where not has_row), ''),
+         count(*),
+         count(*) filter (where has_row)
+    into v_missing, v_allowed, v_priced
+  from priced;
+
+  -- A vocabulary of nothing would make both checks below pass without meaning
+  -- anything, so the constraint has to be there before it can be counted.
+  if v_allowed = 0 then
+    raise exception 'FAIL (a): no action_type CHECK constraint found on public.proctoring_logs';
+  end if;
 
   if v_missing <> '' then
     raise exception 'FAIL (a): no violation_weights row for: %', v_missing;
   end if;
 
-  select count(*) into v_count from public.violation_weights;
-  if v_count <> 11 then
-    raise exception 'FAIL (a): expected 11 weighted action types, found %', v_count;
+  -- Counted against the vocabulary, not against the table. `violation_weights` is
+  -- operator-editable on purpose (the policies let an administrator insert, re-price
+  -- or delete a row), so a live project can hold rows this check has no opinion
+  -- about - a tuned weight, or a type a newer client posts before the constraint
+  -- learned it. What must hold is that every type `proctoring_logs` can store is
+  -- priced, exactly once; counting the whole table would assert what the database
+  -- happens to contain instead, and fail on a project that is working.
+  if v_priced <> v_allowed then
+    raise exception 'FAIL (a): expected % weighted action types, found %',
+      v_allowed, v_priced;
   end if;
   raise notice 'PASS (a): every allowed action_type has a weight';
 end $$;
@@ -751,9 +779,13 @@ begin
        where id = current_setting('test.sub_mixed')::uuid) is not null then
     raise exception 'FAIL (f)vi: a disqualified attempt carries a score';
   end if;
-  if (select count(*) from public.attempt_review_logs) <> 2 then
+  -- Scoped to the fixture paper: a live project already holds review rows of its own,
+  -- so an unscoped count here measured the database rather than this run.
+  if (select count(*) from public.attempt_review_logs
+       where exam_id = current_setting('test.exam')::uuid) <> 2 then
     raise exception 'FAIL (f)vi: expected 2 audit rows, found %',
-      (select count(*) from public.attempt_review_logs);
+      (select count(*) from public.attempt_review_logs
+        where exam_id = current_setting('test.exam')::uuid);
   end if;
   raise notice 'PASS (f)vi: the decision changed the row and was audited';
 end $$;
@@ -818,10 +850,14 @@ begin
     raise exception 'FAIL (f)viii: the audit row names % / %',
       v_log.decision, v_log.actor_id;
   end if;
-  -- Three audit rows now: lecturer (clear), supervisor (disqualify), admin (clear).
-  if (select count(*) from public.attempt_review_logs) <> 3 then
+  -- Three audit rows on this paper now: lecturer (clear), supervisor (disqualify),
+  -- admin (clear) - counted on `test.exam`, because a live project has review rows of
+  -- its own and this asserts what the run wrote.
+  if (select count(*) from public.attempt_review_logs
+       where exam_id = current_setting('test.exam')::uuid) <> 3 then
     raise exception 'FAIL (f)viii: expected 3 audit rows, found %',
-      (select count(*) from public.attempt_review_logs);
+      (select count(*) from public.attempt_review_logs
+        where exam_id = current_setting('test.exam')::uuid);
   end if;
   raise notice 'PASS (f)viii: the admin unlock is audited against the admin account';
 end $$;
