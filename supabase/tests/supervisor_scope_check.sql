@@ -14,7 +14,9 @@
 -- Prerequisites: `supabase start` is running, and `supabase db reset` has applied
 -- `supabase/schema.sql` (which carries section 2c/2d on a fresh install) or
 -- `supabase/migrations/20261109090000_supervisor_exam_assignments.sql` on an
--- existing project.
+-- existing project - plus `20261110090000_supervisor_student_arm.sql`, which closes
+-- the student arm to a supervisor. Block (b) below is the check that found that arm
+-- open: on a project without the guard it reports the unassigned paper by name.
 --
 -- HOW RLS IS APPLIED
 --   Identical to `targeting_check.sql`, `weighted_strikes_check.sql`,
@@ -52,7 +54,11 @@
 --       supervisor true only for the assigned paper, lecturer and student false,
 --       and a NULL paper false even for an admin.
 --   (b) the console list (`exams_select`): the supervisor is offered the assigned
---       paper and not the other; the lecturer and the admin still see both.
+--       paper and not the other; the lecturer and the admin still see both. The
+--       second paper is deliberately *untargeted* (no faculty/department/level on
+--       the paper, none on the supervisor's profile), because that is the one row
+--       the **student** arm of the policy used to hand a supervisor - closed by
+--       `20261110090000_supervisor_student_arm.sql`.
 --   (c) the roster (`submissions_select_own_or_supervisor`): the supervisor reads
 --       the assigned paper's attempts only; the lecturer still reads every attempt,
 --       which is what makes their monitor work on any sitting.
@@ -259,6 +265,13 @@ select set_config('request.jwt.claims', '', true);
 -- The supervisor console lists `publishedExamsProvider`, which is this policy. The
 -- assigned paper is offered; the other one is not offered at all - which is what the
 -- empty state on that console is for when there is no assignment either.
+--
+-- `test.theirs` is the row that makes this block worth running: it is published and
+-- untargeted, and a supervisor's own profile carries no labels either, so the student
+-- arm `student_can_access_exam()` matches it for them unless that predicate excludes
+-- the supervisor tier (it does, since `20261110090000`). The failure message names the
+-- paper that got through, because "2 papers, expected 1" on its own reads like a
+-- fixture error - and the first time this block ran it *was* reported as one.
 set local role authenticated;
 select set_config('request.jwt.claims',
   format('{"sub": "%s", "role": "authenticated", "email": "scope.supervisor@test.local"}',
@@ -266,14 +279,21 @@ select set_config('request.jwt.claims',
 do $$
 declare
   v_visible int;
+  v_extra   text;
 begin
-  select count(*) into v_visible
-  from public.exams
-  where id in (current_setting('test.mine')::uuid,
-               current_setting('test.theirs')::uuid);
+  select count(*),
+         string_agg(e.title, ', ' order by e.title)
+           filter (where e.id <> current_setting('test.mine')::uuid)
+    into v_visible, v_extra
+  from public.exams e
+  where e.id in (current_setting('test.mine')::uuid,
+                 current_setting('test.theirs')::uuid);
 
   if v_visible <> 1 then
-    raise exception 'FAIL (b): a supervisor was offered % papers, expected 1', v_visible;
+    raise exception 'FAIL (b): a supervisor was offered % papers, expected 1 - also %'
+      ', through the student arm of exams_select. student_can_access_exam() must '
+      'answer false for a supervisor: apply 20261110090000_supervisor_student_arm.sql',
+      v_visible, coalesce(v_extra, 'nothing named');
   end if;
   if not exists (select 1 from public.exams
                   where id = current_setting('test.mine')::uuid) then

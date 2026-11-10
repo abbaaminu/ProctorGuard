@@ -439,6 +439,20 @@ $$;
 --
 -- No `is_staff()` arm either: staff access does not depend on being aimed at, so
 -- the callers OR in `is_exam_supervisor()` / `owns_exam()` on their own.
+--
+-- And no **supervisor**: `not public.is_supervisor_only()` in front of the EXISTS
+-- below. The predicate asks about the caller's labels, and a profile with NULL
+-- labels matches an untargeted paper - which is every staff profile, because the
+-- admin console creates accounts with a role, a name and an email and nothing else.
+-- So the student arm of `exams_select` used to offer an unassigned supervisor any
+-- published untargeted paper, which they could then read the questions of and even
+-- start. `20261103090100` left that arm role-neutral on purpose - a lecturer who is
+-- also enrolled is "exactly the borrow-list case" - and that case survives: the
+-- guard names the supervisor tier and nothing else, so a lecturer and an
+-- administrator answer here exactly as they did, and a supervisor's reach stays
+-- `can_supervise_exam(paper)` in the callers, where it belongs.
+-- `20261110090000_supervisor_student_arm.sql` is the same statement for a project
+-- that is already live.
 create or replace function public.student_can_access_exam(p_exam_id uuid)
 returns boolean
 language sql
@@ -446,37 +460,38 @@ security definer
 stable
 set search_path = public
 as $$
-  select exists (
-    select 1
-    from public.exams e
-    where e.id = p_exam_id
-      and e.is_published = true
-      and (
-        exists (
-          select 1
-          from public.profiles p
-          where p.id = auth.uid()
-            and (nullif(btrim(e.faculty), '') is null
-                 or (nullif(btrim(p.faculty), '') is not null
-                     and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
-            and (nullif(btrim(e.department), '') is null
-                 or (nullif(btrim(p.department), '') is not null
-                     and lower(btrim(p.department)) = lower(btrim(e.department))))
-            and (nullif(btrim(e.level), '') is null
-                 or (nullif(btrim(p.level), '') is not null
-                     and lower(btrim(p.level)) = lower(btrim(e.level))))
-        )
-        or exists (
-          select 1
-          from public.exam_allowed_students a
-          where a.exam_id = e.id and a.student_id = auth.uid()
-        )
-      )
-  );
+  select not public.is_supervisor_only()
+     and exists (
+       select 1
+       from public.exams e
+       where e.id = p_exam_id
+         and e.is_published = true
+         and (
+           exists (
+             select 1
+             from public.profiles p
+             where p.id = auth.uid()
+               and (nullif(btrim(e.faculty), '') is null
+                    or (nullif(btrim(p.faculty), '') is not null
+                        and lower(btrim(p.faculty)) = lower(btrim(e.faculty))))
+               and (nullif(btrim(e.department), '') is null
+                    or (nullif(btrim(p.department), '') is not null
+                        and lower(btrim(p.department)) = lower(btrim(e.department))))
+               and (nullif(btrim(e.level), '') is null
+                    or (nullif(btrim(p.level), '') is not null
+                        and lower(btrim(p.level)) = lower(btrim(e.level))))
+           )
+           or exists (
+             select 1
+             from public.exam_allowed_students a
+             where a.exam_id = e.id and a.student_id = auth.uid()
+           )
+         )
+     );
 $$;
 
 comment on function public.student_can_access_exam(uuid) is
-  'True when the paper is offered to the caller: published, and matched either by its faculty/department/level labels (blank label = no narrowing, blank profile field = no match) or by the exam_allowed_students borrow list. Not a schedule-window test and not a staff test.';
+  'True when the paper is offered to the caller: published, and matched either by its faculty/department/level labels (blank label = no narrowing, blank profile field = no match) or by the exam_allowed_students borrow list. False for a supervisor, whose reach is can_supervise_exam() instead. Not a schedule-window test and not a staff test.';
 
 revoke execute on function public.student_can_access_exam(uuid) from public, anon;
 grant execute on function public.student_can_access_exam(uuid) to authenticated, service_role;
@@ -1129,6 +1144,12 @@ drop policy if exists "exams_delete_owner" on public.exams;
 -- The exception list is read through its own policies above, which let the
 -- student see exactly the rows that name them, so this EXISTS needs no definer
 -- helper and cannot recurse.
+--
+-- The third arm is a *student's* arm: `student_can_access_exam()` answers false for
+-- a supervisor (`not is_supervisor_only()`), so an unassigned paper is not offered
+-- to that console by it - the first arm is the supervisor's, and it names the
+-- assignment. Without that term a supervisor's blank profile matched every
+-- untargeted paper, which is the leak `20261110090000` closes.
 create policy "exams_select"
   on public.exams for select
   to authenticated

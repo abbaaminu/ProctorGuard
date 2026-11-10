@@ -34,9 +34,12 @@ supabase/     Schema, migrations, seed data, and Edge Functions
   offers the papers an administrator **assigned to them**
   (`supervisor_exam_assignments`, read by `can_supervise_exam()`) and shows that
   paper's evidence; a lecturer's reads the evidence recorded on the papers they
-  wrote, on any sitting's roster. Reset removes the submission and cascaded incident
-  records so the student can start over; associated snapshots are removed through
-  Supabase Storage.
+  wrote, on any sitting's roster. The student-facing arms are closed to the
+  supervisor role - the paper list, the question feed, "may I start it?" and the
+  consent record all ask `student_can_access_exam()`, which answers false for a
+  supervisor - so an unassigned paper cannot arrive through them. Reset removes
+  the submission and cascaded incident records so the student can start over;
+  associated snapshots are removed through Supabase Storage.
 - **Administrators, supervisors, and lecturers** can review analytics and
   submission activity. Server-side row-level security remains authoritative for
   every operation.
@@ -402,6 +405,7 @@ operator's decision. See
    supabase db query --linked -f supabase/migrations/20261106090100_snapshot_retention.sql
    supabase db query --linked -f supabase/migrations/20261108090000_looking_away_and_noise_count.sql
    supabase db query --linked -f supabase/migrations/20261109090000_supervisor_exam_assignments.sql
+   supabase db query --linked -f supabase/migrations/20261110090000_supervisor_student_arm.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -680,6 +684,24 @@ Things worth knowing before you turn it on:
   vs unassigned paper, roster, incident feed, stills, review decision, reset, the RPCs,
   the demotion path and the profile roster read). Verify with
   `select exam_id, supervisor_id from public.supervisor_exam_assignments;`.
+- Apply `supabase/migrations/20261110090000_supervisor_student_arm.sql` **last of all**,
+  after the scope file, on every project. It is one `create or replace function`:
+  `student_can_access_exam()` gains `not public.is_supervisor_only()` in front of the
+  rule it already had. That predicate is the **student** arm of four paths — the
+  console's paper list (`exams_select`), the question feed (`questions_public`), "may
+  I start this?" (`submissions_insert_own_ongoing`) and `record_consent()` — and it
+  asks about the caller's faculty/department/level, where a blank paper label means
+  "no narrowing". A staff profile carries no labels, so an **unassigned** supervisor
+  matched every published *untargeted* paper: it was offered in their list, its
+  questions could be read while the window was open, and an attempt could be opened on
+  it in their own name. After this the predicate answers false for the supervisor tier,
+  and nothing else changes: students, lecturers (including one who is also enrolled,
+  the borrow-list case the predicate was written for) and administrators answer exactly
+  as before, and a supervisor's reach stays `can_supervise_exam()` on the papers
+  assigned to them. No policy, view, grant or row is touched, it is safe to re-run, and
+  an attempt a supervisor opened through the old arm keeps its answers and its
+  evidence. `supabase/tests/supervisor_scope_check.sql` block (b) is the check that
+  found the leak.
 - Apply `supabase/migrations/optional_question_shuffling.sql` before the first
   paper that has question-order shuffling enabled. Until it runs, the
   `shuffle_questions` column does not exist: the authoring console reports the

@@ -2646,6 +2646,95 @@ void main() {
       expect(rule, contains('from public.exam_allowed_students a'));
       expect(rule, contains('a.exam_id = e.id and a.student_id = auth.uid()'));
     });
+    test('the student arms answer false for a supervisor', () {
+      final sql = schemaSql();
+      if (sql == null) return; // a checkout without ../supabase
+
+      // The rule asks about the caller's *labels*, and a staff profile has none -
+      // so before this guard an unassigned supervisor matched every published
+      // untargeted paper: `exams_select` offered it, `questions_public` served its
+      // questions while the window was open, and `submissions_insert_own_ongoing`
+      // let them start it. A supervisor's arm is `can_supervise_exam()` in the
+      // callers, where the paper is known; this predicate is the student's, so it
+      // answers false for that one tier and for nobody else.
+      final body = _functionBody(sql, 'student_can_access_exam');
+      expect(body, isNotNull, reason: 'the cohort rule lost its home');
+      expect(
+        body,
+        startsWith(
+          'create or replace function public.student_can_access_exam(p_exam_id uuid)\n'
+          'returns boolean\n'
+          'language sql\n'
+          'security definer\n'
+          'stable\n'
+          'set search_path = public\n'
+          r'as $$',
+        ),
+        reason: 'the predicate must stay a definer/stable function',
+      );
+      expect(body, contains('select not public.is_supervisor_only()'));
+      expect(body, contains('and exists ('));
+      expect(
+        body,
+        isNot(contains("'student'")),
+        reason: 'the guard names the supervisor tier, not the student role: '
+            '20261103090100 leaves the enrolled-lecturer borrow case open on purpose',
+      );
+      // The rule behind the guard is untouched: publication, the three labels, the
+      // borrow list.
+      expect(body, contains('e.is_published = true'));
+      expect(body, contains('from public.exam_allowed_students a'));
+
+      // Every caller asks this function instead of carrying its own copy, which is
+      // why one guard closes the whole family: the paper list asks it in its
+      // predicate, and "may I start it?" in its WITH CHECK.
+      expect(
+        selectPredicate(sql, 'exams_select'),
+        contains('public.student_can_access_exam(id)'),
+        reason: 'exams_select stopped asking the student predicate',
+      );
+      expect(
+        _policyWithCheck(sql, 'submissions_insert_own_ongoing'),
+        contains('public.student_can_access_exam(exam_id)'),
+        reason: 'submissions_insert_own_ongoing stopped asking the student predicate',
+      );
+
+      // The migration is the same SQL, and both apply lists and the README name it,
+      // or an operator following either never runs the fix.
+      final migration = File(
+        '../supabase/migrations/20261110090000_supervisor_student_arm.sql',
+      );
+      if (!migration.existsSync()) {
+        fail('the open student arm needs a file to run, not just a schema.sql edit');
+      }
+      expect(
+        _functionBody(migration.readAsStringSync(), 'student_can_access_exam'),
+        body,
+        reason: 'schema.sql and the migration disagree about the predicate',
+      );
+      for (final script in <String>[
+        '../apply_in_order.ps1',
+        '../apply_live_cli.ps1',
+      ]) {
+        final file = File(script);
+        if (!file.existsSync()) continue;
+        expect(
+          file.readAsStringSync(),
+          contains('20261110090000_supervisor_student_arm'),
+          reason: '$script does not apply the supervisor guard',
+        );
+      }
+      final readme = File('../README.md');
+      if (readme.existsSync()) {
+        expect(
+          readme.readAsStringSync(),
+          contains('20261110090000_supervisor_student_arm'),
+          reason: 'the README never tells an operator to run it',
+        );
+      }
+    });
+
+
 
     test("the borrow list is the student's own row, writable by the author",
         () {
