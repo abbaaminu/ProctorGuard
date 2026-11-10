@@ -1,10 +1,15 @@
 -- =====================================================================
--- SUPERVISOR SCOPE RLS TEST  -  run against a LOCAL `supabase start` database
+-- SUPERVISOR SCOPE RLS TEST  -  run against `supabase start` or a hosted project
 -- =====================================================================
 -- Run from the repo root with:
 --
 --   psql postgresql://postgres:postgres@127.0.0.1:54322/postgres
 --     -f supabase/tests/supervisor_scope_check.sql
+--
+-- Against a hosted project, use that project's connection string and connect the
+-- way `schema.sql` was applied - as the owner role (`postgres`) - because the
+-- fixtures below are written with no policy in the way, and every check block sets
+-- its own role from there.
 --
 -- Prerequisites: `supabase start` is running, and `supabase db reset` has applied
 -- `supabase/schema.sql` (which carries section 2c/2d on a fresh install) or
@@ -20,6 +25,21 @@
 --   otherwise still be set - and `guard_profile_labels()` refuses a label write from
 --   any caller carrying them). The whole file is wrapped in begin; ... rollback; and
 --   every fixture is written as `postgres`, so nothing persists.
+--
+-- FIXTURES AND A LIVE PROJECT
+--   Every fixture row is keyed to a `gen_random_uuid()` from this run, and every
+--   count below is filtered to one of those ids - the paper, the attempt, the
+--   profile - rather than to a whole table, so the same file asks the same question
+--   on an empty `supabase start` database and on a live project that already holds
+--   accounts, papers, attempts and evidence. No fixture is looked up by name or by
+--   "the only row there is", and no account is assumed to exist.
+--
+--   `public.profiles.id` references `auth.users(id)`, which a plain insert into
+--   `public.profiles` does not create (23503 `profiles_id_fkey`). The parent rows
+--   come from `tmp_fixture_auth_user()` at the top of the transaction: a BEFORE
+--   INSERT trigger on `public.profiles`, SECURITY DEFINER, so the fixtures are
+--   ordinary `insert into public.profiles` statements - in this block and in the
+--   later roster block (k) - and the helper is rolled back with everything else.
 --
 -- WHAT IT PROVES
 --   The supervisor scope (`20261109090000_supervisor_exam_assignments.sql`):
@@ -64,6 +84,17 @@
 --       the whole roster.
 begin;
 
+-- Fixture helper: profiles.id references auth.users(id), which a plain insert
+-- into public.profiles does not create. Rolled back with everything else.
+create function public.tmp_fixture_auth_user() returns trigger
+language plpgsql security definer set search_path = public as $f$
+begin
+  insert into auth.users (id, email) values (new.id, new.email) on conflict (id) do nothing;
+  return new;
+end $f$;
+create trigger a_tmp_fixture_auth_user before insert on public.profiles
+  for each row execute function public.tmp_fixture_auth_user();
+
 -- =====================================================================
 -- FIXTURES  (as `postgres`, so no policy applies)
 -- =====================================================================
@@ -72,7 +103,8 @@ declare
   v_admin      uuid := gen_random_uuid();
   v_lecturer   uuid := gen_random_uuid();
   v_supervisor uuid := gen_random_uuid();  -- assigned to `v_mine`
-  v_peer       uuid := gen_random_uuid();  -- a supervisor with no assignment
+  v_spare      uuid := gen_random_uuid();  -- a second supervisor, assigned only in (i)ii
+  v_peer       uuid := gen_random_uuid();  -- a supervisor with no assignment at all
   v_s1         uuid := gen_random_uuid();  -- flagged attempt, assigned paper
   v_s2         uuid := gen_random_uuid();  -- flagged attempt, other paper
   v_s3         uuid := gen_random_uuid();  -- ongoing attempt, assigned paper
@@ -89,6 +121,7 @@ begin
     (v_lecturer,   'lecturer',   'Lecturer',       'scope.lecturer@test.local'),
     (v_supervisor, 'supervisor', 'Assigned Sup',   'scope.supervisor@test.local'),
     (v_peer,       'supervisor', 'Unassigned Sup', 'scope.peer@test.local'),
+    (v_spare,      'supervisor', 'Second Sup',     'scope.spare@test.local'),
     (v_s1,         'student',    'Student One',    'scope.s1@test.local'),
     (v_s2,         'student',    'Student Two',    'scope.s2@test.local'),
     (v_s3,         'student',    'Student Three',  'scope.s3@test.local'),
@@ -131,6 +164,7 @@ begin
   perform set_config('test.lecturer',   v_lecturer::text, false);
   perform set_config('test.supervisor', v_supervisor::text, false);
   perform set_config('test.peer',       v_peer::text, false);
+  perform set_config('test.spare',      v_spare::text, false);
   perform set_config('test.s1',         v_s1::text, false);
   perform set_config('test.s2',         v_s2::text, false);
   perform set_config('test.mine',       v_mine::text, false);
@@ -569,8 +603,14 @@ declare
 begin
   -- The row the console writes: no `assigned_by` in the payload, so the column
   -- defaults to the caller. An assignment for a second supervisor on the other paper.
+  --
+  -- The account is `test.spare`, not `test.peer`: (k)vii asks what a supervisor
+  -- with *no* assignment can read, and an assignment written here would still be
+  -- there when that block runs - the peer would then read the two students who sat
+  -- `test.theirs`, and the check would fail on its own fixture rather than on the
+  -- policy.
   insert into public.supervisor_exam_assignments (exam_id, supervisor_id)
-    values (current_setting('test.theirs')::uuid, current_setting('test.peer')::uuid);
+    values (current_setting('test.theirs')::uuid, current_setting('test.spare')::uuid);
 
   select count(*) into v_rows
   from public.supervisor_exam_assignments
@@ -592,7 +632,7 @@ begin
   -- No UPDATE policy: the row is a fact, and re-aiming it is a different assignment.
   update public.supervisor_exam_assignments
      set assigned_at = now()
-   where supervisor_id = current_setting('test.peer')::uuid;
+   where supervisor_id = current_setting('test.spare')::uuid;
   get diagnostics v_after = row_count;
   if v_after <> 0 then
     raise exception 'FAIL (i)iv: % assignment row(s) were updated', v_after;
@@ -736,7 +776,10 @@ end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);
 
--- A supervisor with no assignment at all reads exactly one row: their own.
+-- A supervisor with no assignment at all reads exactly one row: their own. This is
+-- `test.peer`, the one supervisor account nothing assigns - the second supervisor in
+-- (i)ii is `test.spare` for exactly that reason - so the answer is the policy's and
+-- not an artefact of the fixtures.
 set local role authenticated;
 select set_config('request.jwt.claims',
   format('{"sub": "%s", "role": "authenticated", "email": "scope.peer@test.local"}',
