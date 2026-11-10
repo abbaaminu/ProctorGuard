@@ -84,8 +84,10 @@
 --       - RLS never sees those calls, so the predicate inside them is the only gate.
 --   (i) the assignment table itself: an administrator writes it in their own name, a
 --       supervisor cannot write it at all, a non-supervisor account is refused by
---       `guard_supervisor_assignment()`, and an UPDATE changes nothing (there is no
---       update policy).
+--       `guard_supervisor_assignment()`, and an UPDATE changes nothing - there is no
+--       update policy, and `authenticated` holds no UPDATE grant either, so the
+--       refusal is 42501 at whichever layer answers first and 0 rows on a project
+--       that granted the privilege anyway.
 --   (j) demoting the supervisor to lecturer removes the reach on the instant the
 --       role changes - `can_supervise_exam()` asks the role as well as the row - and
 --       re-promoting restores the sittings it was trusted with.
@@ -785,10 +787,23 @@ begin
   end;
 
   -- No UPDATE policy: the row is a fact, and re-aiming it is a different assignment.
-  update public.supervisor_exam_assignments
-     set assigned_at = now()
-   where supervisor_id = current_setting('test.spare')::uuid;
-  get diagnostics v_after = row_count;
+  --
+  -- `20261109090000_supervisor_exam_assignments.sql` also revokes `update, truncate`
+  -- from `authenticated`, so on a correctly built project this statement stops at the
+  -- privilege check with 42501 and never reaches RLS - an uncaught error here would
+  -- abort the whole script on the *grant*, which is not the thing this block is
+  -- asking about. Both answers mean the same thing, so the check accepts either: a
+  -- project that granted UPDATE anyway must still come back with 0 rows from the
+  -- absent policy.
+  v_after := 0;
+  begin
+    update public.supervisor_exam_assignments
+       set assigned_at = now()
+     where supervisor_id = current_setting('test.spare')::uuid;
+    get diagnostics v_after = row_count;
+  exception when insufficient_privilege then
+    v_after := 0;
+  end;
   if v_after <> 0 then
     raise exception 'FAIL (i)iv: % assignment row(s) were updated', v_after;
   end if;

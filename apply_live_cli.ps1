@@ -20,7 +20,8 @@ $files = @(
  '20261106090000_proctoring_consents','20261106090100_snapshot_retention',
  '20261108090000_looking_away_and_noise_count',
  '20261109090000_supervisor_exam_assignments',
- '20261110090000_supervisor_student_arm','20261110090100_snapshot_orphan_check'
+ '20261110090000_supervisor_student_arm','20261110090100_snapshot_orphan_check',
+ '20261110090200_supervisor_profile_read'
 )
 
 # 1. Every file must exist before anything runs.

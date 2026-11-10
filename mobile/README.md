@@ -2241,7 +2241,10 @@ written-down opt-out for a throwaway demo build and never for one a student runs
   about: `profiles_select_own_or_staff` lets a supervisor read the profile of a
   student who sat, was granted or is aimed at a paper they run — which is what the
   monitor's names come from — and no longer the whole institution's roster, while a
-  lecturer and an administrator keep it. `owns_exam()` scopes the
+  lecturer and an administrator keep it. It reached an already-applied project
+  through `20261110090200_supervisor_profile_read.sql`, because the narrowing was
+  first written into `20261109090000`, a file such a project had already run.
+  `owns_exam()` scopes the
   incident feed and the reset audit to the papers the reader wrote. RLS cannot
   restrict a *column*, so the
   `profiles_guard_role_change` trigger raises `42501`

@@ -4470,6 +4470,33 @@ void main() {
       ]) {
         expect(sql, contains(marker), reason: 'the check stopped proving $marker');
       }
+
+      // (i)iv asks whether an assignment row can be rewritten in place. On a
+      // correctly built project it cannot even reach RLS: 20261109090000 revokes
+      // `update, truncate` from `authenticated`, so the statement is refused with
+      // 42501 and an uncaught error would abort the whole script on the grant
+      // instead of on the policy. The check has to accept that answer as a pass.
+      expect(
+        RegExp(
+          r'begin\n\s+update public\.supervisor_exam_assignments[\s\S]*?'
+          r'exception when insufficient_privilege then\n\s+v_after := 0;\n\s+end;',
+        ).hasMatch(sql),
+        isTrue,
+        reason: 'the assignment UPDATE check aborts on the missing UPDATE grant',
+      );
+    });
+
+    test('the targeting check reads a supervisor still on an assigned paper', () {
+      final file = File('../supabase/tests/targeting_check.sql');
+      if (!file.existsSync()) return;
+      final sql = file.readAsStringSync().replaceAll('\r\n', '\n');
+
+      // The storage read arm is `can_supervise_exam()` since 20261109090000, and
+      // this file assigns the supervisor to the two *untargeted* fixtures only. So
+      // the still it must read lives in an untargeted attempt's folder - `sub_a` is
+      // on the targeted paper, and that half is the refusal, not the read.
+      expect(sql, contains("current_setting('test.sub_del') || '/no_face_1.jpg'"));
+      expect(sql, contains('FAIL (i)iv: a supervisor read a snapshot'));
     });
 
     test('schema.sql carries the table, the predicates and the write policies', () {
@@ -4569,6 +4596,161 @@ void main() {
         _policyUsing(sql, 'profiles_select_own_or_staff'),
         reason: 'the scope migration and the full schema disagree about the roster read',
       );
+    });
+
+    test('a project that ran the scope file first has a file to run for the roster read',
+        () {
+      // 8e193ae added `can_read_profile()` and the narrowed policy to a migration
+      // that had already been applied, and its VERIFY block only runs when the file
+      // is run. A project that applied 20261109090000 before that commit keeps
+      // `id = auth.uid() or is_staff()`, so the supervisor still reads every profile
+      // row - and nothing in the repository can reach it. This file is that path.
+      final file = File(
+        '../supabase/migrations/20261110090200_supervisor_profile_read.sql',
+      );
+      if (!file.existsSync()) {
+        fail(
+          'the scoped roster read has no upgrade path: a project that ran '
+          '20261109090000 before 8e193ae cannot get it',
+        );
+      }
+      final sql = file.readAsStringSync().replaceAll('\r\n', '\n');
+
+      for (final section in <String>[
+        '-- WHY THIS FILE EXISTS',
+        '-- WHAT CHANGES',
+        '-- WHAT IT DOES NOT DO',
+        '-- PREREQUISITES',
+        '-- 3. VERIFY',
+      ]) {
+        expect(sql, contains(section), reason: 'missing section: $section');
+      }
+
+      // Three copies of two definitions is two too many, so they are pinned against
+      // each other: the full schema, the scope migration, and this upgrade.
+      final full = schemaSql();
+      if (full == null) return; // a checkout without ../supabase
+      expect(
+        _functionBody(sql, 'can_read_profile'),
+        _functionBody(full, 'can_read_profile'),
+        reason: 'the upgrade and the full schema disagree about the roster read',
+      );
+      expect(
+        _policyUsing(sql, 'profiles_select_own_or_staff'),
+        _policyUsing(full, 'profiles_select_own_or_staff'),
+        reason: 'the upgrade and the full schema disagree about the roster read',
+      );
+
+      // A second permissive read policy is a union with this one, and a project built
+      // from a pre-rename file - or hand-edited in the dashboard - still carries
+      // these names. `Allow users to read own profile and staff to read all users` is
+      // not in any revision of schema.sql: it was written by hand, and it is the one
+      // that made the live run of this file raise instead of reporting success.
+      for (final legacy in <String>[
+        'drop policy if exists "Authenticated users can read profiles" '
+            'on public.profiles;',
+        'drop policy if exists "Allow users to read own profile and staff to read '
+            'all users" on public.profiles;',
+        'drop policy if exists "Users can read own profile" on public.profiles;',
+      ]) {
+        expect(
+          sql,
+          contains(legacy),
+          reason: 'a leftover read policy would keep the whole roster readable',
+        );
+        expect(
+          full,
+          contains(legacy),
+          reason: 'schema.sql leaves the same leftover read policy in place',
+        );
+      }
+      // The one name the repository cannot vouch for is printed before it is dropped.
+      expect(
+        sql,
+        contains('dropping a hand-made profiles read policy'),
+        reason: 'a deletion nobody can trace should at least be in the Run output',
+      );
+
+      // ...and a name is not enough, which the live run proved: the policy there is
+      // called "Allow users to read own profile and staff to read all", one word short
+      // of the name dropped above, so the by-name drop walked past it and the verify
+      // block stopped the file. The sweep is what reaches it, so the sweep is what is
+      // pinned: it drops by predicate, prints what it drops, treats a duplicate
+      // own-row read as redundant rather than fatal, and stops on a read policy it
+      // cannot classify instead of unioning with it.
+      expect(
+        sql,
+        contains("execute format('drop policy %I on public.profiles'"),
+        reason: 'the leftover policies are not all known by name',
+      );
+      expect(
+        sql,
+        contains(
+          "v_squash like '%is_staff%' and v_squash not like '%can_read_profile%'",
+        ),
+        reason: 'the un-narrowed roster read is is_staff() without can_read_profile()',
+      );
+      expect(
+        sql,
+        contains("v_squash in ('id=auth.uid', 'auth.uid=id')"),
+        reason: 'an own-row duplicate is not a widening, and must not stop the file',
+      );
+      expect(
+        sql,
+        contains("v_squash = 'true'"),
+        reason: 'a read-everything policy is the leak at its widest',
+      );
+      expect(
+        sql,
+        contains("v_squash like '%can_read_profile%' and r.cmd = 'SELECT'"),
+        reason: 'a hand-edited half-fix under another name is replaced, not unioned',
+      );
+
+      // Two things that make every policy in the file a formality when they are wrong,
+      // and that a project can be missing without any *policy* looking wrong: RLS
+      // itself, and the administrator's policy asking `is_staff()` where it should ask
+      // `is_admin()`.
+      expect(
+        sql,
+        contains('alter table public.profiles enable row level security;'),
+        reason: 'with RLS off, no policy on the table is consulted',
+      );
+      expect(
+        RegExp(
+          r'create policy "profiles_admin_all"\s+on public\.profiles for all'
+          r'\s+to authenticated\s+using \(public\.is_admin\(\)\)'
+          r'\s+with check \(public\.is_admin\(\)\);',
+        ).hasMatch(sql.replaceAll('\r\n', '\n')),
+        isTrue,
+        reason: 'profiles_admin_all left as is_staff() hands the roster to a supervisor',
+      );
+      expect(
+        sql,
+        contains("policyname not in ('profiles_select_own_or_staff', 'profiles_admin_all')"),
+        reason: 'the verify block must notice a second read policy',
+      );
+
+      // It is a file somebody has to run: both apply lists and the README name it.
+      for (final script in <String>[
+        '../apply_in_order.ps1',
+        '../apply_live_cli.ps1',
+      ]) {
+        final file = File(script);
+        if (!file.existsSync()) continue;
+        expect(
+          file.readAsStringSync(),
+          contains('20261110090200_supervisor_profile_read'),
+          reason: '$script does not apply the roster-read upgrade',
+        );
+      }
+      final readme = File('../README.md');
+      if (readme.existsSync()) {
+        expect(
+          readme.readAsStringSync(),
+          contains('20261110090200_supervisor_profile_read'),
+          reason: 'the README never tells an operator to run it',
+        );
+      }
     });
   });
 

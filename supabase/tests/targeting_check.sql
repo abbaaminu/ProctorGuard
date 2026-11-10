@@ -54,9 +54,11 @@
 --       supervisor do.
 --   (i) storage.objects + submissions_delete_supervisor: a lecturer cannot read
 --       another paper's snapshots and cannot delete another paper's attempt; the
---       author, the owning student and a supervisor can. (i)viii-ix add the purge:
---       not even the reset tier may delete a *live* attempt's still - the policy
---       requires the folder to resolve to no submission - while the same folder
+--       author, the owning student and a supervisor do - the supervisor on the paper
+--       the fixture assigns them ((i)iv reads that folder and is refused on the
+--       unassigned one, because the arm is `can_supervise_exam()`). (i)viii-ix add the
+--       purge: not even the reset tier may delete a *live* attempt's still - the
+--       policy requires the folder to resolve to no submission - while the same folder
 --       becomes purgeable once the attempt row is gone, which is the order
 --       `resetSubmission()` uses.
 --   (k) register_violation: only this attempt's own
@@ -728,6 +730,17 @@ begin
   insert into storage.objects (bucket_id, name)
     values ('proctor-snapshots',
             current_setting('test.sub_a') || '/looking_away_1.jpg');
+
+  -- A second still, in the folder of an attempt on the *untargeted* paper - the one
+  -- this file assigns the supervisor to. (i)iv is about the supervisor arm of the
+  -- read policy, and since `20261109090000_supervisor_exam_assignments.sql` that arm
+  -- is `can_supervise_exam()` on the paper the folder resolves to. `sub_a` is on the
+  -- targeted paper, which no assignment names, so the supervisor's positive read has
+  -- to be proven on this folder and the refusal on that one - the scope itself (no
+  -- row, no reach) is `supervisor_scope_check.sql` (e)ii.
+  insert into storage.objects (bucket_id, name)
+    values ('proctor-snapshots',
+            current_setting('test.sub_del') || '/no_face_1.jpg');
 end $$;
 
 -- (i) i: the owning student reads (and therefore signs) their own still.
@@ -781,7 +794,12 @@ end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);
 
--- (i) iv: so can a supervisor.
+-- (i) iv: so can a supervisor - of the paper the folder belongs to. `sub_del` is an
+-- attempt on the *untargeted* paper, the one the fixture assigns the supervisor to;
+-- `sub_a` is on the targeted paper and no assignment names it, so the same account
+-- reads nothing there. That is the `can_supervise_exam()` arm of the read policy, not
+-- a regression: `supervisor_scope_check.sql` (e)ii is the scope proof, and this pair
+-- is here so the assertions after it do not quietly rely on institution-wide reach.
 set local role authenticated;
 select set_config('request.jwt.claims',
   format('{"sub": "%s", "role": "authenticated", "email": "supervisor@test.local"}',
@@ -790,10 +808,15 @@ do $$
 begin
   if (select count(*) from storage.objects o
       where o.bucket_id = 'proctor-snapshots'
-        and o.name = current_setting('test.sub_a') || '/looking_away_1.jpg') <> 1 then
-    raise exception 'FAIL (i)iv: a supervisor cannot read the snapshot';
+        and o.name = current_setting('test.sub_del') || '/no_face_1.jpg') <> 1 then
+    raise exception 'FAIL (i)iv: a supervisor cannot read the snapshot of a paper they supervise';
   end if;
-  raise notice 'PASS (i)iv: a supervisor reads the snapshot';
+  if (select count(*) from storage.objects o
+      where o.bucket_id = 'proctor-snapshots'
+        and o.name = current_setting('test.sub_a') || '/looking_away_1.jpg') <> 0 then
+    raise exception 'FAIL (i)iv: a supervisor read a snapshot of a paper no assignment names';
+  end if;
+  raise notice 'PASS (i)iv: a supervisor reads the evidence of the paper they supervise';
 end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);

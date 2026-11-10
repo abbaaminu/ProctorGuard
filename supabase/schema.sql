@@ -512,9 +512,20 @@ as $$
 $$;
 
 -- Drop legacy policies to ensure a clean state. The `users_*` names are what a
--- pre-rename database still carries on this table, so they are dropped too.
+-- pre-rename database still carries on this table, so they are dropped too - and so
+-- is "Allow users to read own profile and staff to read all users", a hand-made
+-- dashboard policy that no revision of this file ever created and whose predicate is
+-- the same `id = auth.uid() or is_staff()`. A leftover permissive read policy is a
+-- *union* with the one below, so leaving it would undo the supervisor scope. A live
+-- project carried the same hand-made policy one word short
+-- ("Allow users to read own profile and staff to read all"), which a by-name drop
+-- cannot reach - that is why `supabase/migrations/20261110090200_supervisor_profile_read.sql`
+-- sweeps the table by predicate as well: an `is_staff()` read without
+-- `can_read_profile()` is the un-narrowed roster whatever it is called.
+drop policy if exists "Allow users to read own profile and staff to read all users" on public.profiles;
 drop policy if exists "users_select_own_or_supervisor" on public.profiles;
 drop policy if exists "Users can view own profile" on public.profiles;
+drop policy if exists "Users can read own profile" on public.profiles;
 drop policy if exists "Authenticated users can read profiles" on public.profiles;
 drop policy if exists "users_insert_self" on public.profiles;
 drop policy if exists "users_insert_self_student" on public.profiles;

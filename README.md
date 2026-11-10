@@ -407,6 +407,7 @@ operator's decision. See
    supabase db query --linked -f supabase/migrations/20261109090000_supervisor_exam_assignments.sql
    supabase db query --linked -f supabase/migrations/20261110090000_supervisor_student_arm.sql
    supabase db query --linked -f supabase/migrations/20261110090100_snapshot_orphan_check.sql
+   supabase db query --linked -f supabase/migrations/20261110090200_supervisor_profile_read.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -672,8 +673,9 @@ Things worth knowing before you turn it on:
   expect `1 / true` twice. Nothing is backfilled: existing evidence keeps its rows
   and existing attempts keep their status.
 - Apply `supabase/migrations/20261109090000_supervisor_exam_assignments.sql` after it,
-  **last of all**, on every project. It creates `public.supervisor_exam_assignments` (one
-  `(paper, supervisor)` row per sitting), the `can_supervise_exam()` /
+  before the three supervisor follow-ups below, on every project. It creates
+  `public.supervisor_exam_assignments` (one `(paper, supervisor)` row per sitting),
+  the `can_supervise_exam()` /
   `is_supervisor_only()` predicates, and re-creates every policy and RPC that used to
   ask the role tier `is_exam_supervisor()` so that the supervisor arm asks the scope
   question instead. It changes **who may read and write**, never what is stored: no
@@ -696,6 +698,9 @@ Things worth knowing before you turn it on:
   vs unassigned paper, roster, incident feed, stills, review decision, reset, the RPCs,
   the demotion path and the profile roster read). Verify with
   `select exam_id, supervisor_id from public.supervisor_exam_assignments;`.
+  A project that ran this file **before** the roster read was scoped has neither
+  `can_read_profile()` nor the narrowed policy (see
+  `20261110090200_supervisor_profile_read.sql` below, which is the upgrade for it).
 - Apply `supabase/migrations/20261110090000_supervisor_student_arm.sql` after the scope
   file, on every project. It is one `create or replace function`:
   `student_can_access_exam()` gains `not public.is_supervisor_only()` in front of the
@@ -714,8 +719,8 @@ Things worth knowing before you turn it on:
   an attempt a supervisor opened through the old arm keeps its answers and its
   evidence. `supabase/tests/supervisor_scope_check.sql` block (b) is the check that
   found the leak.
-- Apply `supabase/migrations/20261110090100_snapshot_orphan_check.sql` **last of all**,
-  after both of the files above, on every project. It is one
+- Apply `supabase/migrations/20261110090100_snapshot_orphan_check.sql` after both of the
+  files above, on every project. It is one
   `create or replace function` and two `drop policy` / `create policy` pairs: the two
   snapshot purge policies (`Proctor snapshots supervisor purge`, `Proctor snapshots
   orphan read for purge`) asked "does this folder name an attempt?" with an inline
@@ -735,6 +740,48 @@ Things worth knowing before you turn it on:
   those two policies at the old shape reopens the hole, so re-apply this one after it.
   `supabase/tests/supervisor_scope_check.sql` blocks (e)ii-iii are the checks that found
   it and prove both halves.
+- Apply `supabase/migrations/20261110090200_supervisor_profile_read.sql` after the
+  scope file, on every project that ran `20261109090000_supervisor_exam_assignments.sql`
+  before the roster read was scoped (before commit `8e193ae`). That commit added
+  `can_read_profile()` and the narrowed `profiles_select_own_or_staff` **to the
+  migration that had already been applied**, and a file cannot fix a project that has
+  already run it: such a project has no `can_read_profile()` and still carries
+  `id = auth.uid() or public.is_staff()`, so a supervisor reads every profile row in
+  the institution — name, matriculation number, faculty, department, level,
+  photograph — assigned or not. This file is the upgrade path: one
+  `create or replace function` and one `drop policy` / `create policy` pair,
+  character-identical to `schema.sql` and to `20261109090000`, plus the drop of the
+  legacy read policies a pre-rename project still carries —
+  `users_select_own_or_supervisor`, `Users can view own profile`,
+  `Users can read own profile`, `Authenticated users can read profiles`, and the
+  hand-made `Allow users to read own profile and staff to read all users`, which exists
+  in no revision of `schema.sql` (a second permissive read policy is a union with the
+  new one, so it would keep the roster just as wide whatever the predicate says). Names
+  are not enough on their own — the live project's copy of that policy is one word
+  short, `Allow users to read own profile and staff to read all` — so after the by-name
+  drops the file **sweeps the table by predicate**: a read policy that asks
+  `is_staff()` without `can_read_profile()` is the un-narrowed roster under any label
+  and goes (its definition printed in a `NOTICE` first); a policy that is only
+  `(auth.uid() = id)` is a duplicate of the narrowed policy's own first arm and goes
+  too; `using (true)` — the dashboard's default read-everything policy — goes; and a
+  hand-edited policy that does ask `can_read_profile()` but under a name of its own is
+  replaced by the canonical one. A read policy it cannot read is not touched: it is
+  named with its predicate and the file stops. It
+  also enables row level security on `public.profiles` — a policy nobody consults
+  narrows nothing — and re-creates `profiles_admin_all` as `is_admin()`, because a copy
+  that asks `is_staff()` matches a supervisor and hands the whole roster back through
+  the administrator's arm. It raises rather than reporting success if the
+  policy does not ask `can_read_profile()`, if the predicate lost its cohort guard or
+  its `role = 'student'` test, if RLS is off on the table, if `profiles_admin_all` or
+  the role predicates behind both arms (`is_supervisor_only()`, `is_admin()`) do not
+  name the roles they test, or if any *other* read policy is left on
+  `public.profiles` beside `profiles_select_own_or_staff` and `profiles_admin_all` —
+  naming it with its `using` expression, which is how the hand-made policy on a live
+  project was found. It is safe to re-run, it reads and writes no row, and it
+  touches no snapshot policy, so `20261110090100_snapshot_orphan_check.sql` does not
+  have to follow it. `supabase/tests/supervisor_scope_check.sql` block (k) is the
+  check that finds the missing half: (a)-(j) pass on such a project, and (k)v —
+  "the supervisor read a student on a paper they do not run" — is what fails.
 - Apply `supabase/migrations/optional_question_shuffling.sql` before the first
   paper that has question-order shuffling enabled. Until it runs, the
   `shuffle_questions` column does not exist: the authoring console reports the
