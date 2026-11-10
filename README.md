@@ -406,6 +406,7 @@ operator's decision. See
    supabase db query --linked -f supabase/migrations/20261108090000_looking_away_and_noise_count.sql
    supabase db query --linked -f supabase/migrations/20261109090000_supervisor_exam_assignments.sql
    supabase db query --linked -f supabase/migrations/20261110090000_supervisor_student_arm.sql
+   supabase db query --linked -f supabase/migrations/20261110090100_snapshot_orphan_check.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -467,7 +468,12 @@ operator's decision. See
    `NULL` and the strike still counts) and
    `…090800_snapshot_purge_not_live_attempt` (a snapshot is purgeable only once its
    attempt row is gone — the order the console's reset already uses, which is what
-   stops a live sitting's evidence being deleted).
+   stops a live sitting's evidence being deleted). That last file asks the question
+   with an inline subquery, which a policy evaluates as the *caller*;
+   `20261110090100_snapshot_orphan_check.sql` is the follow-up that asks it as the
+   owner, because once `20261109090000_supervisor_exam_assignments` scoped the attempt
+   table to a supervisor's own papers the inline form made another paper's live stills
+   look orphaned — readable and deletable.
    Each file's header names its prerequisites and the file it must follow.
    Re-running the nine in the order listed above is safe, with one exception that
    arrived later: `…090700_register_violation_snapshot_path` recreates
@@ -630,13 +636,19 @@ Things worth knowing before you turn it on:
   change a return type: the re-run fails with `42P13` and leaves the caller
   thinking the path rule was re-applied). If that happens, re-apply
   `20261104090100_weighted_strikes_and_flagged_review.sql`.
-   `secure_exam_access_and_deadlines.sql` installs the same two-column
-   version, so that warning covers it too, and the same re-apply repairs it.
-   Two older files recreate
-  policies they replace, so re-apply `20261103090500_snapshot_read_policy.sql`,
+  `secure_exam_access_and_deadlines.sql` installs the same two-column
+  version, so that warning covers it too, and the same re-apply repairs it.
+  Three older files recreate policies they replace, so re-apply
+  `20261103090500_snapshot_read_policy.sql`,
   `…090600_submissions_delete_supervisor.sql` and
   `…090800_snapshot_purge_not_live_attempt.sql` after re-running
-  `private_proctor_snapshots.sql` or `staff_attempt_resets.sql`.
+  `private_proctor_snapshots.sql`, `staff_attempt_resets.sql` or
+  `secure_exam_access_and_deadlines.sql` — and then, after all of those,
+  `20261110090100_snapshot_orphan_check.sql`: each of them re-creates
+  `Proctor snapshots supervisor purge` without `snapshot_attempt_exists()` —
+  `…090800` with the caller-scoped subquery the orphan check exists to replace, the
+  other three with no orphan test at all (a live sitting's stills deletable by any
+  lecturer) — and `…090800` alone also re-creates the orphan-read companion.
 - Apply `supabase/migrations/20261104090000_violation_weights.sql` and then
   `20261104090100_weighted_strikes_and_flagged_review.sql`, in that order, on every
   project. The first creates and seeds `public.violation_weights`; the second moves
@@ -684,8 +696,8 @@ Things worth knowing before you turn it on:
   vs unassigned paper, roster, incident feed, stills, review decision, reset, the RPCs,
   the demotion path and the profile roster read). Verify with
   `select exam_id, supervisor_id from public.supervisor_exam_assignments;`.
-- Apply `supabase/migrations/20261110090000_supervisor_student_arm.sql` **last of all**,
-  after the scope file, on every project. It is one `create or replace function`:
+- Apply `supabase/migrations/20261110090000_supervisor_student_arm.sql` after the scope
+  file, on every project. It is one `create or replace function`:
   `student_can_access_exam()` gains `not public.is_supervisor_only()` in front of the
   rule it already had. That predicate is the **student** arm of four paths — the
   console's paper list (`exams_select`), the question feed (`questions_public`), "may
@@ -702,6 +714,27 @@ Things worth knowing before you turn it on:
   an attempt a supervisor opened through the old arm keeps its answers and its
   evidence. `supabase/tests/supervisor_scope_check.sql` block (b) is the check that
   found the leak.
+- Apply `supabase/migrations/20261110090100_snapshot_orphan_check.sql` **last of all**,
+  after both of the files above, on every project. It is one
+  `create or replace function` and two `drop policy` / `create policy` pairs: the two
+  snapshot purge policies (`Proctor snapshots supervisor purge`, `Proctor snapshots
+  orphan read for purge`) asked "does this folder name an attempt?" with an inline
+  `not exists (select 1 from public.exam_submissions …)`, and a policy expression is
+  evaluated with the **caller's** privileges. Since `20261109090000` narrowed
+  `submissions_select_own_or_supervisor`, an **unassigned** supervisor matched 0 rows
+  for another paper's live attempt — so `not exists` was true, the folder read as
+  *orphaned*, and the same account that can neither read nor delete that attempt could
+  sign a URL to its stills and delete them: the destructive half of "Reset attempt"
+  without the repair half, and no audit row anywhere. `public.snapshot_attempt_exists(text)`
+  answers as its owner (`security definer`, `stable`, pinned `search_path`), so
+  "orphaned" means what it says whoever is asking — a reset keeps purging what a reset
+  left behind, and an attempt nobody's reset touched keeps its evidence. Nothing else
+  moves: `Proctor snapshots read access`, the upload policy and `is_attempt_resetter()`
+  are untouched. It raises rather than reporting success if either policy still asks
+  the question inline or still mentions `exam_submissions`, and any file that re-creates
+  those two policies at the old shape reopens the hole, so re-apply this one after it.
+  `supabase/tests/supervisor_scope_check.sql` blocks (e)ii-iii are the checks that found
+  it and prove both halves.
 - Apply `supabase/migrations/optional_question_shuffling.sql` before the first
   paper that has question-order shuffling enabled. Until it runs, the
   `shuffle_questions` column does not exist: the authoring console reports the

@@ -160,6 +160,17 @@ with an expiry rather than a URL that keeps working forever once it is forwarded
   deleting one is the reset's own purge, allowed only for `is_attempt_resetter()`
   (`Proctor snapshots supervisor purge`) — a student can never erase their own
   evidence.
+- The two storage policies a reset leans on ask two different questions, and since
+  `../supabase/migrations/20261110090100_snapshot_orphan_check.sql` the second is
+  answered by the database rather than by the caller: `is_attempt_resetter()` decides
+  **who** may purge, and `public.snapshot_attempt_exists()` decides **what** is
+  purgeable, as a `security definer` function. That matters because a policy
+  expression runs with the caller's rights: with an inline
+  `not exists (... exam_submissions ...)`, a supervisor who was not assigned to a
+  paper read "no attempt" for that paper's live sitting — the folder looked orphaned,
+  and its stills could be signed and deleted by the one account that cannot open the
+  attempt at all. The read policy is narrow for the same reason: the owning student,
+  the paper's author, or a supervisor assigned to that paper.
 - `SupabaseService.snapshotObjectPath` resolves every shape the column holds — the
   path this build writes, a pre-migration `/object/public/...` URL, or a
   console-minted `/object/sign/...?token=` one — so evidence written before the

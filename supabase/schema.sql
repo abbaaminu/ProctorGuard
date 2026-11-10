@@ -2271,7 +2271,8 @@ drop policy if exists "Proctor snapshots supervisor purge" on storage.objects;
 -- because the question "may this account supervise it" needs the paper the folder
 -- resolves to; the orphaned window is covered by the purge policies below, which
 -- ask `is_attempt_resetter()` (the tier that is allowed to delete an attempt at
--- all) and only match once the folder resolves to nothing.
+-- all) and only match once `snapshot_attempt_exists()` says the folder names no
+-- attempt at all.
 create policy "Proctor snapshots read access"
   on storage.objects for select
   to authenticated
@@ -2304,6 +2305,63 @@ create policy "Proctor snapshots upload own ongoing session"
     )
   );
 
+-- Does this object's folder name an attempt? Asked as the OWNER, never as the
+-- caller, and that is the whole point: a policy expression is evaluated with the
+-- caller's privileges, so the two purge policies below cannot ask this themselves
+-- without the answer changing with who is asking.
+-- `submissions_select_own_or_supervisor` shows a supervisor only the attempts of
+-- the papers assigned to them, so an inline `not exists (select 1 from
+-- public.exam_submissions ...)` inside a policy reads a *scope* - 0 rows for a
+-- paper they were not given - and not a fact. That made a live attempt's folder
+-- look orphaned, and its stills readable and purgable, to exactly the account that
+-- can neither read that attempt nor delete it
+-- (`migrations/20261110090100_snapshot_orphan_check.sql` is this fix applied to an
+-- existing project). A definer function is what `owns_exam()`,
+-- `can_supervise_exam()` and `can_read_profile()` already are in this file, for the
+-- same reason: the question is about a row the caller may not read.
+--
+-- `stable`, so it is answered once per candidate object inside one DELETE and sees
+-- the table as of that statement - the snapshot in which a reset's earlier
+-- `delete from exam_submissions` has already happened. The first path segment is
+-- shape-tested before the `::uuid` cast because `storage.objects.name` is free
+-- text: a cast that raised on a stray object would abort a whole purge statement
+-- (22P02) instead of answering about that one object. It is compared as a uuid
+-- rather than as text so one folder spelled another way still names its attempt,
+-- which is the fail-closed direction (kept, not purged).
+create or replace function public.snapshot_attempt_exists(p_object_name text)
+returns boolean
+language plpgsql
+security definer
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_folder text;
+begin
+  if p_object_name is null then
+    return false;
+  end if;
+
+  v_folder := (storage.foldername(p_object_name))[1];
+
+  if v_folder is null
+     or v_folder !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  then
+    return false;
+  end if;
+
+  return exists (
+    select 1 from public.exam_submissions s where s.id = v_folder::uuid
+  );
+end;
+$$;
+
+-- Called by the two policies below (as `authenticated`) and by nothing else: not a
+-- client API, so it is not reachable from PostgREST even though the policies are.
+revoke execute on function public.snapshot_attempt_exists(text) from public, anon;
+grant execute on function public.snapshot_attempt_exists(text) to authenticated, service_role;
+
+
 -- No update policy: a stored snapshot is never rewritten.
 --
 -- Delete is one deliberate exception, and it exists for exactly one action - the
@@ -2326,28 +2384,29 @@ create policy "Proctor snapshots upload own ongoing session"
 --     author),
 --     so the destructive half of a reset was reachable without the repair half.
 --
--- Without `is_attempt_resetter()` the `not exists` arm would be a hole rather than
--- a guard - any signed-in account could delete the orphaned stills of a finished
+-- Without `is_attempt_resetter()` the orphan arm would be a hole rather than a
+-- guard - any signed-in account could delete the orphaned stills of a finished
 -- reset - so both terms stay. And unlike the read/upload policies above this one
 -- cannot be anchored to the submission folder: its whole purpose is the window
 -- in which that folder resolves to nothing.
 --
--- The subquery is evaluated under the caller's own permissions (a policy is not
--- definer rights), so it reads as staff: admin, supervisor and lecturer - the tier
--- `is_attempt_resetter()` names - are all `is_staff()`, and
--- `submissions_select_own_or_supervisor` lets staff read every attempt. A role that
--- could reset an attempt but could not read `exam_submissions` would make the arm
--- vacuously true, so the two tiers have to stay paired.
+-- The subquery is NOT evaluated under the caller's own permissions - it is
+-- `public.snapshot_attempt_exists()` above, a definer function, and that is a fix
+-- rather than a flourish. It read as staff when it was written, because
+-- `submissions_select_own_or_supervisor` then handed every staff member every
+-- attempt; since `20261109090000` the same sentence is evaluated under the caller's
+-- scope instead, which turns a supervisor's unassigned paper into an "orphan" and
+-- hands them a signed URL to - and a DELETE over - the stills of an attempt they may
+-- not even read. The tier (`is_attempt_resetter()`) and the question ("does this
+-- folder name no attempt") are the ones this file has always meant; the definer is
+-- what keeps the answer about the folder rather than about the reader.
 create policy "Proctor snapshots supervisor purge"
   on storage.objects for delete
   to authenticated
   using (
     bucket_id = 'proctor-snapshots'
     and public.is_attempt_resetter()
-    and not exists (
-      select 1 from public.exam_submissions s
-      where s.id::text = (storage.foldername(name))[1]
-    )
+    and not public.snapshot_attempt_exists(name)
   );
 
 
@@ -2358,6 +2417,13 @@ create policy "Proctor snapshots supervisor purge"
 -- companion the purge matched 0 rows for a lecturer and left the stills behind.
 -- Same predicate as the purge policy, on SELECT; it exposes only already-orphaned
 -- objects, to the tier that is about to delete them.
+--
+-- It is also the policy the "unassigned supervisor reads another paper's stills"
+-- hole was *read* through: with the orphan test evaluated under the caller's RLS,
+-- a paper they were not assigned showed no attempt, so this policy matched and the
+-- console could sign a URL for the stills of an attempt it could not open - or see
+-- at all. `snapshot_attempt_exists()` answers about the folder rather than about
+-- the reader, so "orphaned" means what it says whoever is asking.
 drop policy if exists "Proctor snapshots orphan read for purge" on storage.objects;
 create policy "Proctor snapshots orphan read for purge"
   on storage.objects for select
@@ -2365,10 +2431,7 @@ create policy "Proctor snapshots orphan read for purge"
   using (
     bucket_id = 'proctor-snapshots'
     and public.is_attempt_resetter()
-    and not exists (
-      select 1 from public.exam_submissions s
-      where s.id::text = (storage.foldername(name))[1]
-    )
+    and not public.snapshot_attempt_exists(name)
   );
 
 -- ---------------------------------------------------------------------

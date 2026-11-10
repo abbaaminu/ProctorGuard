@@ -3055,35 +3055,122 @@ void main() {
     });
 
     test("a live attempt's evidence cannot be purged, a reset one can", () {
-      // The reset sequence is delete -> purge -> audit, and this policy is what
-      // makes the order the rule: an object is purgeable only once its folder no
-      // longer resolves to a submission.
+      // The reset sequence is delete -> purge -> audit, and these two policies are
+      // what makes the order the rule: an object is purgeable only once its folder
+      // no longer resolves to a submission. The third term is a call to
+      // `snapshot_attempt_exists()` and not an inline `not exists (...)` for the
+      // reason the whole fix exists: a policy expression runs with the CALLER's
+      // rights, so a subquery here asks what the caller may read - "is this
+      // attempt invisible to me?" - and not whether the folder names an attempt.
+      // Once `20261109090000` scoped `submissions_select_own_or_supervisor` to a
+      // supervisor's own papers, an unassigned supervisor read 0 rows for another
+      // paper's live attempt, so the folder looked orphaned: its stills could be
+      // signed and deleted by the account that could neither read nor delete the
+      // attempt. The helper answers as its owner, so the answer is about the folder.
       final sql = schemaSql();
       if (sql == null) return;
 
       final purge = _policyUsing(sql, 'Proctor snapshots supervisor purge');
-      expect(purge, contains("bucket_id = 'proctor-snapshots'"));
-      expect(purge, contains('public.is_attempt_resetter()'));
-      expect(purge, contains('not exists ('));
-      expect(purge, contains('from public.exam_submissions s'));
+      final orphanRead = _policyUsing(
+        sql,
+        'Proctor snapshots orphan read for purge',
+      );
+      for (final policy in <String?>[purge, orphanRead]) {
+        expect(policy, contains("bucket_id = 'proctor-snapshots'"));
+        expect(policy, contains('public.is_attempt_resetter()'));
+        expect(policy, contains('not public.snapshot_attempt_exists(name)'));
+        expect(
+          policy,
+          isNot(contains('exam_submissions')),
+          reason: 'an inline subquery reads as the caller, so it answers '
+              '"what may I see?" instead of "does this folder name an attempt?"',
+        );
+      }
+
+      // The helper is the fix, and all three attributes matter: `security definer`
+      // is what the answer stops depending on the reader, `stable` is what makes
+      // it the snapshot in which the reset's earlier DELETE has already happened,
+      // and the pinned `search_path` is what keeps a temporary schema from
+      // shadowing `exam_submissions` in front of the definer body.
+      final helper = _functionBody(sql, 'snapshot_attempt_exists');
+      expect(helper, isNotNull);
+      for (final term in <String>[
+        'security definer',
+        'stable',
+        'set search_path = public, pg_temp',
+        'from public.exam_submissions s where s.id = v_folder::uuid',
+      ]) {
+        expect(helper, contains(term), reason: 'the helper lost "$term"');
+      }
+      // Shape-tested before the cast: `storage.objects.name` is free text, and a
+      // 22P02 raised over one stray object would abort the whole purge statement
+      // instead of answering about that object.
+      expect(helper, contains("v_folder !~* '^[0-9a-f]{8}-"));
+      // Not a client API: an account that could call it directly could ask
+      // "does this attempt id exist?" for any id, which the roster scope withholds.
       expect(
-        purge,
-        contains('s.id::text = (storage.foldername(name))[1]'),
-        reason: 'the purge must use the same folder expression the read and '
-            'upload policies use',
+        sql,
+        contains(
+          'revoke execute on function public.snapshot_attempt_exists(text) '
+          'from public, anon;',
+        ),
+      );
+      expect(
+        sql,
+        contains(
+          'grant execute on function public.snapshot_attempt_exists(text) '
+          'to authenticated, service_role;',
+        ),
       );
 
+      // The upgrade path has to arrive at the same three terms and the same helper:
+      // `20261103090800` still carries the inline subquery (it is history), and this
+      // file is what an existing project applies on top of it.
       final migration = File(
-        '../supabase/migrations/20261103090800_snapshot_purge_not_live_attempt.sql',
+        '../supabase/migrations/20261110090100_snapshot_orphan_check.sql',
       );
       if (migration.existsSync()) {
+        final upgrade = migration.readAsStringSync();
+        for (final policy in <String>[
+          'Proctor snapshots supervisor purge',
+          'Proctor snapshots orphan read for purge',
+        ]) {
+          expect(
+            _policyUsing(upgrade, policy),
+            _policyUsing(sql, policy),
+            reason: 'the upgrade migration and schema.sql disagree about $policy',
+          );
+        }
         expect(
-          _policyUsing(
-            migration.readAsStringSync(),
-            'Proctor snapshots supervisor purge',
-          ),
-          purge,
-          reason: 'the upgrade migration and schema.sql disagree about the purge',
+          _functionBody(upgrade, 'snapshot_attempt_exists'),
+          helper,
+          reason: 'the upgrade migration and schema.sql disagree about the helper',
+        );
+      }
+
+      // ...and both apply lists and the README have to name it, because the file is
+      // the only thing that repairs a project already at `20261110090000`: the oldest
+      // purge migration and the two that re-create these policies without an orphan
+      // test at all (`private_proctor_snapshots.sql`, `staff_attempt_resets.sql`) all
+      // leave the hole open on their own.
+      for (final script in <String>[
+        '../apply_in_order.ps1',
+        '../apply_live_cli.ps1',
+      ]) {
+        final file = File(script);
+        if (!file.existsSync()) continue;
+        expect(
+          file.readAsStringSync(),
+          contains('20261110090100_snapshot_orphan_check'),
+          reason: '$script does not apply the snapshot orphan check',
+        );
+      }
+      final readme = File('../README.md');
+      if (readme.existsSync()) {
+        expect(
+          readme.readAsStringSync(),
+          contains('20261110090100_snapshot_orphan_check'),
+          reason: 'the README never tells an operator to run it',
         );
       }
 
@@ -4371,6 +4458,8 @@ void main() {
         'PASS (a)ii',
         'PASS (c)',
         'PASS (e)',
+        'PASS (e)ii',
+        'PASS (e)iii',
         'PASS (f)',
         'PASS (g)',
         'PASS (i)iii',

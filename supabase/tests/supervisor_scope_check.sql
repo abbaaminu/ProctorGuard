@@ -15,8 +15,12 @@
 -- `supabase/schema.sql` (which carries section 2c/2d on a fresh install) or
 -- `supabase/migrations/20261109090000_supervisor_exam_assignments.sql` on an
 -- existing project - plus `20261110090000_supervisor_student_arm.sql`, which closes
--- the student arm to a supervisor. Block (b) below is the check that found that arm
--- open: on a project without the guard it reports the unassigned paper by name.
+-- the student arm to a supervisor, and `20261110090100_snapshot_orphan_check.sql`,
+-- which asks the snapshot purge policies' orphan question as the owner instead of as
+-- the caller. Block (b) below is the check that found the student arm open: on a
+-- project without the guard it reports the unassigned paper by name. Blocks (e)ii-iii
+-- are the check that found the purge open: on a project without the definer helper
+-- they report another paper's live stills, readable and deleted.
 --
 -- HOW RLS IS APPLIED
 --   Identical to `targeting_check.sql`, `weighted_strikes_check.sql`,
@@ -66,7 +70,10 @@
 --       the lecturer keeps the feed of the paper they wrote, and the student their
 --       own row.
 --   (e) a still in the private bucket: readable for the assigned paper, refused for
---       the other one, and the owning student is unaffected.
+--       the other one, and the owning student is unaffected. (e)ii-iii add the purge:
+--       an unassigned supervisor reads and deletes 0 rows of another paper's *live*
+--       attempt, and an orphaned still is still readable and purgeable by the reset
+--       tier - the two halves of `20261110090100_snapshot_orphan_check.sql`.
 --   (f) `resolve_flagged_attempt()`: refused on the unassigned paper, allowed on the
 --       assigned one, the review row it writes is readable afterwards, and an
 --       administrator needs no assignment.
@@ -421,8 +428,10 @@ select set_config('request.jwt.claims', '', true);
 -- (e)  a still in the private bucket
 -- =====================================================================
 -- The read policy now resolves the folder to the attempt and asks
--- `can_supervise_exam()`; the orphaned window after a delete is the purge policy's,
--- proven in `targeting_check.sql` (i)viii-ix.
+-- `can_supervise_exam()`. The two purge policies (the delete, and the orphan-read
+-- companion a `DELETE ... WHERE` needs) are (e)ii-iii below; their unscoped
+-- behaviour - a live sitting is never purgeable, a reset one always is - is
+-- `targeting_check.sql` (i)viii-ix.
 set local role authenticated;
 select set_config('request.jwt.claims',
   format('{"sub": "%s", "role": "authenticated", "email": "scope.supervisor@test.local"}',
@@ -452,6 +461,132 @@ begin
 end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);
+
+-- (e) ii: the reset tier is scoped to the paper here too - it cannot read, sign a URL
+-- to, or delete the stills of an attempt it may not see. This is the check that found
+-- the hole `20261110090100_snapshot_orphan_check.sql` closes: `test.sub_theirs` is the
+-- unassigned paper's attempt and the bucket holds one still in its folder, and both
+-- purge policies used to ask "does this folder resolve to an attempt?" with a subquery
+-- evaluated under THIS caller's RLS - which answers no row for a paper they were not
+-- given, i.e. "orphaned", i.e. readable and deletable. The attempt row itself is
+-- refused (block (c)) and its DELETE is refused (block (g)); before the fix the
+-- evidence went anyway.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.peer@test.local"}',
+         current_setting('test.peer')), true);
+do $$
+declare
+  v_read    int;
+  v_deleted int;
+begin
+  select count(*) into v_read
+  from storage.objects
+  where bucket_id = 'proctor-snapshots'
+    and name = current_setting('test.sub_theirs') || '/looking_away_1.jpg';
+  if v_read <> 0 then
+    raise exception 'FAIL (e)ii: an unassigned supervisor read % still(s) of another paper''s live attempt (apply supabase/migrations/20261110090100_snapshot_orphan_check.sql)', v_read;
+  end if;
+
+  -- As in `targeting_check.sql` (i)viii: the flag the Storage API sets on itself while
+  -- it is the one deleting. On a hosted project the `protect_delete` trigger on
+  -- storage.objects refuses every other SQL DELETE with 42501, and the "0 rows" below
+  -- would then be reporting the trigger instead of the policy.
+  perform set_config('storage.allow_delete_query', 'true', true);
+  delete from storage.objects o
+   where o.bucket_id = 'proctor-snapshots'
+     and o.name = current_setting('test.sub_theirs') || '/looking_away_1.jpg';
+  get diagnostics v_deleted = row_count;
+  if v_deleted <> 0 then
+    raise exception 'FAIL (e)ii: an unassigned supervisor deleted % still(s) of another paper''s live attempt', v_deleted;
+  end if;
+  raise notice 'PASS (e)ii: a live attempt''s stills are out of an unassigned supervisor''s reach, read or delete';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- ... and the object survived, which is what "0 rows" means as opposed to a target that
+-- never existed. Read as `postgres`: the supervisor cannot see it - that is the point -
+-- so this half cannot be asked from their seat.
+do $$
+begin
+  if (select count(*) from storage.objects o
+       where o.bucket_id = 'proctor-snapshots'
+         and o.name = current_setting('test.sub_theirs') || '/looking_away_1.jpg') <> 1 then
+    raise exception 'FAIL (e)ii: the live attempt''s still disappeared - the purge deleted it';
+  end if;
+end $$;
+
+-- (e) iii: the other half, so the fix cannot be "refuse every purge". An orphaned
+-- still - the state `resetSubmission()` creates, since it deletes the attempt row
+-- before it calls `storage.remove()` - belongs to no attempt at all, so both purge
+-- policies must still match it for the reset tier.
+--
+-- The attempt is created and deleted here rather than in FIXTURES because block (c)
+-- counts the assigned paper's attempts: a sixth row added up there would be counted.
+do $$
+declare
+  v_student uuid := gen_random_uuid();
+  v_sub     uuid := gen_random_uuid();
+begin
+  insert into public.profiles (id, role, full_name, email)
+    values (v_student, 'student', 'Student Seven', 'scope.s7@test.local');
+
+  insert into public.exam_submissions
+    (id, student_id, exam_id, status, started_at, submitted_at)
+    values (v_sub, v_student, current_setting('test.mine')::uuid, 'flagged_for_review',
+            now() - interval '40 minutes', now() - interval '5 minutes');
+
+  insert into storage.objects (bucket_id, name)
+    values ('proctor-snapshots', v_sub::text || '/looking_away_1.jpg');
+
+  -- The reset's own order: the attempt goes first...
+  delete from public.exam_submissions where id = v_sub;
+
+  perform set_config('test.sub_orphan', v_sub::text, false);
+end $$;
+
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.supervisor@test.local"}',
+         current_setting('test.supervisor')), true);
+do $$
+declare
+  v_read    int;
+  v_deleted int;
+begin
+  -- `Proctor snapshots orphan read for purge`: a DELETE with a WHERE clause must pass
+  -- the SELECT policies too, so this is the policy that makes a purge possible at
+  -- all - and the one a live attempt's stills were being read through before the fix.
+  select count(*) into v_read
+  from storage.objects
+  where bucket_id = 'proctor-snapshots'
+    and name = current_setting('test.sub_orphan') || '/looking_away_1.jpg';
+  if v_read <> 1 then
+    raise exception 'FAIL (e)iii: an orphaned still is not readable by the reset tier (% rows)', v_read;
+  end if;
+
+  perform set_config('storage.allow_delete_query', 'true', true);
+  delete from storage.objects o
+   where o.bucket_id = 'proctor-snapshots'
+     and o.name = current_setting('test.sub_orphan') || '/looking_away_1.jpg';
+  get diagnostics v_deleted = row_count;
+  if v_deleted <> 1 then
+    raise exception 'FAIL (e)iii: an orphaned still could not be purged by the reset tier (% rows)', v_deleted;
+  end if;
+  raise notice 'PASS (e)iii: an orphaned still is still readable and purgeable once its attempt is gone';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+do $$
+begin
+  if (select count(*) from storage.objects o
+       where o.bucket_id = 'proctor-snapshots'
+         and o.name = current_setting('test.sub_orphan') || '/looking_away_1.jpg') <> 0 then
+    raise exception 'FAIL (e)iii: the orphaned still is still in the bucket';
+  end if;
+end $$;
 
 -- =====================================================================
 -- (f)  the review decision: resolve_flagged_attempt()
