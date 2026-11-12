@@ -25,8 +25,8 @@ import {
 const RULES = {
   yawDegrees: 25,
   pitchDegrees: 18,
-  immediateYawDegrees: 30,
-  sustainMs: 300,
+  lookAwaySustainMs: 2000,
+  noFaceSustainMs: 300,
   graceMs: 0,
   multipleFacesCooldownMs: 30000,
 };
@@ -69,8 +69,8 @@ test('describeRules names every number the score was produced under', () => {
   const text = describeRules(RULES);
   assert.match(text, /yaw > 25°/);
   assert.match(text, /pitch > 18°/);
-  assert.match(text, /immediate > 30°/);
-  assert.match(text, /sustain 300ms/);
+  assert.match(text, /look-away hold 2000ms/);
+  assert.match(text, /no-face hold 300ms/);
   assert.match(text, /grace 0ms/);
   assert.match(text, /two-face re-arm 30000ms/);
 });

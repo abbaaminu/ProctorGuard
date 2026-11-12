@@ -3,8 +3,9 @@
  *
  * `createJudge` is a port of `WebFacePresenceMonitor`, so these tests are about
  * the parts a reviewer would check against the Dart: a sustained `no_face` is one
- * violation however long it lasts, a near-sideways turn reports at once, a second
- * person latches across a cooldown, and the startup grace can be switched back on.
+ * violation however long it lasts, a turned head - at any angle - has to hold, a
+ * second person latches across a cooldown, and the startup grace can be switched
+ * back on.
  */
 
 import assert from 'node:assert/strict';
@@ -23,7 +24,7 @@ import {
 const rules = (overrides = {}) => ({ ...DEFAULT_RULES, ...overrides });
 
 test('a sustained no_face is one violation, however long it lasts', () => {
-  const judge = createJudge(rules({ sustainMs: 300 }));
+  const judge = createJudge(rules({ noFaceSustainMs: 300 }));
   assert.equal(judge.feed('no_face', 0), null);
   assert.equal(judge.feed('no_face', 200), null);
   // The sustain has elapsed: the app reports now, not at the first tick.
@@ -41,19 +42,23 @@ test('a face coming back re-arms the episode', () => {
   assert.equal(judge.feed('no_face', 900), 'no_face');
 });
 
-test('looking_away waits for the sustain, and pose: past the immediate angle does not', () => {
-  const sustained = createJudge(rules({ sustainMs: 300 }));
+test('looking_away waits for the hold, and no angle skips it', () => {
+  const sustained = createJudge(rules({ lookAwaySustainMs: 300 }));
   assert.equal(sustained.feed('looking_away', 0), null);
   assert.equal(sustained.feed('looking_away', 299), null);
   assert.equal(sustained.feed('looking_away', 300), 'looking_away');
 
-  // A near-sideways head is unambiguous on the first detection, so the sustain is
-  // skipped rather than filled.
-  const immediate = createJudge(rules({ sustainMs: 300, immediateYawDegrees: 30 }));
-  assert.equal(immediate.feed('pose:45,0', 0), 'looking_away');
-  // Just over the look-away angle but under the immediate one still waits - 20 deg
-  // against the app's 15 / 30 pair.
-  const nearly = createJudge(rules({ immediateYawDegrees: 30 }));
+  // A near-sideways head used to report on the first detection here (past 30
+  // degrees, no sustain). The monitor no longer has that exemption - one bad frame
+  // can read 60 degrees - so neither does its port: 45 degrees waits out the hold
+  // exactly like 20.
+  const wide = createJudge(rules({ lookAwaySustainMs: 300 }));
+  assert.equal(wide.feed('pose:45,0', 0), null);
+  assert.equal(wide.feed('pose:45,0', 299), null);
+  assert.equal(wide.feed('pose:45,0', 300), 'looking_away');
+
+  // Just over the gate waits too, and the gate is the app's 15 degrees.
+  const nearly = createJudge(rules({ lookAwaySustainMs: 300 }));
   assert.equal(nearly.feed('pose:20,0', 0), null);
   assert.equal(nearly.feed('pose:20,0', 300), 'looking_away');
 });
@@ -66,25 +71,29 @@ test('the pose gate is symmetric on both axes', () => {
     ['pose:20,0', 'pose:-20,0'],
     ['pose:0,20', 'pose:0,-20'],
   ]) {
-    const judge = createJudge(rules({ sustainMs: 300 }));
+    const judge = createJudge(rules({ lookAwaySustainMs: 300 }));
     assert.equal(judge.feed(there, 0), null);
     assert.equal(judge.feed(there, 300), 'looking_away', `${there} should report`);
-    const mirrored = createJudge(rules({ sustainMs: 300 }));
+    const mirrored = createJudge(rules({ lookAwaySustainMs: 300 }));
     assert.equal(mirrored.feed(back, 0), null);
     assert.equal(mirrored.feed(back, 300), 'looking_away', `${back} should report`);
   }
 });
 
 test('a pose inside the box ends the episode and re-arms it', () => {
-  const judge = createJudge(rules());
-  assert.equal(judge.feed('pose:40,0', 0), 'looking_away');
-  assert.equal(judge.feed('pose:40,0', 100), null);
+  const judge = createJudge(rules({ lookAwaySustainMs: 300 }));
+  assert.equal(judge.feed('pose:40,0', 0), null);
+  assert.equal(judge.feed('pose:40,0', 300), 'looking_away');
+  assert.equal(judge.feed('pose:40,0', 400), null);
   // Centred again: the episode is over, so the next turn is a new one.
-  assert.equal(judge.feed('pose:0,0', 150), null);
+  assert.equal(judge.feed('pose:0,0', 450), null);
   // Pitch counts as much as yaw: looking down at a phone is looking away, and it
-  // still has to last the sustain.
-  assert.equal(judge.feed('pose:-2,-25', 200), null);
-  assert.equal(judge.feed('pose:-2,-25', 500), 'looking_away');
+  // still has to last the hold.
+  assert.equal(judge.feed('pose:-2,-25', 500), null);
+  assert.equal(judge.feed('pose:-2,-25', 800), 'looking_away');
+  // Inside the tolerances is not evidence, however long it goes on.
+  assert.equal(judge.feed('pose:14,14', 900), null);
+  assert.equal(judge.feed('pose:14,14', 5000), null);
 });
 
 test('multiple_faces reports once and latches across the cooldown', () => {
@@ -114,7 +123,7 @@ test('a second person ends the single-face episodes rather than pausing them', (
 });
 
 test('a face appearing ends an away episode without needing a report', () => {
-  const judge = createJudge(rules());
+  const judge = createJudge(rules({ lookAwaySustainMs: 300 }));
   assert.equal(judge.feed('looking_away', 0), null);
   // Without a face there is no head pose to judge, so the away clock is dropped.
   assert.equal(judge.feed('no_face', 100), null);
@@ -163,7 +172,7 @@ test('judgeVerdicts stamps each episode with the clip time it happened', () => {
       { message: 'looking_away', t: 2.0 },
       { message: 'looking_away', t: 2.4 },
     ],
-    rules({ sustainMs: 300 }),
+    rules({ lookAwaySustainMs: 300, noFaceSustainMs: 300 }),
   );
   assert.deepEqual(actions, [
     { action: 'no_face', t: 0.4 },
@@ -185,7 +194,10 @@ test('readAppRules reads the numbers out of the Dart that states them', () => {
     assert.equal(typeof value, 'number', `${key} should be a number`);
     assert.ok(Number.isFinite(value) && value >= 0, `${key} should be a sane rule`);
   }
-  assert.ok(app.sustainMs > 0, 'the app sustains an episode before reporting');
+  // The two holds are different questions and the app answers them with different
+  // numbers: two seconds for a turned head, 300 ms for a camera that has stopped
+  // showing one - and the grace is the shared five seconds.
+  assert.ok(app.lookAwaySustainMs > app.noFaceSustainMs, 'a turn waits longer than an absence');
   assert.ok(app.graceMs > 0, 'the app ignores the start of an attempt');
 
   // The evaluation's default is not the app's grace, and that difference is the

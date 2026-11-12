@@ -36,13 +36,19 @@ function table(headers, rows, aligns) {
   );
 }
 
-/** The rules in one line, so a scored run can be reproduced from its own output. */
+/**
+ * The rules in one line, so a scored run can be reproduced from its own output.
+ *
+ * Two holds, not one: the gate that decides a head has turned is a different
+ * question from how long a missing face waits, and the app answers them with
+ * different numbers.
+ */
 export function describeRules(rules) {
   return [
     `yaw > ${rules.yawDegrees}°`,
     `pitch > ${rules.pitchDegrees}°`,
-    `immediate > ${rules.immediateYawDegrees}°`,
-    `sustain ${rules.sustainMs}ms`,
+    `look-away hold ${rules.lookAwaySustainMs}ms`,
+    `no-face hold ${rules.noFaceSustainMs}ms`,
     `grace ${rules.graceMs}ms`,
     `two-face re-arm ${rules.multipleFacesCooldownMs}ms`,
   ].join(', ');

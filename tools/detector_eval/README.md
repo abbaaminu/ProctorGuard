@@ -51,6 +51,14 @@ than quietly scoring a different app. `test/judge.test.mjs` fails if
 first seconds of an attempt. `--grace 5` reproduces the app exactly, which is worth
 doing once: it is the only place this tool and the app are allowed to disagree.
 
+Two holds, not one. A head that has turned waits `lookAwaySustainMs` (the app's 2 s
+at 15°, shared with the phone), while a missing face waits `noFaceSustainMs` (300 ms):
+"the head went past the gate and stayed there" and "the camera stopped showing a
+face" are different questions, and the browser has always answered them with
+different numbers. There is no angle at which a turn is reported on sight — a 60°
+estimate can come from a single bad frame, so every angle past the gate waits out
+the hold.
+
 ## Labelling
 
 Copy `labels.template.csv` to `labels.csv` and replace the example rows. One row per
