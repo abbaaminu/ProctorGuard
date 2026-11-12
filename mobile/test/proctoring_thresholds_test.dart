@@ -55,7 +55,7 @@ void main() {
       );
     });
 
-    test('both platforms judge a head with the same angle', () {
+    test('both platforms judge a head with the same angle and the same hold', () {
       final engine = MediaPipeProctoringService();
       addTearDown(engine.dispose);
       final web = WebFacePresenceMonitor(source: _SilentSource());
@@ -72,15 +72,25 @@ void main() {
       // its own while still agreeing with the constants.
       expect(engine.offCenterThresholdDegrees, engine.pitchThresholdDegrees);
       expect(web.offCenterYawDegrees, web.offCenterPitchDegrees);
-      // The web's near-sideways shortcut may only shorten the wait for a head that
-      // is already unmistakably turned; it is asserted in the monitor itself to be
-      // past the ordinary tolerance, and this is the same statement from outside.
-      expect(web.immediateAwayYawDegrees, greaterThan(web.offCenterYawDegrees));
-      // The sustain is the one number the web does not take from the engine: a
-      // page's detector has no fixed frame rate, so the monitor measures elapsed
-      // time against its own window instead of counting frames.
-      // `web_face_presence.dart` explains the difference.
-      expect(web.sustain, isNot(lookAwaySustain));
+      // The *hold* is shared too, and this is the parity the audit asked for: 15
+      // degrees of yaw or pitch, absolute, held for two seconds, on both platforms.
+      // The web measures that two seconds on a clock where the engine measures it
+      // over consecutive frames, but the finding, and the number in it, is one.
+      expect(web.lookAwaySustain, lookAwaySustain);
+      expect(web.lookAwaySustain, engine.lookAwaySustain);
+      // There is no near-sideways exemption on either platform. The web used to
+      // report a `pose:` past 30 deg on the first detection, three times sooner
+      // than the phone; that shortcut is removed rather than equalised, because the
+      // engine's own exemption was removed for a reason that applies to a browser
+      // detector too (one bad frame can read 60 deg).
+      expect(web.offCenterYawDegrees, engine.offCenterThresholdDegrees);
+      // Absence is the one window that is *not* the look-away's: a covered, muted
+      // or unplugged camera has to say so at once, and the engine confirms it over
+      // three frames (~0.45 s) rather than two seconds. Pinned, so a future tidy-up
+      // cannot quietly make "my camera is covered" a two-second wait - or make a
+      // student's blink a `no_face`.
+      expect(web.noFaceSustain, const Duration(milliseconds: 300));
+      expect(web.noFaceSustain, lessThan(web.lookAwaySustain));
     });
   });
 

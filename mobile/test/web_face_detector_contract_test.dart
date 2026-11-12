@@ -30,8 +30,9 @@ import 'package:proctorguard/core/services/web_face_signal_source.dart';
 ///    opened, a browser with no face model: accusing any of those is a strike a
 ///    student did not earn, so each has to be silence or `centered`.
 ///  * **It was polled too slowly to be a strike.** Dart sustains a verdict for
-///    [WebFacePresenceMonitor.sustain]; a detector that reports once per sustain
-///    would open an episode and never close it.
+///    [WebFacePresenceMonitor.noFaceSustain] (and a pose for
+///    [WebFacePresenceMonitor.lookAwaySustain]); a detector that reports once per
+///    sustain would open an episode and never close it.
 void main() {
   /// Reads a file relative to the package root (`mobile/`, the working directory
   /// `flutter test` uses). Null when a checkout does not have it, so a failure
@@ -57,7 +58,7 @@ void main() {
   }
 
   /// The polling interval written into the file. It is the only `INTERVAL_MS`
-  /// constant, and it is what Dart's sustain is measured against.
+  /// constant, and it is what Dart's absence window is measured against.
   int pollingInterval() {
     final match = RegExp(r'INTERVAL_MS\s*=\s*(\d+)').firstMatch(detector());
     expect(
@@ -945,19 +946,37 @@ void main() {
   });
 
   group('the loop', () {
-    test('is polled faster than the sustain it has to fill', () {
+    test('polls often enough for both windows to fill', () {
       final monitor = WebFacePresenceMonitor(source: _SilentSource());
       addTearDown(monitor.dispose);
 
       final interval = pollingInterval();
+      // The absence window is the short one, and the tick is longer than it: the
+      // first `no_face` opens the episode and the second already leaves it older
+      // than the window, so a covered lens is a strike on the second tick even if a
+      // tick is missed in between.
       expect(
         interval,
-        greaterThan(monitor.sustain.inMilliseconds),
+        greaterThan(monitor.noFaceSustain.inMilliseconds),
         reason:
             'the detector polls every $interval ms and the monitor sustains a '
-            'verdict for ${monitor.sustain.inMilliseconds} ms, so a verdict can be '
-            're-sent before the sustain has elapsed and a covered camera never '
-            'reaches a strike',
+            '`no_face` for ${monitor.noFaceSustain.inMilliseconds} ms, so a single '
+            'verdict can no longer fill the window and a covered camera waits for '
+            'two ticks that may never come',
+      );
+      // The look-away window is the phone's two seconds, and the tick fills it over
+      // several samples instead of one - which is what "held" means. It still may
+      // not be longer than the whole window: one sample per two seconds is a head
+      // that was seen once, sitting on the boundary, and one missed tick would mean
+      // never.
+      expect(
+        interval,
+        lessThan(monitor.lookAwaySustain.inMilliseconds),
+        reason:
+            'the detector polls every $interval ms, so a turned head is measured '
+            '${monitor.lookAwaySustain.inMilliseconds ~/ interval} times inside the '
+            '${monitor.lookAwaySustain.inMilliseconds} ms window; a tick longer than '
+            'the window would make one sample a strike',
       );
       expect(
         interval,
@@ -1079,7 +1098,7 @@ void main() {
 /// A source with nothing to say, so the monitor's defaults can be read on the VM.
 ///
 /// The rules themselves are covered by `web_face_presence_test.dart`; this file
-/// only needs [WebFacePresenceMonitor.sustain] to hold the JavaScript interval
+/// only needs [WebFacePresenceMonitor.noFaceSustain] to hold the JavaScript interval
 /// against.
 class _SilentSource implements WebFaceSignalSource {
   @override

@@ -33,10 +33,13 @@ void main() {
   void report(String message) => monitor.handleMessage(message);
 
   /// One detection far enough after the previous one that the condition has
-  /// demonstrably held: the sustain window plus a margin, so the tests do not
+  /// demonstrably held: the look-away window plus a margin, so the tests do not
   /// depend on the exact boundary.
+  ///
+  /// The look-away window is the longer of the two, so holding for it also fills
+  /// the shorter `no_face` one - which is what the episode tests want either way.
   void hold(String message) {
-    now = now.add(monitor.sustain + const Duration(milliseconds: 100));
+    now = now.add(monitor.lookAwaySustain + const Duration(milliseconds: 100));
     report(message);
   }
 
@@ -217,15 +220,24 @@ void main() {
       expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
     });
 
-    test('a near-sideways turn needs no sustain', () async {
+    test('a near-sideways turn is held exactly like any other', () async {
+      // 70 deg of yaw is past the point where anything on the screen could still
+      // be read, and it is still *not* a strike on sight: the web used to report it
+      // on the first detection (a 'near-sideways shortcut' at 30 deg yaw), which
+      // made a browser three times quicker than the phone for the same head. The
+      // engine has no such exemption and the audit asked for parity, so how long is
+      // the whole rule and the angle only decides whether the rule applies.
       report('pose:70,0');
       await flush();
       expect(
         signals,
-        <GazeSignal>[GazeSignal.lookingAway],
-        reason: 'nothing on the screen is readable at 70 deg, so the first '
-            'detection is already the episode',
+        isEmpty,
+        reason: 'one detection is a glance, however far round it is',
       );
+
+      hold('pose:70,0');
+      await flush();
+      expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
 
       // Still one strike while the head stays there.
       hold('pose:70,0');
@@ -236,6 +248,14 @@ void main() {
       report('pose:0,0');
       now = now.add(const Duration(seconds: 2));
       report('pose:70,0');
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+        reason: 'the new turn has only just started',
+      );
+
+      hold('pose:70,0');
       await flush();
       expect(
         signals.where((signal) => signal == GazeSignal.lookingAway),
@@ -392,14 +412,36 @@ void main() {
     });
 
     test('a fast detector cannot stack strikes', () async {
-      // A page running at 20 fps calls far more often than the sustain window;
+      // A page running at 20 fps calls far more often than the look-away window;
       // what matters is elapsed time, not how many times it said so.
-      for (var i = 0; i < 40; i++) {
+      for (var i = 0; i < 60; i++) {
         now = now.add(const Duration(milliseconds: 50));
         report(WebFaceMessages.lookingAway);
       }
       await flush();
       expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
+    });
+
+    test('a covered camera is reported on the shorter absence window', () async {
+      // `no_face` is deliberately not the look-away window: a lens that is covered,
+      // muted or unplugged is not a reading position, and the engine confirms it over
+      // three frames (~0.45 s) rather than two seconds. Two detections at the shipped
+      // detector's 350 ms tick fill it; one does not.
+      final start = now;
+      report(WebFaceMessages.noFace);
+      await flush();
+      expect(signals, isEmpty, reason: 'the first empty frame opens the episode');
+
+      now = now.add(monitor.noFaceSustain);
+      report(WebFaceMessages.noFace);
+      await flush();
+      expect(signals, <GazeSignal>[GazeSignal.noFace]);
+      expect(
+        now.difference(start),
+        lessThan(monitor.lookAwaySustain),
+        reason: 'the absence rule must fire inside the look-away window, or it is '
+            'not a faster rule at all',
+      );
     });
   });
 
@@ -431,7 +473,7 @@ void main() {
       gated.handleMessage(WebFaceMessages.lookingAway, at: after);
       gated.handleMessage(
         WebFaceMessages.lookingAway,
-        at: after.add(gated.sustain + const Duration(milliseconds: 100)),
+        at: after.add(gated.lookAwaySustain + const Duration(milliseconds: 100)),
       );
       await flush();
       expect(seen, <GazeSignal>[GazeSignal.lookingAway]);
@@ -490,7 +532,7 @@ void main() {
       await flush();
       expect(signals, isEmpty, reason: 'still just a glance');
 
-      now = now.add(monitor.sustain + const Duration(milliseconds: 100));
+      now = now.add(monitor.lookAwaySustain + const Duration(milliseconds: 100));
       source.emit('Looking_Away');
       await flush();
       expect(signals, <GazeSignal>[GazeSignal.lookingAway]);

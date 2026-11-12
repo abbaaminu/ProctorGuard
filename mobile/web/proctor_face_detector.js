@@ -143,10 +143,13 @@
 
   // --- Tuning ---------------------------------------------------------------
 
-  // One tick more than `WebFacePresenceMonitor.sustain` (300 ms): the first
-  // `no_face` opens the episode, the second leaves it older than the sustain.
-  // Measured in wall time, not frames, because nothing guarantees this page's
-  // frame rate.
+  // One tick more than `WebFacePresenceMonitor.noFaceSustain` (300 ms): the first
+  // `no_face` opens the episode, the second leaves it older than the window. It is
+  // also a fraction of the look-away window (`lookAwaySustain`, the phone's 2 s),
+  // which a measured `pose:` fills over several ticks - every verdict except a
+  // repeated `centered` is re-sent on each tick, so a held head keeps the clock
+  // running. Measured in wall time, not frames, because nothing guarantees this
+  // page's frame rate.
   var INTERVAL_MS = 350;
 
   // How often a holding `centered` is said again while it holds. It is not

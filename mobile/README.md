@@ -1388,8 +1388,9 @@ DOM half in `web_face_signal_source_web.dart`) installs the one global function
 both use, with the attempt, and removes it when the attempt ends.
 
 **What `proctor_face_detector.js` measures.** It polls about three times a second
-(350 ms — one tick more than the monitor's 300 ms sustain, so the first verdict
-opens an episode and the second is the strike) and samples the preview
+(350 ms — one tick more than the monitor's 300 ms absence window, so the first
+`no_face` opens an episode and the second is the strike; a turned head fills the
+two-second look-away window over six ticks) and samples the preview
 `camera_web` renders, which it finds through Flutter's platform-view host and any
 shadow root above it. Per tick:
 
@@ -1451,7 +1452,8 @@ box: the MediaPipe landmarks give yaw (how far the nose has swung from the
 midpoint between the eyes) and pitch (its drop below the eye line), smoothed over
 a few ticks and judged by `WebFacePresenceMonitor` with the phone build's own
 tolerances (`15°` yaw / `15°` pitch, absolute on both axes so either direction
-counts the same, and a turn past `30°` yaw at once). A count
+counts the same) **and the phone build's own hold** (`lookAwaySustain`, two
+seconds). A count
 with no angle stays a count. A host running a different detector (WASM/WebGPU, or
 a remote service) keeps using the bridge below and can say `looking_away` or
 `pose:<yaw>,<pitch>` itself.
@@ -1495,20 +1497,29 @@ window.proctorGuardFaceSignal('centered');
 | Message | Meaning | Becomes |
 | --- | --- | --- |
 | `centered` | face visible, head within tolerance | ends the current episode (never a strike itself) |
-| `looking_away` | face visible, head turned away | `looking_away`, if it holds for 300ms |
-| `no_face` | nothing in frame | `no_face`, if it holds for 300ms |
+| `looking_away` | face visible, head turned away | `looking_away`, if it holds for 2s (`lookAwaySustain`) — so keep sending it while it holds |
+| `no_face` | nothing in frame | `no_face`, if it holds for 300ms (`noFaceSustain`) |
 | `multiple_faces` | a second person in frame | `multiple_faces`, at once (latched 30s) |
-| `pose:<yaw>,<pitch>` | head pose in degrees, instead of a verdict | this app applies the same tolerances as the phone build (`15°` yaw / `15°` pitch on the absolute angle, and a turn past `30°` yaw at once) |
+| `pose:<yaw>,<pitch>` | head pose in degrees, instead of a verdict | this app applies the same tolerances as the phone build (`15°` yaw / `15°` pitch on the absolute angle) and the same 2s hold |
 
 `WebFacePresenceMonitor` (`web_face_presence.dart`) is the judgement, not the
-detection: it sustains a condition before reporting it (a measured `pose:` turned
-past `30°` yaw excepted — that far round, the first detection is already the
-episode), re-arms after `centered`, and ignores the first 5s, so a browser episode
-is worth exactly the strike a phone's is and arrives through the same
-`ProctoringNotifier.reportGazeSignal` door. The 300ms window is the parity number:
-it is one of the shortest intervals a host detector is polled at (~3-10 fps), so a
-glance that would be a strike on the phone is a strike here too rather than waiting
-for a second of evidence the host may never send. Three consequences worth knowing:
+detection: it sustains a condition before reporting it, re-arms after `centered`,
+and ignores the first 5s, so a browser episode is worth exactly the strike a
+phone's is and arrives through the same
+`ProctoringNotifier.reportGazeSignal` door. A look-away is the phone's two seconds
+(`lookAwaySustain`, shared with the engine) at the phone's 15° on either axis, held
+in *elapsed time* rather than in frames because a host detector has no guaranteed
+frame rate: the rule, the angle and the hold are one, only the unit differs. The
+300ms window that used to be the web's parity number is now only the absence rule
+— and the absence rule keeps it deliberately: a covered, muted or unplugged camera
+has to say so at once, the engine confirms it over three frames (~0.45 s) rather
+than two seconds, and no student earns a `no_face` by moving. A **30° "near
+sideways" shortcut** (a `pose:` past it reported on the first detection) used to
+sit on top of that: it has been **removed** rather than equalised, because the
+phone engine deliberately has no such exemption — a 60° estimate can come from one
+bad frame, so the angle is unambiguous about the *frame*, not about the student —
+and a web-only version made a browser three times quicker than the phone for the
+same head. Three consequences worth knowing:
 
 * **Nothing is invented.** `isSupported` is false on every platform but the web,
   and on the web the sensor speaks only about evidence it has: a frame it could
@@ -1797,17 +1808,22 @@ back in the tolerated pose resets the counters, so only an unbroken run counts, 
 each episode reports once: a sustained look-away is one strike, not one per
 inference. `multiple_faces` is the exception: two people in frame needs no
 measuring, so it reports immediately and is latched per episode instead. There is no
-second exception on the phone — a near-sideways head is held like any other turn,
-because a 60 deg estimate can come from one bad frame, so it is unambiguous about
-the *frame*, not about the student. The browser monitor does keep one,
-`immediateAwayYawDegrees` (`30`): a `pose:` message past it is reported without
-waiting out its 300 ms, on the grounds that a host detector reporting angles has
-already done the measuring. Browsers get the same rule from
-the other side of the stack — `web_face_presence.dart` reports a `no_face` or a
-look-away that holds for 300 ms, which is the shortest interval a browser face
-detector can be asked for without depending on its frame rate, and the shipped
-`web/proctor_face_detector.js` is polled at 350 ms so a covered camera is a strike
-on the second tick; a second person in frame is still reported at once.
+second exception on either platform — a near-sideways head is held like any other
+turn, because a 60 deg estimate can come from one bad frame, so it is unambiguous
+about the *frame*, not about the student. The browser monitor used to keep one
+(`immediateAwayYawDegrees`, `30`: a `pose:` message past it was reported without
+waiting out its window); it was removed for that reason and for parity, so the
+browser and the phone now hold the same 15° for the same two seconds
+(`lookAwaySustain`). Browsers get the same rule from
+the other side of the stack — `web_face_presence.dart` reports a look-away that
+holds for 2 s, and a `no_face` that holds for 300 ms (`noFaceSustain`, the shorter
+window kept on purpose: a covered camera is not a reading position, and the engine
+confirms absence over three frames rather than two seconds). The shipped
+`web/proctor_face_detector.js` is polled at 350 ms, so a covered camera is a strike
+on the second tick and a turned head fills the two-second window over six — every
+verdict except a repeated `centered` is re-sent on each tick, which is what makes a
+window measured in time fillable at all; a second person in frame is still reported
+at once.
 `ProctoringNotifier.setCameraActive` gates the whole camera set while the feed is not
 streaming, and `ProctoringState.faceMissing` is the *state* the page blocks on rather
 than the strike: a `no_face`/`looking_away` signal sets it and the next `centered`

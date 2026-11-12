@@ -634,8 +634,21 @@ void main() {
         reason: 'a glance at the keyboard is not a violation',
       );
 
+      // The settle is the phone's own two seconds (`lookAwaySustain`): the browser
+      // used to fill it in 300 ms, which made one glance three times as expensive
+      // as the identical glance on Android. Half of it is still a glance.
       now = now.add(const Duration(milliseconds: 1300));
       faces.emit('LOOKING_AWAY');
+      await tester.pump();
+      await tester.pump();
+      expect(
+        proctoring.violations,
+        isEmpty,
+        reason: '1.3 s of a 2 s hold is not yet a held look away',
+      );
+
+      now = now.add(const Duration(milliseconds: 800));
+      faces.emit('Looking_Away');
       await tester.pump();
       await tester.pump();
 
@@ -643,17 +656,24 @@ void main() {
       expect(find.text('Warning 1'), findsOneWidget);
     });
 
-    testWidgets('a near-sideways head is one looking_away strike on sight',
+    testWidgets('a near-sideways head is held like any other turn',
         (tester) async {
       await openPastGrace(tester);
 
-      // The page measured the head, and 70 deg is past the point where anything
-      // on the screen could still be read - so the strike does not wait out a
-      // sustain the way a glance at 40 deg would.
+      // 70 deg is past the point where anything on the screen could be read, and it
+      // is still not a strike on sight: the web's old "near-sideways" shortcut (a
+      // `pose:` past 30 deg reported on the first detection) is gone, because the
+      // phone engine has no such rule and the same head has to cost the same strike
+      // on both platforms.
       faces.emit('pose:70,0');
       await tester.pump();
       await tester.pump();
+      expect(proctoring.violations, isEmpty);
 
+      now = now.add(const Duration(milliseconds: 2100));
+      faces.emit('pose:70,5');
+      await tester.pump();
+      await tester.pump();
       expect(proctoring.violations.single.type.dbValue, 'looking_away');
       expect(find.text('Warning 1'), findsOneWidget);
 
