@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/di/providers.dart';
 import '../../../../core/services/offline_sync_service.dart';
+import '../../../../core/services/supabase_service.dart';
 import '../../../../core/utils/proctor_log.dart';
 import '../../domain/entities/exam_submit_result.dart';
 import '../../domain/entities/question.dart';
@@ -509,6 +510,13 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
       // Local first: this resolves once the answer is durable on the device, so
       // a dropped connection no longer costs the student the choice they made.
       await _persistChoice(question.id, optionIndex);
+    } on SessionSupersededException {
+      // Not a connection problem: another device signed in, so this session
+      // cannot write (schema.sql §1b) and the gate is about to sign out. Say so
+      // instead of blaming the network.
+      proctorLog('ProctorGuard: answer refused, session superseded');
+      onMessage?.call(sessionSupersededMessage);
+      return;
     } catch (error) {
       // Only reachable without a queue (see [_persistChoice]). Grading reads the
       // *server* copy, so stay on the question instead of advancing past the
@@ -638,6 +646,14 @@ class ExamSessionController extends StateNotifier<ExamSessionState> {
 
     try {
       await _persistText(questionId, text);
+    } on SessionSupersededException {
+      // See [selectOption]: the write was refused because another device signed
+      // in, not because the network is down.
+      proctorLog('ProctorGuard: text answer refused, session superseded');
+      if (!mounted) return false;
+      state = state.copyWith(savingText: false);
+      onMessage?.call(sessionSupersededMessage);
+      return false;
     } catch (error) {
       proctorLog('ProctorGuard: text answer save failed: $error');
       if (!mounted) return false;

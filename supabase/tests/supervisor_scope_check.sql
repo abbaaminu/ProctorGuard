@@ -15,12 +15,16 @@
 -- `supabase/schema.sql` (which carries section 2c/2d on a fresh install) or
 -- `supabase/migrations/20261109090000_supervisor_exam_assignments.sql` on an
 -- existing project - plus `20261110090000_supervisor_student_arm.sql`, which closes
--- the student arm to a supervisor, and `20261110090100_snapshot_orphan_check.sql`,
--- which asks the snapshot purge policies' orphan question as the owner instead of as
--- the caller. Block (b) below is the check that found the student arm open: on a
--- project without the guard it reports the unassigned paper by name. Blocks (e)ii-iii
--- are the check that found the purge open: on a project without the definer helper
--- they report another paper's live stills, readable and deleted.
+-- the student arm to a supervisor, `20261110090100_snapshot_orphan_check.sql`, which
+-- asks the snapshot purge policies' orphan question as the owner instead of as the
+-- caller, and `20261111090100_lecturer_isolation.sql`, which replaces every
+-- lecturer-level read with `can_reach_exam(exam_id)`. Block (b) below is the check
+-- that found the student arm open: on a project without the guard it reports the
+-- unassigned paper by name. Blocks (e)ii-iii are the check that found the purge open:
+-- on a project without the definer helper they report another paper's live stills,
+-- readable and deleted. Block (l) is the same check for the paper scope itself: on a
+-- project without the isolation file it lists a colleague's paper, its questions, its
+-- attempts, its marks, its incidents and its stills.
 --
 -- HOW RLS IS APPLIED
 --   Identical to `targeting_check.sql`, `weighted_strikes_check.sql`,
@@ -48,24 +52,26 @@
 --   later roster block (k) - and the helper is rolled back with everything else.
 --
 -- WHAT IT PROVES
---   The supervisor scope (`20261109090000_supervisor_exam_assignments.sql`):
---   a supervisor reaches the papers an administrator assigned to them, an
---   administrator reaches every paper without a row, and **a lecturer keeps exactly
---   what they had** - every assertion that names the lecturer below is the shape
---   `lecturer_scoped_log_reads.sql` left behind.
+--   The supervisor scope (`20261109090000_supervisor_exam_assignments.sql`): a
+--   supervisor reaches the papers an administrator assigned to them, an
+--   administrator reaches every paper without a row, and a lecturer keeps the papers
+--   they wrote - every assertion that names the lecturer below is asked of the
+--   *author* of both fixture papers, so it proves the author arm survived the
+--   narrowing; block (l) is the other half, a lecturer who wrote nothing.
 --
 --   (a) `can_supervise_exam()` is per paper: admin true everywhere with no row,
 --       supervisor true only for the assigned paper, lecturer and student false,
 --       and a NULL paper false even for an admin.
 --   (b) the console list (`exams_select`): the supervisor is offered the assigned
---       paper and not the other; the lecturer and the admin still see both. The
---       second paper is deliberately *untargeted* (no faculty/department/level on
---       the paper, none on the supervisor's profile), because that is the one row
---       the **student** arm of the policy used to hand a supervisor - closed by
---       `20261110090000_supervisor_student_arm.sql`.
+--       paper and not the other; the lecturer (who wrote both) and the admin still
+--       see both. The second paper is deliberately *untargeted* (no
+--       faculty/department/level on the paper, none on the supervisor's profile),
+--       because that is the one row the **student** arm of the policy used to hand a
+--       supervisor - closed by `20261110090000_supervisor_student_arm.sql`.
 --   (c) the roster (`submissions_select_own_or_supervisor`): the supervisor reads
---       the assigned paper's attempts only; the lecturer still reads every attempt,
---       which is what makes their monitor work on any sitting.
+--       the assigned paper's attempts only; the lecturer reads the attempts on the
+--       papers they wrote, which is what makes their monitor work on any sitting they
+--       are accountable for.
 --   (d) the incident feed (`logs_select_own_or_supervisor`): assigned paper only;
 --       the lecturer keeps the feed of the paper they wrote, and the student their
 --       own row.
@@ -95,8 +101,16 @@
 --       name of every student on a paper they run - one who sat it, one on its
 --       borrow list, one a labelled paper of theirs is aimed at - and, with no
 --       assignment, exactly their own row. Another paper's student and another
---       member of staff stay unreadable, and the lecturer and the administrator keep
---       the whole roster.
+--       member of staff stay unreadable; the lecturer reads the students on the
+--       papers they wrote and no colleague's row; the administrator keeps the whole
+--       roster with no paper at all.
+--   (l) lecturer isolation (`20261111090100_lecturer_isolation.sql`): a lecturer who
+--       wrote none of the fixture papers reads nothing of a colleague's sitting -
+--       the paper, its questions, its attempts, its hand marks, its incidents, its
+--       automatic score, its stills - cannot reset it, and cannot finish the reset
+--       somebody else made of it; while the paper's own author, an administrator and
+--       a supervisor the administrator assigned to that paper keep every one of those
+--       reads, and the purge grant stays with the paper rather than the tier.
 begin;
 
 -- Fixture helper: profiles.id references auth.users(id), which a plain insert
@@ -980,9 +994,16 @@ reset role;
 select set_config('request.jwt.claims', '', true);
 
 
--- ...and the two roles that were never narrowed keep the whole roster. This is the
--- "unchanged" half, and it is the read the marking queue (`_namesFor()` in
--- question_authoring_repository_impl.dart) and the admin console go through.
+-- ...and the two roles that are *not* narrowed to one paper's roster: an
+-- administrator keeps every row with no paper at all (the account list), and a
+-- lecturer keeps the students of the papers they wrote - which is the read the
+-- marking queue (`_namesFor()` in question_authoring_repository_impl.dart) makes,
+-- so every name on a paper that queue can show still resolves.
+--
+-- Since `20261111090100_lecturer_isolation.sql` the lecturer arm is
+-- `is_staff() and can_read_profile(id)` rather than `is_staff()` alone, so a
+-- colleague's account - another lecturer's, a supervisor's, an administrator's - is
+-- no longer readable by being employed here.
 set local role authenticated;
 select set_config('request.jwt.claims',
   format('{"sub": "%s", "role": "authenticated", "email": "scope.lecturer@test.local"}',
@@ -991,19 +1012,27 @@ do $$
 declare
   v_visible int;
 begin
+  -- The four students this lecturer's own papers reach: s1 sat `test.mine`, s2 sat
+  -- `test.theirs` (both written by this account), `test.borrower` is on `test.mine`'s
+  -- borrow list and `test.targeted` is aimed at the labelled paper it wrote.
   select count(*) into v_visible
   from public.profiles
   where id in (current_setting('test.s1')::uuid,
                current_setting('test.s2')::uuid,
-               current_setting('test.peer')::uuid,
-               current_setting('test.admin')::uuid,
                current_setting('test.borrower')::uuid,
                current_setting('test.targeted')::uuid);
 
-  if v_visible <> 6 then
-    raise exception 'FAIL (k)viii: a lecturer reads % of the 6 other rows, expected all of them', v_visible;
+  if v_visible <> 4 then
+    raise exception 'FAIL (k)viii: a lecturer reads % of the 4 students on their own papers, expected all of them', v_visible;
   end if;
-  raise notice 'PASS (k)viii: a lecturer keeps the whole roster (unchanged)';
+
+  -- ...and no colleague's row, which no paper of theirs reaches.
+  if exists (select 1 from public.profiles
+              where id in (current_setting('test.peer')::uuid,
+                           current_setting('test.admin')::uuid)) then
+    raise exception 'FAIL (k)viii: a lecturer read a colleague''s profile row';
+  end if;
+  raise notice 'PASS (k)viii: a lecturer reads the students on their own papers, and no colleague';
 end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);
@@ -1029,6 +1058,427 @@ begin
     raise exception 'FAIL (k)ix: an administrator reads % of the 6 other rows, expected all of them', v_visible;
   end if;
   raise notice 'PASS (k)ix: an administrator keeps the whole roster (no assignment needed)';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+
+-- =====================================================================
+-- (l)  lecturer isolation: a colleague's paper
+-- =====================================================================
+-- `20261111090100_lecturer_isolation.sql` replaced every lecturer-level read with
+-- `can_reach_exam(exam_id)`, and this block asks it from the wrong side of the
+-- fence. `test.lecturer` wrote `test.mine` and `test.theirs` (so (b)-(d) already
+-- prove the author arm survived); the paper below was written by somebody else,
+-- and nothing here may reach it.
+--
+-- The paper is **labelled** on purpose. `exams_select`'s second arm is
+-- `student_can_access_exam()`, which an unlabelled paper offers to any caller whose
+-- profile carries no labels - a lecturer included, and deliberately so: an enrolled
+-- lecturer sitting a colleague's paper is the borrow-list case that predicate was
+-- written for. That is a paper *row*, not its answers, and this file does not change
+-- it; a labelled paper keeps the check about the scope and not about that trade-off.
+--
+-- Fixtures are written here rather than in FIXTURES for the reason (e)iii gives:
+-- blocks (b) and (c) count papers and attempts, and a second author's paper would be
+-- counted in both. `postgres` writes them, so no policy is in the way. The one
+-- change made later, in (l)v, is the assignment row an administrator would create in
+-- the console: it is what turns the colleague's paper into a sitting this supervisor
+-- may run - and it must not turn it into one any lecturer may read.
+do $$
+declare
+  v_rival   uuid := gen_random_uuid();  -- the lecturer who wrote that paper
+  v_other   uuid := gen_random_uuid();  -- the paper
+  v_q       uuid := gen_random_uuid();  -- one multiple-choice question on it
+  v_learner uuid := gen_random_uuid();  -- the student who sat it
+  v_att     uuid := gen_random_uuid();  -- the handed-in attempt
+begin
+  insert into public.profiles (id, role, full_name, email) values
+    (v_rival,   'lecturer', 'Other Lecturer', 'scope.rival@test.local'),
+    (v_learner, 'student',  'Student Eight',  'scope.s8@test.local');
+
+  insert into public.exams (id, title, created_by, duration_minutes, is_published,
+                            faculty, department, level) values
+    (v_other, 'A colleague''s sitting', v_rival, 60, true, 'Science', 'Physics', '300');
+
+  insert into public.questions
+    (id, exam_id, question_text, question_type, options, correct_option, points) values
+    (v_q, v_other, '2 + 2?', 'multiple_choice', '[2, 3, 4]'::jsonb, 1, 5);
+
+  -- Handed in with the one answer right, so the automatic score of this attempt is 5
+  -- for whoever may read it - the number (l)ii asks a stranger for.
+  insert into public.exam_submissions
+    (id, student_id, exam_id, answers, status, score, started_at, submitted_at) values
+    (v_att, v_learner, v_other, jsonb_build_object(v_q::text, 1), 'submitted', 5,
+     now() - interval '50 minutes', now() - interval '10 minutes');
+
+  -- A hand mark on the same attempt, so the `question_grades` read has a row too.
+  insert into public.question_grades (submission_id, question_id, awarded, graded_by)
+    values (v_att, v_q, 5, v_rival);
+
+  insert into public.proctoring_logs (submission_id, action_type)
+    values (v_att, 'looking_away');
+
+  insert into storage.objects (bucket_id, name)
+    values ('proctor-snapshots', v_att::text || '/looking_away_1.jpg');
+
+  perform set_config('test.rival',   v_rival::text,   false);
+  perform set_config('test.other',   v_other::text,   false);
+  perform set_config('test.learner', v_learner::text, false);
+  perform set_config('test.att',     v_att::text,     false);
+end $$;
+
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.lecturer@test.local"}',
+         current_setting('test.lecturer')), true);
+do $$
+declare
+  v_rows int;
+  v_num  numeric;
+begin
+  -- The paper itself: `exams_select` is what the marking queue and the monitor's
+  -- picker list, so a row here is a paper this account could open.
+  if exists (select 1 from public.exams
+              where id = current_setting('test.other')::uuid) then
+    raise exception 'FAIL (l): a lecturer read a colleague''s paper';
+  end if;
+
+  -- Its questions, which carry the answer key.
+  select count(*) into v_rows
+  from public.questions
+  where exam_id = current_setting('test.other')::uuid;
+  if v_rows <> 0 then
+    raise exception 'FAIL (l): a lecturer read % question(s) of a colleague''s paper', v_rows;
+  end if;
+
+  -- Its attempt - the roster read every monitor grid is built from.
+  select count(*) into v_rows
+  from public.exam_submissions
+  where exam_id = current_setting('test.other')::uuid;
+  if v_rows <> 0 then
+    raise exception 'FAIL (l): a lecturer read % attempt(s) of a colleague''s paper', v_rows;
+  end if;
+  raise notice 'PASS (l): a colleague''s paper, its questions and its attempts are unreadable';
+
+  -- Its hand marks.
+  select count(*) into v_rows
+  from public.question_grades
+  where submission_id = current_setting('test.att')::uuid;
+  if v_rows <> 0 then
+    raise exception 'FAIL (l)ii: a lecturer read % hand mark(s) of a colleague''s attempt', v_rows;
+  end if;
+
+  -- Its incident feed.
+  select count(*) into v_rows
+  from public.proctoring_logs
+  where submission_id = current_setting('test.att')::uuid;
+  if v_rows <> 0 then
+    raise exception 'FAIL (l)ii: a lecturer read % incident row(s) of a colleague''s attempt', v_rows;
+  end if;
+
+  -- ...and the automatic score: a SECURITY DEFINER RPC, so the one read RLS never
+  -- sees. It answers 0 rather than raising for a stranger - the key awards 5 - so it
+  -- is asserted as a number.
+  v_num := public.auto_graded_score(current_setting('test.att')::uuid);
+  if v_num <> 0 then
+    raise exception 'FAIL (l)ii: auto_graded_score() served % to a stranger', v_num;
+  end if;
+  raise notice 'PASS (l)ii: a colleague''s marks, incidents and automatic score are unreadable';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- (l)iii: the still, and the reset that would empty its folder. Both are the half
+-- that matters if this is going to leak - a photograph of a student in a paper the
+-- caller has no reach over, and the purge that follows a delete.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.lecturer@test.local"}',
+         current_setting('test.lecturer')), true);
+do $$
+declare
+  v_rows    int;
+  v_deleted int;
+begin
+  select count(*) into v_rows
+  from storage.objects o
+  where o.bucket_id = 'proctor-snapshots'
+    and o.name = current_setting('test.att') || '/looking_away_1.jpg';
+  if v_rows <> 0 then
+    raise exception 'FAIL (l)iii: a lecturer read % still(s) of a colleague''s attempt', v_rows;
+  end if;
+
+  -- The reset's own order (`DashboardRepositoryImpl.resetSubmission()`): the attempt
+  -- row goes first, so a refused DELETE is the whole repair refused.
+  delete from public.exam_submissions
+   where id = current_setting('test.att')::uuid;
+  get diagnostics v_deleted = row_count;
+  if v_deleted <> 0 then
+    raise exception 'FAIL (l)iii: a lecturer reset % attempt(s) on a colleague''s paper', v_deleted;
+  end if;
+
+  -- ...and the purge the console would call next. The attempt is still there, so
+  -- `snapshot_attempt_exists()` refuses the folder whatever the tier - the second
+  -- line of defence, not the one this block is about.
+  perform set_config('storage.allow_delete_query', 'true', true);
+  delete from storage.objects o
+   where o.bucket_id = 'proctor-snapshots'
+     and o.name = current_setting('test.att') || '/looking_away_1.jpg';
+  get diagnostics v_deleted = row_count;
+  if v_deleted <> 0 then
+    raise exception 'FAIL (l)iii: a lecturer deleted % still(s) of a colleague''s attempt', v_deleted;
+  end if;
+  raise notice 'PASS (l)iii: a colleague''s still is unreadable, and neither it nor its attempt is deletable';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- (l)iv: an administrator reaches that paper with no row in
+-- `supervisor_exam_assignments` at all - the arm that keeps the admin console's global
+-- lists and the marking queue working after the narrowing.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.admin@test.local"}',
+         current_setting('test.admin')), true);
+do $$
+declare
+  v_rows int;
+  v_num  numeric;
+begin
+  select count(*) into v_rows
+  from public.exams
+  where id = current_setting('test.other')::uuid;
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)iv: an administrator cannot read a paper nobody assigned';
+  end if;
+
+  select count(*) into v_rows
+  from public.exam_submissions
+  where exam_id = current_setting('test.other')::uuid;
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)iv: an administrator reads % attempt(s) on an unassigned paper, expected 1', v_rows;
+  end if;
+
+  v_num := public.auto_graded_score(current_setting('test.att')::uuid);
+  if v_num <> 5 then
+    raise exception 'FAIL (l)iv: auto_graded_score() answered % for an administrator, expected 5', v_num;
+  end if;
+  raise notice 'PASS (l)iv: an administrator reaches a colleague''s paper with no assignment';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- (l)v: ...and the arm the isolation file leans on for a paper written by somebody
+-- else: an administrator can assign this supervisor to the colleague's paper, and
+-- the reach that buys (`can_supervise_exam()`, the second half of
+-- `can_reach_exam()`) is the whole of someone else's sitting. Written as
+-- `postgres`, like the rest of the fixtures - `supervisor_exam_assignments` takes an
+-- administrator's write (block (i)iii), and this block is about the read it buys.
+do $$
+begin
+  insert into public.supervisor_exam_assignments (exam_id, supervisor_id, assigned_by)
+  values (current_setting('test.other')::uuid,
+          current_setting('test.supervisor')::uuid,
+          current_setting('test.admin')::uuid);
+end $$;
+
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.supervisor@test.local"}',
+         current_setting('test.supervisor')), true);
+do $$
+declare
+  v_rows int;
+  v_num  numeric;
+begin
+  select count(*) into v_rows
+  from public.exams
+  where id = current_setting('test.other')::uuid;
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)v: an assigned supervisor cannot read the paper they were given';
+  end if;
+
+  select count(*) into v_rows
+  from public.questions
+  where exam_id = current_setting('test.other')::uuid;
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)v: an assigned supervisor reads % of the paper''s 1 question', v_rows;
+  end if;
+
+  select count(*) into v_rows
+  from public.exam_submissions
+  where exam_id = current_setting('test.other')::uuid;
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)v: an assigned supervisor reads % of the paper''s 1 attempt', v_rows;
+  end if;
+
+  select count(*) into v_rows
+  from public.question_grades
+  where submission_id = current_setting('test.att')::uuid;
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)v: an assigned supervisor reads % of the attempt''s 1 mark', v_rows;
+  end if;
+
+  select count(*) into v_rows
+  from public.proctoring_logs
+  where submission_id = current_setting('test.att')::uuid;
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)v: an assigned supervisor reads % of the attempt''s 1 incident', v_rows;
+  end if;
+
+  v_num := public.auto_graded_score(current_setting('test.att')::uuid);
+  if v_num <> 5 then
+    raise exception 'FAIL (l)v: auto_graded_score() answered % for an assigned supervisor, expected 5', v_num;
+  end if;
+
+  select count(*) into v_rows
+  from storage.objects o
+  where o.bucket_id = 'proctor-snapshots'
+    and o.name = current_setting('test.att') || '/looking_away_1.jpg';
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)v: an assigned supervisor cannot read the attempt''s still';
+  end if;
+  raise notice 'PASS (l)v: an assignment buys the whole sitting - and the lecturer who wrote nothing still has none of it';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- (l)vi: the paper's author keeps every read and the reset itself - the half the
+-- narrowing must not break, because the author is the account accountable for the
+-- paper.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.rival@test.local"}',
+         current_setting('test.rival')), true);
+do $$
+declare
+  v_rows    int;
+  v_deleted int;
+  v_num     numeric;
+begin
+  select count(*) into v_rows
+  from public.questions
+  where exam_id = current_setting('test.other')::uuid;
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)vi: the author reads % of their own paper''s 1 question', v_rows;
+  end if;
+
+  select count(*) into v_rows
+  from public.question_grades
+  where submission_id = current_setting('test.att')::uuid;
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)vi: the author reads % of their own attempt''s 1 mark', v_rows;
+  end if;
+
+  select count(*) into v_rows
+  from public.proctoring_logs
+  where submission_id = current_setting('test.att')::uuid;
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)vi: the author reads % of their own attempt''s 1 incident', v_rows;
+  end if;
+
+  v_num := public.auto_graded_score(current_setting('test.att')::uuid);
+  if v_num <> 5 then
+    raise exception 'FAIL (l)vi: auto_graded_score() answered % for the author, expected 5', v_num;
+  end if;
+
+  select count(*) into v_rows
+  from storage.objects o
+  where o.bucket_id = 'proctor-snapshots'
+    and o.name = current_setting('test.att') || '/looking_away_1.jpg';
+  if v_rows <> 1 then
+    raise exception 'FAIL (l)vi: the author cannot read their own attempt''s still';
+  end if;
+
+  -- The reset the console offers them: the attempt row first (which writes the purge
+  -- grant), then the still.
+  delete from public.exam_submissions
+   where id = current_setting('test.att')::uuid;
+  get diagnostics v_deleted = row_count;
+  if v_deleted <> 1 then
+    raise exception 'FAIL (l)vi: the author''s reset deleted % rows, expected 1', v_deleted;
+  end if;
+  raise notice 'PASS (l)vi: the paper''s author keeps every read, and the reset';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- (l)vii: ...and the grant that reset just wrote belongs to the paper, not to the
+-- tier. `may_purge_snapshot()` is what both purge policies ask
+-- (`public.snapshot_purge_grants` is the row it reads), so a colleague asking about
+-- that folder must be told no, read 0 rows and delete 0 rows. Before the isolation
+-- file the only question was `is_attempt_resetter()`, which every lecturer answers,
+-- and the folder was theirs to empty.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.lecturer@test.local"}',
+         current_setting('test.lecturer')), true);
+do $$
+declare
+  v_rows    int;
+  v_deleted int;
+begin
+  if public.may_purge_snapshot(current_setting('test.att') || '/looking_away_1.jpg') then
+    raise exception 'FAIL (l)vii: a lecturer may purge a folder a colleague''s reset orphaned';
+  end if;
+
+  select count(*) into v_rows
+  from storage.objects o
+  where o.bucket_id = 'proctor-snapshots'
+    and o.name = current_setting('test.att') || '/looking_away_1.jpg';
+  if v_rows <> 0 then
+    raise exception 'FAIL (l)vii: a lecturer read % orphaned still(s) of a colleague''s paper', v_rows;
+  end if;
+
+  perform set_config('storage.allow_delete_query', 'true', true);
+  delete from storage.objects o
+   where o.bucket_id = 'proctor-snapshots'
+     and o.name = current_setting('test.att') || '/looking_away_1.jpg';
+  get diagnostics v_deleted = row_count;
+  if v_deleted <> 0 then
+    raise exception 'FAIL (l)vii: a lecturer deleted % orphaned still(s) of a colleague''s paper', v_deleted;
+  end if;
+  raise notice 'PASS (l)vii: a purge grant is not transferable - the reset is not a colleague''s to finish';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- ...and the object survived, which is what "0 rows" means as opposed to a target
+-- that was never there. Read as `postgres`: the lecturer cannot see it - that is the
+-- point - so this half cannot be asked from their seat.
+do $$
+begin
+  if (select count(*) from storage.objects o
+       where o.bucket_id = 'proctor-snapshots'
+         and o.name = current_setting('test.att') || '/looking_away_1.jpg') <> 1 then
+    raise exception 'FAIL (l)vii: the orphaned still disappeared - a colleague purged it';
+  end if;
+end $$;
+
+-- (l)viii: the author finishes the reset they started, purge included, so the fix
+-- cannot have been "refuse every purge".
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "scope.rival@test.local"}',
+         current_setting('test.rival')), true);
+do $$
+declare
+  v_deleted int;
+begin
+  if not public.may_purge_snapshot(current_setting('test.att') || '/looking_away_1.jpg') then
+    raise exception 'FAIL (l)viii: the author cannot finish the reset of their own attempt';
+  end if;
+
+  perform set_config('storage.allow_delete_query', 'true', true);
+  delete from storage.objects o
+   where o.bucket_id = 'proctor-snapshots'
+     and o.name = current_setting('test.att') || '/looking_away_1.jpg';
+  get diagnostics v_deleted = row_count;
+  if v_deleted <> 1 then
+    raise exception 'FAIL (l)viii: the author purged % still(s), expected 1', v_deleted;
+  end if;
+  raise notice 'PASS (l)viii: the author finishes their own reset, purge included';
 end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);

@@ -63,14 +63,17 @@ labelled paper of theirs — the students the monitor shows — where `is_staff(
 to hand every supervisor every profile row in the institution, name, identity number
 and academic labels included, assigned or not. A lecturer keeps exactly the papers
 they wrote: `owns_exam()` (`exams.created_by = auth.uid()`) scopes their edits, the
-incident feed and the reset audit to those papers, while the **roster read** stays
-`is_staff()`-wide, so a lecturer can watch any sitting's roster and see the evidence
-recorded inside only their own papers. The staff repair actions follow the same
-split. `is_attempt_resetter()` (admin, supervisor **and** lecturer) is what the app
-gates the **Reset attempt** control on, but the DELETE itself is
-`can_supervise_exam(exam_id) or owns_exam(exam_id)` — the assigned supervisor, an
-administrator, or the paper's own author, never another sitting's supervisor and
-never another lecturer's paper. A reset deletes the attempt row (its incident rows
+incident feed and the reset audit to those papers **and the roster with them**: since
+`20261111090100_lecturer_isolation.sql` every lecturer-level read asks
+`can_reach_exam(exam_id)` — the papers they wrote, the papers an administrator
+assigned them, and (for an administrator) all of them — so a lecturer's monitor
+lists the students of the papers they can reach and not one attempt from a
+colleague's sitting. The staff repair actions follow the same split.
+`is_attempt_resetter()` (admin, supervisor **and** lecturer) is what the app gates
+the **Reset attempt** control on, but the DELETE itself is `can_reach_exam(exam_id)`
+— the assigned supervisor, an administrator, or the paper's own author, never
+another sitting's supervisor and never another lecturer's paper. A reset deletes
+the attempt row (its incident rows
 cascade, its stills are purged through the Storage API) and appends an audit row to
 `session_reset_logs`; it is deliberately **not** how a flagged attempt is released.
 That is `resolve_flagged_attempt()`, a supervisor-or-author decision between
@@ -408,6 +411,8 @@ operator's decision. See
    supabase db query --linked -f supabase/migrations/20261110090000_supervisor_student_arm.sql
    supabase db query --linked -f supabase/migrations/20261110090100_snapshot_orphan_check.sql
    supabase db query --linked -f supabase/migrations/20261110090200_supervisor_profile_read.sql
+   supabase db query --linked -f supabase/migrations/20261111090000_single_session.sql
+   supabase db query --linked -f supabase/migrations/20261111090100_lecturer_isolation.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -681,8 +686,10 @@ Things worth knowing before you turn it on:
   question instead. It changes **who may read and write**, never what is stored: no
   row of `proctoring_logs`, `exam_submissions`, `proctor_heartbeats`,
   `proctoring_consents`, `session_reset_logs` or `attempt_review_logs` is rewritten.
-  Lecturers keep exactly what they had (`owns_exam()` and the `is_staff()` roster
-  read are untouched) and administrators need no row. The one read it narrows that is
+  Lecturers kept exactly what they had at that point (`owns_exam()` and the
+  `is_staff()` roster read were untouched by *this* file — the roster is scoped to
+  the paper by `20261111090100_lecturer_isolation.sql`, below) and administrators
+  need no row. The one read it narrows that is
   not about a paper's evidence is the roster itself: `profiles_select_own_or_staff`
   let **any** supervisor read **every** profile row in the institution — name,
   email address, matriculation or staff number and the academic labels — by being
@@ -782,6 +789,56 @@ Things worth knowing before you turn it on:
   have to follow it. `supabase/tests/supervisor_scope_check.sql` block (k) is the
   check that finds the missing half: (a)-(j) pass on such a project, and (k)v —
   "the supervisor read a student on a paper they do not run" — is what fails.
+- Apply `supabase/migrations/20261111090000_single_session.sql` after every other
+  file, on every project, whenever it is convenient: it is additive, re-runnable,
+  backfills nothing and locks nobody out. It is the **one active login per account**
+  rule: `public.active_sessions` holds one row per account — the `session_id` of the
+  sign-in that may write, the `iat` that won it and the coarse device label — and
+  `public.claim_session()` takes that claim for the caller's own token, refusing with
+  `accepted = false` when the token is *older* than the stored one, so a restored tab
+  or a resumed app cannot take an account back. The five write paths of a sitting
+  (`merge_submission_answer`, `merge_submission_text_answer`, `submit_exam`,
+  `register_violation`, `record_heartbeat`) and the `submissions_insert_own_ongoing`
+  policy then ask `public.is_current_session()` and raise **`PT409`** — a project's own
+  code, not a standard one — when another sign-in has replaced this device, so a
+  client can tell "another device signed in" from "the attempt closed" (`55000`) and
+  from "not yours" (`42501`). `public.session_supersessions` is the audit: one row per
+  takeover, with the attempt that was open at that moment, readable by the
+  administrator and by the lecturer and supervisor of the paper it names, and by
+  nobody else. Row level security is on, and `active_sessions` has a read policy and
+  **no write policy** at all, so a device cannot overwrite or delete its own claim.
+  What the file cannot do is revoke an access token — nothing in the schema can — so
+  a superseded device is refused rather than disconnected, and an account with no
+  claim row (an older client, the SQL editor, the `service_role` key) is let through
+  until it claims; the shipped app closes that gap by calling
+  `signOut(scope: SignOutScope.others)` on sign-in, claiming, and re-asking every 30
+  seconds and on resume. `supabase/tests/single_session_check.sql` proves the whole
+  sequence, and `mobile/test/schema_contract_test.dart` fails the build if this file
+  and `schema.sql` section 1b drift apart.
+- Apply `supabase/migrations/20261111090100_lecturer_isolation.sql` after it, on every
+  project: it is the file that stops one lecturer reading another lecturer's paper.
+  Until it runs, `is_staff()` is the roster gate, so any lecturer account can list
+  every attempt in the institution (`submissions_select_own_or_supervisor`), open a
+  colleague's paper in the monitor, sign a URL for its stills while the read policy
+  names the paper, mark its essays, and purge orphaned evidence from the whole
+  bucket. It replaces those ten reads with `public.can_reach_exam(exam_id)` — the
+  paper's author, the supervisor assigned to it, or an administrator — and adds
+  `public.snapshot_purge_grants` / `may_purge_snapshot(name)`, because the purge
+  policies had no row to scope to once the attempt was deleted. That last part means
+  a project **keeps** the grants written by the new trigger: a still orphaned before
+  the migration can no longer be purged by the account that could not read the
+  attempt. It is re-runnable, backfills nothing, and ends with a `DO` block that
+  raises — naming the policy at fault — if any lecturer-level read in the project is
+  still tier-wide. Nobody is locked out: an author keeps their own papers, a
+  supervisor keeps their assignments, and an administrator needs no row. A lecturer
+  who wants a colleague's sitting now needs a `supervisor_exam_assignments` row for
+  it, which is the point. `supabase/tests/supervisor_scope_check.sql` block (l) is
+  that check, in eight halves: a colleague's paper, questions, attempt, hand marks,
+  incident feed, automatic score and stills are all unreadable to a lecturer who
+  wrote none of them, the attempt and the orphaned still are not deletable, and the
+  reset's purge grant is not theirs to finish — while the paper's author, an
+  administrator, and a supervisor the administrator *assigns* to that paper read all
+  of it, and the author still finishes their own reset.
 - Apply `supabase/migrations/optional_question_shuffling.sql` before the first
   paper that has question-order shuffling enabled. Until it runs, the
   `shuffle_questions` column does not exist: the authoring console reports the

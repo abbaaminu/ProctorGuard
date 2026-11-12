@@ -1,5 +1,6 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../../../../core/services/supabase_service.dart';
 import '../../domain/entities/exam.dart';
 import '../../domain/entities/exam_submit_result.dart';
 import '../../domain/entities/question.dart';
@@ -72,8 +73,7 @@ class ExamRepositoryImpl implements ExamRepository {
         'p_selected_option': selectedOption,
       });
     } on PostgrestException catch (error) {
-      if (error.code == '55000') throw const AnswerWriteRejected();
-      rethrow;
+      throw _mapAnswerWriteError(error);
     }
   }
 
@@ -93,8 +93,7 @@ class ExamRepositoryImpl implements ExamRepository {
         'p_answer': answer,
       });
     } on PostgrestException catch (error) {
-      if (error.code == '55000') throw const AnswerWriteRejected();
-      rethrow;
+      throw _mapAnswerWriteError(error);
     }
   }
 
@@ -108,10 +107,18 @@ class ExamRepositoryImpl implements ExamRepository {
     //
     // It answers with `(result_status, final_score)`, which is the mark the
     // student is shown straight away when the paper has no essay on it.
-    final response = await _client.rpc('submit_exam', params: {
-      'p_submission_id': submissionId,
-    });
-    return ExamSubmitResult.fromRpc(response);
+    try {
+      final response = await _client.rpc('submit_exam', params: {
+        'p_submission_id': submissionId,
+      });
+      return ExamSubmitResult.fromRpc(response);
+    } on PostgrestException catch (error) {
+      // The one write a superseded device must not mistake for a network
+      // failure: handing in is not retried by the queue, so it is reported as
+      // what it is.
+      if (error.code == 'PT409') throw const SessionSupersededException();
+      rethrow;
+    }
   }
 
   @override
@@ -120,9 +127,27 @@ class ExamRepositoryImpl implements ExamRepository {
     // redundancy path (offline queue flush after reconnect, or a strike whose
     // log row never reached the server). `p_disqualified` never grades, and the
     // RPC is idempotent for an attempt that is already closed.
-    await _client.rpc('submit_exam', params: {
-      'p_submission_id': submissionId,
-      'p_disqualified': true,
-    });
+    try {
+      await _client.rpc('submit_exam', params: {
+        'p_submission_id': submissionId,
+        'p_disqualified': true,
+      });
+    } on PostgrestException catch (error) {
+      if (error.code == 'PT409') throw const SessionSupersededException();
+      rethrow;
+    }
+  }
+
+  /// Turns the two codes the write RPCs use to refuse an answer into the errors
+  /// the UI already understands, and hands anything else back untouched.
+  ///
+  /// `55000` is "this attempt is closed" ([AnswerWriteRejected]) and `PT409` is
+  /// "another device signed in" ([SessionSupersededException], schema.sql §1b) —
+  /// the queue treats the first as a permanent rejection and the second as a
+  /// sign-out, so the two must not collapse into one another.
+  Exception _mapAnswerWriteError(PostgrestException error) {
+    if (error.code == '55000') return const AnswerWriteRejected();
+    if (error.code == 'PT409') return const SessionSupersededException();
+    return error;
   }
 }

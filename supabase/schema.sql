@@ -47,6 +47,16 @@
 --     idempotent per `client_event_id`, which is what lets the app queue a
 --     violation it could not deliver and replay it later without inventing a
 --     second strike (see `client_timestamp` / `client_event_id` in section 5).
+--   * One active login per account, and the **newest sign-in wins** (section 1b).
+--     `public.active_sessions` keeps one row per account - the one session that
+--     may write - and `public.is_current_session()` is the question every write
+--     path asks: the two answer merges, `submit_exam`, `register_violation`,
+--     `record_heartbeat`, and the policy that lets an attempt be started at all.
+--     A session a later sign-in replaced answers false and raises `PT409`; the app
+--     signs that device out when it notices. It closes the window a JWT cannot (an
+--     access token cannot be revoked before it expires) for every account that has
+--     claimed a session, and it fails open for one that never has - section 1b
+--     states both halves of that plainly, including what it does not cover.
 --   * A reset is itself evidence. Clearing an attempt destroys it together with
 --     its incident rows, so the call that does it also records what it
 --     destroyed in `session_reset_logs` (section 7): append-only, with
@@ -535,14 +545,53 @@ drop policy if exists "profiles_insert_self_student" on public.profiles;
 drop policy if exists "profiles_update_self" on public.profiles;
 drop policy if exists "profiles_admin_all" on public.profiles;
 
--- "May this supervisor read *this person's* profile row?" - the per-person twin of
--- `can_supervise_exam()` (§2d), and the reason a supervisor's monitor can print
--- "Aisha Bello" without a supervisor being able to enumerate the student body.
+-- The paper scope, stated once: the author (`owns_exam()`), an administrator or
+-- the supervisor assigned to it (`can_supervise_exam()`). Every lecturer-visible
+-- read below asks this and nothing else -
+--     exams_select, exam_allowed_students_select, can_read_profile(),
+--     submissions_select_own_or_supervisor, consents_select_own_or_supervisor,
+--     question_grades_select_staff, "Proctor snapshots read access",
+--     may_purge_snapshot(), auto_graded_score()
+-- - so "may this account see this paper's data" cannot drift between them.
+-- `supabase/migrations/20261111090100_lecturer_isolation.sql` is the same
+-- function applied to an existing project, and states the why: until it, a
+-- lecturer was `is_staff()`, which was every paper in the institution.
+--
+-- It is written here, above the two helpers it names, because section 0a turns
+-- `check_function_bodies` off: the body is resolved when the function is called,
+-- not when it is created, and the tables and helpers it quotes appear later in
+-- this file.
+create or replace function public.can_reach_exam(p_exam_id uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select p_exam_id is not null
+     and (
+       public.owns_exam(p_exam_id)
+       or public.can_supervise_exam(p_exam_id)
+     );
+$$;
+
+comment on function public.can_reach_exam(uuid) is
+  'The one paper scope: true for the lecturer who wrote the paper (exams.created_by), for an administrator, and for a supervisor assigned to it in supervisor_exam_assignments - i.e. owns_exam() or can_supervise_exam(). False for a lecturer who did not write it and was not assigned to it, for a student, and for a null paper. Every lecturer-visible read asks this.';
+
+revoke execute on function public.can_reach_exam(uuid) from public, anon;
+grant execute on function public.can_reach_exam(uuid) to authenticated, service_role;
+
+
+-- "May this account read *this person's* profile row?" - the per-person twin of
+-- `can_reach_exam()` above (`§1`), and the reason a lecturer's marking queue and a
+-- supervisor's monitor can print "Aisha Bello" without either of them being able
+-- to enumerate the student body.
 --
 -- Three questions, in order:
---   * did this person *sit* a paper the caller runs - an `exam_submissions` row on
---     an assigned paper. This is the roster the monitor renders, and the only place
---     a supervisor strictly needs somebody's name;
+--   * did this person *sit* a paper the caller can reach - an `exam_submissions`
+--     row on a paper they authored (or administer, or were assigned). This is the
+--     roster the monitor and the marking queue render, and the only place a
+--     lecturer strictly needs somebody's name;
 --   * was this person *granted* one of those papers - an `exam_allowed_students`
 --     row (§2b), the "may this person sit it" answer the console shows before an
 --     attempt exists;
@@ -578,22 +627,19 @@ as $$
        exists (
          select 1
          from public.exam_submissions s
-         join public.supervisor_exam_assignments a on a.exam_id = s.exam_id
          where s.student_id = p_profile_id
-           and a.supervisor_id = auth.uid()
+           and public.can_reach_exam(s.exam_id)
        )
        or exists (
          select 1
          from public.exam_allowed_students t
-         join public.supervisor_exam_assignments a on a.exam_id = t.exam_id
          where t.student_id = p_profile_id
-           and a.supervisor_id = auth.uid()
+           and public.can_reach_exam(t.exam_id)
        )
        or exists (
          select 1
          from public.profiles p
-         join public.supervisor_exam_assignments a on a.supervisor_id = auth.uid()
-         join public.exams e on e.id = a.exam_id
+         join public.exams e on public.can_reach_exam(e.id)
          where p.id = p_profile_id
            and p.role = 'student'
            and (
@@ -615,33 +661,39 @@ as $$
 $$;
 
 comment on function public.can_read_profile(uuid) is
-  'Per-person scope for the profiles read: true for a student who sat, was granted or is aimed at a paper the caller is assigned to. The read policy asks it only of a supervisor - an administrator and a lecturer are not is_supervisor_only() - so it answers false for another member of staff by design.';
+  'Per-person scope for the profiles read: true for a student who sat, was granted or is aimed at a paper the caller can reach (can_reach_exam: the author, an administrator, or the assigned supervisor). False for another member of staff - a colleague lecturer''s own profile row is not readable through this - and for a student with no paper in common.';
 
 revoke execute on function public.can_read_profile(uuid) from public, anon;
 grant execute on function public.can_read_profile(uuid) to authenticated, service_role;
 
--- Read: your own row; every row when you are staff - the staff roster, the admin
--- console's account list and live exam monitor all render other people's names and
--- roles. Deliberately NOT "any authenticated user": a student must not be able to
--- enumerate the roster of the whole institution.
+-- Read: your own row; every row for an administrator; and for every other staff
+-- account, the rows `can_read_profile()` answers yes about - the staff roster, the
+-- admin console's account list and the live exam monitor all render other people's
+-- names and roles. Deliberately NOT "any authenticated user": a student must not
+-- be able to enumerate the roster of the whole institution.
 --
--- The supervisor is the one staff role whose read is narrowed. Until
--- `20261109090000_supervisor_exam_assignments.sql` any supervisor read every
--- profile row by being `is_staff()` - every matriculation number, faculty,
--- department, level and photograph in the institution, with no assignment and no
--- sitting - because the tier read was the only question this policy asked.
--- `can_read_profile()` above is the per-person narrowing: the students who sat,
--- were granted, or are aimed at a paper the supervisor runs. An administrator and a
--- lecturer are not `is_supervisor_only()`, so their roster read is the sentence it
--- always was.
+-- Two narrowings live here, one file apart, and they are the same narrow read:
+-- * a **supervisor**, since `20261109090000_supervisor_exam_assignments.sql`. Until
+--   then any supervisor read every profile row by being `is_staff()` - every
+--   matriculation number, faculty, department, level and photograph in the
+--   institution, with no assignment and no sitting - because the tier read was the
+--   only question this policy asked;
+-- * a **lecturer**, since `20261111090100_lecturer_isolation.sql`. The arm used to
+--   read `is_staff() and (not is_supervisor_only() or can_read_profile(id))`, so
+--   the compliment "everybody who is not a supervisor" was the leak: any lecturer
+--   read the whole roster too.
+-- `is_admin()` is written out rather than folded into `can_read_profile()` because
+-- an administrator must keep the account list on a project with no papers at all,
+-- where the per-person answer is false for everybody.
 create policy "profiles_select_own_or_staff"
   on public.profiles for select
   to authenticated
   using (
     id = auth.uid()
+    or public.is_admin()
     or (
       public.is_staff()
-      and (not public.is_supervisor_only() or public.can_read_profile(id))
+      and public.can_read_profile(id)
     )
   );
 
@@ -1067,6 +1119,325 @@ revoke execute on function public.guard_supervisor_assignment() from public, ano
 grant execute on function public.guard_supervisor_assignment() to authenticated, service_role;
 
 -- ---------------------------------------------------------------------
+-- 1b. ONE ACTIVE LOGIN PER ACCOUNT
+-- ---------------------------------------------------------------------
+-- Supabase signs a device in; it never signs another one out. `signOut()` from the
+-- app is `SignOutScope.local` by default (gotrue-dart 2.27.3), so a second sign-in
+-- leaves the first device holding a perfectly valid access token - and the auth
+-- server keeps no revocation list, so a JWT cannot be withdrawn before `exp` (one
+-- hour by default). That window is what this section closes where it matters: the
+-- tables written while an attempt is running.
+--
+-- The client does the polite half. After a successful sign-in it calls
+-- `signOut(scope: SignOutScope.others)` so the other device's *refresh* token is
+-- revoked, then `claim_session()` to take the row below, then asks
+-- `is_current_session()` every 30 seconds and on resume. A device that gets
+-- `false` signs itself out with "You signed in on another device". That half only
+-- works on a client that runs it, so the half that is *enforced* lives here: the
+-- five paths that write during an attempt ask `is_current_session()` and raise
+-- `PT409` when the answer is false.
+--
+-- WHO WINS: the newest token, ordered by `iat`. Letting the last
+-- `claim_session()` call win instead would hand the row back to a superseded
+-- device that merely returned from the background or was restored from storage -
+-- the order of *claims* is not the order of *sign-ins*. `iat` is minted per
+-- sign-in, so a device that signs in again always carries the newer one, and a
+-- device replaying an old token can never take the row back.
+--
+-- WHAT IT DOES NOT COVER - stated here because the alternative is a false sense of
+-- safety:
+--   * A reader. A superseded device can still *read* its attempt until its token
+--     expires; only writes are gated. (The client has already dropped it to the
+--     login screen, which is the part a student notices.)
+--   * The snapshot upload. It goes through a storage policy, not an RPC, and
+--     `storage.objects` cannot see `active_sessions`; an upload already started
+--     completes.
+--   * An account that never claimed. No row means nothing to contradict, so
+--     `is_current_session()` answers true: a client older than this section - or
+--     one that was offline at claim time - keeps working exactly as it did. Locking
+--     it out would strand every user of a build that has not updated yet.
+--   * Two devices of the *same* session. One row is one session, full stop: an
+--     account cannot sit the same paper on a phone and a laptop at once, which is
+--     the point.
+--   * A patched client that simply never claims. The gate compares a token with a
+--     token, so a client that stops calling `claim_session()` leaves no row and is
+--     let through. What changes is that the *shipped* app cannot leave two live
+--     sessions behind, and `session_supersessions` records every takeover.
+--
+-- Determinism: `claim_session()` is `security definer` and serialises on the
+-- account's own row (`select ... for update`), so two devices claiming at the same
+-- instant are ordered by the server rather than by whoever reached the network
+-- first.
+
+-- The two claims this section reads off the caller's own token. `session_id` is
+-- minted per sign-in (one `auth.sessions` row) and `iat` is the second it was
+-- issued; both come from `request.jwt.claims`, so neither needs a table of its
+-- own. Outside an authenticated request both are null - the SQL editor, a
+-- migration and the `service_role` key carry no token - and every answer below is
+-- written to be true for them.
+create or replace function public.session_claim()
+returns text
+language sql
+stable
+as $$
+  select nullif(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'session_id',
+    ''
+  )
+$$;
+
+comment on function public.session_claim() is
+  'The session_id claim of the request''s own access token - the auth.sessions row the token was minted for - or null when the request carries no token (SQL editor, migration, service_role). It reads nothing but the request''s own claims.';
+
+revoke execute on function public.session_claim() from public, anon;
+grant execute on function public.session_claim() to authenticated, service_role;
+
+create or replace function public.session_issued_at()
+returns timestamptz
+language sql
+stable
+as $$
+  select to_timestamp(
+    nullif(
+      nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'iat',
+      ''
+    )::bigint
+  )
+$$;
+
+comment on function public.session_issued_at() is
+  'The iat claim of the request''s own access token as a timestamptz - when this sign-in happened, which is what orders two devices on one account - or null when the request carries no token.';
+
+revoke execute on function public.session_issued_at() from public, anon;
+grant execute on function public.session_issued_at() to authenticated, service_role;
+
+-- The claim itself: one row per account, holding the one session that may write.
+-- A row is created by the account's first `claim_session()` and replaced - never
+-- stacked - by every sign-in after it, so `user_id` is the primary key and there is
+-- no way for two rows to disagree. `issued_at` is the winning token's `iat`, which
+-- is what a later claim is compared against; `device_label` is the coarse platform
+-- name the app sends (`android`, `ios`, `web`, ...) and exists so a supervisor
+-- reading `session_supersessions` can tell a phone from a lab desktop.
+create table if not exists public.active_sessions (
+  user_id      uuid primary key references auth.users(id) on delete cascade,
+  session_id   text not null,
+  issued_at    timestamptz not null,
+  device_label text,
+  claimed_at   timestamptz not null default now()
+);
+
+alter table public.active_sessions enable row level security;
+
+-- Read your own row (the app shows nothing of it, but a client may ask), and no
+-- write policy at all: `claim_session()` is `security definer` and is the only
+-- writer, so a device cannot overwrite or delete its own claim with a PostgREST
+-- call and talk its way past the gate.
+drop policy if exists "active_sessions_select_own" on public.active_sessions;
+create policy "active_sessions_select_own"
+  on public.active_sessions for select
+  to authenticated
+  using (user_id = auth.uid());
+
+-- The audit: one row per takeover, written by `claim_session()` when a *different*
+-- session takes an account's claim. Mirrors `session_reset_logs` - no foreign
+-- keys, because the row is evidence: deleting the attempt, the paper or the account
+-- afterwards must not delete the record that two logins happened, and
+-- `submission_id` is there to answer the question a supervisor actually asks ("did
+-- the second login happen while the paper was open?"). Rows with no attempt running
+-- are kept too: they still say when an account changed hands.
+create table if not exists public.session_supersessions (
+  id                  uuid primary key default uuid_generate_v4(),
+  user_id             uuid not null,
+  previous_session_id text not null,
+  new_session_id      text not null,
+  submission_id       uuid,
+  exam_id             uuid,
+  device_label        text,
+  superseded_at       timestamptz not null default now()
+);
+
+alter table public.session_supersessions enable row level security;
+
+-- The administrator reads the whole record; a lecturer and a supervisor read the
+-- rows that bear on a paper they run, through the same two predicates every other
+-- staff read uses. A student reads none of it - their own rows included - because
+-- the table exists to tell *staff* what a login did, and `claim_session()` already
+-- told the student, on the device that lost the session.
+drop policy if exists "session_supersessions_select_staff" on public.session_supersessions;
+create policy "session_supersessions_select_staff"
+  on public.session_supersessions for select
+  to authenticated
+  using (
+    public.is_admin()
+    or public.can_supervise_exam(exam_id)
+    or public.owns_exam(exam_id)
+  );
+
+create index if not exists idx_session_supersessions_user_id
+  on public.session_supersessions(user_id, superseded_at desc);
+create index if not exists idx_session_supersessions_exam_id
+  on public.session_supersessions(exam_id);
+
+-- Take the account's claim for the session that is calling. Called once per
+-- sign-in (see `SupabaseService.claimSession`), and again harmlessly whenever the
+-- app checks in: a repeat from the *same* session is a no-op that keeps the
+-- original `claimed_at`, so that value means "when this device took the account".
+--
+-- The answer is a row rather than an exception for the losing side, because losing
+-- is not an error - it is the normal outcome of signing in on a second device, and
+-- the client turns `accepted = false` into a sign-out with a message.
+create or replace function public.claim_session(
+  p_device_label text default null
+)
+returns table (
+  accepted            boolean,
+  active_session_id   text,
+  claimed_at          timestamptz,
+  replaced_session_id text
+)
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_user       uuid := auth.uid();
+  v_session    text := public.session_claim();
+  v_issued     timestamptz;
+  v_prev       public.active_sessions;
+  v_submission uuid;
+  v_exam       uuid;
+begin
+  if v_user is null then
+    raise exception 'claim_session: sign in before claiming a session'
+      using errcode = '28000',
+            hint = 'this RPC is called with a signed-in access token; the SQL editor and the service_role key carry none';
+  end if;
+
+  if v_session is null then
+    raise exception 'claim_session: this request carries no session_id claim'
+      using errcode = '22023',
+            hint = 'the token must come from a password or magic-link sign-in; an older auth server may not mint session_id';
+  end if;
+
+  -- `iat` is missing only on a token this server did not mint. `now()` is then the
+  -- best ordering available, and it still keeps "the later claim wins" monotonic
+  -- for that one device.
+  v_issued := coalesce(public.session_issued_at(), now());
+
+  select a.* into v_prev
+    from public.active_sessions a
+   where a.user_id = v_user
+     for update;
+
+  if v_prev.user_id is not null then
+    if v_prev.session_id = v_session then
+      -- The same session asking again: an app restart, a reconnect, the liveness
+      -- check. Keep the moment it took the account and refresh the label.
+      update public.active_sessions
+         set device_label = coalesce(p_device_label, active_sessions.device_label)
+       where user_id = v_user;
+
+      return query select true, v_session, v_prev.claimed_at, null::text;
+      return;
+    end if;
+
+    -- A superseded device coming back. Its token is older than the one already
+    -- held, so it is refused - otherwise a restored tab or a resumed app would take
+    -- the account back the moment it woke up, and "newest wins" would mean "last to
+    -- call wins".
+    if v_prev.issued_at > v_issued then
+      -- Nothing was replaced, so the fourth column says so: the session that lost is
+      -- the caller's own, and it already knows which one that is.
+      return query select false, v_prev.session_id, v_prev.claimed_at, null::text;
+      return;
+    end if;
+  end if;
+
+  insert into public.active_sessions (user_id, session_id, issued_at, device_label, claimed_at)
+  values (v_user, v_session, v_issued, p_device_label, now())
+  on conflict (user_id) do update
+    set session_id   = excluded.session_id,
+        issued_at    = excluded.issued_at,
+        device_label = coalesce(excluded.device_label, public.active_sessions.device_label),
+        claimed_at   = now();
+
+  -- A takeover, not a first claim: record it, with the attempt that was open at
+  -- that moment, if there was one. `submission_id` is not a foreign key, so this row
+  -- survives the reset that clears the attempt.
+  if v_prev.user_id is not null and v_prev.session_id <> v_session then
+    select s.id, s.exam_id into v_submission, v_exam
+      from public.exam_submissions s
+     where s.student_id = v_user
+       and s.status = 'ongoing'
+     order by s.started_at desc
+     limit 1;
+
+    insert into public.session_supersessions (
+      user_id, previous_session_id, new_session_id, submission_id, exam_id, device_label
+    ) values (
+      v_user, v_prev.session_id, v_session, v_submission, v_exam, p_device_label
+    );
+  end if;
+
+  return query select true, v_session, now(), v_prev.session_id;
+end;
+$$;
+
+comment on function public.claim_session(text) is
+  'Takes the account''s single active session for the caller''s own token and answers (accepted, active_session_id, claimed_at, replaced_session_id). A different session wins only if its iat is newer than the stored one, so a superseded device replaying an older token is refused; a repeat from the winning session is a no-op that keeps claimed_at. security definer, serialised on the account row, and the only writer of active_sessions.';
+
+revoke execute on function public.claim_session(text) from public, anon;
+grant execute on function public.claim_session(text) to authenticated, service_role;
+
+-- "Is this request coming from the session that currently holds the account?"
+--
+-- Yes for the holder; yes for a caller with no claim row, which is how an account
+-- that has never claimed - an older client, a client that was offline at claim
+-- time, the SQL editor, a migration, the service_role key - keeps working exactly as
+-- it did before this section existed; yes for a token with no `session_id` claim, for
+-- the same reason. Only "a row exists and it names another session" answers false,
+-- and that is the one case this section exists to refuse.
+--
+-- `security definer` so the answer does not depend on the read policy above, and
+-- `stable` so it may be folded once per statement - which is also why it is not a
+-- cache: a statement that began before a takeover can still see the pre-takeover
+-- row, and the next statement cannot.
+create or replace function public.is_current_session()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select coalesce(
+    (
+      select public.session_claim() is null
+          or a.session_id = public.session_claim()
+        from public.active_sessions a
+       where a.user_id = auth.uid()
+    ),
+    true
+  )
+$$;
+
+comment on function public.is_current_session() is
+  'True unless a sign-in newer than this token holds the account: the claim row is absent, or this request carries no session_id claim, or the stored session_id is the caller''s own. Read by the five gated write paths and by submissions_insert_own_ongoing.';
+
+revoke execute on function public.is_current_session() from public, anon;
+grant execute on function public.is_current_session() to authenticated, service_role;
+
+-- Where it is asked (all five raise `PT409` and nothing is written):
+--   * `merge_submission_answer`      - a saved option;
+--   * `merge_submission_text_answer` - a saved free-text answer;
+--   * `submit_exam`                  - the submission itself;
+--   * `register_violation`           - a proctoring strike;
+--   * `record_heartbeat`             - the liveness row the monitor draws;
+-- and once outside an RPC, in the `submissions_insert_own_ongoing` policy, so a
+-- superseded device cannot open a *second* attempt while the first is running. A
+-- later sign-in never rewrites what the earlier one already wrote: the gate decides
+-- who may write now, not what was written before.
+
+-- ---------------------------------------------------------------------
 -- 2b. BORROWED-COURSE ACCESS
 -- ---------------------------------------------------------------------
 -- A paper is aimed at a cohort by the three columns above, but a cohort is not
@@ -1097,18 +1468,18 @@ drop policy if exists "exam_allowed_students_select" on public.exam_allowed_stud
 drop policy if exists "exam_allowed_students_insert_owner" on public.exam_allowed_students;
 drop policy if exists "exam_allowed_students_delete_owner" on public.exam_allowed_students;
 
--- Read: the student the row names, or any member of staff (the console lists a
--- paper's exceptions next to the paper). A student must not be able to see who
--- else was granted one — that is somebody else's business.
+-- Read: the student the row names, or the paper it names. "Any member of staff"
+-- was the previous answer, which told every lecturer who was granted an exception
+-- on a colleague's paper - who sits a paper out of cohort is that paper's
+-- business. A student must not be able to see who else was granted one — that is
+-- somebody else's business. The two write policies below still ask
+-- `owns_exam(exam_id)`, so no tool loses a write.
 create policy "exam_allowed_students_select"
   on public.exam_allowed_students for select
   to authenticated
   using (
     student_id = auth.uid()
-    or (
-      public.is_staff()
-      and (not public.is_supervisor_only() or public.can_supervise_exam(exam_id))
-    )
+    or public.can_reach_exam(exam_id)
   );
 
 -- Write: only the paper's author. `owns_exam()` is SECURITY DEFINER, so this
@@ -1129,17 +1500,25 @@ drop policy if exists "exams_insert_supervisor_only" on public.exams;
 drop policy if exists "exams_update_owner" on public.exams;
 drop policy if exists "exams_delete_owner" on public.exams;
 
--- Read: staff see their papers, published or not - an invigilator opens a sitting
--- in the department they were assigned to, and the console's monitor list depends
--- on it; the author always sees their own drafts.
+-- Read: the papers this account can reach, published or not - an invigilator opens
+-- a sitting they were assigned to, and the console's monitor list depends on it;
+-- the author always sees their own drafts.
 --
--- Who "their papers" means, exactly: an administrator and a lecturer see every
--- paper (unchanged - the lecturer's monitor and the authoring console lean on it),
--- while a **supervisor** sees the papers an administrator assigned to them
--- (`can_supervise_exam()`, section 2d). That is what makes the supervisor console's
--- list the sittings they are responsible for instead of the whole institution's,
--- and it is the read half of the scope the other policies enforce: hiding the row
--- here means an unassigned paper's title, schedule and roster are not even offered.
+-- Reach is `can_reach_exam()` (section 1) and it is one sentence:
+--   * an **administrator** sees every paper - the console's global list, the label
+--     correction tool and the live monitor lean on it;
+--   * a **lecturer** sees the papers they wrote, and only those. Until
+--     `20261111090100_lecturer_isolation.sql` this arm was `is_staff()`, i.e. the
+--     whole institution's catalogue - every title, schedule, cohort and roster
+--     count - and `created_by = auth.uid()` was a redundant third arm for a
+--     lecturer, since `owns_exam(id)` inside `can_reach_exam()` is that sentence
+--     asked from the row's own id;
+--   * a **supervisor** sees the papers an administrator assigned to them
+--     (`can_supervise_exam()`, section 2d), since `20261109090000`.
+-- That is the read half of the scope the other policies enforce: hiding the row
+-- here means an unreachable paper's title, schedule and roster are not even
+-- offered, so the console cannot be opened on a sitting nobody asked this account
+-- to run.
 --
 -- Students see a **published** paper only when it is aimed at them:
 --     every column the paper names must match their own `profiles` row. A paper
@@ -1156,20 +1535,18 @@ drop policy if exists "exams_delete_owner" on public.exams;
 -- student see exactly the rows that name them, so this EXISTS needs no definer
 -- helper and cannot recurse.
 --
--- The third arm is a *student's* arm: `student_can_access_exam()` answers false for
+-- The second arm is a *student's* arm: `student_can_access_exam()` answers false for
 -- a supervisor (`not is_supervisor_only()`), so an unassigned paper is not offered
--- to that console by it - the first arm is the supervisor's, and it names the
--- assignment. Without that term a supervisor's blank profile matched every
--- untargeted paper, which is the leak `20261110090000` closes.
+-- to that console by it - the first arm is the staff arm, and it names the paper.
+-- Without that term a supervisor's blank profile matched every untargeted paper,
+-- which is the leak `20261110090000` closes. It is also what keeps a lecturer who
+-- is *enrolled as a student* able to sit - and read - a colleague's published
+-- paper; the attempt that creates is theirs alone.
 create policy "exams_select"
   on public.exams for select
   to authenticated
   using (
-    (
-      public.is_staff()
-      and (not public.is_supervisor_only() or public.can_supervise_exam(id))
-    )
-    or created_by = auth.uid()
+    public.can_reach_exam(id)
     or public.student_can_access_exam(id)
   );
 
@@ -1486,10 +1863,11 @@ create policy "consents_insert_own"
   to authenticated
   with check (student_id = auth.uid());
 
--- Read: your own acceptances, or the supervisor of the paper it names (admin and
--- the assigned supervisor - `can_supervise_exam()`, section 2d). Deliberately not
--- `is_staff()`: a lecturer reads the evidence of a sitting; "did this person agree,
--- and to what wording?" is a supervisory question.
+-- Read: your own acceptances, or one given for a paper you can reach - the paper's
+-- author, an administrator, or the supervisor assigned to it (`can_reach_exam()`,
+-- section 1). Deliberately not `is_staff()`: "did this person agree, and to what
+-- wording?" is a paper's question, and a general acceptance (`exam_id IS NULL`)
+-- belongs to its subject alone.
 --
 -- A general acceptance (`exam_id IS NULL`) is readable by its subject only. There is
 -- no paper to be assigned to, so no supervisor is accountable for it - and the row
@@ -1505,7 +1883,7 @@ create policy "consents_select_own_or_supervisor"
   to authenticated
   using (
     student_id = auth.uid()
-    or (exam_id is not null and public.can_supervise_exam(exam_id))
+    or (exam_id is not null and public.can_reach_exam(exam_id))
   );
 
 revoke all on table public.proctoring_consents from anon;
@@ -1624,25 +2002,26 @@ drop policy if exists "submissions_update_own_ongoing" on public.exam_submission
 drop policy if exists "submissions_update_supervisor" on public.exam_submissions;
 drop policy if exists "submissions_delete_supervisor" on public.exam_submissions;
 
--- Read: your own attempt, or any attempt of a paper you may supervise. The console
--- roster/audit and the mobile live monitor both need the wide read, and
--- `exams_select` already grants it for the exam rows themselves.
+-- Read: your own attempt, or an attempt of a paper you can reach
+-- (`can_reach_exam()`, section 1). The console roster/audit and the mobile live
+-- monitor both need the wide read over the papers they are for, and `exams_select`
+-- already grants it for the exam rows themselves.
 --
--- "Any attempt" is admin-anywhere, lecturer-anywhere (unchanged: a lecturer may
--- watch any sitting - `lecturer_scoped_log_reads.sql`'s "what it does not change"),
--- and supervisor-only-on-assigned-papers (`can_supervise_exam()`, section 2d). The
--- roster is the one table where the scope is visible as an *absence* rather than a
--- refusal: an unassigned paper's attempts are not streamed to the console at all, so
--- the monitor cannot be opened on a sitting nobody asked this account to run.
+-- "The papers they are for" used to be "every paper a lecturer could see", because
+-- this arm was `is_staff()`: this row carries `answers`, `score` and `status`, so
+-- any lecturer could read any student's script. Since
+-- `20261111090100_lecturer_isolation.sql` it is the author's papers, the papers an
+-- administrator assigned to a supervisor, and every paper for an administrator.
+-- The roster is the one table where the scope is visible as an *absence* rather
+-- than an error: an unreachable paper's attempts are not streamed to the console at
+-- all, so the monitor cannot be opened on a sitting nobody asked this account to
+-- run - and its empty state is a sentence rather than a scrolled-through roster.
 create policy "submissions_select_own_or_supervisor"
   on public.exam_submissions for select
   to authenticated
   using (
     student_id = auth.uid()
-    or (
-      public.is_staff()
-      and (not public.is_supervisor_only() or public.can_supervise_exam(exam_id))
-    )
+    or public.can_reach_exam(exam_id)
   );
 
 -- A start row can only ever be a fresh attempt: the student's own id, ongoing
@@ -1672,6 +2051,13 @@ create policy "submissions_select_own_or_supervisor"
 -- folded into `student_can_access_exam()` because that predicate also answers
 -- `exams_select` and `questions_public` - a student must be able to read the
 -- paper before they can decide whether to accept the notice for it.
+--
+-- "Is this device still the account's active session?" is the fourth, and section
+-- 1b is why: an account has one session that may write, so a device another
+-- sign-in replaced may not open a *second* attempt while the first is running -
+-- which is exactly the shape of two people sitting one paper on two phones. The
+-- five write RPCs ask `is_current_session()` themselves; this is the one write
+-- during a sitting that is not an RPC.
 create policy "submissions_insert_own_ongoing"
   on public.exam_submissions for insert
   to authenticated
@@ -1684,6 +2070,7 @@ create policy "submissions_insert_own_ongoing"
     and started_at = now()
     and public.student_can_access_exam(exam_id)
     and public.student_has_consent(exam_id)
+    and public.is_current_session()
     and exists (
       select 1 from public.exams e
       where e.id = exam_id
@@ -2294,8 +2681,7 @@ create policy "Proctor snapshots read access"
       where s.id::text = (storage.foldername(name))[1]
         and (
           s.student_id = auth.uid()
-          or public.owns_exam(s.exam_id)
-          or public.can_supervise_exam(s.exam_id)
+          or public.can_reach_exam(s.exam_id)
         )
     )
   );
@@ -2372,6 +2758,120 @@ $$;
 revoke execute on function public.snapshot_attempt_exists(text) from public, anon;
 grant execute on function public.snapshot_attempt_exists(text) to authenticated, service_role;
 
+-- ---------------------------------------------------------------------
+-- The purge grant: whose orphaned stills are they?
+-- ---------------------------------------------------------------------
+-- `snapshot_attempt_exists()` settles *whether* a folder is orphaned and
+-- `is_attempt_resetter()` says *who may ever purge* (admin, supervisor, lecturer).
+-- Neither says *whose* orphan it is, and without that third question the two
+-- purge policies below handed every lecturer the whole bucket: any of them could
+-- delete the stills of any reset attempt in the institution, including papers they
+-- had never seen (`20261111090100_lecturer_isolation.sql`).
+--
+-- A reset deletes the attempt row first and purges second - the order the policies
+-- force, because an object is only purgeable once its folder resolves to no
+-- attempt - so the fact to keep is "this folder's attempt was deleted, on this
+-- paper, by this account". An AFTER DELETE trigger is the only place that can still
+-- see it. One row per deleted attempt: `submission_id` is the folder, `exam_id` the
+-- paper (kept so whoever is accountable for the paper *now* can finish a reset
+-- somebody else started, and so a delete with no JWT - psql, the retention job -
+-- still leaves a usable record), `granted_to` the account that pressed the button.
+--
+-- No foreign keys: a cascade from `exams` or `profiles` would erase the grant while
+-- the stills are still in the bucket.
+create table if not exists public.snapshot_purge_grants (
+  submission_id uuid primary key,
+  exam_id       uuid not null,
+  granted_to    uuid,
+  granted_at    timestamptz not null default now()
+);
+
+comment on table public.snapshot_purge_grants is
+  'One row per deleted exam_submissions row, written by the AFTER DELETE trigger below: which attempt folder disappeared, on which paper, and who deleted it. Read only by may_purge_snapshot(); it is what scopes the two snapshot purge policies to the paper the reset belonged to instead of to the staff tier at large. It is never read for a folder the retention window has already emptied, so stale rows are inert.';
+
+revoke all on table public.snapshot_purge_grants from anon, authenticated;
+grant all on table public.snapshot_purge_grants to service_role;
+
+-- RLS on with no policy at all: readable through `may_purge_snapshot()` (SECURITY
+-- DEFINER) and by the service role, and by nobody else - not even an administrator,
+-- who has no screen that shows it.
+alter table public.snapshot_purge_grants enable row level security;
+
+create or replace function public.record_snapshot_purge_grant()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  insert into public.snapshot_purge_grants (submission_id, exam_id, granted_to)
+  values (old.id, old.exam_id, auth.uid())
+  on conflict (submission_id) do update
+    set exam_id    = excluded.exam_id,
+        granted_to = excluded.granted_to,
+        granted_at = now();
+  return old;
+end;
+$$;
+
+comment on function public.record_snapshot_purge_grant() is
+  'AFTER DELETE trigger body on exam_submissions: records the folder, the paper and the account so may_purge_snapshot() can answer "may this caller finish this reset" after the attempt row is gone.';
+
+revoke execute on function public.record_snapshot_purge_grant() from public, anon, authenticated;
+
+drop trigger if exists exam_submissions_record_purge_grant on public.exam_submissions;
+create trigger exam_submissions_record_purge_grant
+  after delete on public.exam_submissions
+  for each row execute function public.record_snapshot_purge_grant();
+
+-- "May this caller finish the reset that emptied this folder?" The account that
+-- deleted the attempt, or anybody who can reach the paper it belonged to.
+--
+-- Shape-tested before the cast, like `snapshot_attempt_exists()`: `name` is free
+-- text and a cast that raised on a stray object would abort a whole purge statement
+-- instead of answering about that one object.
+create or replace function public.may_purge_snapshot(p_object_name text)
+returns boolean
+language plpgsql
+security definer
+stable
+set search_path = public, pg_temp
+as $$
+declare
+  v_folder text;
+begin
+  if p_object_name is null then
+    return false;
+  end if;
+
+  v_folder := (storage.foldername(p_object_name))[1];
+
+  if v_folder is null
+     or v_folder !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  then
+    return false;
+  end if;
+
+  return exists (
+    select 1
+    from public.snapshot_purge_grants g
+    where g.submission_id = v_folder::uuid
+      and (
+        g.granted_to = auth.uid()
+        or public.can_reach_exam(g.exam_id)
+      )
+  );
+end;
+$$;
+
+comment on function public.may_purge_snapshot(text) is
+  'True when the caller may purge the stills of this attempt folder: the account that deleted the attempt (snapshot_purge_grants.granted_to), or anybody who can reach the paper it belonged to. False for a folder no reset produced - a live attempt (snapshot_attempt_exists() also refuses those) and a folder left by the service role, which purges without RLS.';
+
+revoke execute on function public.may_purge_snapshot(text) from public, anon;
+grant execute on function public.may_purge_snapshot(text) to authenticated, service_role;
+
+
+
 
 -- No update policy: a stored snapshot is never rewritten.
 --
@@ -2401,6 +2901,14 @@ grant execute on function public.snapshot_attempt_exists(text) to authenticated,
 -- cannot be anchored to the submission folder: its whole purpose is the window
 -- in which that folder resolves to nothing.
 --
+-- That is why the third term is `may_purge_snapshot(name)` rather than another
+-- EXISTS on `exam_submissions`: the folder is empty, so the paper it belonged to
+-- lives in the grant the AFTER DELETE trigger wrote, and "the account that did the
+-- reset, or anybody who can reach that paper" is the answer
+-- `20261111090100_lecturer_isolation.sql` adds. Without it the tier read was a
+-- *bucket-wide* read: every lecturer is `is_attempt_resetter()`, so every lecturer
+-- could delete the stills of a reset on a paper they had never seen.
+--
 -- The subquery is NOT evaluated under the caller's own permissions - it is
 -- `public.snapshot_attempt_exists()` above, a definer function, and that is a fix
 -- rather than a flourish. It read as staff when it was written, because
@@ -2418,6 +2926,7 @@ create policy "Proctor snapshots supervisor purge"
     bucket_id = 'proctor-snapshots'
     and public.is_attempt_resetter()
     and not public.snapshot_attempt_exists(name)
+    and public.may_purge_snapshot(name)
   );
 
 
@@ -2443,6 +2952,7 @@ create policy "Proctor snapshots orphan read for purge"
     bucket_id = 'proctor-snapshots'
     and public.is_attempt_resetter()
     and not public.snapshot_attempt_exists(name)
+    and public.may_purge_snapshot(name)
   );
 
 -- ---------------------------------------------------------------------
@@ -2616,8 +3126,9 @@ alter table public.question_grades enable row level security;
 
 drop policy if exists "question_grades_select_staff" on public.question_grades;
 
--- Read: the staff tier, like the attempts and their incident rows - the lecturer
--- marking a paper and the supervisor answering an appeal see the same marks.
+-- Read: the marks of an attempt on a paper the caller can reach
+-- (`can_reach_exam()`, section 1) - the lecturer marking a paper and the supervisor
+-- answering an appeal see the same marks, and no third lecturer sees them.
 -- Students read no rows here: their total is on their own
 -- `exam_submissions.score`, which `submissions_select_own_or_supervisor` already
 -- lets them read.
@@ -2625,13 +3136,11 @@ create policy "question_grades_select_staff"
   on public.question_grades for select
   to authenticated
   using (
-    public.is_staff()
-    and (
-      not public.is_supervisor_only()
-      or exists (
-        select 1 from public.exam_submissions s
-        where s.id = submission_id and public.can_supervise_exam(s.exam_id)
-      )
+    exists (
+      select 1
+      from public.exam_submissions s
+      where s.id = submission_id
+        and public.can_reach_exam(s.exam_id)
     )
   );
 
@@ -2648,6 +3157,12 @@ create policy "question_grades_select_staff"
 -- Indexes
 -- ---------------------------------------------------------------------
 create index if not exists idx_questions_exam_id on public.questions(exam_id);
+-- `can_reach_exam()` filters `exams.created_by` on every paper-scoped read, and
+-- `owns_exam()` asks the same column from a bare uuid - so without this each of
+-- those predicates scanned the whole papers table, once per candidate row on
+-- `profiles` and `exam_submissions`. The supervisor half of the scope is already
+-- covered by the `supervisor_exam_assignments` primary key.
+create index if not exists idx_exams_created_by on public.exams(created_by);
 create index if not exists idx_submissions_exam_id on public.exam_submissions(exam_id);
 create index if not exists idx_submissions_student_id on public.exam_submissions(student_id);
 -- Roster queries and staff analytics filter an exam by status,
@@ -2781,6 +3296,17 @@ begin
   if auth.uid() is null then
     raise exception 'authentication is required to register a violation'
       using errcode = '42501';
+  end if;
+
+  -- One active login per account (section 1b). A device whose session a newer
+  -- sign-in replaced may not keep writing evidence: the client signs itself out
+  -- when `is_current_session()` turns false, and this is the half a client that
+  -- never asks cannot skip. `PT409` is the code the app reads as "another device
+  -- signed in" rather than as a failed write.
+  if not public.is_current_session() then
+    raise exception 'register_violation: this session was replaced by a newer sign-in'
+      using errcode = 'PT409',
+            hint = 'sign in again; only the most recent sign-in on an account may write';
   end if;
 
   -- SECURITY DEFINER is required here (a student may neither insert into
@@ -3094,6 +3620,16 @@ begin
   if auth.uid() is null then
     raise exception 'record_heartbeat: sign in before reporting a heartbeat'
       using errcode = '28000';
+  end if;
+
+  -- One active login per account (section 1b): a superseded device stops keeping
+  -- the monitor's coverage green, which is the point of gating this RPC. The client
+  -- signs itself out on the same condition; the refusal is for a client that does
+  -- not ask.
+  if not public.is_current_session() then
+    raise exception 'record_heartbeat: this session was replaced by a newer sign-in'
+      using errcode = 'PT409',
+            hint = 'sign in again; only the most recent sign-in on an account may write';
   end if;
 
   -- `for update` serialises two beats that arrive together, so the rate-limit
@@ -3589,6 +4125,15 @@ begin
       using errcode = '42501';
   end if;
 
+  -- One active login per account (section 1b): the device that lost the account may
+  -- not keep saving into the attempt. `PT409` rather than `55000`, so the client can
+  -- tell "another device signed in" from "the attempt closed".
+  if not public.is_current_session() then
+    raise exception 'merge_submission_answer: this session was replaced by a newer sign-in'
+      using errcode = 'PT409',
+            hint = 'sign in again; only the most recent sign-in on an account may write';
+  end if;
+
   update public.exam_submissions as s
   set answers = jsonb_set(
         coalesce(s.answers, '{}'::jsonb),
@@ -3659,6 +4204,16 @@ begin
   if auth.uid() is null then
     raise exception 'authentication is required to submit an exam'
       using errcode = '42501';
+  end if;
+
+  -- One active login per account (section 1b). Closing the attempt is the write a
+  -- superseded device must not make: submitting is idempotent, so a late replay
+  -- would otherwise succeed silently and lock the account that *is* signed in out of
+  -- its own sitting. `PT409` tells the client to sign in again, not to retry.
+  if not public.is_current_session() then
+    raise exception 'submit_exam: this session was replaced by a newer sign-in'
+      using errcode = 'PT409',
+            hint = 'sign in again; only the most recent sign-in on an account may write';
   end if;
 
   select s.student_id, s.exam_id, s.status, s.started_at,
@@ -3765,6 +4320,14 @@ begin
       using errcode = '42501';
   end if;
 
+  -- One active login per account (section 1b) - the free-text twin of the option
+  -- merge above, and refused the same way.
+  if not public.is_current_session() then
+    raise exception 'merge_submission_text_answer: this session was replaced by a newer sign-in'
+      using errcode = 'PT409',
+            hint = 'sign in again; only the most recent sign-in on an account may write';
+  end if;
+
   update public.exam_submissions as s
   set answers = jsonb_set(
         coalesce(s.answers, '{}'::jsonb),
@@ -3806,7 +4369,14 @@ grant execute on function public.merge_submission_text_answer(uuid, uuid, text) 
 -- SECURITY DEFINER because the caller's own policies would hide the answer key:
 -- `questions` has no student SELECT policy, so under invoker semantics every
 -- attempt would grade 0. It returns one number - never the key it read - and it
--- answers only for an attempt the caller may already see.
+-- answers only for the student who owns the attempt or for a caller who can reach
+-- its paper (`can_reach_exam()`, section 1). That last clause was `is_staff()`
+-- until `20261111090100_lecturer_isolation.sql`, i.e. any lecturer could call this
+-- with any attempt id and read a stranger's automatic score.
+--
+-- The two internal callers are unaffected: `submit_exam()` runs it for the student
+-- whose `s.student_id = auth.uid()`, and `grade_submission()` has already refused
+-- everybody but the paper's author or its supervisors.
 create or replace function public.auto_graded_score(p_submission_id uuid)
 returns numeric
 language sql
@@ -3818,7 +4388,7 @@ as $$
   from public.questions q
   join public.exam_submissions s on s.id = p_submission_id
   where q.exam_id = s.exam_id
-    and (s.student_id = auth.uid() or public.is_staff())
+    and (s.student_id = auth.uid() or public.can_reach_exam(s.exam_id))
     and (
       (
         q.question_type = 'multiple_choice'

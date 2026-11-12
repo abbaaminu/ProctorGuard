@@ -1074,21 +1074,26 @@ void main() {
       );
     });
 
-    test('the roster is staff-wide except for the assigned supervisor', () {
+    test('the roster follows the paper, for every staff role', () {
       final sql = schemaSql();
       if (sql == null) return;
 
-      // A lecturer may watch any sitting - "WHAT IT DOES NOT CHANGE" in
-      // lecturer_scoped_log_reads.sql - so the attempts keep the wide staff read for
-      // them. Since `20261109090000_supervisor_exam_assignments.sql` the one staff
-      // label that is narrowed is `supervisor`, and only to the papers an
-      // administrator assigned it. If the ownership arm ever replaced the staff one,
-      // a lecturer's monitor on another teacher's paper would show an empty roster.
+      // A lecturer used to read any attempt (`is_staff()`), which is what let the
+      // monitor be opened on a colleague's sitting. Since
+      // `20261111090100_lecturer_isolation.sql` the roster is your own attempt or
+      // the attempts of a paper you can reach - the author's, an administrator's,
+      // or the supervisor's the paper was assigned to - and no other lecturer's.
+      // `is_staff()` appearing here again would hand back every script in the
+      // institution, so the two assertions that used to demand it now refuse it.
       final predicate = predicateOf(sql, 'submissions_select_own_or_supervisor');
       expect(predicate, contains('student_id = auth.uid()'));
-      expect(predicate, contains('public.is_staff()'));
-      expect(predicate, contains('not public.is_supervisor_only()'));
-      expect(predicate, contains('public.can_supervise_exam(exam_id)'));
+      expect(predicate, contains('public.can_reach_exam(exam_id)'));
+      expect(
+        predicate,
+        isNot(contains('public.is_staff()')),
+        reason: 'is_staff() is every paper in the institution, not a scope',
+      );
+      expect(predicate, isNot(contains('is_supervisor_only')));
       expect(predicate, isNot(contains('is_exam_supervisor')));
     });
 
@@ -2601,18 +2606,24 @@ void main() {
       expect(sql, contains('idx_exam_allowed_students_student'));
     });
 
-    test('exams_select narrows students by cohort and leaves staff unscoped',
-        () {
+    test('exams_select narrows students by cohort and staff by reach', () {
       final sql = schemaSql();
       if (sql == null) return; // a checkout without ../supabase
 
       final predicate = selectPredicate(sql, 'exams_select');
       expect(predicate, isNotNull);
 
-      // Staff, and the author of a draft, see every paper: an invigilator opens
-      // sittings in any department.
-      expect(predicate, contains('public.is_staff()'));
-      expect(predicate, contains('created_by = auth.uid()'));
+      // Staff reach: the papers they wrote, the papers an administrator assigned
+      // them, and (for an administrator) all of them - one helper, so the console
+      // list and the nine other reads cannot disagree about it. `is_staff()` here
+      // was the whole catalogue, and `created_by = auth.uid()` was a second
+      // spelling of the author's arm.
+      expect(predicate, contains('public.can_reach_exam(id)'));
+      expect(
+        predicate,
+        isNot(contains('public.is_staff()')),
+        reason: 'the staff tier is not a paper scope',
+      );
       // A student only ever sees a paper the named predicate says is theirs. The
       // rule itself no longer lives in this policy: it is
       // `public.student_can_access_exam(id)`, so that the question feed and the
@@ -3085,6 +3096,14 @@ void main() {
           reason: 'an inline subquery reads as the caller, so it answers '
               '"what may I see?" instead of "does this folder name an attempt?"',
         );
+        // The third term is whose orphan it was. `is_attempt_resetter()` names
+        // every lecturer, so without this the tier read was the whole bucket:
+        // apply `20261111090100_lecturer_isolation.sql`.
+        expect(
+          policy,
+          contains('public.may_purge_snapshot(name)'),
+          reason: 'a purge policy without the grant is the bucket-wide purge',
+        );
       }
 
       // The helper is the fix, and all three attributes matter: `security definer`
@@ -3124,13 +3143,14 @@ void main() {
       );
 
       // The upgrade path has to arrive at the same three terms and the same helper:
-      // `20261103090800` still carries the inline subquery (it is history), and this
-      // file is what an existing project applies on top of it.
-      final migration = File(
-        '../supabase/migrations/20261110090100_snapshot_orphan_check.sql',
+      // `20261103090800` still carries the inline subquery (it is history) and
+      // `20261110090100` the two-term fix, and this file is what an existing project
+      // applies on top of them - so it is the copy a fresh install must agree with.
+      final isolation = File(
+        '../supabase/migrations/20261111090100_lecturer_isolation.sql',
       );
-      if (migration.existsSync()) {
-        final upgrade = migration.readAsStringSync();
+      if (isolation.existsSync()) {
+        final upgrade = isolation.readAsStringSync();
         for (final policy in <String>[
           'Proctor snapshots supervisor purge',
           'Proctor snapshots orphan read for purge',
@@ -3141,10 +3161,19 @@ void main() {
             reason: 'the upgrade migration and schema.sql disagree about $policy',
           );
         }
+        // The helper itself is not re-created by this file: the copy a fresh install
+        // runs is still the one `20261110090100` wrote, asserted below.
+      }
+
+      final migration = File(
+        '../supabase/migrations/20261110090100_snapshot_orphan_check.sql',
+      );
+      if (migration.existsSync()) {
+        // The helper is unchanged by the later file, so the two must still agree.
         expect(
-          _functionBody(upgrade, 'snapshot_attempt_exists'),
+          _functionBody(migration.readAsStringSync(), 'snapshot_attempt_exists'),
           helper,
-          reason: 'the upgrade migration and schema.sql disagree about the helper',
+          reason: 'the orphan check and schema.sql disagree about the helper',
         );
       }
 
@@ -3212,11 +3241,12 @@ void main() {
       );
 
       // Signing a URL is a SELECT, so this predicate is the read gate on the
-      // evidence itself.
+      // evidence itself. Two arms became one helper in
+      // `20261111090100_lecturer_isolation.sql`: the same papers, spelled once.
       final storage = _policyUsing(sql, 'Proctor snapshots read access');
-      expect(storage, contains('public.can_supervise_exam(s.exam_id)'));
-      expect(storage, contains('public.owns_exam(s.exam_id)'));
+      expect(storage, contains('public.can_reach_exam(s.exam_id)'));
       expect(storage, isNot(contains('is_staff')));
+      expect(storage, isNot(contains('is_supervisor_only')));
     });
 
     test('the profile labels a policy compares are not self-service', () {
@@ -3827,15 +3857,22 @@ void main() {
       // drifted would enforce something different in a fresh project than in an
       // upgraded one, and nothing else in the repository would notice.
       //
-      // `record_heartbeat` is still this file's own definition. The two coverage
-      // readers and the read policy were re-created by
+      // `record_heartbeat` is no longer this file's own definition: section 1b of
+      // schema.sql puts the single-session gate inside it, so
+      // `20261111090000_single_session.sql` is the file a fresh install has to agree
+      // with. The two coverage readers and the read policy were re-created by
       // `20261109090000_supervisor_exam_assignments.sql` (their supervisor arm is the
-      // scope question now), so *that* is the file a fresh install has to agree with.
-      expect(
-        _functionBody(upgrade, 'record_heartbeat'),
-        _functionBody(sql, 'record_heartbeat'),
-        reason: 'record_heartbeat differs between schema.sql and its migration',
+      // scope question now), so *that* is the file for those.
+      final session = File(
+        '../supabase/migrations/20261111090000_single_session.sql',
       );
+      if (session.existsSync()) {
+        expect(
+          _functionBody(session.readAsStringSync(), 'record_heartbeat'),
+          _functionBody(sql, 'record_heartbeat'),
+          reason: 'record_heartbeat differs between schema.sql and the session gate',
+        );
+      }
 
       final scope = File(
         '../supabase/migrations/20261109090000_supervisor_exam_assignments.sql',
@@ -3928,16 +3965,19 @@ void main() {
         contains('student_id = auth.uid()'),
       );
 
-      // Read: own rows, or the supervisor of the paper the acceptance names. Not
-      // `is_staff()` - a lecturer reads the evidence of a sitting, not a person's
-      // agreement - and not the tier any more: a supervisor reads the acceptances of
-      // the papers assigned to them (`can_supervise_exam()`), which is why a general
-      // acceptance (`exam_id IS NULL`) is not in this arm at all.
+      // Read: own rows, or a staff member who can reach the paper the acceptance
+      // names. Not `is_staff()` - a lecturer reads the evidence of a sitting, not a
+      // person's agreement - and not the tier any more: since
+      // `20261111090100_lecturer_isolation.sql` the arm is `can_reach_exam(exam_id)`,
+      // so the paper's author, the supervisor assigned to it and an administrator
+      // see it, and a general acceptance (`exam_id IS NULL`) is in no arm but the
+      // student's own.
       final read = _policyUsing(sql, 'consents_select_own_or_supervisor');
       expect(read, contains('student_id = auth.uid()'));
       expect(read, contains('exam_id is not null'));
-      expect(read, contains('public.can_supervise_exam(exam_id)'));
+      expect(read, contains('public.can_reach_exam(exam_id)'));
       expect(read, isNot(contains('is_staff')));
+      expect(read, isNot(contains('is_supervisor_only')));
 
       // The absence *is* the control: no UPDATE or DELETE policy, and no grant
       // past select/insert.
@@ -4287,30 +4327,43 @@ void main() {
 
       // The policy this migration exists to change must be identical on both paths
       // too, or a fresh install and an upgraded project enforce different rules -
-      // which is the one thing a consent gate must never do.
-      expect(
-        _policyWithCheck(upgrade, 'submissions_insert_own_ongoing'),
-        _policyWithCheck(sql, 'submissions_insert_own_ongoing'),
-        reason: 'the attempt policy disagrees between the two paths',
+      // which is the one thing a consent gate must never do. The attempt policy has
+      // since been re-created by `20261111090000_single_session.sql` (it asks
+      // `is_current_session()` now), so *that* is the copy a fresh install agrees with.
+      final session = File(
+        '../supabase/migrations/20261111090000_single_session.sql',
       );
+      if (session.existsSync()) {
+        expect(
+          _policyWithCheck(
+            session.readAsStringSync(),
+            'submissions_insert_own_ongoing',
+          ),
+          _policyWithCheck(sql, 'submissions_insert_own_ongoing'),
+          reason: 'the attempt policy disagrees between the two paths',
+        );
+      }
       expect(
         _policyWithCheck(upgrade, 'consents_insert_own'),
         _policyWithCheck(sql, 'consents_insert_own'),
       );
-      // The read policy was re-created by the scope migration (a supervisor reads the
-      // acceptances of the papers assigned to them, and a general acceptance is their
-      // subject's alone), so that is the file a fresh install has to agree with.
-      final scope = File(
-        '../supabase/migrations/20261109090000_supervisor_exam_assignments.sql',
+      // The read policy has been re-created twice: by the scope migration (a
+      // supervisor reads the acceptances of the papers assigned to them, and a
+      // general acceptance is their subject's alone) and then by
+      // `20261111090100_lecturer_isolation.sql` (the same, with the author's arm), so
+      // *that* is the copy a fresh install has to agree with.
+      final isolation = File(
+        '../supabase/migrations/20261111090100_lecturer_isolation.sql',
       );
-      if (scope.existsSync()) {
+      if (isolation.existsSync()) {
         expect(
           _policyUsing(
-            scope.readAsStringSync(),
+            isolation.readAsStringSync(),
             'consents_select_own_or_supervisor',
           ),
           _policyUsing(sql, 'consents_select_own_or_supervisor'),
-          reason: 'the scope migration and schema.sql disagree about the consent read',
+          reason: 'the lecturer-isolation file and schema.sql disagree about the '
+              'consent read',
         );
       }
     });
@@ -4467,6 +4520,17 @@ void main() {
         'PASS (k)',
         'PASS (k)vii',
         'PASS (k)ix',
+        // Lecturer isolation (`20261111090100_lecturer_isolation.sql`): the same
+        // file asks a lecturer who wrote nothing what they can reach, and the
+        // answer has to be none of a colleague's paper.
+        'PASS (l)',
+        'PASS (l)ii',
+        'PASS (l)iii',
+        'PASS (l)iv',
+        'PASS (l)v',
+        'PASS (l)vi',
+        'PASS (l)vii',
+        'PASS (l)viii',
       ]) {
         expect(sql, contains(marker), reason: 'the check stopped proving $marker');
       }
@@ -4546,16 +4610,18 @@ void main() {
       expect(sql, isNot(contains('"supervisor_assignments_update')));
     });
 
-    test('the roster read is narrowed for a supervisor, unchanged for staff', () {
+    test('the roster read is narrowed for every staff role alike', () {
       final sql = schemaSql();
       if (sql == null) return; // a checkout without ../supabase
 
-      // Own row first, then the staff tier with only the supervisor arm narrowed:
-      // the question is asked of the *person* the row is, not of a paper.
+      // Own row first, an administrator's whole list second, then the per-person
+      // question for the rest of the staff tier. There is no third label left to
+      // exempt: since `20261111090100_lecturer_isolation.sql` a lecturer is asked
+      // the same question a supervisor is.
       expect(
         _policyUsing(sql, 'profiles_select_own_or_staff'),
-        'id = auth.uid() or ( public.is_staff() and '
-        '(not public.is_supervisor_only() or public.can_read_profile(id)) )',
+        'id = auth.uid() or public.is_admin() or ( public.is_staff() and '
+        'public.can_read_profile(id) )',
       );
 
       final body = _functionBody(sql, 'can_read_profile');
@@ -4564,37 +4630,46 @@ void main() {
         isNotNull,
         reason: 'the roster read asks a predicate that is not in the file',
       );
-      // The three answers: an attempt on an assigned paper (the monitor's roster), a
-      // borrow-list row on one, and the cohort a *labelled* paper names. Without the
-      // last two a supervisor could not print a name before the first attempt.
+      // The three answers: an attempt on a paper the caller can reach (the monitor's
+      // roster), a borrow-list row on one, and the cohort a *labelled* paper names.
+      // Without the last two a supervisor could not print a name before the first
+      // attempt, and a lecturer could not print one on the marking queue either.
       expect(body, contains('public.exam_submissions'));
       expect(body, contains('public.exam_allowed_students'));
-      expect(body, contains('public.supervisor_exam_assignments'));
+      // The paper scope is asked, not restated: `supervisor_exam_assignments` used to
+      // be joined here directly, which is why a lecturer - who reaches papers through
+      // `owns_exam()` - read no row on the paper they wrote.
+      expect(body, contains('public.can_reach_exam(s.exam_id)'));
+      expect(body, contains('public.can_reach_exam(t.exam_id)'));
+      expect(body, isNot(contains('public.supervisor_exam_assignments')));
       // ...and a paper that names no cohort must not stand in for "everybody in the
       // institution", which is the hole this predicate exists to close.
       expect(body, contains("nullif(btrim(e.faculty), '') is not null"));
       expect(body, contains("p.role = 'student'"));
-      // Never another member of staff: no screen a supervisor can reach prints a
+      // Never another member of staff: no screen a staff console can reach prints a
       // colleague's name, and the author of a paper is a uuid the console ignores.
       expect(body, isNot(contains("'admin'")));
       expect(body, isNot(contains("'lecturer'")));
 
-      // The same policy and the same function on an upgraded project: the migration
-      // runs last there, so *it* is what a linked database ends up enforcing.
-      final scope = File(
-        '../supabase/migrations/20261109090000_supervisor_exam_assignments.sql',
+      // The same policy and the same function on an upgraded project: the isolation
+      // migration runs last there, so *it* is what a linked database ends up
+      // enforcing.
+      final isolation = File(
+        '../supabase/migrations/20261111090100_lecturer_isolation.sql',
       );
-      if (!scope.existsSync()) return; // a checkout without ../supabase
-      final scopeSql = scope.readAsStringSync().replaceAll('\r\n', '\n');
+      if (!isolation.existsSync()) return; // a checkout without ../supabase
+      final isolationSql = isolation.readAsStringSync().replaceAll('\r\n', '\n');
       expect(
-        _functionBody(scopeSql, 'can_read_profile'),
+        _functionBody(isolationSql, 'can_read_profile'),
         body,
-        reason: 'the scope migration and the full schema disagree about the roster read',
+        reason: 'the isolation migration and the full schema disagree about the '
+            'roster read',
       );
       expect(
-        _policyUsing(scopeSql, 'profiles_select_own_or_staff'),
+        _policyUsing(isolationSql, 'profiles_select_own_or_staff'),
         _policyUsing(sql, 'profiles_select_own_or_staff'),
-        reason: 'the scope migration and the full schema disagree about the roster read',
+        reason: 'the isolation migration and the full schema disagree about the '
+            'roster read',
       );
     });
 
@@ -4627,19 +4702,37 @@ void main() {
       }
 
       // Three copies of two definitions is two too many, so they are pinned against
-      // each other: the full schema, the scope migration, and this upgrade.
+      // each other. This file and `20261109090000` are history now: the current
+      // definition of both is the one `20261111090100_lecturer_isolation.sql`
+      // writes, and a project upgraded through all of them ends up enforcing that
+      // one - so *that* is the copy the full schema has to agree with. What this
+      // file must still carry is its own half: the supervisor-joined body it
+      // shipped, which is what the project it was written for gets, and the sweep.
       final full = schemaSql();
       if (full == null) return; // a checkout without ../supabase
       expect(
         _functionBody(sql, 'can_read_profile'),
-        _functionBody(full, 'can_read_profile'),
-        reason: 'the upgrade and the full schema disagree about the roster read',
+        contains('public.supervisor_exam_assignments'),
+        reason: 'this file is the supervisor-era body: history, and still shipped',
       );
-      expect(
-        _policyUsing(sql, 'profiles_select_own_or_staff'),
-        _policyUsing(full, 'profiles_select_own_or_staff'),
-        reason: 'the upgrade and the full schema disagree about the roster read',
+      final isolation = File(
+        '../supabase/migrations/20261111090100_lecturer_isolation.sql',
       );
+      if (isolation.existsSync()) {
+        final current = isolation.readAsStringSync().replaceAll('\r\n', '\n');
+        expect(
+          _functionBody(current, 'can_read_profile'),
+          _functionBody(full, 'can_read_profile'),
+          reason: 'the isolation migration and the full schema disagree about the '
+              'roster read',
+        );
+        expect(
+          _policyUsing(current, 'profiles_select_own_or_staff'),
+          _policyUsing(full, 'profiles_select_own_or_staff'),
+          reason: 'the isolation migration and the full schema disagree about the '
+              'roster read',
+        );
+      }
 
       // A second permissive read policy is a union with this one, and a project built
       // from a pre-rename file - or hand-edited in the dashboard - still carries
@@ -4748,6 +4841,293 @@ void main() {
         expect(
           readme.readAsStringSync(),
           contains('20261110090200_supervisor_profile_read'),
+          reason: 'the README never tells an operator to run it',
+        );
+      }
+    });
+  });
+
+  group('single session contract', () {
+    test('claimSession posts p_device_label and reads the row it answers',
+        () async {
+      transport.responseBody = '[{"accepted": false, "active_session_id": "s-2",'
+          ' "claimed_at": "2026-11-11T09:00:00+00:00",'
+          ' "replaced_session_id": null}]';
+      SupabaseService.instance.debugSetClient(client);
+      addTearDown(() => SupabaseService.instance.debugSetClient(null));
+
+      final claim =
+          await SupabaseService.instance.claimSession(deviceLabel: 'android');
+
+      expect(transport.requests.single.url.path, '/rest/v1/rpc/claim_session');
+      final body = jsonDecode(transport.bodies.single) as Map<String, dynamic>;
+      // The argument is named as `claim_session(p_device_label text)` names it,
+      // and it carries the coarse platform name, which is what the audit row shows.
+      expect(body, <String, dynamic>{'p_device_label': 'android'});
+      expect(claim.measured, isTrue, reason: 'a refusal is still an answer');
+      expect(claim.accepted, isFalse, reason: 'the newer sign-in keeps the account');
+      expect(claim.activeSessionId, 's-2');
+      expect(claim.claimedAt, DateTime.utc(2026, 11, 11, 9));
+    });
+
+    test('a project without the functions carries the session on', () async {
+      // What PostgREST answers before `20261111090000_single_session.sql` has
+      // been applied: the app must keep working exactly as it did, rather than
+      // signing every student out of an exam the moment it starts.
+      transport.statusCode = 404;
+      transport.responseBody = '{"code":"PGRST202","message":'
+          '"Could not find the function public.claim_session","details":null,'
+          '"hint":null}';
+      SupabaseService.instance.debugSetClient(client);
+      addTearDown(() => SupabaseService.instance.debugSetClient(null));
+
+      final claim = await SupabaseService.instance.claimSession();
+
+      expect(claim.measured, isFalse);
+      expect(claim.accepted, isTrue, reason: 'a missing function is not a no');
+      expect(await SupabaseService.instance.isCurrentSession(), isNull);
+    });
+
+    test('isCurrentSession answers with the boolean the gate polls', () async {
+      SupabaseService.instance.debugSetClient(client);
+      addTearDown(() => SupabaseService.instance.debugSetClient(null));
+
+      transport.responseBody = 'false';
+      expect(await SupabaseService.instance.isCurrentSession(), isFalse);
+      expect(
+        transport.requests.last.url.path,
+        '/rest/v1/rpc/is_current_session',
+      );
+
+      transport.responseBody = 'true';
+      expect(await SupabaseService.instance.isCurrentSession(), isTrue);
+
+      // Anything that is not a boolean — an empty body, a null, a project
+      // answering something else — is "could not ask". Only `false` signs out.
+      for (final response in <String>['null', '[]', '"true"', '']) {
+        transport.responseBody = response;
+        expect(
+          await SupabaseService.instance.isCurrentSession(),
+          isNull,
+          reason: '"$response" must not sign a device out',
+        );
+      }
+    });
+
+    test('schema.sql keeps one claim row per account and no write policy', () {
+      final sql = schemaSql();
+      if (sql == null) return; // a lone app checkout: nothing to compare against
+
+      final statements = _withoutSqlComments(sql);
+      final squashed = statements.replaceAll(RegExp(r'\s+'), ' ');
+
+      expect(
+        squashed,
+        contains('create table if not exists public.active_sessions'),
+      );
+      // `user_id` is the primary key, so two rows can never disagree about which
+      // session holds the account — the whole design rests on that.
+      expect(
+        RegExp(r'create table if not exists public\.active_sessions \(\s*'
+                r'user_id\s+uuid primary key')
+            .hasMatch(statements),
+        isTrue,
+      );
+      expect(squashed, contains('session_id text not null'));
+      expect(squashed, contains('issued_at timestamptz not null'));
+      expect(squashed, contains('device_label text'));
+      expect(
+        _policyUsing(sql, 'active_sessions_select_own'),
+        'user_id = auth.uid()',
+      );
+      // One policy, and it is a SELECT: `claim_session()` is `security definer` and
+      // the only writer, because a device that could UPDATE its own claim could
+      // talk its way past every gate below.
+      expect(
+        RegExp(r'create policy "[a-z_]+"\s+on public\.active_sessions')
+            .allMatches(statements)
+            .length,
+        1,
+        reason: 'a second policy on active_sessions is a way round the gate',
+      );
+      expect(
+        RegExp(r'on public\.active_sessions for (insert|update|delete|all)')
+            .hasMatch(squashed),
+        isFalse,
+      );
+
+      // The audit trail: one row per takeover, kept for staff.
+      expect(
+        squashed,
+        contains('create table if not exists public.session_supersessions'),
+      );
+      expect(squashed, contains('previous_session_id text'));
+      expect(squashed, contains('new_session_id text'));
+      expect(
+        RegExp('create index if not exists idx_session_supersessions_user_id')
+            .hasMatch(squashed),
+        isTrue,
+        reason: 'the takeover history is read per account, newest first',
+      );
+    });
+    test('claim_session orders by iat, answers a refusal, and audits it', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      final body = _functionBody(sql, 'claim_session');
+      expect(body, isNotNull, reason: 'schema.sql no longer defines it');
+      expect(body, contains('security definer'));
+      expect(body, contains('returns table ('));
+      // The four column names are the contract `SessionClaim.fromRpc` parses.
+      for (final column in <String>[
+        'accepted',
+        'active_session_id',
+        'claimed_at',
+        'replaced_session_id',
+      ]) {
+        expect(body, contains(column));
+      }
+      expect(
+        body,
+        contains('for update'),
+        reason: 'two devices claiming at once are ordered by the server',
+      );
+      expect(
+        body,
+        contains('if v_prev.issued_at > v_issued then'),
+        reason: 'newest token wins; the last caller must not take the account back',
+      );
+      expect(
+        body,
+        contains('return query select false, v_prev.session_id'),
+        reason: 'losing is an answer, not an exception',
+      );
+      expect(
+        body,
+        contains('return query select true, v_session, v_prev.claimed_at'),
+        reason: 'a repeat from the holder keeps the moment it took the account',
+      );
+      expect(body, contains('insert into public.session_supersessions'));
+
+      // Grants: the RPC is for signed-in callers only.
+      expect(
+        _withoutSqlComments(sql),
+        contains(
+          'revoke execute on function public.claim_session(text) '
+          'from public, anon;',
+        ),
+      );
+    });
+
+    test('is_current_session fails open, and only a claim row can say no', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      final body = _functionBody(sql, 'is_current_session');
+      expect(body, isNotNull);
+      expect(body, contains('security definer'));
+      expect(body, contains('a.session_id = public.session_claim()'));
+      expect(
+        body,
+        contains('public.session_claim() is null'),
+        reason: 'a token with no session_id claim must keep working',
+      );
+      expect(
+        body,
+        contains('true'),
+        reason: 'no claim row means nothing contradicts the request',
+      );
+      // The claim row is the *only* thing that can refuse: a student must not be
+      // locked out by anything else this function could have looked at.
+      expect(body, isNot(contains('auth.users')));
+    });
+
+    test('the five write paths and the attempt insert ask the question', () {
+      final sql = schemaSql();
+      if (sql == null) return;
+
+      // Every path that writes during a sitting. A new one that forgets the gate
+      // is a hole a superseded device can write through, so the list is explicit.
+      for (final function in <String>[
+        'register_violation',
+        'record_heartbeat',
+        'merge_submission_answer',
+        'submit_exam',
+        'merge_submission_text_answer',
+      ]) {
+        final body = _functionBody(sql, function);
+        expect(body, isNotNull, reason: 'schema.sql no longer defines $function');
+        expect(
+          body,
+          contains('if not public.is_current_session() then'),
+          reason: '$function writes into a sitting without asking who holds it',
+        );
+        expect(
+          body,
+          contains("errcode = 'PT409'"),
+          reason: '$function must answer PT409, which the client signs out on',
+        );
+      }
+
+      // Opening the attempt is an INSERT, not an RPC: the same question sits in
+      // its policy, so a superseded device cannot start a second sitting.
+      expect(
+        _policyWithCheck(sql, 'submissions_insert_own_ongoing'),
+        contains('public.is_current_session()'),
+      );
+    });
+
+    test('the upgrade migration and the operator lists carry the same contract',
+        () {
+      final migration =
+          File('../supabase/migrations/20261111090000_single_session.sql');
+      final sql = schemaSql();
+      if (!migration.existsSync() || sql == null) return;
+
+      final upgrade = migration.readAsStringSync();
+      // The two files must define the gate identically: a project created from
+      // schema.sql and one upgraded by this migration have to answer the same way.
+      for (final function in <String>[
+        'session_claim',
+        'session_issued_at',
+        'claim_session',
+        'is_current_session',
+      ]) {
+        expect(
+          _functionBody(upgrade, function),
+          _functionBody(sql, function),
+          reason: '$function drifted between schema.sql and the migration',
+        );
+      }
+      expect(upgrade, contains('create table if not exists public.active_sessions'));
+
+      // The manual test that proves the SQL half on a real database. It is a
+      // script somebody runs, so it must leave no rows behind.
+      final check = File('../supabase/tests/single_session_check.sql');
+      if (check.existsSync()) {
+        final body = check.readAsStringSync().trimRight();
+        expect(body, endsWith('rollback;'));
+        expect(body, contains('begin;'));
+      }
+
+      // And an operator has to be told to run the migration, in every list.
+      for (final script in <String>[
+        '../apply_in_order.ps1',
+        '../apply_live_cli.ps1',
+      ]) {
+        final file = File(script);
+        if (!file.existsSync()) continue;
+        expect(
+          file.readAsStringSync(),
+          contains('20261111090000_single_session'),
+          reason: '$script does not apply the single-session gate',
+        );
+      }
+      final readme = File('../README.md');
+      if (readme.existsSync()) {
+        expect(
+          readme.readAsStringSync(),
+          contains('20261111090000_single_session'),
           reason: 'the README never tells an operator to run it',
         );
       }

@@ -8,6 +8,7 @@ import '../../features/proctoring/domain/entities/violation.dart';
 import '../../features/proctoring/domain/repositories/proctoring_repository.dart';
 import 'key_value_store.dart';
 import 'network_status.dart';
+import 'supabase_service.dart';
 
 /// One answer the student has given that the server has not confirmed yet.
 ///
@@ -682,6 +683,16 @@ class OfflineSyncService implements ViolationOutbox {
               flagged: result.flagged,
             ),
           );
+        } on SessionSupersededException {
+          // Another device signed in later, so this session is refused on every
+          // write (schema.sql §1b) and will stay refused until somebody signs in
+          // on this device again. The beats stay queued — they are still true —
+          // but the pass stops instead of spending its failure budget on rows
+          // that cannot land. The session gate signs this device out meanwhile.
+          _lastError = sessionSupersededMessage;
+          _online = true;
+          _notify();
+          return;
         } catch (error) {
           proctorLog('ProctorGuard: violation still queued ($error)');
           _offline('Could not deliver a proctoring log yet.');
@@ -706,6 +717,16 @@ class OfflineSyncService implements ViolationOutbox {
               selectedOption: pending.selectedOption!,
             );
           }
+        } on SessionSupersededException {
+          // Same refusal as above, for a saved answer (schema.sql §1b). The row
+          // is *kept*: it is this student's answer, and signing in again on this
+          // device makes the session current, so a later pass can still deliver
+          // it. Nothing else in the queue can land in the meantime, so the pass
+          // ends here.
+          _lastError = sessionSupersededMessage;
+          _online = true;
+          _notify();
+          return;
         } on AnswerWriteRejected {
           final index = _answers.indexOf(pending);
           if (index != -1) _answers[index] = pending.markRejected();

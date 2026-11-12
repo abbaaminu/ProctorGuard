@@ -1,5 +1,6 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../../../../core/services/supabase_service.dart';
 import '../../domain/entities/heartbeat.dart';
 import '../../domain/entities/violation.dart';
 import '../../domain/repositories/proctoring_repository.dart';
@@ -44,13 +45,22 @@ class ProctoringRepositoryImpl implements ProctoringRepository {
     // dashboard orders by), and the second is the idempotency key that stops a
     // replayed row from becoming a second strike (see the unique index on
     // proctoring_logs.client_event_id).
-    final rows = await _client.rpc('register_violation', params: {
-      'p_submission_id': submissionId,
-      'p_action_type': violation.type.dbValue,
-      'p_snapshot_url': violation.snapshotUrl,
-      'p_client_timestamp': violation.timestamp.toUtc().toIso8601String(),
-      'p_client_event_id': violation.clientEventId,
-    }) as List<dynamic>;
+    final List<dynamic> rows;
+    try {
+      rows = await _client.rpc('register_violation', params: {
+        'p_submission_id': submissionId,
+        'p_action_type': violation.type.dbValue,
+        'p_snapshot_url': violation.snapshotUrl,
+        'p_client_timestamp': violation.timestamp.toUtc().toIso8601String(),
+        'p_client_event_id': violation.clientEventId,
+      }) as List<dynamic>;
+    } on PostgrestException catch (error) {
+      // `PT409` is the one call the offline queue must not keep retrying: the
+      // RPC refuses it because another device signed in later (schema.sql §1b),
+      // and the log will never be accepted from this session.
+      if (error.code == 'PT409') throw const SessionSupersededException();
+      rethrow;
+    }
 
     final row = rows.first as Map<String, dynamic>;
     return (
@@ -85,14 +95,22 @@ class ProctoringRepositoryImpl implements ProctoringRepository {
     // RPC decides the outcome, so there is nothing here for a patched client to
     // gain by lying beyond the two booleans - which are the point of the feature
     // and are documented as unverifiable in the README.
-    final rows = await _client.rpc('record_heartbeat', params: {
-      'p_submission_id': submissionId,
-      'p_camera_ok': cameraOk,
-      'p_monitoring_ok': monitoringOk,
-      'p_app_version': appVersion,
-      'p_client_time': clientTime?.toUtc().toIso8601String(),
-      'p_client_event_id': clientEventId,
-    }) as List<dynamic>;
+    final List<dynamic> rows;
+    try {
+      rows = await _client.rpc('record_heartbeat', params: {
+        'p_submission_id': submissionId,
+        'p_camera_ok': cameraOk,
+        'p_monitoring_ok': monitoringOk,
+        'p_app_version': appVersion,
+        'p_client_time': clientTime?.toUtc().toIso8601String(),
+        'p_client_event_id': clientEventId,
+      }) as List<dynamic>;
+    } on PostgrestException catch (error) {
+      // A superseded device's beats are refused for good (§1b). Reported as
+      // itself so the beat loop stops hammering a session that cannot write.
+      if (error.code == 'PT409') throw const SessionSupersededException();
+      rethrow;
+    }
 
     final row = rows.first as Map<String, dynamic>;
     return HeartbeatAck(

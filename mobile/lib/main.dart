@@ -18,6 +18,7 @@ import 'features/admin/presentation/providers/admin_providers.dart';
 import 'features/auth/data/repositories/profile_repository_impl.dart';
 import 'features/auth/presentation/providers/profile_provider.dart';
 import 'features/auth/presentation/widgets/role_gate.dart';
+import 'features/auth/presentation/widgets/session_liveness.dart';
 import 'features/authoring/data/repositories/question_authoring_repository_impl.dart';
 import 'features/authoring/presentation/providers/question_authoring_providers.dart';
 import 'features/dashboard/data/repositories/dashboard_repository_impl.dart';
@@ -185,11 +186,17 @@ class ExamProctorApp extends StatelessWidget {
       // staff console. Swap in go_router config when deep links matter —
       // every page takes plain constructor args.
       home: supabaseStatus == SupabaseInitStatus.ready
-          // Wrapped so coming back to the app re-reads the shared lists
-          // (published exams, the roster, authored papers, analytics) instead of
-          // serving whatever they cached when they were first opened — see
-          // [RefreshOnResume].
-          ? const RefreshOnResume(child: RoleGate())
+          // Outermost is the session gate: one login per account, enforced by the
+          // server on every write (schema.sql §1b) and followed here so a
+          // superseded device lands back on the login screen instead of on an
+          // exam it can no longer save — see [SessionLiveness].
+          ? const SessionLiveness(
+              // Under it, coming back to the app re-reads the shared lists
+              // (published exams, the roster, authored papers, analytics) instead
+              // of serving whatever they cached when they were first opened — see
+              // [RefreshOnResume].
+              child: RefreshOnResume(child: RoleGate()),
+            )
           : SetupRequiredPage(
               status: supabaseStatus,
               detail: service.initError,

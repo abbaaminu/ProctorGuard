@@ -28,7 +28,9 @@ $files = @(
  '20261109090000_supervisor_exam_assignments',
  '20261110090000_supervisor_student_arm',
  '20261110090100_snapshot_orphan_check',
- '20261110090200_supervisor_profile_read'
+ '20261110090200_supervisor_profile_read',
+ '20261111090000_single_session',
+ '20261111090100_lecturer_isolation'
 )
 $i = 0
 foreach ($f in $files) {

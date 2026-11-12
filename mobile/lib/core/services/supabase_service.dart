@@ -227,6 +227,83 @@ class AuthOutcome {
   final String? message;
 }
 
+/// What `claim_session()` answered (schema.sql §1b).
+///
+/// Three states, because "the server refused this device" and "the server could
+/// not be asked" must not be the same thing: only [accepted] `false` signs a
+/// device out. A transient failure, an old token without a `session_id` claim, or
+/// a project that has not run `20261111090000_single_session.sql` yet all come
+/// back [measured] `false` and are treated as "carry on", which mirrors the way
+/// the SQL gate fails open.
+class SessionClaim {
+  const SessionClaim._({
+    required this.accepted,
+    required this.measured,
+    this.activeSessionId,
+    this.claimedAt,
+    this.replacedSessionId,
+  });
+
+  /// Nobody was asked (or the answer was unreadable): carry on.
+  const SessionClaim.unmeasured() : this._(accepted: true, measured: false);
+
+  /// Reads the single row a `setof` RPC returns. Anything unexpected — an empty
+  /// array, a missing `accepted` column, a project where the function is not
+  /// deployed — degrades to [SessionClaim.unmeasured] rather than guessing.
+  factory SessionClaim.fromRpc(dynamic response) {
+    if (response is! List || response.isEmpty) {
+      return const SessionClaim.unmeasured();
+    }
+    final row = response.first;
+    if (row is! Map) return const SessionClaim.unmeasured();
+    final accepted = row['accepted'];
+    if (accepted is! bool) return const SessionClaim.unmeasured();
+    final claimedAt = row['claimed_at'];
+    return SessionClaim._(
+      accepted: accepted,
+      measured: true,
+      activeSessionId: row['active_session_id'] as String?,
+      claimedAt: claimedAt is String
+          ? DateTime.tryParse(claimedAt)
+          : claimedAt is DateTime
+              ? claimedAt
+              : null,
+      replacedSessionId: row['replaced_session_id'] as String?,
+    );
+  }
+
+  /// Whether this device now holds the account's single active session.
+  final bool accepted;
+
+  /// Whether the server actually answered. `false` means "unknown", not "no".
+  final bool measured;
+
+  /// The session id that holds the account — this device's when [accepted].
+  final String? activeSessionId;
+
+  /// When that session took the account (server clock); kept across a re-claim.
+  final DateTime? claimedAt;
+
+  /// The session this claim displaced, null on a first claim or a repeat.
+  final String? replacedSessionId;
+}
+
+/// The server refused a write because a newer sign-in holds the account
+/// (`PT409`, schema.sql §1b) — the device was superseded, not disconnected.
+///
+/// Distinct from an offline failure on purpose: retrying will never succeed, and
+/// the student has to sign in again, so the queue stops retrying it.
+class SessionSupersededException implements Exception {
+  const SessionSupersededException();
+
+  @override
+  String toString() => sessionSupersededMessage;
+}
+
+/// What a device that lost the account is told before it is signed out.
+const String sessionSupersededMessage =
+    'You signed in on another device, so this one has been signed out.';
+
 /// Thin wrapper around the Supabase client so the rest of the app never
 /// imports `supabase_flutter` directly (keeps the data layer swappable and
 /// testable).
@@ -467,6 +544,67 @@ class SupabaseService {
         await auth.signOut();
         return const AuthOutcome.success();
       });
+
+  /// Revokes every *other* device's session for this account, keeping this one.
+  ///
+  /// [signOut] is a local sign-out, so without this a second device leaves the
+  /// first one holding a refresh token it can still spend. Called right after a
+  /// sign-in completes and deliberately **not awaited** there: the sign-in is
+  /// already over, and a slower round trip must not hold up the role gate. The
+  /// authoritative half of "one login per account" is the `active_sessions` gate
+  /// in schema.sql §1b, which works even if this call fails.
+  Future<AuthOutcome> signOutOtherDevices() =>
+      _guardAuth('sign-out of other devices', () async {
+        final auth = _client?.auth;
+        if (auth == null) return _notConfigured;
+        await auth.signOut(scope: SignOutScope.others);
+        return const AuthOutcome.success();
+      });
+
+  /// Claims the account's single active session for this device (schema.sql
+  /// §1b): the server answers whether this token still holds the account.
+  ///
+  /// Never throws, and never returns a hard "no" it cannot back up — a project
+  /// without the migration (`PGRST202`), a token with no `session_id` claim
+  /// (`22023`) or a dropped connection all come back
+  /// [SessionClaim.unmeasured]. Only an explicit `false` means another device
+  /// signed in later and this one has to go.
+  Future<SessionClaim> claimSession({String? deviceLabel}) async {
+    final client = _client;
+    if (client == null) return const SessionClaim.unmeasured();
+    try {
+      final response = await client.rpc(
+        'claim_session',
+        params: {'p_device_label': deviceLabel},
+      );
+      return SessionClaim.fromRpc(response);
+    } on PostgrestException catch (error) {
+      proctorLog('SupabaseService: claim_session answered ${error.code}');
+      return const SessionClaim.unmeasured();
+    } catch (error) {
+      proctorLog('SupabaseService: claim_session failed: $error');
+      return const SessionClaim.unmeasured();
+    }
+  }
+
+  /// Asks the server whether this token still holds the account (§1b).
+  ///
+  /// `null` means "could not ask" — no client, offline, or the function is not
+  /// deployed — and every caller treats that as "carry on", exactly like the SQL
+  /// gate does for a request with no claim row.
+  Future<bool?> isCurrentSession() async {
+    final client = _client;
+    if (client == null) return null;
+    try {
+      // A `null`, an empty body or a project answering something else entirely is
+      // "could not ask", never "no": the gate signs a device out on `false` alone.
+      final response = await client.rpc('is_current_session');
+      return response is bool ? response : null;
+    } catch (error) {
+      proctorLog('SupabaseService: is_current_session unavailable: $error');
+      return null;
+    }
+  }
 
   static const AuthOutcome _notConfigured =
       AuthOutcome.failure('Backend not configured — see the setup screen.');
