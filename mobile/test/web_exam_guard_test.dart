@@ -167,6 +167,97 @@ void main() {
       expect(fullscreen, <String>['pending']);
     });
 
+    // One act, one strike: a minimise is reported twice by Chromium - the window
+    // loses focus, then fullscreen follows - and the attempt must not pay twice.
+    for (final departure in <WebGuardEvent>[
+      WebGuardEvent.windowBlurred,
+      WebGuardEvent.tabHidden,
+    ]) {
+      test('$departure and the fullscreen exit it causes are one strike',
+          () async {
+        final guard = newGuard();
+        addTearDown(guard.stop);
+        await guard.start();
+
+        guards.emit(departure);
+        guards.emit(WebGuardEvent.fullscreenExited);
+        await pumpEventQueue();
+
+        expect(seen, <WebGuardEvent>[departure], reason: 'the exit is not a second row');
+
+        // The countdown still ran, so the guard still asked them back and still
+        // got the overlay that makes the offer.
+        expect(guard.fullscreenExitPending, isTrue);
+        expect(fullscreen, <String>['pending']);
+
+        guard.expireFullscreenGrace();
+        await pumpEventQueue();
+
+        expect(
+          seen,
+          <WebGuardEvent>[departure],
+          reason: 'the countdown belonged to an act already charged',
+        );
+        expect(guard.fullscreenExitPending, isFalse);
+      });
+    }
+
+    test('an ESC from inside fullscreen is a strike, however recent the blur',
+        () async {
+      var now = DateTime(2026, 1, 1, 9);
+      final guard = newGuard(
+        fullscreenGrace: const Duration(seconds: 5),
+        clock: () => now,
+      );
+      addTearDown(guard.stop);
+      await guard.start();
+
+      guards.emit(WebGuardEvent.windowBlurred); // a glance at another window
+      await pumpEventQueue();
+      expect(seen, <WebGuardEvent>[WebGuardEvent.windowBlurred]);
+
+      // Back on the exam, still in fullscreen, well past the countdown the one
+      // departure was allowed: this is a second act, so it costs a second strike.
+      now = now.add(const Duration(seconds: 30));
+      guards.emit(WebGuardEvent.fullscreenExited);
+      await pumpEventQueue();
+      guard.expireFullscreenGrace();
+
+      expect(seen, <WebGuardEvent>[
+        WebGuardEvent.windowBlurred,
+        WebGuardEvent.fullscreenExited,
+      ]);
+    });
+
+    test('staying out of fullscreen is charged once, however often the page asks',
+        () async {
+      final guard = newGuard(fullscreenGrace: const Duration(milliseconds: 30));
+      addTearDown(guard.stop);
+      await guard.start();
+
+      guards.emit(WebGuardEvent.fullscreenExited);
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(seen, <WebGuardEvent>[WebGuardEvent.fullscreenExited]);
+
+      // Still out of fullscreen and the page comes back to the foreground: the
+      // countdown re-opens so the overlay pushes them back, but the exit was
+      // already paid for.
+      guards.inFullscreen = false;
+      guard.reassertFullscreen();
+      expect(guard.fullscreenExitPending, isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(seen, hasLength(1), reason: 'one exit, one strike');
+
+      // Back in fullscreen, then out again: a new act, a new strike.
+      guards.inFullscreen = true;
+      guards.emit(WebGuardEvent.fullscreenEntered);
+      await pumpEventQueue();
+      guards.inFullscreen = false;
+      guards.emit(WebGuardEvent.fullscreenExited);
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(seen, hasLength(2));
+    });
+
     test('a session that ends mid-countdown logs nothing', () async {
       final guard = newGuard();
       await guard.start();

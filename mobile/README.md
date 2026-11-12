@@ -281,6 +281,15 @@ counting strikes. Three deliberate mitigations:
   that ends mid-countdown logs nothing at all (leaving fullscreen on the way out is
   not cheating), and `reassertFullscreen()` re-opens the window when the page comes
   back to the foreground still out of fullscreen.
+- **One departure is one strike, whatever the browser reports.** Minimising a window
+  reaches the guard twice — a `blur` (or a hidden tab) at once, and a fullscreen exit
+  a moment later — and the student did one thing. The blur or hidden tab is the
+  strike; an exit inside `fullscreenGrace` of that strike still gets the countdown
+  (correctly: they *are* out of fullscreen, so the overlay should say so) but closes
+  without a second row. An ESC pressed later, from inside fullscreen, is a new act and
+  is charged as one, and staying out of fullscreen is charged once per episode however
+  often `reassertFullscreen()` re-opens the window. Same rule as everywhere else in
+  the pipeline: one act, one row.
 
 That makes this enforcement rather than suggestion: on Chrome and Edge, switching
 tabs, blurring the window or dropping out of fullscreen each log a violation

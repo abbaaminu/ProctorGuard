@@ -10,6 +10,11 @@ import 'web_guards.dart';
 /// The platform implementation owns the one DOM-shaped rule — a fullscreen exit
 /// only counts after a confirmed entry.
 ///
+/// One act costs one strike. A minimise reaches this class as a blur or a hidden
+/// tab *and*, a moment later, as a fullscreen exit; the first is a strike on the
+/// spot, the second only opens a countdown, and if that countdown belongs to the
+/// same departure it closes without charging again (see [_sameDeparture]).
+///
 /// Beyond focus and fullscreen it also drives the *lockdown* (see
 /// [WebGuards.startExamLockdown]): copy/cut/paste, the context menu and a
 /// developer-tools panel are reported through the same [onViolation] callback,
@@ -70,6 +75,23 @@ class WebExamGuard {
   bool _gracePending = false;
   DateTime? _graceDeadline;
 
+  /// True when the countdown now open belongs to a departure that has already
+  /// been struck for, so that it must not be struck again — see [_sameDeparture].
+  bool _graceSameAct = false;
+
+  /// When the student was last struck for leaving the exam surface
+  /// ([WebGuardEvent.tabHidden] or [WebGuardEvent.windowBlurred]).
+  ///
+  /// One minimise can speak twice: the window loses focus, and the browser drops
+  /// out of fullscreen a moment later. The exit is then the trailing half of an
+  /// act that has already cost an `app_minimized`, not a second act.
+  DateTime? _departureStruckAt;
+
+  /// True once a fullscreen exit has cost a strike since fullscreen was last
+  /// entered, so that staying out of it cannot be charged twice however often
+  /// the page re-asserts the requirement ([reassertFullscreen]).
+  bool _exitCharged = false;
+
   /// True while the document is in fullscreen right now.
   bool get isFullscreen => guards.isFullscreen;
 
@@ -81,6 +103,8 @@ class WebExamGuard {
   /// navigation often gets `false` and the page then offers a tap.
   Future<bool> start() async {
     _startedAt = _now();
+    _departureStruckAt = null;
+    _exitCharged = false;
     _subscription ??= guards.events.listen(_handle);
     // The lockdown goes on before the fullscreen transition, and after the
     // subscription above, for two reasons: the transition's own blur/fullscreen
@@ -108,6 +132,10 @@ class WebExamGuard {
     // Fullscreen bookkeeping runs even inside the start-up grace: it only opens or
     // closes the countdown below, and never logs anything by itself.
     if (event == WebGuardEvent.fullscreenEntered) {
+      // Back on the exam surface: the departure is over, and the next exit is a
+      // new act that may cost a strike again.
+      _departureStruckAt = null;
+      _exitCharged = false;
       if (_finishFullscreenGrace()) onFullscreenRestored?.call();
       return;
     }
@@ -118,11 +146,31 @@ class WebExamGuard {
     }
 
     if (event == WebGuardEvent.fullscreenExited) {
-      _beginFullscreenGrace();
+      _beginFullscreenGrace(sameAct: _sameDeparture());
       return;
     }
 
+    // A blur or a hidden tab is a strike on the spot, and it is also the first
+    // half of the departure whose second half may be a fullscreen exit.
+    if (event == WebGuardEvent.tabHidden ||
+        event == WebGuardEvent.windowBlurred) {
+      _departureStruckAt = _now();
+    }
     onViolation(event);
+  }
+
+  /// True when this fullscreen exit is the trailing half of a departure that has
+  /// already been struck for.
+  ///
+  /// Minimising a window is one act that Chromium can report twice: the window
+  /// loses focus immediately, and fullscreen follows. Charging both would take
+  /// two of the three strikes that close an attempt from a single careless
+  /// moment. The window here is [fullscreenGrace] because that is exactly the
+  /// period in which an exit is *not* a strike yet — a departure inside it is the
+  /// same act, while an ESC pressed from inside fullscreen, later, is a new one.
+  bool _sameDeparture() {
+    final struckAt = _departureStruckAt;
+    return struckAt != null && _now().difference(struckAt) < fullscreenGrace;
   }
 
   /// True for the events the lockdown produces — something the student *did*
@@ -162,9 +210,16 @@ class WebExamGuard {
   /// strike lands exactly when the student stops seeing the counter. The timer
   /// started in [_beginFullscreenGrace] is the safety net for a page that never
   /// calls it. Idempotent, so the two racing is harmless.
+  ///
+  /// A countdown that belongs to an already-struck departure, or to an exit that
+  /// has already been charged, closes without a violation: the student was still
+  /// asked back, and the attempt pays once for the one act.
   void expireFullscreenGrace() {
     if (!_gracePending) return;
+    final charges = !_graceSameAct && !_exitCharged;
     _finishFullscreenGrace();
+    if (!charges) return;
+    _exitCharged = true;
     onViolation(WebGuardEvent.fullscreenExited);
   }
 
@@ -173,12 +228,13 @@ class WebExamGuard {
   /// starts under exactly the same rule as a `fullscreenchange` would.
   void reassertFullscreen() {
     if (_stopped || !_fullscreenEntered || guards.isFullscreen) return;
-    _beginFullscreenGrace();
+    _beginFullscreenGrace(sameAct: _sameDeparture());
   }
 
-  void _beginFullscreenGrace() {
+  void _beginFullscreenGrace({bool sameAct = false}) {
     if (_stopped || _gracePending) return; // one countdown per exit
     _gracePending = true;
+    _graceSameAct = sameAct;
     _graceDeadline = _now().add(fullscreenGrace);
     _graceTimer = Timer(fullscreenGrace, expireFullscreenGrace);
     onFullscreenExitPending?.call();
@@ -189,6 +245,7 @@ class WebExamGuard {
   bool _finishFullscreenGrace() {
     final pending = _gracePending;
     _gracePending = false;
+    _graceSameAct = false;
     _graceDeadline = null;
     _graceTimer?.cancel();
     _graceTimer = null;
