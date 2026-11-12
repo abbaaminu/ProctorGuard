@@ -52,15 +52,22 @@ abstract final class WebFaceMessages {
 ///    away is reported again;
 ///  * `multiple_faces` is not sustained (two people need no measuring): it is
 ///    latched until the student has been alone for [multipleFacesCooldown];
-///  * nothing is reported during [startupGrace].
+///  * nothing is reported during [startupGrace] - the engine's
+///    [thresholds.cameraStartupGrace], shared, so a browser and a phone start judging
+///    five seconds in rather than one of them on its first detection.
 ///
-/// The tolerances and the look-away window are the engine's own, shared rather than
-/// copied (`proctoring_thresholds.dart`): "turned" has to mean the same 15 degrees on
-/// both axes, in either direction, and "held" the same two seconds, on both
-/// platforms - or a browser session and a phone session judge the same head
-/// differently, and an appeal is decided by which device the student happened to sit
-/// in front of. Both engines compare the absolute angle, so which direction a
-/// particular detector calls positive cannot change the verdict.
+/// The tolerances, the look-away window and the start-up window are the engine's own,
+/// shared rather than copied (`proctoring_thresholds.dart`): "turned" has to mean the
+/// same 15 degrees on both axes, in either direction, "held" the same two seconds, and
+/// "starting" the same five, on both platforms - or a browser session and a phone
+/// session judge the same head differently, and an appeal is decided by which device
+/// the student happened to sit in front of. Both engines compare the absolute angle, so
+/// which direction a particular detector calls positive cannot change the verdict.
+///
+/// Only the *anchor* of those five seconds differs, and it has to: a page knows when
+/// the attempt opened ([start]), while the engine sees nothing until a camera hands it
+/// a frame. Both windows end five seconds after the first thing the platform could
+/// judge.
 ///
 /// The difference is the unit of "held", not its length. The engine counts *frames*
 /// for the tick of evidence and then requires [thresholds.lookAwaySustain] of them,
@@ -85,7 +92,7 @@ class WebFacePresenceMonitor {
     required WebFaceSignalSource source,
     this.lookAwaySustain = thresholds.lookAwaySustain,
     this.noFaceSustain = const Duration(milliseconds: 300),
-    this.startupGrace = const Duration(seconds: 5),
+    this.startupGrace = thresholds.cameraStartupGrace,
     this.multipleFacesCooldown = const Duration(seconds: 30),
     // The engine's tolerances, from the one file that states the rule: 15 degrees
     // on each axis, absolute, so `pose:15,0` and `pose:-15,0` are both a glance
@@ -148,8 +155,11 @@ class WebFacePresenceMonitor {
 
   /// How long after [start] detections are ignored.
   ///
-  /// A student joining an attempt is still adjusting the camera, and the page's
-  /// detector may still be reporting frames from before the exam opened.
+  /// [thresholds.cameraStartupGrace] - the engine's own five seconds, shared rather
+  /// than restated, so a browser and a phone use one window instead of two that
+  /// happen to be equal. A student joining an attempt is still adjusting the camera,
+  /// and the page's detector may still be reporting frames from before the exam
+  /// opened.
   final Duration startupGrace;
 
   /// How long the student must be alone before another person in frame counts as

@@ -93,8 +93,16 @@ void main() {
     /// read it — they count *frames*, which is the whole point — while the
     /// multi-face cooldown does, so a 30-second cooldown can be exercised
     /// instantly.
+    ///
+    /// [MediaPipeProctoringService.startupGrace] is switched *off* here: these tests
+    /// start a sitting at `t0` and expect the first frames to count, and the shipped
+    /// five-second window would swallow every one of them. The window itself has its
+    /// own group below, on an engine that keeps the default.
     MediaPipeProctoringService clocked() {
-      final engine = MediaPipeProctoringService(clock: () => now);
+      final engine = MediaPipeProctoringService(
+        clock: () => now,
+        startupGrace: Duration.zero,
+      );
       addTearDown(engine.dispose);
       return engine;
     }
@@ -521,6 +529,192 @@ void main() {
     });
   });
 
+  group('the start-up window', () {
+    // The five seconds both platforms now ignore (`cameraStartupGrace`). The engine
+    // used to judge its very first frame, so a student still moving the camera into
+    // place could be struck by their own set-up; the browser has ignored its first
+    // five seconds since it was written. These tests spend the window on the engine
+    // that keeps the default, which is why the group above switches it off.
+    late DateTime now;
+
+    setUp(() => now = DateTime(2026, 1, 1, 12));
+
+    /// An engine with the shipped defaults on a clock the test owns.
+    MediaPipeProctoringService starting() {
+      final engine = MediaPipeProctoringService(clock: () => now);
+      addTearDown(engine.dispose);
+      return engine;
+    }
+
+    /// Keeps [result] arriving for [duration], one frame per
+    /// [MediaPipeProctoringService.inferenceInterval], advancing the clock with each.
+    void watch(
+      MediaPipeProctoringService engine,
+      FaceFrameResult result,
+      Duration duration,
+    ) {
+      final frames =
+          (duration.inMilliseconds / engine.inferenceInterval.inMilliseconds)
+              .ceil();
+      for (var i = 0; i < frames; i++) {
+        now = now.add(engine.inferenceInterval);
+        engine.handleResult(result);
+      }
+    }
+
+    const turned = FaceFrameResult(faceCount: 1, yawDegrees: 40);
+
+    test('a head turned while the student sets up is not a strike', () async {
+      final engine = starting();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      // Four and a half seconds of a turned head from the very first frame: the
+      // student is aiming the lens at the chair they are about to sit in, not
+      // reading anything. Nothing at all is reported, and the counters are cleared
+      // on every one of those frames rather than banked.
+      watch(engine, turned, const Duration(milliseconds: 4500));
+      await pumpEventQueue();
+      expect(seen, isEmpty);
+
+      // Past the window the head has to earn the phone's own two seconds, so the
+      // first judged frame is not a strike either...
+      watch(engine, turned, const Duration(seconds: 1));
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        isEmpty,
+        reason: 'the window ends a set-up, it does not pre-load the sustain',
+      );
+
+      // ...and a held turn still is, exactly once.
+      watch(engine, turned, lookAwaySustain);
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+      );
+    });
+    test('a camera that opens late does not spend the window while it is black',
+        () async {
+      final engine = starting();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      // Three seconds with no frames at all - the preview is still opening. The
+      // window is anchored on the first frame the engine *judges*, not on
+      // construction, so none of it is spent here.
+      now = now.add(const Duration(seconds: 3));
+      engine.handleResult(turned);
+      await pumpEventQueue();
+      expect(seen, isEmpty);
+
+      // Four seconds of frames later, still inside the window.
+      watch(engine, turned, const Duration(seconds: 4));
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        isEmpty,
+        reason: 'a slow preview must not eat the grace the student needs',
+      );
+
+      // Five seconds after the first frame the head is judged, and a held turn
+      // lands.
+      watch(engine, turned, const Duration(seconds: 5));
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+      );
+    });
+    test('an empty frame during set-up is not a no_face', () async {
+      final engine = starting();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      // A student leaning out of shot to pick up a chair, counted as ten missing
+      // frames: the three-frame absence rule would have fired on the set-up.
+      watch(
+        engine,
+        const FaceFrameResult(faceCount: 0),
+        const Duration(seconds: 4),
+      );
+      await pumpEventQueue();
+      expect(seen, isEmpty);
+
+      // Once the window is spent, three frames without a face are still exactly
+      // what they were: one strike on a camera that is covered or has been left.
+      watch(
+        engine,
+        const FaceFrameResult(faceCount: 0),
+        const Duration(seconds: 2),
+      );
+      await pumpEventQueue();
+      expect(seen, <GazeSignal>[GazeSignal.noFace]);
+    });
+
+    test('a second person during set-up is not reported, and is afterwards',
+        () async {
+      final engine = starting();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      // The person helping position the camera is not evidence about the student,
+      // which is why the window covers `multiple_faces` too - the one signal that
+      // otherwise needs no measuring.
+      watch(
+        engine,
+        const FaceFrameResult(faceCount: 2),
+        const Duration(seconds: 4),
+      );
+      await pumpEventQueue();
+      expect(seen, isEmpty);
+
+      // A guest who is still there when the window ends is reported at once, as
+      // always: the grace delays the strike, it does not lose it.
+      watch(
+        engine,
+        const FaceFrameResult(faceCount: 2),
+        const Duration(seconds: 2),
+      );
+      await pumpEventQueue();
+      expect(seen, <GazeSignal>[GazeSignal.multipleFaces]);
+    });
+    test('a counter reset does not hand out a second window', () async {
+      final engine = starting();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      // Spend the window with a student who is behaving.
+      watch(
+        engine,
+        const FaceFrameResult(faceCount: 1),
+        const Duration(seconds: 6),
+      );
+      await pumpEventQueue();
+
+      // The stream flaps - which the page reports through `setStreamActive` - and
+      // comes back. It is judged on the frames it produces next: a window that
+      // could be re-opened this way would be five unwatched seconds on demand.
+      engine.setStreamActive(false);
+      engine.setStreamActive(true);
+
+      watch(engine, turned, lookAwaySustain + engine.inferenceInterval);
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+        reason: 'the sitting has one start-up window, not one per reset',
+      );
+    });
+
+  });
+
   group('engine defaults', () {
     test('match the documented throttle / threshold / sustain contract', () {
       expect(engine.inferenceInterval, const Duration(milliseconds: 150));
@@ -539,6 +733,9 @@ void main() {
       // A multi-face episode is latched rather than frame-counted, so this is
       // how long the student has to be *alone* before a second one counts.
       expect(engine.multipleFacesCooldown, const Duration(seconds: 30));
+      // And the sitting starts with five seconds in which nothing is judged -
+      // `cameraStartupGrace`, the same window the browser monitor has always had.
+      expect(engine.startupGrace, cameraStartupGrace);
     });
 
     test('expose a broadcast signal stream and leak nothing on dispose', () {

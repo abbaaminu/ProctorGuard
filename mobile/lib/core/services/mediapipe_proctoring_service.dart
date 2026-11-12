@@ -40,6 +40,7 @@ class MediaPipeProctoringService {
     this.offCenterThresholdDegrees = thresholds.lookAwayYawDegrees,
     this.pitchThresholdDegrees = thresholds.lookAwayPitchDegrees,
     this.lookAwaySustain = thresholds.lookAwaySustain,
+    this.startupGrace = thresholds.cameraStartupGrace,
     this.consecutiveFrameThreshold = 1,
     this.missingFaceFrameThreshold = 3,
     this.multipleFacesCooldown = const Duration(seconds: 30),
@@ -59,6 +60,10 @@ class MediaPipeProctoringService {
         assert(
           !lookAwaySustain.isNegative,
           'a negative sustain would report a look-away it has not seen yet',
+        ),
+        assert(
+          !startupGrace.isNegative,
+          'a negative grace would time out before the sitting starts',
         ),
         _clock = clock ?? DateTime.now {
     if (mockCamera) _startMockFeed();
@@ -115,6 +120,23 @@ class MediaPipeProctoringService {
   /// A frame back inside the tolerances ends the episode and restarts the clock, so
   /// a series of quick glances never accumulates into a strike.
   final Duration lookAwaySustain;
+
+  /// How long after the sitting's first frame nothing is judged at all.
+  ///
+  /// [thresholds.cameraStartupGrace]: five seconds, from the first frame the engine
+  /// judges. A student is still moving the camera into place when the paper opens,
+  /// and a phone used to log a `looking_away` or a `no_face` while its owner was
+  /// doing exactly that - the browser was the forgiving platform, by accident, and
+  /// this is the engine catching up with it rather than the other way round.
+  ///
+  /// Counted from [_firstFrameAt] rather than from construction, so a camera that
+  /// takes a while to open does not spend the window while it is still black; and
+  /// not restarted by [resetSustained], so a feed that drops out and returns
+  /// mid-sitting is examined on the frames it produces next instead of handing out
+  /// another five unwatched seconds. Nothing is reported inside the window,
+  /// [GazeSignal.multipleFaces] included, and nothing is missed by it: whatever was
+  /// happening is still happening when it ends.
+  final Duration startupGrace;
 
   /// How many **consecutive frames** must also be off-centre before
   /// [GazeSignal.lookingAway] is reported.
@@ -200,6 +222,10 @@ class MediaPipeProctoringService {
   /// back to null, so the clock only ever covers *consecutive* off-centre frames.
   DateTime? _lookAwaySince;
 
+  /// When the first frame of the sitting reached the engine - the anchor for
+  /// [startupGrace], set once and never cleared (see [resetSustained]).
+  DateTime? _firstFrameAt;
+
   /// When the most recent two-face frame was seen, and whether the multi-face
   /// signal has already been reported for the current episode.
   ///
@@ -269,12 +295,17 @@ class MediaPipeProctoringService {
   }
 
   /// Clears every consecutive-frame counter and latch. Called when the camera
-  /// goes offline (see [setStreamActive]) and whenever the notifier pauses
-  /// tracking, so resuming never inherits a half-counted episode.
+  /// goes offline (see [setStreamActive]), whenever the notifier pauses tracking,
+  /// and on every frame inside [startupGrace], so resuming never inherits a
+  /// half-counted episode.
   ///
   /// The multi-face latch goes with them: a feed that comes back with two people
   /// in front of it is a fresh episode, and carrying the cooldown across the gap
   /// would hide the guest who arrived while the camera was down.
+  ///
+  /// The start-up anchor ([_firstFrameAt]) is deliberately *not* cleared: a
+  /// sitting's grace window is spent once, and a counter reset that re-armed it
+  /// would make five unwatched seconds available on demand.
   void resetSustained() {
     _offCenterFrames = 0;
     _faceMissingFrames = 0;
@@ -522,6 +553,12 @@ class MediaPipeProctoringService {
   /// people in frame needs no measuring), so it is latched instead: one episode,
   /// and the episode ends only once the student has been alone in frame for
   /// [multipleFacesCooldown].
+  ///
+  /// Nothing at all is reported during [startupGrace], which is measured from the
+  /// sitting's first frame: a student is still arranging the camera when the paper
+  /// opens, and every one of those frames clears the counters instead of counting
+  /// towards a strike (`multiple_faces` included - the person helping position the
+  /// lens is not evidence about the student).
 
   void _handleResult(FaceFrameResult result) {
     // An inference that was already on the wire when the session ended still
@@ -532,6 +569,19 @@ class MediaPipeProctoringService {
     if (_disposed || _signalController.isClosed) return;
 
     final now = _clock();
+
+    // The start-up window. Anchored on the first frame the engine is asked to
+    // judge - not on construction, and not on `setStreamActive`, which flips with
+    // the camera - so the five seconds are spent watching a camera that works
+    // rather than a preview that has not opened yet.
+    final firstFrameAt = _firstFrameAt ??= now;
+    if (now.difference(firstFrameAt) < startupGrace) {
+      // Cleared rather than banked: the first frame judged after the window starts
+      // its own episode, so a head that happened to be turned while the student was
+      // setting up is not already 4.9 seconds into a strike.
+      resetSustained();
+      return;
+    }
 
     if (result.faceCount == 0) {
       // Face missing: [missingFaceFrameThreshold] frames in a row without one

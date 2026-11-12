@@ -91,6 +91,13 @@ void main() {
       // student's blink a `no_face`.
       expect(web.noFaceSustain, const Duration(milliseconds: 300));
       expect(web.noFaceSustain, lessThan(web.lookAwaySustain));
+      // And the start-up window is shared too, which is the other half of the audit's
+      // finding: the browser ignored its first five seconds while Android judged its
+      // very first frame, so a phone could strike a student who was still moving the
+      // camera into place. One constant now, read by both.
+      expect(cameraStartupGrace, const Duration(seconds: 5));
+      expect(web.startupGrace, cameraStartupGrace);
+      expect(engine.startupGrace, cameraStartupGrace);
     });
   });
 

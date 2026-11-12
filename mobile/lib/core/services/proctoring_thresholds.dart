@@ -21,7 +21,10 @@
 ///     the sustain is measured on consecutive frames, so a glance and a return
 ///     never add up to one strike;
 ///   * one episode is one strike: the engine latches the signal until a frame
-///     comes back inside the tolerances.
+///     comes back inside the tolerances;
+///   * and nothing is judged at all until [cameraStartupGrace] has passed since the
+///     sitting's first frame, on either platform - a student is still arranging the
+///     camera when the paper opens.
 ///
 /// Why 15 degrees, and why two seconds: the angle is where the head has visibly
 /// stopped facing the screen, and the duration is the answer to the false
@@ -66,6 +69,33 @@ const double lookAwayPitchDegrees = 15.0;
 /// How long the head has to stay past [lookAwayYawDegrees] / [lookAwayPitchDegrees],
 /// across consecutive frames, before the look-away is reported.
 const Duration lookAwaySustain = Duration(seconds: 2);
+
+/// How long after the first frame of a sitting nothing is judged, on either
+/// platform.
+///
+/// A student joining an attempt is still sitting down: moving the camera into
+/// place, finding the light, putting a bag on the floor. The engine used to start
+/// judging on its very first frame while `web_face_presence.dart` ignored its first
+/// five seconds, so the browser was the forgiving one and a phone could log a
+/// `looking_away` or a `no_face` while its owner was still adjusting the lens. One
+/// of the two start-up behaviours had to go, and the finding is the missing one:
+/// Android had no grace at all.
+///
+/// Five seconds, counted from the **first frame the engine judges** rather than
+/// from construction or from the page opening, because that is the moment a camera
+/// starts telling anyone anything - a feed that takes three seconds to open must
+/// not spend the grace window while it is still black. It is not re-armed by
+/// `MediaPipeProctoringService.resetSustained` (a feed that drops out and comes back
+/// mid-sitting is examined on the frames it produces next), because a window that
+/// could be re-opened on demand would be a way to be unwatched for five seconds at
+/// a time. Nothing at all is reported inside it, `multiple_faces` included: the
+/// person helping position the camera is not evidence about the student, and
+/// whatever the window concealed is still there when it ends.
+///
+/// The browser *guard* window (`WebExamGuard.startupGrace`) happens to be the same
+/// five seconds for a different question - a page still loading its listeners - and
+/// is deliberately not this constant.
+const Duration cameraStartupGrace = Duration(seconds: 5);
 
 // ---------------------------------------------------------------------
 // The audio rule - the same shape, one sentence:
