@@ -44,7 +44,13 @@
 --   values the gate reads - `sub`, `session_id` and `iat` - and the two session ids
 --   on one account are the whole point of the file.
 --
---   The whole file is wrapped in begin; ... rollback; - no data persists.
+--   The whole file is wrapped in begin; ... rollback; - no data persists, and that
+--   is also why `now()` is the *same* instant in every block: it is the
+--   transaction's start. Two claims in production are two requests and two
+--   transactions, so their `claimed_at` values differ; two claims here cannot,
+--   and no block below asserts that this file's clock advanced. What they assert
+--   is the row - its `session_id`, its `issued_at`, its label, and a `claimed_at`
+--   that never moves backwards - because that is what a client can see.
 -- =====================================================================
 
 begin;
@@ -282,13 +288,23 @@ begin
     raise exception 'FAIL (c): the claim reported replacing "%s", expected dev-a1',
       coalesce(r.replaced_session_id, 'null');
   end if;
-  if r.claimed_at <= v_prev then
-    raise exception 'FAIL (c): claimed_at did not move (% -> %)', v_prev, r.claimed_at;
+  -- `now()` is this transaction's start, and the whole file is one transaction, so
+  -- a takeover here answers the same instant as the claim it replaced. The rule
+  -- that matters to a client is the other direction: the takeover must not record
+  -- an earlier moment than the one it replaced, and the row it wrote must hold
+  -- exactly the moment it answered (asserted below). A claim that kept the old
+  -- device's timestamp would fail here.
+  if r.claimed_at < v_prev then
+    raise exception 'FAIL (c): claimed_at went backwards (% -> %)', v_prev, r.claimed_at;
   end if;
 
   select * into v_row from public.active_sessions where user_id = auth.uid();
   if v_row.session_id is distinct from current_setting('test.dev_a2') then
     raise exception 'FAIL (c): the row still names "%s"', v_row.session_id;
+  end if;
+  if v_row.claimed_at is distinct from r.claimed_at then
+    raise exception 'FAIL (c): the claim answered claimed_at % but the row holds %',
+      r.claimed_at, v_row.claimed_at;
   end if;
   if v_row.issued_at is distinct from to_timestamp(current_setting('test.iat_a2')::bigint) then
     raise exception 'FAIL (c): the row stored issued_at % (the new token says %)',
