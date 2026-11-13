@@ -17,8 +17,10 @@
 --   (a) `record_consent()` stores what a student accepted - the version, the
 --       server's own timestamp, the paper - and is idempotent: a replay returns
 --       the same row instead of a second one.
---   (b) the read policy is "my own acceptance, or the intervention tier": another
---       student sees nothing, a supervisor sees the row.
+--   (b) the read policy is "my own acceptance, or a paper I can reach": another
+--       student sees nothing, the supervisor assigned to the paper sees its row,
+--       the lecturer who wrote it sees exactly the acceptances for it, and a
+--       lecturer who wrote nothing sees none.
 --   (c) an acceptance cannot be forged, rewritten or removed by an API caller:
 --       no insert for somebody else, no update, no delete. The absence of those
 --       grants and policies *is* the control.
@@ -70,7 +72,8 @@ create trigger a_tmp_fixture_auth_user before insert on public.profiles
 -- ---------------------------------------------------------------------
 do $$
 declare
-  v_lecturer    uuid := gen_random_uuid();
+  v_lecturer    uuid := gen_random_uuid();  -- (b) wrote both papers
+  v_stranger    uuid := gen_random_uuid();  -- (b) a lecturer who wrote none of them
   v_supervisor  uuid := gen_random_uuid();
   v_none        uuid := gen_random_uuid();  -- (e) never accepts anything
   v_exam        uuid := gen_random_uuid();  -- (e) accepts for one paper only
@@ -87,6 +90,7 @@ declare
 begin
   insert into public.profiles (id, role, full_name, email) values
     (v_lecturer,   'lecturer',   'Ada Lecturer',    'ada.consent@test.local'),
+    (v_stranger,   'lecturer',   'Bo Lecturer',     'bo.consent@test.local'),
     (v_supervisor, 'supervisor', 'Musa Supervisor', 'musa.consent@test.local'),
     (v_none,       'student',    'No Consent',      'none.consent@test.local'),
     (v_exam,       'student',    'Exam Consent',    'exam.consent@test.local'),
@@ -128,6 +132,7 @@ begin
     from public.proctoring_consent_config cc where cc.id = 1;
 
   perform set_config('test.lecturer',   v_lecturer::text, false);
+  perform set_config('test.stranger',   v_stranger::text, false);
   perform set_config('test.supervisor', v_supervisor::text, false);
   perform set_config('test.none',       v_none::text, false);
   perform set_config('test.exam_stu',   v_exam::text, false);
@@ -216,8 +221,10 @@ select set_config('request.jwt.claims', '', true);
 -- (b)  Who may read an acceptance
 -- =====================================================================
 -- The acceptance recorded in (a) belongs to `test.exam_stu`. A classmate must not
--- see it; a supervisor must. (The `is_staff()` arm is deliberately absent from
--- this policy, so a lecturer is checked below too.)
+-- see it; a supervisor assigned to the paper must. The policy's second arm is
+-- `can_reach_exam(exam_id)` - the paper's author, an administrator, the assigned
+-- supervisor - and deliberately not `is_staff()`, so the two lecturers below are
+-- the interesting half.
 set local role authenticated;
 select set_config('request.jwt.claims',
   format('{"sub": "%s", "role": "authenticated", "email": "other.consent@test.local"}',
@@ -249,17 +256,23 @@ declare
   v_visible int;
 begin
   select count(*) into v_visible from public.proctoring_consents where exam_id = v_exam;
-  if v_visible < 1 then
-    raise exception 'FAIL (b): a supervisor could not read the acceptance';
+  if v_visible <> 1 then
+    raise exception 'FAIL (b): a supervisor reads % acceptance row(s) on their paper, expected the one', v_visible;
   end if;
-  raise notice 'PASS (b): the intervention tier reads it';
+  raise notice 'PASS (b): the assigned supervisor reads the acceptance';
 end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);
 
 
--- A lecturer reads the evidence of a sitting but not "did this person agree": the
--- read policy is `is_exam_supervisor()` (admin + supervisor), not `is_staff()`.
+-- A lecturer reads the acceptances given for a paper they can reach - and the
+-- paper's author is one of them (`owns_exam()` inside `can_reach_exam()`), since
+-- `20261111090100_lecturer_isolation.sql`. "Did this person agree to my notice,
+-- and to what wording?" is the paper's question, which is why the arm is the paper
+-- scope and not `is_staff()`. This block used to expect nothing at all: that was
+-- the rule while the arm was `is_exam_supervisor()` (admin + supervisor), and it
+-- fails against the policy the schema installs now. The lecturer fixture wrote
+-- both papers, so (a)'s exam-scoped acceptance is theirs to read.
 set local role authenticated;
 select set_config('request.jwt.claims',
   format('{"sub": "%s", "role": "authenticated", "email": "ada.consent@test.local"}',
@@ -268,12 +281,46 @@ do $$
 declare
   v_exam    uuid := current_setting('test.exam_a')::uuid;
   v_visible int;
+  v_mine    int;
 begin
   select count(*) into v_visible from public.proctoring_consents where exam_id = v_exam;
-  if v_visible <> 0 then
-    raise exception 'FAIL (b): a lecturer read % consent row(s) - the tier is too wide', v_visible;
+  if v_visible <> 1 then
+    raise exception 'FAIL (b): the paper''s author reads % acceptance row(s) on it, expected the one', v_visible;
   end if;
-  raise notice 'PASS (b): a lecturer does not read acceptances';
+
+  -- ...and it is that paper's acceptance, not some other row the arm happened to
+  -- let through.
+  select count(*) into v_mine
+    from public.proctoring_consents
+   where exam_id = v_exam and student_id = current_setting('test.exam_stu')::uuid;
+  if v_mine <> 1 then
+    raise exception 'FAIL (b): the author read the wrong acceptance for their paper';
+  end if;
+  raise notice 'PASS (b): the paper''s author reads the acceptances for it';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- ...and a lecturer who wrote neither paper and is assigned to neither - the other
+-- half of `can_reach_exam()` - reads nothing. Without this block an author's arm
+-- written as `is_staff()` would pass every assertion above it.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  format('{"sub": "%s", "role": "authenticated", "email": "bo.consent@test.local"}',
+         current_setting('test.stranger')), true);
+do $$
+declare
+  v_exam_a  uuid := current_setting('test.exam_a')::uuid;
+  v_exam_b  uuid := current_setting('test.exam_b')::uuid;
+  v_visible int;
+begin
+  select count(*) into v_visible
+    from public.proctoring_consents
+   where exam_id in (v_exam_a, v_exam_b);
+  if v_visible <> 0 then
+    raise exception 'FAIL (b): a lecturer with no paper in common read % acceptance row(s) - the tier is too wide', v_visible;
+  end if;
+  raise notice 'PASS (b): a lecturer who wrote neither paper reads no acceptances';
 end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);
