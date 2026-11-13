@@ -30,7 +30,8 @@ $files = @(
  '20261110090100_snapshot_orphan_check',
  '20261110090200_supervisor_profile_read',
  '20261111090000_single_session',
- '20261111090100_lecturer_isolation'
+ '20261111090100_lecturer_isolation',
+ '20261112090000_lecturer_roster_read'
 )
 $i = 0
 foreach ($f in $files) {

@@ -4845,6 +4845,109 @@ void main() {
         );
       }
     });
+    test(
+        'a project that missed the isolation file has a file to run for the roster '
+        'read', () {
+      // The twin of the test above, one narrowing later. `20261111090100_lecturer_
+      // isolation.sql` widens `can_read_profile()` and narrows the roster policy in
+      // one commit, and its VERIFY block only runs when the file is run. A project
+      // that applied `20261110090200` and stopped keeps *both* old halves - the
+      // `not is_supervisor_only()` arm in the policy, the assignment join in the
+      // body - so a lecturer still reads every profile row in the institution.
+      // Block (k)viii of `supabase/tests/supervisor_scope_check.sql` is what says
+      // so; this file is the path out of it.
+      final file = File(
+        '../supabase/migrations/20261112090000_lecturer_roster_read.sql',
+      );
+      if (!file.existsSync()) {
+        fail(
+          'the lecturer roster read has no upgrade path: a project that ran '
+          '20261110090200 and not 20261111090100 cannot get it',
+        );
+      }
+      final sql = file.readAsStringSync().replaceAll('\r\n', '\n');
+
+      for (final section in <String>[
+        '-- WHY THIS FILE EXISTS',
+        '-- WHAT CHANGES',
+        '-- WHAT IT DOES NOT DO',
+        '-- PREREQUISITES',
+        '-- 4. VERIFY',
+      ]) {
+        expect(sql, contains(section), reason: 'missing section: $section');
+      }
+
+      // It re-installs the *current* pair - not a third variant of them. The body
+      // and the policy it writes have to be the ones the isolation file writes,
+      // which are the ones schema.sql carries, or a project repaired through this
+      // file enforces something nobody reviewed.
+      expect(
+        sql,
+        contains('drop policy if exists "profiles_select_own_or_staff"'),
+        reason: 'recreating the policy without dropping it first is a 42710',
+      );
+      expect(
+        sql,
+        contains('alter table public.profiles enable row level security;'),
+        reason: 'with RLS off, no policy on the table is consulted',
+      );
+      final full = schemaSql();
+      if (full != null) {
+        expect(
+          _functionBody(sql, 'can_read_profile'),
+          _functionBody(full, 'can_read_profile'),
+          reason: 'the repair file and the full schema disagree about the current '
+              'roster read',
+        );
+        expect(
+          _policyUsing(sql, 'profiles_select_own_or_staff'),
+          _policyUsing(full, 'profiles_select_own_or_staff'),
+          reason: 'the repair file and the full schema disagree about the current '
+              'roster read',
+        );
+      }
+      final isolation = File(
+        '../supabase/migrations/20261111090100_lecturer_isolation.sql',
+      );
+      if (isolation.existsSync()) {
+        final current = isolation.readAsStringSync().replaceAll('\r\n', '\n');
+        expect(
+          _functionBody(sql, 'can_read_profile'),
+          _functionBody(current, 'can_read_profile'),
+          reason: 'the repair file has to install the isolation file\'s body, not a '
+              'variant of it',
+        );
+        expect(
+          _policyUsing(sql, 'profiles_select_own_or_staff'),
+          _policyUsing(current, 'profiles_select_own_or_staff'),
+          reason: 'the repair file has to install the isolation file\'s policy',
+        );
+      }
+
+      // It is a file somebody has to run: both apply lists and the README name it.
+      for (final script in <String>[
+        '../apply_in_order.ps1',
+        '../apply_live_cli.ps1',
+      ]) {
+        final list = File(script);
+        if (!list.existsSync()) continue;
+        expect(
+          list.readAsStringSync(),
+          contains('20261112090000_lecturer_roster_read'),
+          reason: '$script does not apply the roster-read repair',
+        );
+      }
+      final readme = File('../README.md');
+      if (readme.existsSync()) {
+        expect(
+          readme.readAsStringSync(),
+          contains('20261112090000_lecturer_roster_read'),
+          reason: 'the README never tells an operator to run it',
+        );
+      }
+    });
+
+
   });
 
   group('single session contract', () {

@@ -1004,6 +1004,12 @@ select set_config('request.jwt.claims', '', true);
 -- `is_staff() and can_read_profile(id)` rather than `is_staff()` alone, so a
 -- colleague's account - another lecturer's, a supervisor's, an administrator's - is
 -- no longer readable by being employed here.
+--
+-- The two failures below are also the two ways a project can be half-installed, and
+-- they name the file that cures both: `20261112090000_lecturer_roster_read.sql`
+-- installs the function and the policy together, which is what
+-- `20261111090100_lecturer_isolation.sql` does as its roster half - so a project
+-- that reports *either* count is the one that file is for.
 set local role authenticated;
 select set_config('request.jwt.claims',
   format('{"sub": "%s", "role": "authenticated", "email": "scope.lecturer@test.local"}',
@@ -1023,14 +1029,14 @@ begin
                current_setting('test.targeted')::uuid);
 
   if v_visible <> 4 then
-    raise exception 'FAIL (k)viii: a lecturer reads % of the 4 students on their own papers, expected all of them', v_visible;
+    raise exception 'FAIL (k)viii: a lecturer reads % of the 4 students on their own papers, expected all of them - either the roster policy is too narrow or can_read_profile() still joins supervisor_exam_assignments (a lecturer has no assignment). supabase/migrations/20261112090000_lecturer_roster_read.sql installs both halves', v_visible;
   end if;
 
   -- ...and no colleague's row, which no paper of theirs reaches.
   if exists (select 1 from public.profiles
               where id in (current_setting('test.peer')::uuid,
                            current_setting('test.admin')::uuid)) then
-    raise exception 'FAIL (k)viii: a lecturer read a colleague''s profile row';
+    raise exception 'FAIL (k)viii: a lecturer read a colleague''s profile row - profiles_select_own_or_staff still carries the not is_supervisor_only() arm, which is true for every lecturer. supabase/migrations/20261112090000_lecturer_roster_read.sql installs the can_read_profile() arm';
   end if;
   raise notice 'PASS (k)viii: a lecturer reads the students on their own papers, and no colleague';
 end $$;

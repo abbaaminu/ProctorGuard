@@ -413,6 +413,7 @@ operator's decision. See
    supabase db query --linked -f supabase/migrations/20261110090200_supervisor_profile_read.sql
    supabase db query --linked -f supabase/migrations/20261111090000_single_session.sql
    supabase db query --linked -f supabase/migrations/20261111090100_lecturer_isolation.sql
+   supabase db query --linked -f supabase/migrations/20261112090000_lecturer_roster_read.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -839,6 +840,20 @@ Things worth knowing before you turn it on:
   reset's purge grant is not theirs to finish — while the paper's author, an
   administrator, and a supervisor the administrator *assigns* to that paper read all
   of it, and the author still finishes their own reset.
+- If a project was installed **before** `20261111090100` and that isolation file has
+  already been run on it, the roster half of it can be missing — block (k)viii of
+  `supabase/tests/supervisor_scope_check.sql` is what reports it, as "a lecturer read
+  a colleague's profile row". Run
+  `supabase/migrations/20261112090000_lecturer_roster_read.sql` after it: it
+  re-installs the three objects that half changes and nothing else —
+  `public.can_reach_exam(uuid)`, `can_read_profile(uuid)` and
+  `profiles_select_own_or_staff`, with the `is_admin()` shape of `profiles_admin_all`
+  and the RLS flag alongside them. It is a no-op on a project that already has them,
+  backfills nothing, and ends with a `DO` block that raises — naming the policy — if
+  the old `not is_supervisor_only()` arm survived, and prints a NOTICE if the other
+  nine lecturer-level reads are *still* tier-wide, because that means the isolation
+  file never ran at all and running this one alone would narrow the roster while
+  leaving every attempt readable.
 - Apply `supabase/migrations/optional_question_shuffling.sql` before the first
   paper that has question-order shuffling enabled. Until it runs, the
   `shuffle_questions` column does not exist: the authoring console reports the
