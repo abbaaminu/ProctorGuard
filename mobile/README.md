@@ -1050,7 +1050,7 @@ nothing in it is a decision to make. Two tabs:
 
 | Tab | What the student is told |
 | --- | --- |
-| `instructions-tab-proctor` | the camera (on for the whole sitting, faces checked on-device, a snapshot kept with each incident, and that a person reviews every snapshot), the microphone (noise above the room's own floor is what counts, stated the way the detector enforces it: **two unbroken seconds**, or the same sound **returning in bursts** (three of at least 300 ms, or 4 s in all, inside a rolling minute), so a cough, a chair or a keyboard is still not a strike, with the indicator showing the level and a refused or unplugged mic saying so instead of passing as fine: see [Microphone proctoring](#microphone-proctoring-levels-not-recordings)), staying in the exam (the kiosk pin on a phone, the browser guards: tab/focus/fullscreen, copy/paste, back/reload), and the consequence: **three counted strikes stop the attempt for a supervisor to review**, never an automatic disqualification, with looking away (a head turned for two seconds) and background noise among the counted strikes since `20261108090000_looking_away_and_noise_count.sql`, while a blocked paste, a suppressed right-click and sitting idle are recorded for the reviewer and never count, a wrong decision undoable by reset, and a reset by the paper's author or a supervisor clearing the attempt, its incidents and its snapshots: see [Tuning the violation weights](../README.md#tuning-the-violation-weights) |
+| `instructions-tab-proctor` | the camera (on for the whole sitting, faces checked on-device, a snapshot kept with each incident, and that a person reviews every snapshot; a head turned away for **two seconds**, or the same turn **returning in glances** (three of at least 500 ms, or 5 s in all, inside a rolling minute), because a student reading from notes never holds one turn that long), the microphone (noise above the room's own floor is what counts, stated the way the detector enforces it: **two unbroken seconds**, or the same sound **returning in bursts** (three of at least 300 ms, or 4 s in all, inside a rolling minute), so a cough, a chair or a keyboard is still not a strike, with the indicator showing the level and a refused or unplugged mic saying so instead of passing as fine: see [Microphone proctoring](#microphone-proctoring-levels-not-recordings)), staying in the exam (the kiosk pin on a phone, the browser guards: tab/focus/fullscreen, copy/paste, back/reload), and the consequence: **three counted strikes stop the attempt for a supervisor to review**, never an automatic disqualification, with looking away (a head held turned for two seconds, or a minute of shorter glances) and background noise among the counted strikes since `20261108090000_looking_away_and_noise_count.sql`, while a blocked paste, a suppressed right-click and sitting idle are recorded for the reviewer and never count, a wrong decision undoable by reset, and a reset by the paper's author or a supervisor clearing the attempt, its incidents and its snapshots: see [Tuning the violation weights](../README.md#tuning-the-violation-weights) |
 | `instructions-tab-exam` | the clock (the paper's own duration from the start, a scheduled paper also closing at `ends_at`, answers saved as you go including offline, an unanswered question scoring nothing), when a mark appears (instantly for a paper with no written answers; after the lecturer marks the essays otherwise), one attempt per paper and what a reset clears, what the device check requires (and that a browser flags faces by review, not live), and what to do if something goes wrong |
 
 The wording deliberately matches the screens the student is about to meet — the
@@ -1771,7 +1771,7 @@ the weighted strike rule:
 
 | Detector | Signal | `action_type` |
 | --- | --- | --- |
-| ML Kit face detection | no face (three consecutive frames) / several faces / head pose off-axis (a turn or a tilt past 15 deg on either axis, either direction, **held for two seconds** across consecutive frames) | `no_face`, `multiple_faces`, `looking_away` |
+| ML Kit face detection | no face (three consecutive frames) / several faces / head pose off-axis (a turn or a tilt past 15 deg on either axis, either direction, **held for two seconds** across consecutive frames, or **three such glances of at least 500 ms, or 5 s off screen in total, inside a rolling 60 s window**) | `no_face`, `multiple_faces`, `looking_away` |
 | `web/proctor_face_detector.js` (Chrome/Edge) | the preview's camera track ended, is muted/disabled, is paused or hidden, a preview that has shown nothing for five seconds, or the frame carries no picture (featureless whatever its brightness, dim and near-featureless, blown out, or the same thumbnail for three ticks running) → `no_face`; a face count and head pose from the Shape Detection API or the shipped MediaPipe model, so a look-away becomes `looking_away` too — and a page that can only count faces says so on `proctorGuardFaceAnalysis` rather than leave an unmeasured sitting looking proctored ([details above](#face-signals-on-the-web-the-host-page-bridge)) | `no_face`, `multiple_faces`, `looking_away` |
 | `ExamLifecycleObserver` | `paused` / `inactive` / `hidden` (app switch, notification shade, incoming call) | `app_minimized` |
 | `KioskService.escapes` | lock task state polls inactive twice while the exam runs (the student escaped screen pinning) | `app_minimized` |
@@ -1798,6 +1798,41 @@ two-second sustain is what has to carry that weight — it is long enough that n
 reading position holds it, and short enough that a student working from a second
 screen is caught while they are still doing it.
 
+**The second way of asking the same question is repeated glances, and it exists
+because the first one is blind to a student's normal rhythm.** A candidate working
+from notes on the desk looks down for half a second, back up to type, down again —
+never two unbroken seconds, so the sustain above never fires, whatever the total
+time off screen adds up to. Beside it, and without relaxing it, both engines now bank
+*episodes* in one shared `LookAwayBurstWindow`
+(`core/services/look_away_burst_window.dart`, used by
+`MediaPipeProctoringService` and `WebFacePresenceMonitor` alike, so a phone and a
+browser cannot disagree): an episode off screen lasting at least 500 ms
+(`lookAwayMinEpisode`) is a **glance**, and **three glances inside a rolling
+60-second window** (`lookAwayBurstCount`, `lookAwayBurstWindow`) are one
+`looking_away` — as is **5 s off screen in that window however it was divided up**
+(`lookAwayBurstCumulative`), which is the shape the count is blind to: sixteen
+300 ms looks each too short to be a glance. A run shorter than 500 ms is still
+measured (it adds to the total), it just is not a glance on its own. The window ages
+on the clock rather than on frames, so an engine that stops delivering frames cannot
+keep old evidence alive, and `reset()` (a camera that goes down, a new sitting) drops
+it.
+
+The two rules do not stack on one turn. An episode that reaches two seconds is
+reported by the sustain rule and is **not** banked as a glance (`bankSustained`
+stays false for that episode), and a burst strike **empties the window** it was
+counted from, so one long look away — or a run of glances that already earned a
+strike — cannot produce two. The strike is emitted on the frame that closes the
+third glance (or the frame that crosses 5 s of total), not held for a later frame,
+and it clears the trip rather than latching: the closing frame is a head that came
+back to centre, so whatever it sees next is a new glance. A glance that is still open
+when the sitting ends is simply dropped — it was never closed, so it was never
+counted as a whole one, though its elapsed time did add to the total while it was
+open. Four numbers, one rule, all named in `proctoring_thresholds.dart`
+(`lookAwayMinEpisode`, `lookAwayBurstWindow`, `lookAwayBurstCount`,
+`lookAwayBurstCumulative`) and none of them measured with a real head yet — 500 ms and
+three-a-minute are guesses about reading behaviour, and they are the numbers most
+likely to need tuning in a pilot.
+
 A web-only "a chin 20 deg **down** counts sooner than a chin 20 deg up" rule was
 asked for and is deliberately **not** implemented: it is asymmetric in a way the
 phone build is not, and it depends on the sign a browser detector gives pitch (the
@@ -1815,7 +1850,11 @@ behind glasses, a hand across the lens). Frames are the honest unit here —
 how much wall time a frame stands for and is throttling, not evidence. Any frame
 back in the tolerated pose resets the counters, so only an unbroken run counts, and
 each episode reports once: a sustained look-away is one strike, not one per
-inference. `multiple_faces` is the exception: two people in frame needs no
+inference. A run that reached the sustain is also **not** banked in the glance
+window above, so one long turn is never both a sustained strike and a glance; a run
+that ended shorter than the sustain is closed into that window on the frame that
+comes back inside the tolerances, and the window is what turns several of those into
+a strike. `multiple_faces` is the exception: two people in frame needs no
 measuring, so it reports immediately and is latched per episode instead. There is no
 second exception on either platform — a near-sideways head is held like any other
 turn, because a 60 deg estimate can come from one bad frame, so it is unambiguous
@@ -1932,7 +1971,15 @@ own unpin is not an escape" and "a single inactive blip is tolerated" rules);
 `faceMissing` state that the equipment block is raised on (set by `no_face` and
 `looking_away`, cleared by `centered` and by a camera that goes down) and the evidence
 budget (a critical strike overtakes a softer one stuck on the same dead capture, and an
-in-time still is still attached). The audio
+in-time still is still attached). The camera half adds
+`mobile/test/look_away_burst_window_test.dart` (the repeated-glance rule on its own:
+count, cumulative total, the rolling window, a run that reached the sustain not being
+banked, the strike that empties it, an open episode counted for the total but never
+as a whole glance, `abandonEpisode`, `reset`/`clear`, and the shipped constants) plus
+the `repeated glances` groups in `mobile/test/mediapipe_proctoring_service_test.dart`
+and `mobile/test/web_face_presence_test.dart`, which pin the same stream of verdicts
+to the same strikes on both platforms — including that the strike lands on the frame
+that closes the third glance and that a reset drops the evidence. The audio
 half adds `mobile/test/audio_monitoring_test.dart` (the detector's rules and the
 monitor's state machine), `mobile/test/audio_noise_burst_window_test.dart` (the
 repeated-burst rule: count, total, the rolling window, the strike that empties it),

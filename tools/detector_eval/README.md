@@ -59,6 +59,20 @@ different numbers. There is no angle at which a turn is reported on sight — a 
 estimate can come from a single bad frame, so every angle past the gate waits out
 the hold.
 
+**Known gap: the repeated-glance window is not ported yet.** `WebFacePresenceMonitor`
+now also banks short glances — three of at least 500 ms, or 5 s off screen in total,
+inside a rolling 60 s window are one `looking_away`
+(`lookAwayMinEpisode`, `lookAwayBurstCount`, `lookAwayBurstCumulative`,
+`lookAwayBurstWindow`, mirrored by `LookAwayBurstWindow` on both platforms). This
+port still judges each episode on the 2 s hold alone, so **a clip of a student
+glancing at notes and back will be scored no violation here** even though the app
+would log one. Until the port is caught up, read this tool's recall as a floor for
+the sustained rule only, and do not read its false-positive rate as the app's — it
+is missing the rule most likely to produce one. The port needs the same three
+pieces as `LookAwayBurstWindow` (an open episode, a queue of closed ones aged by
+their end, a strike that empties the queue) plus a `test/judge.test.mjs` group
+pinning them to the Dart stream.
+
 ## Labelling
 
 Copy `labels.template.csv` to `labels.csv` and replace the example rows. One row per

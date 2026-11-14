@@ -64,8 +64,14 @@ void main() {
       expect(find.byKey(const Key('instructions-tab-proctor')), findsOneWidget);
       expect(find.byKey(const Key('instructions-tab-exam')), findsOneWidget);
 
-      // The proctor half starts first: it describes what is about to start.
+      // The proctor half starts first: it describes what is about to start. The
+      // tab scrolls, so the second rule is reached the way a student reaches it.
       expect(find.text('Your camera stays on'), findsOneWidget);
+      await tester.scrollUntilVisible(
+        find.text('Your microphone stays on'),
+        120,
+        scrollable: find.byType(Scrollable).last,
+      );
       expect(find.text('Your microphone stays on'), findsOneWidget);
     });
 
@@ -78,10 +84,37 @@ void main() {
       // browser/kiosk rules that decide what an interruption is.
       expect(find.textContaining('snapshot is kept with any incident'),
           findsOneWidget);
+
+      // The camera rule is the rule both engines enforce: a turn held for two
+      // seconds, or the same turn coming back - three glances of half a second
+      // or more inside a rolling minute, or five seconds in all
+      // (`proctoring_thresholds.dart`). The copy used to describe only the
+      // two-second turn, which a student who reads from notes never makes.
+      expect(
+        find.textContaining('A turn held for two seconds counts'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining(
+          'three glances of half a second or more inside a minute',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('reading from notes on the desk'),
+        findsOneWidget,
+      );
+
+      // The tab scrolls - the camera rule alone is taller than a phone-sized
+      // dialog - so the microphone rule is reached the way a student reaches it.
+      await tester.scrollUntilVisible(
+        find.textContaining("above the room's own level"),
+        120,
+        scrollable: find.byType(Scrollable).last,
+      );
       expect(find.textContaining("above the room's own level"), findsOneWidget);
 
-      // The tab scrolls — four rules do not fit a phone-sized dialog — so the
-      // kiosk rule is reached the way a student reaches it.
+      // ...and the kiosk rule is below that.
       await tester.scrollUntilVisible(
         find.textContaining('the screen is pinned'),
         120,
@@ -101,6 +134,11 @@ void main() {
       // see `proctoring_thresholds.dart`). The copy used to round that to "about a
       // second", which a student reads either as "one word is a strike" or as "one
       // word is fine"; neither is the rule.
+      await tester.scrollUntilVisible(
+        find.textContaining('two unbroken seconds'),
+        120,
+        scrollable: find.byType(Scrollable).last,
+      );
       expect(find.textContaining('two unbroken seconds'), findsOneWidget);
       expect(
         find.textContaining('three short bursts inside a minute'),
@@ -121,6 +159,12 @@ void main() {
       );
       expect(
         find.textContaining('turned away from the screen for two seconds'),
+        findsOneWidget,
+      );
+      // ...and the consequence sentence carries the repeated-glance half too,
+      // because that is the half a student reading from notes meets in practice.
+      expect(
+        find.textContaining('a minute of shorter glances'),
         findsOneWidget,
       );
       expect(

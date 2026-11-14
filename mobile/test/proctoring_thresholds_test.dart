@@ -99,6 +99,103 @@ void main() {
       expect(web.startupGrace, cameraStartupGrace);
       expect(engine.startupGrace, cameraStartupGrace);
     });
+
+    test('repeated glances are judged in a window, beside the one above', () {
+      // A student reading paper and screen in turn never holds a turn for two
+      // seconds, so the sustained rule above saw nothing at all. The second way of
+      // asking the same question is a rolling window: three glances, or five
+      // seconds of them, inside a minute.
+      expect(lookAwayMinEpisode, const Duration(milliseconds: 500));
+      expect(lookAwayBurstWindow, const Duration(seconds: 60));
+      expect(lookAwayBurstCount, 3);
+      expect(lookAwayBurstCumulative, const Duration(seconds: 5));
+
+      // A glance has to be shorter than the sustained hold, or that rule owns the
+      // run already and one turn would be two strikes.
+      expect(lookAwayMinEpisode, lessThan(lookAwaySustain));
+      // ...and longer than a blink, or one bad Euler estimate would count.
+      expect(lookAwayMinEpisode, greaterThan(const Duration(milliseconds: 100)));
+      // Three counted glances have to fit inside the window with room to spare, or
+      // a student glancing every half minute could never reach the count.
+      expect(
+        lookAwayBurstWindow,
+        greaterThan(lookAwayMinEpisode * lookAwayBurstCount),
+      );
+      // The total is reachable without one counted glance - sub-minimum fragments
+      // add up - which is the whole reason it sits beside the count...
+      expect(
+        lookAwayBurstCumulative,
+        greaterThan(lookAwayMinEpisode * lookAwayBurstCount),
+      );
+      // ...and it is still a fraction of the minute, so a student who looks at the
+      // keyboard now and then is not struck just for doing so.
+      expect(lookAwayBurstCumulative, lessThan(lookAwayBurstWindow));
+    });
+
+    test('the same three glances are one strike on either platform', () async {
+      // Parity is not a doc comment. Both hosts feed one `LookAwayBurstWindow`, and
+      // this is the sequence that proves it: three 600 ms glances, two seconds
+      // apart, each ended by a look back at the screen. Neither run reaches the
+      // two-second hold, so the sustained rule is silent and the window is the only
+      // thing that can speak.
+      var now = DateTime(2026, 1, 1, 12);
+      final engine = MediaPipeProctoringService(
+        clock: () => now,
+        startupGrace: Duration.zero,
+      );
+      addTearDown(engine.dispose);
+      final fromEngine = <GazeSignal>[];
+      final engineSub = engine.signals.listen(fromEngine.add);
+      addTearDown(engineSub.cancel);
+
+      final web = WebFacePresenceMonitor(
+        source: _SilentSource(),
+        clock: () => now,
+        // The shipped five-second window would swallow this whole sequence; the
+        // start-up rule has its own tests.
+        startupGrace: Duration.zero,
+      )..start(at: now);
+      addTearDown(web.dispose);
+      final fromWeb = <GazeSignal>[];
+      final webSub = web.signals.listen(fromWeb.add);
+      addTearDown(webSub.cancel);
+
+      const turned = FaceFrameResult(faceCount: 1, yawDegrees: 30);
+      const facing = FaceFrameResult(faceCount: 1);
+      for (var glance = 0; glance < 3; glance++) {
+        // 600 ms of a turned head: four frames on the phone, opened by the one
+        // `looking_away` a browser detector would send at that instant.
+        for (var frame = 0; frame < 4; frame++) {
+          now = now.add(engine.inferenceInterval);
+          if (frame == 0) {
+            web.handleMessage(WebFaceMessages.lookingAway);
+          }
+          engine.handleResult(turned);
+        }
+        // ...and back at the screen, once for each host, at the same instant.
+        now = now.add(engine.inferenceInterval);
+        web.handleMessage(WebFaceMessages.centered);
+        engine.handleResult(facing);
+        now = now.add(const Duration(seconds: 2));
+      }
+
+      await pumpEventQueue();
+      expect(
+        fromEngine.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+        reason: 'three glances are one strike on the phone',
+      );
+      expect(
+        fromWeb.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+        reason: '...and one on the browser, because it is the same window',
+      );
+      // Not just the same count but the same place in the sequence: the strike is
+      // carried by the detection that ends the third glance, after two `centered`
+      // signals, so an appeal reads the same on either platform.
+      expect(fromEngine.indexOf(GazeSignal.lookingAway), 2);
+      expect(fromWeb.indexOf(GazeSignal.lookingAway), 2);
+    });
   });
 
   group('audio noise rule', () {

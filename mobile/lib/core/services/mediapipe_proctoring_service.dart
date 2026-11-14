@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/services.dart' show DeviceOrientation;
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 
+import 'look_away_burst_window.dart';
 import 'proctoring_thresholds.dart' as thresholds;
 
 /// Raw result of one inference pass over a camera frame.
@@ -65,6 +66,7 @@ class MediaPipeProctoringService {
           !startupGrace.isNegative,
           'a negative grace would time out before the sitting starts',
         ),
+        _lookAwayBurst = LookAwayBurstWindow(sustain: lookAwaySustain),
         _clock = clock ?? DateTime.now {
     if (mockCamera) _startMockFeed();
   }
@@ -117,8 +119,11 @@ class MediaPipeProctoringService {
   /// and it is still short enough to catch somebody working from a second screen
   /// while they are doing it.
   ///
-  /// A frame back inside the tolerances ends the episode and restarts the clock, so
-  /// a series of quick glances never accumulates into a strike.
+  /// A frame back inside the tolerances ends the episode and restarts the clock.
+  /// That does **not** make repeated glances free: [_lookAwayBurst] counts them
+  /// separately (three glances, or five seconds off screen, inside a minute), so
+  /// this rule catches the turn that is held and the window catches the student who
+  /// keeps returning to the same off-screen place.
   final Duration lookAwaySustain;
 
   /// How long after the sitting's first frame nothing is judged at all.
@@ -222,6 +227,19 @@ class MediaPipeProctoringService {
   /// back to null, so the clock only ever covers *consecutive* off-centre frames.
   DateTime? _lookAwaySince;
 
+  /// The rolling half of the look-away rule, beside [_lookAwaySince]:
+  /// [thresholds.lookAwayBurstCount] glances of at least
+  /// [thresholds.lookAwayMinEpisode] each, or
+  /// [thresholds.lookAwayBurstCumulative] of off-screen time in total, inside
+  /// [thresholds.lookAwayBurstWindow] are also one `lookingAway`.
+  ///
+  /// Shared with `WebFacePresenceMonitor` (`LookAwayBurstWindow`) rather than
+  /// reimplemented, so a browser and a phone count the same glances the same way.
+  /// The sustained rule is untouched by it: an episode that reaches
+  /// [lookAwaySustain] belongs to that rule and is not recorded here, and a strike
+  /// from either rule empties this window.
+  final LookAwayBurstWindow _lookAwayBurst;
+
   /// When the first frame of the sitting reached the engine - the anchor for
   /// [startupGrace], set once and never cleared (see [resetSustained]).
   DateTime? _firstFrameAt;
@@ -303,6 +321,10 @@ class MediaPipeProctoringService {
   /// in front of it is a fresh episode, and carrying the cooldown across the gap
   /// would hide the guest who arrived while the camera was down.
   ///
+  /// The rolling look-away window goes too ([_lookAwayBurst]): a camera that was
+  /// not delivering saw no glances, so the evidence behind a burst strike must not
+  /// survive the gap and be spent on the first frame that comes back.
+  ///
   /// The start-up anchor ([_firstFrameAt]) is deliberately *not* cleared: a
   /// sitting's grace window is spent once, and a counter reset that re-armed it
   /// would make five unwatched seconds available on demand.
@@ -317,6 +339,9 @@ class MediaPipeProctoringService {
     // nothing for the whole gap, so a turn it finds on the next frame must start
     // its two seconds there rather than inherit the seconds before the drop.
     _lookAwaySince = null;
+    // ...and so does the rolling window: a camera that was not delivering saw no
+    // glances, so the evidence behind a burst strike must not survive the gap.
+    _lookAwayBurst.clear();
   }
 
   /// Feed every camera frame here; internal throttling decides whether it
@@ -527,13 +552,24 @@ class MediaPipeProctoringService {
 
   /// Applies the look-away and missing-face rules to one detection result.
   ///
-  /// [GazeSignal.lookingAway] is reported only once the head has stayed past
+  /// [GazeSignal.lookingAway] is reported once the head has stayed past
   /// [offCenterThresholdDegrees] / [pitchThresholdDegrees] for [lookAwaySustain]
   /// *and* [consecutiveFrameThreshold] frames, with no frame back inside the
-  /// tolerances in between (`_lookAwaySince`). A glance, a blink and a notification
-  /// therefore produce nothing, which is the point: the old single-frame rule
-  /// turned every one of them into a strike, and a student warned for glancing at
-  /// their own keyboard learns to ignore the warning.
+  /// tolerances in between (`_lookAwaySince`). A single glance, a blink and a
+  /// notification therefore produce nothing, which is the point: the old
+  /// single-frame rule turned every one of them into a strike, and a student warned
+  /// for glancing at their own keyboard learns to ignore the warning.
+  ///
+  /// [GazeSignal.lookingAway] is *also* reported from the rolling window beside
+  /// that rule ([_lookAwayBurst]): [thresholds.lookAwayBurstCount] separate glances
+  /// of at least [thresholds.lookAwayMinEpisode], or
+  /// [thresholds.lookAwayBurstCumulative] of off-screen time in total, inside
+  /// [thresholds.lookAwayBurstWindow]. A student reading a printed sheet, the
+  /// screen, and the sheet again never holds one unbroken turn, so the sustained
+  /// rule alone cannot see them; the window is what makes the repeated glance
+  /// count - once, not once per glance, because the strike empties it. A run long
+  /// enough for [lookAwaySustain] is not banked by it, so a held turn is still one
+  /// strike rather than two.
   ///
   /// There is no "unambiguous turn" bypass any more. A near-sideways head is
   /// unambiguous about the *frame*, not about the student - the detector can put a
@@ -546,8 +582,9 @@ class MediaPipeProctoringService {
   /// glasses, a hand across the lens) on its own. Each episode emits at most once,
   /// so a sustained look-away or a face that stays out of frame is one strike, not
   /// one per inference. Any frame back in the tolerated state - a visible face, a
-  /// centered head - resets the counters and the episode clock, so nothing
-  /// accumulates across separate glances.
+  /// centered head - resets the counters and the episode clock; the episode clock is
+  /// what the two-second rule measures, and it is the window, not the clock, that
+  /// remembers a glance that has ended.
   ///
   /// [GazeSignal.multipleFaces] is the other condition with no threshold (two
   /// people in frame needs no measuring), so it is latched instead: one episode,
@@ -590,6 +627,7 @@ class MediaPipeProctoringService {
       _offCenterFrames = 0;
       _lookAwaySince = null;
       _lookAwayFlagged = false;
+      _lookAwayBurst.abandonEpisode();
 
       _faceMissingFrames++;
       if (!_noFaceFlagged &&
@@ -615,6 +653,7 @@ class MediaPipeProctoringService {
       _offCenterFrames = 0;
       _lookAwaySince = null;
       _lookAwayFlagged = false;
+      _lookAwayBurst.abandonEpisode();
       _multipleFacesAt = now;
       if (_multipleFacesFlagged) return;
       _multipleFacesFlagged = true;
@@ -647,6 +686,21 @@ class MediaPipeProctoringService {
       _offCenterFrames = 0;
       _lookAwaySince = null;
       _lookAwayFlagged = false;
+      // A return inside the tolerances *ends* a glance rather than pausing it,
+      // which is where the rolling window learns how long that glance lasted. It
+      // is also the last moment at which the third glance of the minute can be
+      // counted, so the frame that closes it is the one that carries the signal -
+      // emitting a frame later would make a rule about a minute's behaviour look
+      // like a rule about the head that happens to be on screen at that instant.
+      //
+      // The strike consumes the glances it came from, and the latch stays clear
+      // because this frame also says the head is back: the episode is over, so
+      // the very next glance is a new one rather than a repeat.
+      if (_lookAwayBurst.closeEpisode(now)) {
+        _lookAwayBurst.clear();
+        _signalController.add(GazeSignal.lookingAway);
+        return;
+      }
       _signalController.add(GazeSignal.centered);
       return;
     }
@@ -664,6 +718,22 @@ class MediaPipeProctoringService {
         sustained &&
         _offCenterFrames >= consecutiveFrameThreshold) {
       _lookAwayFlagged = true;
+      // This turn is the sustained rule's strike, so it stops being counted in the
+      // rolling window: one turn is one strike, not two, and the next burst has to
+      // earn its own evidence.
+      _lookAwayBurst.clear();
+      _signalController.add(GazeSignal.lookingAway);
+      return;
+    }
+
+    // The rolling half. This frame is still off screen, so the glance is still
+    // open and the off-screen total it contributes may already be the fifth
+    // second - which is why the total is judged here and not only when the glance
+    // ends. Guarded by the same latch as the sustained rule, so a turn that has
+    // already been reported cannot report again a few frames later.
+    if (!_lookAwayFlagged && _lookAwayBurst.observeOffScreen(now)) {
+      _lookAwayFlagged = true;
+      _lookAwayBurst.clear();
       _signalController.add(GazeSignal.lookingAway);
     }
   }

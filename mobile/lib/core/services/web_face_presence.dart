@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'look_away_burst_window.dart';
 import 'mediapipe_proctoring_service.dart' show GazeSignal;
 import 'proctoring_thresholds.dart' as thresholds;
 import 'web_face_signal_source.dart';
@@ -46,6 +47,13 @@ abstract final class WebFaceMessages {
 ///  * `looking_away` has to hold for [lookAwaySustain] before it is reported, and
 ///    each episode reports once - so one look away is one strike, not one per
 ///    detection, while a blink or a single dropped frame is nothing;
+///  * `looking_away` is *also* reported by the rolling window beside that rule
+///    ([thresholds.lookAwayBurstCount] separate glances, or
+///    [thresholds.lookAwayBurstCumulative] of off-screen time, inside
+///    [thresholds.lookAwayBurstWindow]) - the same `LookAwayBurstWindow` the
+///    on-device engine runs, so a student reading paper and screen in turn is
+///    judged the same way on either platform. A held two seconds is the sustained
+///    rule's and is not banked by the window, and a strike empties the window;
 ///  * `no_face` has to hold for [noFaceSustain], on the same one-report-per-episode
 ///    rule;
 ///  * a `centered` message ends the episode and re-arms it, so a *later* look
@@ -85,7 +93,8 @@ abstract final class WebFaceMessages {
 /// student - and the difference made the browser stricter than the phone for the same
 /// head (a 30 degree turn was a strike in 0.3 s on the web and 2 s on Android). The
 /// sustained window is the rule on both platforms now: a turn past the gate is one
-/// strike once it has been *held*, whatever the angle.
+/// strike once it has been *held*, whatever the angle - and a turn that is not held
+/// still counts as a glance in the shared rolling window, on both.
 
 class WebFacePresenceMonitor {
   WebFacePresenceMonitor({
@@ -122,6 +131,7 @@ class WebFacePresenceMonitor {
           'a zero tolerance would call every head position off centre',
         ),
         _source = source,
+        _awayBurst = LookAwayBurstWindow(sustain: lookAwaySustain),
         _now = clock ?? DateTime.now {
     _subscription = source.messages.listen(handleMessage);
   }
@@ -140,6 +150,10 @@ class WebFacePresenceMonitor {
   /// flickers across the 15 degree line while a head is genuinely moving - because
   /// any detection back inside the tolerance resets the window, exactly as a
   /// `centered` frame does in the engine. Only an unbroken run counts.
+  ///
+  /// A run that ends early is not lost, though: it is one glance in [_awayBurst],
+  /// and the window is what makes repeated glances add up. Resetting this clock is
+  /// what keeps two seconds meaning "held", not "wandering".
   final Duration lookAwaySustain;
 
   /// How long an empty frame has to hold before it is reported as `no_face`.
@@ -187,6 +201,18 @@ class WebFacePresenceMonitor {
   final DateTime Function() _now;
   final StreamController<GazeSignal> _signals =
       StreamController<GazeSignal>.broadcast();
+
+  /// The rolling half of the look-away rule, the same `LookAwayBurstWindow` the
+  /// on-device engine runs: [thresholds.lookAwayBurstCount] separate glances, or
+  /// [thresholds.lookAwayBurstCumulative] of off-screen time, inside
+  /// [thresholds.lookAwayBurstWindow].
+  ///
+  /// It has to be the same object, not a copy of the arithmetic: this class and
+  /// `MediaPipeProctoringService` judge one head from two different detections, and
+  /// a browser that counted a browser's glances differently would decide the appeal
+  /// by platform. A run that reaches [lookAwaySustain] is the sustained rule's and is
+  /// not banked here, and a strike from either rule empties the window.
+  final LookAwayBurstWindow _awayBurst;
 
   StreamSubscription<String>? _subscription;
 
@@ -247,6 +273,7 @@ class WebFacePresenceMonitor {
       _missingSince = null;
       _awayFlagged = false;
       _missingFlagged = false;
+      _awayBurst.abandonEpisode();
       _emit(GazeSignal.multipleFaces);
       return;
     }
@@ -291,6 +318,10 @@ class WebFacePresenceMonitor {
     // (and re-armable) rather than paused.
     _awaySince = null;
     _awayFlagged = false;
+    // ...and the open glance is over too: it is not evidence of anything, so it is
+    // abandoned rather than closed. The glances already recorded stay - they are
+    // about the student, not about the frame that happened to be empty.
+    _awayBurst.abandonEpisode();
 
     _missingSince ??= now;
     if (_missingFlagged) return;
@@ -308,9 +339,21 @@ class WebFacePresenceMonitor {
 
     _awaySince ??= now;
     if (_awayFlagged) return;
-    if (now.difference(_awaySince!) < lookAwaySustain) return;
-    _awayFlagged = true;
-    _emit(GazeSignal.lookingAway);
+    if (now.difference(_awaySince!) >= lookAwaySustain) {
+      _awayFlagged = true;
+      // The sustained rule's strike: this run is not also banked as a glance.
+      _awayBurst.clear();
+      _emit(GazeSignal.lookingAway);
+      return;
+    }
+    // The rolling half. The glance is still open, and its off-screen seconds may
+    // already be the fifth - which is why the total is judged while the head is
+    // still turned, not only once it comes back.
+    if (_awayBurst.observeOffScreen(now)) {
+      _awayFlagged = true;
+      _awayBurst.clear();
+      _emit(GazeSignal.lookingAway);
+    }
   }
 
   void _onCentered(DateTime now) {
@@ -319,6 +362,19 @@ class WebFacePresenceMonitor {
     _awayFlagged = false;
     _missingFlagged = false;
     _endMultiFaceEpisode(now);
+    // A return inside the tolerances ends the glance, which is what the rolling
+    // window needs to know to count it - and the closing message is the one that
+    // carries a burst strike, so a rule about a minute's worth of glances is not
+    // reported on a detection that shows the head facing the screen.
+    //
+    // The strike consumes the glances it came from, and the latch stays clear
+    // because this message also says the head is back: the episode is over, so the
+    // very next glance is a new one rather than a repeat.
+    if (_awayBurst.closeEpisode(now)) {
+      _awayBurst.clear();
+      _emit(GazeSignal.lookingAway);
+      return;
+    }
     // Emitted like the engine's per-frame `centered`: the notifier ignores it,
     // and it is the observable "the episode is over" for anything that wants to
     // show the student they are being seen.

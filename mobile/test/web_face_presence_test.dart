@@ -445,6 +445,151 @@ void main() {
     });
   });
 
+  group('repeated glances', () {
+    /// One glance of [length] that never reaches the sustain, ended by a centred
+    /// detection - the shape the two-second rule cannot see, because no single run
+    /// lasts long enough.
+    void glance(Duration length, {Duration gap = const Duration(seconds: 2)}) {
+      report(WebFaceMessages.lookingAway);
+      now = now.add(length);
+      report(WebFaceMessages.centered);
+      now = now.add(gap);
+    }
+
+    test('three glances inside a minute are one look away', () async {
+      glance(const Duration(milliseconds: 600));
+      glance(const Duration(milliseconds: 600));
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.centered, GazeSignal.centered],
+        reason: 'two glances of the minute are not a pattern',
+      );
+
+      glance(const Duration(milliseconds: 600));
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[
+          GazeSignal.centered,
+          GazeSignal.centered,
+          GazeSignal.lookingAway,
+        ],
+        reason:
+            'the third glance is the finding, carried by the detection that '
+            'ended it rather than by a later one that shows a centred head',
+      );
+    });
+
+    test('three glances over ninety seconds are not', () async {
+      glance(const Duration(milliseconds: 600), gap: const Duration(seconds: 39));
+      glance(const Duration(milliseconds: 600), gap: const Duration(seconds: 39));
+      glance(const Duration(milliseconds: 600));
+      await flush();
+
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        isEmpty,
+        reason: 'a glance a minute and a half ago is not evidence for this one',
+      );
+    });
+
+    test('five seconds off screen in total are one look away', () async {
+      // Fragments too short to be a counted glance, repeated: the shape the count
+      // cannot see, and why the total sits beside it. The gaps keep every
+      // fragment inside the same minute, which is where the total is judged.
+      for (var i = 0; i < 12; i++) {
+        glance(const Duration(milliseconds: 400), gap: const Duration(seconds: 2));
+      }
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        isEmpty,
+        reason: '4.8 s is not five',
+      );
+
+      glance(const Duration(milliseconds: 400), gap: const Duration(seconds: 2));
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+        reason: 'the thirteenth fragment is the fifth second',
+      );
+    });
+
+    test('a strike empties the window, so the next burst is earned again',
+        () async {
+      for (var i = 0; i < 3; i++) {
+        glance(const Duration(milliseconds: 600));
+      }
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+      );
+
+      glance(const Duration(milliseconds: 600));
+      glance(const Duration(milliseconds: 600));
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+        reason: 'the strike consumed the glances it came from, so two are two',
+      );
+
+      glance(const Duration(milliseconds: 600));
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(2),
+      );
+    });
+
+    test('a held turn is one strike, and is not also banked as a glance',
+        () async {
+      sustain(WebFaceMessages.lookingAway); // 2.1 s: the sustained rule's
+      await flush();
+      expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
+
+      report(WebFaceMessages.centered);
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.lookingAway, GazeSignal.centered],
+        reason: 'the run belonged to the sustained rule, so closing it is not a '
+            'second strike',
+      );
+
+      // ...and it is not counted in the window either, so two glances after it are
+      // two glances rather than three.
+      glance(const Duration(milliseconds: 600));
+      glance(const Duration(milliseconds: 600));
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+      );
+    });
+
+    test('a face lost mid-glance ends the glance rather than pausing it',
+        () async {
+      report(WebFaceMessages.lookingAway);
+      now = now.add(const Duration(milliseconds: 1500));
+      report(WebFaceMessages.noFace);
+      report(WebFaceMessages.centered);
+
+      // Two glances since, not three: the 1.5 s before the face was lost is not
+      // evidence of anything, because there was no head pose to judge.
+      glance(const Duration(milliseconds: 600));
+      glance(const Duration(milliseconds: 600));
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        isEmpty,
+      );
+    });
+  });
+
   group('the start-up window', () {
     test('nothing is reported while the student is settling in', () async {
       final gated = buildMonitor(startupGrace: const Duration(seconds: 5));

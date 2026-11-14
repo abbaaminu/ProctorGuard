@@ -97,9 +97,11 @@ final and is not presented as if it were.
 Students meet the same two rules before an attempt exists. A scheduled paper is
 listed but inert outside its window ("It opens …" / "It closed …"), and **both**
 pre-exam screens — the student portal and the device check — open a two-tab
-instructions dialog: **How the proctor works** (the camera and its snapshots, the
-microphone's noise floor — two unbroken seconds, or the same noise returning in
-bursts inside a minute — the kiosk/browser rules, and what three counted signals do:
+instructions dialog: **How the proctor works** (the camera and its snapshots, a
+head held turned for two seconds or the same turn coming back in glances inside a
+minute, the microphone's noise floor — two unbroken seconds, or the same noise
+returning in bursts inside a minute — the kiosk/browser rules, and what three
+counted signals do:
 the attempt stops and goes to a supervisor, whose decision can be undone and whose
 reset clears the attempt) and **Exam rules** (the clock, when a mark appears, one
 attempt per paper, what the device check requires). See
@@ -130,7 +132,14 @@ rather than left to be mistaken for more than it is.
   angles; the client turns those into `no_face`, `multiple_faces` and
   `looking_away`. It performs **no** face recognition and matches no template, so
   it cannot tell a student apart from a similarly-shaped stand-in, and there is
-  no liveness challenge (no blink / turn / read-a-phrase prompt).
+  no liveness challenge (no blink / turn / read-a-phrase prompt). `looking_away`
+  is raised two ways, both on the same 15° gate: a head past **15° on either
+  axis, held for two seconds**, and — for a student reading paper and screen in
+  turn, whose turns never last that long — **three glances of at least 500 ms, or
+  5 s off screen in total, inside a rolling 60-second window**. Either is **one**
+  strike, the burst window is emptied by the strike it produces, and a run that
+  did reach two seconds is not also banked as a glance, so one long turn cannot
+  become two strikes.
 - **Audio is loudness, not content.** The microphone is sampled for level
   (dBFS) only, and `audio_noise` is raised two ways, both on that level: energy
   above the room's measured floor held for **two seconds without dropping below
@@ -206,6 +215,7 @@ rather than left to be mistaken for more than it is.
 | --- | --- | --- |
 | Impersonation / a stand-in on camera | Face detection is not face recognition and has no liveness check | Supervisor review of the attempt's evidence; add an identity-match + liveness step where the stakes require it |
 | A helper off-camera or on another device | The camera only sees in front of the lens; audio is level-only | `multiple_faces`, `no_face`, `looking_away`, `idle_afk` and `secondary_display_detected` signals, plus supervisor judgement |
+| Reading from notes on the desk | A head turned down to a sheet looks exactly like a head turned to a second screen — the camera sees an angle, not a target | Both look-away rules count, so a normal note-reading rhythm **can** reach three strikes: a turn held for 2 s, or three glances of at least 500 ms / 5 s off screen inside a rolling 60 s window, one strike, window emptied by it. A student warned for glancing at their own keyboard is why the third strike produces `flagged_for_review` and never an automatic disqualification, and why the supervisor's `clear` puts the attempt back in the marking queue |
 | Sound that is not plain talking (TV, music, a second speaker) | Loudness cannot be attributed to a person or separated from other sound | Sustained-threshold rules (a median-calibrated room floor plus a 6 dB speech margin, held for 2 s with no dip below the line, one episode = one strike) plus a repeated-burst rule (three bursts of at least 300 ms, or 4 s in total, inside a rolling 60 s window, one strike, window emptied by it) keep one-offs out; content is deliberately never captured. A noisy room **can** reach three counted strikes and close the sitting for review — the rule is strict on purpose and the review is a human's |
 | A microphone that fails mid-session (unplugged, grant revoked, another app took the input) | Level is the only audio signal, so a dead mic stops speech being detected at all | The chip reports `Mic lost` / `Mic unavailable` / `Mic blocked` — **never a false "quiet"** — and the paper is held shut behind the opaque equipment block, with **Reconnect** / **Open settings** / **Leave** (the `unavailable` case stays on the indicator: a barrier nobody can clear would strand the student). A lost mic is an **unproctored gap, not a strike**, so no attempt is ended for it — but nothing can be read or typed behind the block either, so the gap cannot pass as a clean run |
 | Escape from the locked exam surface | Screen pinning (no Device Owner) and browser fullscreen can be left | An escape or a fullscreen exit becomes an `app_minimized` strike; the kiosk badge shows whether pinning is enforced or best-effort |
@@ -219,12 +229,19 @@ Four things are written down here rather than left implicit, because each is the
 kind of detail a pilot finds out the hard way:
 
 - **The look-away gate has never been measured on a device.** The rule (15 deg of
-  yaw and 15 deg of pitch, absolute, held for two seconds) is unit-tested against
+  yaw or 15 deg of pitch, absolute, held for two seconds) is unit-tested against
   both engines, including the boundary and the symmetry, but no real head has been
   put in front of it here. The number that decides whether it is safe is the
   false-positive rate: a candidate who works with the laptop low, or who reads a
   printed answer sheet on the desk, is the case to measure before a
-  timer-driven disqualification is trusted.
+  timer-driven disqualification is trusted. **The repeated-glance half is the same
+  story, and it is the half more likely to fire**: three glances of at least
+  500 ms, or 5 s off screen in total, inside a rolling minute, is a rule about a
+  student's normal reading rhythm — notes on the desk, a question re-read on the
+  next screen — and no real student's rhythm has been used to check 500 ms, 5 s or
+  three-per-minute with a camera. It is unit-tested on both platforms (the same
+  `LookAwayBurstWindow`, so a phone and a browser cannot disagree), and nothing
+  more than that.
 - **The audio threshold has never been measured in a real room either.** The rule is
   a median-calibrated floor plus 6 dB, clamped to −50…−32 dBFS, held for two seconds
   continuously (`AudioNoiseDetector`, `proctoring_thresholds.dart`), with a second
@@ -983,18 +1000,26 @@ Both signals count now
 candidate reading a second screen and a candidate talking the paper through with
 somebody in the room are exactly what a camera-and-microphone proctor is good at —
 and neither used to move the score at all. Neither is a single frame or a single
-sample: the client only reports a look-away after 15° of yaw **and** 15° of pitch
-have been held for 2 seconds, and a noisy room in one of two ways, both on the
-measured level — the level staying above the room's own threshold for 2 seconds
-continuously (a dip resets the timer, and one episode is one strike), **or** three
-bursts of at least 300 ms, or 4 s of above-threshold sound in total, inside a rolling
+sample. A look-away is reported two ways, both on the same 15° gate — a head past
+15° on **either** axis held for 2 seconds, **or** three glances of at least 500 ms,
+or 5 s off screen in total, inside a rolling 60-second window, which is the shape
+the 2 s rule cannot see: a student reading paper and screen in turn never holds a
+turn long enough. A noisy room likewise in one of two ways, both on the measured
+level — the level staying above the room's own threshold for 2 seconds continuously
+(a dip resets the timer, and one episode is one strike), **or** three bursts of at
+least 300 ms, or 4 s of above-threshold sound in total, inside the same rolling
 60-second window, which is the shape the 2 s rule cannot see: a student reading the
-paper out in phrases. A burst strike goes through the same latch and cooldown and
-**empties the window**, so one conversation cannot stack a burst strike and a
-sustained one. Every number there is a named constant in
-`proctoring_thresholds.dart` (`audioNoiseSustain`, `audioNoiseMinBurst`,
-`audioNoiseBurstWindow`, `audioNoiseBurstCount`, `audioNoiseBurstTotal`). The old
-values, for a project comparing notes with an older install:
+paper out in phrases. Either kind of burst strike goes through the same latch and
+cooldown and **empties the window**, so one conversation — or one long turn that
+reached the sustained rule — cannot stack a burst strike and a sustained one.
+A glance shorter than 500 ms is measured (it adds to the 5 s total) without counting
+as a glance, which is what makes the total reachable without a single counted
+glance. Every number there is a named constant in `proctoring_thresholds.dart`
+(`lookAwaySustain`, `lookAwayMinEpisode`, `lookAwayBurstWindow`,
+`lookAwayBurstCount`, `lookAwayBurstCumulative`, `audioNoiseSustain`,
+`audioNoiseMinBurst`, `audioNoiseBurstWindow`, `audioNoiseBurstCount`,
+`audioNoiseBurstTotal`). The old values, for a project comparing notes with an older
+install:
 
 | Signal | Before 20261108090000 | Now |
 |--------|----------------------|-----|
@@ -1006,18 +1031,28 @@ Every signal is still stored in `proctoring_logs` and still shown to the
 supervisor; the weight only decides which ones may end an attempt on their own.
 
 **Some of these numbers have not been tested with real people.** The 15° / 2 s
-look-away rule and the audio rules (the room's median floor plus 6 dB, clamped to
-−50…−32 dBFS, held for 2 s, and the repeated-burst window beside it) are unit-tested
-and pinned, but no real head has been put in front of one here and no real room or
-microphone behind the others. The rate that decides whether they are safe is the
-false-positive rate, and it has not been measured. Two consequences to go in with
-your eyes open:
+look-away rule, the repeated-glance window beside it and the audio rules (the room's
+median floor plus 6 dB, clamped to −50…−32 dBFS, held for 2 s, and the
+repeated-burst window beside it) are unit-tested and pinned, but no real head has
+been put in front of one here and no real room or microphone behind the others. The
+rate that decides whether they are safe is the false-positive rate, and it has not
+been measured. Three consequences to go in with your eyes open:
 
-- a student who works with the laptop low, reads a printed sheet on the desk, or
-  sits in a corridor, a hall or beside a television **can reach three counted
-  strikes and lose the sitting** — which is why the third strike produces
-  `flagged_for_review` and never an automatic disqualification: a human reads it,
-  and `resolve_flagged_attempt('clear')` puts the attempt back in the marking queue;
+- a student who works with the laptop low, reads a printed sheet on the desk,
+  glances at the keyboard between questions, or sits in a corridor, a hall or beside
+  a television **can reach three counted strikes and lose the sitting** — which is
+  why the third strike produces `flagged_for_review` and never an automatic
+  disqualification: a human reads it, and `resolve_flagged_attempt('clear')` puts
+  the attempt back in the marking queue. The repeated-glance rule makes that
+  likelier than the 2 s rule alone did, because it was written for exactly the
+  student who keeps looking down at their notes;
+- the repeated-glance rule is the loosest thing here in practice: 500 ms is a real
+  glance, and five seconds of total time off screen in a minute is less than a
+  page of notes costs. It exists because the 2 s rule is silent about that student,
+  but the honest reading is that it **will** fire on ordinary note-reading — the
+  strike still goes to a human, and the numbers (`lookAwayMinEpisode`,
+  `lookAwayBurstCount`, `lookAwayBurstCumulative`) are the first ones to raise in a
+  pilot if the false-positive rate is too high;
 - the audio rules are strict on purpose (a dip below the threshold restarts the 2 s
   window, and the burst window only forgives a single short noise), so quiet,
   widely-spaced remarks can still go unheard, while a room that is loud in bursts

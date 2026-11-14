@@ -529,6 +529,242 @@ void main() {
     });
   });
 
+  group('repeated glances', () {
+    // The rolling half of the look-away rule: a student who reads paper and
+    // screen in turn never holds a turn for two seconds, and used to collect
+    // nothing at all. The window is shared with the browser (`WebFacePresenceMonitor`
+    // feeds the same `LookAwayBurstWindow`), so these tests and that file's
+    // `repeated glances` group are the same scenario on two sensors.
+    late DateTime now;
+
+    setUp(() => now = DateTime(2026, 1, 1, 12));
+
+    MediaPipeProctoringService clocked() {
+      final engine = MediaPipeProctoringService(
+        clock: () => now,
+        startupGrace: Duration.zero,
+      );
+      addTearDown(engine.dispose);
+      return engine;
+    }
+
+    const turned = FaceFrameResult(faceCount: 1, yawDegrees: 30);
+    const facing = FaceFrameResult(faceCount: 1);
+
+    /// Holds [result] for [duration] the way the camera does: one frame per
+    /// [MediaPipeProctoringService.inferenceInterval], clock advancing with each.
+    void hold(
+      MediaPipeProctoringService engine,
+      FaceFrameResult result,
+      Duration duration,
+    ) {
+      final frames =
+          (duration.inMilliseconds / engine.inferenceInterval.inMilliseconds)
+              .ceil();
+      for (var i = 0; i < frames; i++) {
+        now = now.add(engine.inferenceInterval);
+        engine.handleResult(result);
+      }
+    }
+
+    /// One glance of [length], ended by a frame back inside the tolerances, and
+    /// [gap] spent looking at the screen before the next one. Both lengths are
+    /// multiples of the inference interval, so a glance is exactly as long as it
+    /// says: 600 ms is a glance, 300 ms is a fragment.
+    void glance(
+      MediaPipeProctoringService engine,
+      Duration length, {
+      Duration gap = const Duration(seconds: 2),
+    }) {
+      hold(engine, turned, length);
+      now = now.add(engine.inferenceInterval);
+      engine.handleResult(facing);
+      now = now.add(gap);
+    }
+
+    Iterable<GazeSignal> strikes(List<GazeSignal> seen) =>
+        seen.where((signal) => signal == GazeSignal.lookingAway);
+
+    test('three glances inside a minute are one look away', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      glance(engine, const Duration(milliseconds: 600));
+      glance(engine, const Duration(milliseconds: 600));
+      await pumpEventQueue();
+      expect(strikes(seen), isEmpty, reason: 'two glances are not a pattern');
+
+      glance(engine, const Duration(milliseconds: 600));
+      await pumpEventQueue();
+      expect(
+        strikes(seen),
+        hasLength(1),
+        reason: 'the third glance of the minute is the violation',
+      );
+      expect(
+        seen.last,
+        GazeSignal.lookingAway,
+        reason: 'the frame that closed the third glance carries it, rather '
+            'than a later frame that shows a centred head',
+      );
+    });
+
+    test('three glances over ninety seconds are not', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      for (var i = 0; i < 3; i++) {
+        glance(
+          engine,
+          const Duration(milliseconds: 600),
+          gap: const Duration(seconds: 39),
+        );
+      }
+      await pumpEventQueue();
+      expect(
+        strikes(seen),
+        isEmpty,
+        reason: 'a glance a minute and a half ago is not evidence for this one',
+      );
+    });
+
+    test('five seconds off screen in total are one look away', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      // Fragments too short to count as a glance (300 ms against a 500 ms
+      // minimum), repeated: the shape the episode count cannot see, and the
+      // reason the total sits beside it. Two-second gaps, because the total is
+      // judged inside the same minute as the count - fragments a dozen seconds
+      // apart would age out before they added up to anything.
+      for (var i = 0; i < 16; i++) {
+        glance(
+          engine,
+          const Duration(milliseconds: 300),
+          gap: const Duration(seconds: 2),
+        );
+      }
+      await pumpEventQueue();
+      expect(strikes(seen), isEmpty, reason: '4.8 s is not five');
+
+      glance(
+        engine,
+        const Duration(milliseconds: 300),
+        gap: const Duration(seconds: 2),
+      );
+      await pumpEventQueue();
+      expect(strikes(seen), hasLength(1));
+    });
+
+    test('a strike empties the window, so the next burst is earned again',
+        () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      for (var i = 0; i < 3; i++) {
+        glance(engine, const Duration(milliseconds: 600));
+      }
+      await pumpEventQueue();
+      expect(strikes(seen), hasLength(1));
+
+      glance(engine, const Duration(milliseconds: 600));
+      glance(engine, const Duration(milliseconds: 600));
+      await pumpEventQueue();
+      expect(
+        strikes(seen),
+        hasLength(1),
+        reason: 'the strike consumed the glances it came from, so two are two',
+      );
+
+      glance(engine, const Duration(milliseconds: 600));
+      await pumpEventQueue();
+      expect(strikes(seen), hasLength(2));
+    });
+
+    test('a held turn is one strike, and is not also banked as a glance',
+        () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      hold(engine, turned, const Duration(seconds: 3));
+      await pumpEventQueue();
+      expect(strikes(seen), hasLength(1));
+
+      now = now.add(engine.inferenceInterval);
+      engine.handleResult(facing);
+      await pumpEventQueue();
+      expect(
+        strikes(seen),
+        hasLength(1),
+        reason: 'the run belonged to the sustained rule, so returning is not a '
+            'second strike',
+      );
+
+      // ...and its seconds are not in the window either: two glances after it
+      // are two glances, not three.
+      glance(engine, const Duration(milliseconds: 600));
+      glance(engine, const Duration(milliseconds: 600));
+      await pumpEventQueue();
+      expect(strikes(seen), hasLength(1));
+    });
+
+    test('a face lost mid-glance ends the glance rather than pausing it',
+        () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      hold(engine, turned, const Duration(milliseconds: 1500));
+      // No head to judge a pose from, so the run is over: the second and a half
+      // before it must not become a banked glance.
+      hold(
+        engine,
+        const FaceFrameResult(faceCount: 0),
+        const Duration(milliseconds: 450),
+      );
+      now = now.add(engine.inferenceInterval);
+      engine.handleResult(facing);
+
+      glance(engine, const Duration(milliseconds: 600));
+      glance(engine, const Duration(milliseconds: 600));
+      await pumpEventQueue();
+      expect(
+        strikes(seen),
+        isEmpty,
+        reason: 'the abandoned 1.5 s is no evidence, and two glances is not three',
+      );
+    });
+
+    test('a counter reset drops the evidence as well as the episode', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      glance(engine, const Duration(milliseconds: 600));
+      glance(engine, const Duration(milliseconds: 600));
+
+      // A camera that was not delivering saw no glances, so the two it did see
+      // must not be spent on the first ones after the gap.
+      engine.resetSustained();
+      glance(engine, const Duration(milliseconds: 600));
+      glance(engine, const Duration(milliseconds: 600));
+      await pumpEventQueue();
+      expect(strikes(seen), isEmpty);
+    });
+  });
+
   group('the start-up window', () {
     // The five seconds both platforms now ignore (`cameraStartupGrace`). The engine
     // used to judge its very first frame, so a student still moving the camera into

@@ -16,12 +16,16 @@
 ///     [lookAwayYawDegrees] left or right, or tilted past [lookAwayPitchDegrees]
 ///     up or down - one angle, the same on both axes and in both directions,
 ///     compared as an absolute value;
-///   * it is a **look-away** only once the head has stayed off screen for
-///     [lookAwaySustain] *without a single frame back inside the tolerances* -
-///     the sustain is measured on consecutive frames, so a glance and a return
-///     never add up to one strike;
+///   * it is a **look-away** when the head has stayed off screen for
+///     [lookAwaySustain] *without a single frame back inside the tolerances*;
+///   * beside that, a **window**: [lookAwayBurstCount] glances of at least
+///     [lookAwayMinEpisode] each, or [lookAwayBurstCumulative] of off-screen time
+///     in total, inside [lookAwayBurstWindow] are also one look-away - the shape
+///     the sustained rule cannot see (a student reading a printed sheet, the
+///     screen, the sheet again never holds one unbroken turn);
 ///   * one episode is one strike: the engine latches the signal until a frame
-///     comes back inside the tolerances;
+///     comes back inside the tolerances, and a strike empties the window it came
+///     from;
 ///   * and nothing is judged at all until [cameraStartupGrace] has passed since the
 ///     sitting's first frame, on either platform - a student is still arranging the
 ///     camera when the paper opens.
@@ -69,6 +73,64 @@ const double lookAwayPitchDegrees = 15.0;
 /// How long the head has to stay past [lookAwayYawDegrees] / [lookAwayPitchDegrees],
 /// across consecutive frames, before the look-away is reported.
 const Duration lookAwaySustain = Duration(seconds: 2);
+
+// ---------------------------------------------------------------------
+// The look-away rule, second half - the same question asked in a *window*:
+// **a glance that never lasts two seconds is still looking away, when it keeps
+// coming back.**
+// ---------------------------------------------------------------------
+// [lookAwaySustain] needs one unbroken two seconds, so a student who reads a
+// printed page, looks up at the screen, and goes back to the page is never
+// reported: every return inside the tolerances restarts the window. These four
+// numbers are the second way of asking the same question, and they are additive:
+// they sit *beside* the two-second rule, which is neither relaxed nor replaced by
+// them.
+//
+// Read the honesty note with them. Measured against a person, a glance at notes
+// is not misbehaviour, and this half of the rule is the one that makes natural
+// behaviour add up: a third glance inside a minute is a counted strike, and three
+// counted strikes stop the attempt for a supervisor. That is deliberate - a
+// sitting where the candidate is off screen every few seconds is not a sitting
+// where they are working on the paper - but the cost is real, and how often a
+// real student glances has not been measured here. See
+// `look_away_burst_window.dart` for how the numbers combine.
+
+/// How long a run of off-screen frames has to last before it counts as one
+/// glance rather than as detector jitter.
+///
+/// 500 ms is longer than a blink re-sampled across two frames of a ~7 FPS
+/// detector, longer than the wrong Euler estimate a single frame can produce, and
+/// shorter than the pause of someone who has actually turned to read something.
+/// A shorter run is still *measured* (it counts towards
+/// [lookAwayBurstCumulative]), it just cannot be one of the counted glances on its
+/// own.
+const Duration lookAwayMinEpisode = Duration(milliseconds: 500);
+
+/// The window repeated glances are counted in.
+///
+/// 60 s, because the rule is about *repeated* glances, not about a whole sitting:
+/// a student who looks away once a minute is not working from a second screen, and
+/// a glance that has fallen out of the window is no longer evidence for the glance
+/// just made. It slides with the clock rather than with frames, so a camera that
+/// stops delivering cannot keep old evidence alive.
+const Duration lookAwayBurstWindow = Duration(seconds: 60);
+
+/// How many glances inside [lookAwayBurstWindow] are one `looking_away`.
+///
+/// Three, which is what "repeated" means in practice and is deliberately above the
+/// two that a single look at a clock and a look back at the paper can produce.
+const int lookAwayBurstCount = 3;
+
+/// How much off-screen time inside [lookAwayBurstWindow] is one `looking_away`,
+/// however it was divided up.
+///
+/// This is the half that catches the shape the count cannot see: glances each too
+/// brief to be one of the three, repeated until they are a twentieth of the minute
+/// spent with the head off the screen. Five seconds is short enough that no
+/// ordinary reading position explains it, long enough that no blink or single bad
+/// frame does, and it is reachable without ever producing one counted glance -
+/// which is why it exists beside the count rather than instead of it.
+const Duration lookAwayBurstCumulative = Duration(seconds: 5);
 
 /// How long after the first frame of a sitting nothing is judged, on either
 /// platform.

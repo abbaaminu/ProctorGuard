@@ -163,8 +163,12 @@ const List<_Rule> _proctorRules = <_Rule>[
         'It runs for the whole sitting and your face has to be visible. Frames '
         'are checked on your own device for a missing or second face and for your '
         'head turned away from the screen, and a snapshot is kept with any '
-        'incident. Every snapshot is reviewed by a person — the app does not '
-        'judge it alone.',
+        'incident. A turn held for two seconds counts, and so do repeated ones: '
+        'three glances of half a second or more inside a minute, or five seconds '
+        'turned away in all within that minute, add up to the same thing — so '
+        'reading from notes on the desk is not the same as looking at the screen. '
+        'Every snapshot is reviewed by a person — the app does not judge it '
+        'alone.',
   ),
   _Rule(
     icon: Icons.mic_none_outlined,
@@ -201,11 +205,13 @@ const List<_Rule> _proctorRules = <_Rule>[
         'live. Not every signal weighs the same: a second person in frame, a face '
         'missing from the camera, leaving the exam screen, a second display, a '
         'virtual camera or developer tools each cost one strike, and so do a head '
-        'turned away from the screen for two seconds and noise the microphone '
-        'hears, whether it holds steady or comes back in bursts. Three strikes - '
-        'of any of those kinds, in any mix - stop the attempt and hand it to a '
-        'supervisor for review. A blocked paste, a suppressed right-click or '
-        'sitting idle is recorded and shown to them, but none of those counts. '
+        'turned away from the screen for two seconds — or a minute of shorter '
+        'glances, three of half a second or five seconds in all — and noise the '
+        'microphone hears, whether it holds steady or comes back in bursts. '
+        'Three strikes - of any of those kinds, in any mix - stop the attempt '
+        'and hand it to a supervisor for review. A blocked paste, a suppressed '
+        'right-click or sitting idle is recorded and shown to them, but none of '
+        'those counts. '
         'Nothing is disqualified automatically: an attempt under review has not '
         'been decided, and a supervisor either disqualifies it or restores it for '
         'marking. A decision aimed at the wrong candidate can be undone - the '
