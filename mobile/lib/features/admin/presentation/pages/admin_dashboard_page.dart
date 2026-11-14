@@ -9,10 +9,13 @@ import '../../../dashboard/presentation/pages/analytics_page.dart';
 import '../../../dashboard/presentation/pages/supervisor_exam_picker_page.dart';
 import '../../../supervision/presentation/pages/assign_supervisors_page.dart';
 import '../../../auth/domain/entities/user_profile.dart';
+import '../../domain/entities/admin_account_search.dart';
 import '../../domain/entities/managed_account.dart';
 import '../../domain/entities/profile_labels.dart';
+import '../../domain/entities/search_query.dart';
 import '../../domain/repositories/admin_user_repository.dart';
 import '../providers/admin_providers.dart';
+import '../widgets/admin_search_bar.dart';
 import '../widgets/bulk_student_upload_widget.dart';
 import '../widgets/label_correction_widget.dart';
 
@@ -893,7 +896,12 @@ class _OptionalLabelField extends StatelessWidget {
 /// The account roster: every profile row the caller may read, each with the
 /// menu that moves it to another role, the button that resets its password and
 /// the one that deletes it.
-class _RosterSection extends ConsumerWidget {
+///
+/// Filtering is local and the facet lists are built from the rows themselves
+/// ([AdminAccountSearch]), so the bar can offer a faculty this build's catalogue
+/// has never heard of, and a "Not stated" level exactly when some account
+/// leaves it blank — which is the state the label-correction card exists for.
+class _RosterSection extends ConsumerStatefulWidget {
   const _RosterSection({
     required this.selfId,
     required this.busyId,
@@ -913,7 +921,18 @@ class _RosterSection extends ConsumerWidget {
   final void Function(ManagedAccount account) onEditLabels;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_RosterSection> createState() => _RosterSectionState();
+}
+
+class _RosterSectionState extends ConsumerState<_RosterSection> {
+  /// What is narrowing the roster. The page's state, not the bar's, because the
+  /// page is what has the rows to count against.
+  SearchQuery _query = SearchQuery.empty;
+
+  void _resetQuery() => setState(() => _query = SearchQuery.empty);
+
+  @override
+  Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final accounts = ref.watch(managedAccountsProvider);
 
@@ -936,7 +955,7 @@ class _RosterSection extends ConsumerWidget {
             const Spacer(),
             TextButton.icon(
               key: const Key('admin-reload-accounts'),
-              onPressed: onRefresh,
+              onPressed: widget.onRefresh,
               icon: const Icon(Icons.refresh, size: 18),
               label: const Text('Reload'),
             ),
@@ -952,28 +971,49 @@ class _RosterSection extends ConsumerWidget {
             message: error is AdminAccountException
                 ? error.message
                 : 'Could not load the accounts.',
-            onRetry: onRefresh,
+            onRetry: widget.onRefresh,
           ),
-          data: (rows) => rows.isEmpty
-              ? const _RosterMessage(
-                  icon: Icons.group_outlined,
-                  message: 'No accounts to show yet.',
-                )
-              : Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    for (final account in rows)
-                      _AccountTile(
-                        account: account,
-                        isSelf: selfId != null && account.id == selfId,
-                        busy: busyId == account.id,
-                        onChangeRole: (role) => onChangeRole(account, role),
-                        onDelete: () => onDelete(account),
-                        onResetPassword: () => onResetPassword(account),
-                        onEditLabels: () => onEditLabels(account),
-                      ),
-                  ],
-                ),
+          data: (rows) {
+            final matched = AdminAccountSearch.filter(rows, _query);
+
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (rows.isNotEmpty)
+                  AdminSearchBar(
+                    key: const Key('admin-roster-search'),
+                    keyPrefix: 'admin-roster-search',
+                    query: _query,
+                    groups: AdminAccountSearch.groupsFor(rows),
+                    onChanged: (query) => setState(() => _query = query),
+                    matchCount: matched.length,
+                    totalCount: rows.length,
+                    noun: 'accounts',
+                    hintText: 'Search by name, email, role, number, label…',
+                  ),
+                if (rows.isEmpty)
+                  const _RosterMessage(
+                    icon: Icons.group_outlined,
+                    message: 'No accounts to show yet.',
+                  )
+                else if (matched.isEmpty)
+                  AdminSearchEmpty(noun: 'accounts', onReset: _resetQuery)
+                else
+                  for (final account in matched)
+                    _AccountTile(
+                      account: account,
+                      isSelf: widget.selfId != null &&
+                          account.id == widget.selfId,
+                      busy: widget.busyId == account.id,
+                      onChangeRole: (role) =>
+                          widget.onChangeRole(account, role),
+                      onDelete: () => widget.onDelete(account),
+                      onResetPassword: () => widget.onResetPassword(account),
+                      onEditLabels: () => widget.onEditLabels(account),
+                    ),
+              ],
+            );
+          },
         ),
       ],
     );

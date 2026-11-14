@@ -6,6 +6,7 @@ import 'package:proctorguard/features/admin/domain/entities/profile_labels.dart'
 import 'package:proctorguard/features/admin/domain/entities/student_roster.dart';
 import 'package:proctorguard/features/admin/domain/repositories/admin_user_repository.dart';
 import 'package:proctorguard/features/admin/presentation/providers/admin_providers.dart';
+import 'package:proctorguard/features/admin/presentation/widgets/admin_search_bar.dart';
 import 'package:proctorguard/features/auth/domain/entities/user_profile.dart';
 import 'package:proctorguard/features/auth/domain/repositories/profile_repository.dart';
 import 'package:proctorguard/features/auth/presentation/providers/profile_provider.dart';
@@ -840,6 +841,41 @@ void main() {
       );
       // An account with nothing recorded keeps the plain one-line tile.
       expect(find.text('manager@proctor.test'), findsOneWidget);
+    });
+
+    testWidgets('the roster search narrows it, and its reset puts it back', (
+      tester,
+    ) async {
+      useDesktopSurface(tester);
+      profiles.behaviour = () => Future<UserProfile>.value(rootAdmin);
+
+      await tester.pumpWidget(gateUnderTest(userId: rootAdmin.id));
+      await tester.pumpAndSettle();
+
+      final field = find.byKey(const Key('admin-roster-search-field'));
+      expect(field, findsOneWidget);
+      expect(find.text('3 accounts'), findsOneWidget);
+
+      // A supervisor with no name is found by the address its tile prints.
+      await tester.enterText(field, 'manager');
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.pumpAndSettle();
+      expect(find.text('Aisha Bello'), findsNothing);
+      expect(find.text('manager@proctor.test'), findsOneWidget);
+      expect(find.text('1 of 3 accounts'), findsOneWidget);
+
+      // Typing something that matches nothing offers the way out, and taking it
+      // restores the roster — including the box itself, which the page cleared.
+      await tester.enterText(field, 'nobody-by-that-name');
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.pumpAndSettle();
+      expect(find.byType(AdminSearchEmpty), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('accounts-clear-filters')));
+      await tester.pumpAndSettle();
+      expect(find.text('Aisha Bello'), findsOneWidget);
+      expect(find.text('3 accounts'), findsOneWidget);
+      expect(tester.widget<TextField>(field).controller!.text, isEmpty);
     });
 
     testWidgets('the signed-in admin is listed but cannot re-role themselves', (

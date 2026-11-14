@@ -3,9 +3,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/widgets/home_button.dart';
 import '../../../admin/domain/entities/managed_account.dart';
+import '../../../admin/domain/entities/search_query.dart';
 import '../../../admin/presentation/providers/admin_providers.dart';
+import '../../../admin/presentation/widgets/admin_search_bar.dart';
 import '../../../auth/domain/entities/user_profile.dart';
 import '../../../exam/domain/entities/exam.dart';
+import '../../domain/entities/exam_assignment_search.dart';
 import '../../domain/entities/supervisor_assignment.dart';
 import '../../domain/repositories/supervision_repository.dart';
 import '../providers/supervision_providers.dart';
@@ -30,11 +33,23 @@ import '../providers/supervision_providers.dart';
 /// `is_admin()` and `guard_supervisor_assignment()` refuses any account that is not a
 /// supervisor, so the "no supervisor accounts" state is a prompt to create one, not a
 /// gap this screen could fill itself.
-class AssignSupervisorsPage extends ConsumerWidget {
+class AssignSupervisorsPage extends ConsumerStatefulWidget {
   const AssignSupervisorsPage({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<AssignSupervisorsPage> createState() =>
+      _AssignSupervisorsPageState();
+}
+
+class _AssignSupervisorsPageState extends ConsumerState<AssignSupervisorsPage> {
+  /// What is narrowing the paper list. Held here rather than inside the bar
+  /// because the page owns the rows the count is taken from.
+  SearchQuery _query = SearchQuery.empty;
+
+  void _resetQuery() => setState(() => _query = SearchQuery.empty);
+
+  @override
+  Widget build(BuildContext context) {
     final exams = ref.watch(supervisionExamsProvider);
     final assignments = ref.watch(supervisorAssignmentsProvider);
     final accounts = ref.watch(managedAccountsProvider);
@@ -81,7 +96,6 @@ class AssignSupervisorsPage extends ConsumerWidget {
             child: error != null
                 ? _AssignmentsError(error: '$error', onRetry: refresh)
                 : _body(
-                    ref,
                     exams.valueOrNull,
                     assignments.valueOrNull,
                     accounts.valueOrNull,
@@ -93,7 +107,6 @@ class AssignSupervisorsPage extends ConsumerWidget {
   }
 
   Widget _body(
-    WidgetRef ref,
     List<Exam>? examRows,
     List<SupervisorAssignment>? rows,
     List<ManagedAccount>? accounts,
@@ -115,7 +128,7 @@ class AssignSupervisorsPage extends ConsumerWidget {
         .where((account) => account.role == UserRole.supervisor)
         .toList()
       ..sort((a, b) =>
-          _label(a).toLowerCase().compareTo(_label(b).toLowerCase()));
+          _labelOf(a).toLowerCase().compareTo(_labelOf(b).toLowerCase()));
 
     final byId = {for (final account in accounts) account.id: account};
     final assigned = <String, List<ManagedAccount>>{};
@@ -127,32 +140,69 @@ class AssignSupervisorsPage extends ConsumerWidget {
       (assigned[row.examId] ??= <ManagedAccount>[]).add(account);
     }
 
-    return ListView(
-      padding: const EdgeInsets.symmetric(vertical: 8),
+    final papers = <ExamAssignmentRow>[
+      for (final exam in examRows)
+        ExamAssignmentRow(
+          exam: exam,
+          supervisors: assigned[exam.id] ?? const <ManagedAccount>[],
+        ),
+    ];
+    final visible = ExamAssignmentSearch.filter(papers, _query);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        if (supervisors.isEmpty)
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 0, 16, 12),
-            child: Text(
-              'No supervisor accounts yet. Create one with the Supervisor role in '
-              'this console, then come back to assign it a paper.',
-              key: Key('assign-supervisors-no-supervisors'),
-            ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+          child: AdminSearchBar(
+            key: const Key('assign-supervisors-search'),
+            keyPrefix: 'assign-supervisors-search',
+            query: _query,
+            groups: ExamAssignmentSearch.groupsFor(papers),
+            onChanged: (query) => setState(() => _query = query),
+            matchCount: visible.length,
+            totalCount: papers.length,
+            noun: 'papers',
+            hintText: 'Search by title, faculty, level, supervisor, status…',
           ),
-        for (final exam in examRows)
-          _ExamAssignmentTile(
-            exam: exam,
-            assigned: assigned[exam.id] ?? const <ManagedAccount>[],
-            supervisors: supervisors,
-            onChanged: () => ref.invalidate(supervisorAssignmentsProvider),
+        ),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            children: [
+              if (supervisors.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(16, 0, 16, 12),
+                  child: Text(
+                    'No supervisor accounts yet. Create one with the Supervisor '
+                    'role in this console, then come back to assign it a paper.',
+                    key: Key('assign-supervisors-no-supervisors'),
+                  ),
+                ),
+              if (visible.isEmpty)
+                AdminSearchEmpty(noun: 'papers', onReset: _resetQuery)
+              else
+                for (final paper in visible)
+                  _ExamAssignmentTile(
+                    exam: paper.exam,
+                    assigned: paper.supervisors,
+                    supervisors: supervisors,
+                    onChanged: () =>
+                        ref.invalidate(supervisorAssignmentsProvider),
+                  ),
+            ],
           ),
+        ),
       ],
     );
   }
-
-  static String _label(ManagedAccount account) =>
-      supervisorLabel(fullName: account.fullName, email: account.email);
 }
+
+/// The name the tile, the picker and the search index all show for [account]:
+/// the one [supervisorLabel] builds, so a paper's "who runs this" line and what
+/// an administrator typed cannot disagree.
+String _labelOf(ManagedAccount account) =>
+    supervisorLabel(fullName: account.fullName, email: account.email);
 
 /// One paper, the supervisors on it, and the control that opens the picker.
 class _ExamAssignmentTile extends StatelessWidget {
@@ -171,7 +221,7 @@ class _ExamAssignmentTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final names = assigned.map(AssignSupervisorsPage._label).toList();
+    final names = assigned.map(_labelOf).toList();
 
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),

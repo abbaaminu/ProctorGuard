@@ -3,9 +3,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/services/supabase_service.dart';
 import '../../../../core/widgets/home_button.dart';
+import '../../../admin/domain/entities/search_query.dart';
+import '../../../admin/presentation/widgets/admin_search_bar.dart';
 import '../../../proctoring/domain/entities/proctoring_risk.dart';
 import '../../../proctoring/domain/entities/violation.dart';
 import '../../../proctoring/presentation/widgets/risk_index_chip.dart';
+import '../../domain/entities/attempt_search.dart';
 import '../../domain/repositories/dashboard_repository.dart';
 import '../providers/dashboard_providers.dart';
 import 'analytics_page.dart';
@@ -493,200 +496,198 @@ class SupervisorDashboardPage extends ConsumerWidget {
                       message: 'Could not load the roster.',
                       detail: '$error',
                     ),
-                    data: (rows) => rows.isEmpty
-                        ? const _FeedEmpty(
-                            message: 'No student has started this exam yet.',
-                          )
-                        : ListView.builder(
-                            itemCount: orderedRoster.length,
-                            itemBuilder: (context, i) {
-                              final row = orderedRoster[i];
-                              final status = row['status'] as String;
-                              final score = row['score'];
-                              final flags = flagsBySubmission[row['id']] ?? 0;
+                    data: (rows) => _MonitorRoster(
+                      rows: orderedRoster,
+                      nameById: nameById,
+                      flagsBySubmission: flagsBySubmission,
+                      emptyMessage: 'No student has started this exam yet.',
+                      itemBuilder: (context, row) {
+                        final status = row['status'] as String;
+                        final score = row['score'];
+                        final flags = flagsBySubmission[row['id']] ?? 0;
 
-                              // Was anything actually watching? An empty
-                              // violation feed and a client that stopped
-                              // reporting look identical without this.
-                              final pulse = proctorPulseFor(row, now: now);
-                              final pulseText = pulse == null
-                                  ? ''
-                                  : '  •  ${proctorPulseText(pulse, now: now, lastHeartbeatAt: row['last_heartbeat_at'])}';
+                        // Was anything actually watching? An empty
+                        // violation feed and a client that stopped
+                        // reporting look identical without this.
+                        final pulse = proctorPulseFor(row, now: now);
+                        final pulseText = pulse == null
+                            ? ''
+                            : '  •  ${proctorPulseText(pulse, now: now, lastHeartbeatAt: row['last_heartbeat_at'])}';
 
-                              // The same evidence the "N flags" count is made of,
-                              // scored: flags are the strikes, the mapped signals
-                              // are the mix. Zero flags short-circuits to "no
-                              // evidence", so an untouched attempt is never
-                              // labelled.
-                              final risk = ProctoringRisk.fromViolations(
-                                signalsBySubmission[row['id']] ??
-                                    const <ViolationType>{},
-                                serverStrikes: flags,
-                              );
+                        // The same evidence the "N flags" count is made of,
+                        // scored: flags are the strikes, the mapped signals
+                        // are the mix. Zero flags short-circuits to "no
+                        // evidence", so an untouched attempt is never
+                        // labelled.
+                        final risk = ProctoringRisk.fromViolations(
+                          signalsBySubmission[row['id']] ??
+                              const <ViolationType>{},
+                          serverStrikes: flags,
+                        );
 
-                              return Card(
-                                margin: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                  vertical: 6,
-                                ),
-                                child: ListTile(
-                                  leading: CircleAvatar(
-                                    backgroundColor: _statusColor(status),
-                                    child: Text(
-                                      status.substring(0, 1).toUpperCase(),
-                                      style:
-                                          const TextStyle(color: Colors.white),
-                                    ),
-                                  ),
-                                  title: Text(
-                                    nameById[row['student_id'] as String] ??
-                                        'Student ${_shortId(row['student_id'])}',
-                                  ),
-                                  subtitle: Text(
-                                    'Status: $status'
-                                    '${score != null ? '  •  Score: $score' : ''}'
-                                    '$pulseText',
-                                  ),
-                                  trailing: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      // Band word only: the row already prints
-                                      // its flag count, and the tooltip carries
-                                      // the breakdown of what the score is made
-                                      // of. Hidden at zero flags so a clean row
-                                      // stays as quiet as it was.
-                                      if (flags > 0) ...[
-                                        RiskIndexChip(
-                                          key: Key('risk-${row['id']}'),
-                                          risk: risk,
-                                          compact: true,
-                                        ),
-                                        const SizedBox(width: 8),
-                                      ],
-                                      Text(
-                                        '$flags flags',
-                                        style: TextStyle(
-                                          color: flags > 0
-                                              ? Colors.orange
-                                              : Theme.of(context)
-                                                  .colorScheme
-                                                  .onSurfaceVariant,
-                                        ),
-                                      ),
-                                      // The decision controls: only on an attempt
-                                      // that is actually waiting for one, and only
-                                      // for the tier the RPC accepts.
-                                      if (canResolveHere &&
-                                          status == 'flagged_for_review')
-                                        Consumer(
-                                          builder: (context, watchRef, _) {
-                                            final resolving = watchRef.watch(
-                                              attemptResolutionInFlightProvider(
-                                                row['id'] as String,
-                                              ),
-                                            );
-                                            if (resolving) {
-                                              return const Padding(
-                                                padding: EdgeInsets.symmetric(
-                                                  horizontal: 12,
-                                                ),
-                                                child: SizedBox(
-                                                  height: 18,
-                                                  width: 18,
-                                                  child:
-                                                      CircularProgressIndicator(
-                                                    strokeWidth: 2,
-                                                  ),
-                                                ),
-                                              );
-                                            }
-                                            return Row(
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: [
-                                                // The unlock: the control that
-                                                // makes the student's exam
-                                                // attempt usable again. The RPC
-                                                // is `resolve_flagged_attempt`
-                                                // with 'clear', which restores the
-                                                // attempt to 'submitted' and marks
-                                                // it from the answers already
-                                                // saved - so the word on the
-                                                // console is "unlock", and the
-                                                // tooltip says what that means.
-                                                IconButton(
-                                                  key: Key(
-                                                    'resolve-clear-${row['id']}',
-                                                  ),
-                                                  tooltip: 'Unlock: clear the '
-                                                      'review flag and restore '
-                                                      'the attempt to submitted '
-                                                      'for marking',
-                                                  onPressed: () => resolveAttempt(
-                                                    row,
-                                                    'clear',
-                                                  ),
-                                                  icon: const Icon(
-                                                    Icons.lock_open_outlined,
-                                                    color: Colors.green,
-                                                  ),
-                                                ),
-                                                IconButton(
-                                                  key: Key(
-                                                    'resolve-disqualify-${row['id']}',
-                                                  ),
-                                                  tooltip: 'Disqualify this '
-                                                      'attempt',
-                                                  onPressed: () => resolveAttempt(
-                                                    row,
-                                                    'disqualify',
-                                                  ),
-                                                  icon: const Icon(
-                                                    Icons.gavel,
-                                                    color: Colors.redAccent,
-                                                  ),
-                                                ),
-                                              ],
-                                            );
-                                          },
-                                        ),
-                                      if (canResetAttempts && canResetThisExam)
-                                        Consumer(
-                                          builder: (context, watchRef, _) {
-                                            final resetting = watchRef.watch(
-                                              submissionResetInFlightProvider(
-                                                row['id'] as String,
-                                              ),
-                                            );
-                                            return IconButton(
-                                              key: Key(
-                                                'reset-attempt-${row['id']}',
-                                              ),
-                                              tooltip: 'Reset attempt',
-                                              onPressed: resetting
-                                                  ? null
-                                                  : () => resetAttempt(row),
-                                              icon: resetting
-                                                  ? const SizedBox(
-                                                      width: 18,
-                                                      height: 18,
-                                                      child:
-                                                          CircularProgressIndicator(
-                                                        strokeWidth: 2,
-                                                      ),
-                                                    )
-                                                  : const Icon(
-                                                      Icons.restart_alt,
-                                                      color: Colors.redAccent,
-                                                    ),
-                                            );
-                                          },
-                                        ),
-                                    ],
-                                  ),
-                                ),
-                              );
-                            },
+                        return Card(
+                          margin: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 6,
                           ),
+                          child: ListTile(
+                            leading: CircleAvatar(
+                              backgroundColor: _statusColor(status),
+                              child: Text(
+                                status.substring(0, 1).toUpperCase(),
+                                style:
+                                    const TextStyle(color: Colors.white),
+                              ),
+                            ),
+                            title: Text(
+                              nameById[row['student_id'] as String] ??
+                                  'Student ${_shortId(row['student_id'])}',
+                            ),
+                            subtitle: Text(
+                              'Status: $status'
+                              '${score != null ? '  •  Score: $score' : ''}'
+                              '$pulseText',
+                            ),
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                // Band word only: the row already prints
+                                // its flag count, and the tooltip carries
+                                // the breakdown of what the score is made
+                                // of. Hidden at zero flags so a clean row
+                                // stays as quiet as it was.
+                                if (flags > 0) ...[
+                                  RiskIndexChip(
+                                    key: Key('risk-${row['id']}'),
+                                    risk: risk,
+                                    compact: true,
+                                  ),
+                                  const SizedBox(width: 8),
+                                ],
+                                Text(
+                                  '$flags flags',
+                                  style: TextStyle(
+                                    color: flags > 0
+                                        ? Colors.orange
+                                        : Theme.of(context)
+                                            .colorScheme
+                                            .onSurfaceVariant,
+                                  ),
+                                ),
+                                // The decision controls: only on an attempt
+                                // that is actually waiting for one, and only
+                                // for the tier the RPC accepts.
+                                if (canResolveHere &&
+                                    status == 'flagged_for_review')
+                                  Consumer(
+                                    builder: (context, watchRef, _) {
+                                      final resolving = watchRef.watch(
+                                        attemptResolutionInFlightProvider(
+                                          row['id'] as String,
+                                        ),
+                                      );
+                                      if (resolving) {
+                                        return const Padding(
+                                          padding: EdgeInsets.symmetric(
+                                            horizontal: 12,
+                                          ),
+                                          child: SizedBox(
+                                            height: 18,
+                                            width: 18,
+                                            child:
+                                                CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                            ),
+                                          ),
+                                        );
+                                      }
+                                      return Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          // The unlock: the control that
+                                          // makes the student's exam
+                                          // attempt usable again. The RPC
+                                          // is `resolve_flagged_attempt`
+                                          // with 'clear', which restores the
+                                          // attempt to 'submitted' and marks
+                                          // it from the answers already
+                                          // saved - so the word on the
+                                          // console is "unlock", and the
+                                          // tooltip says what that means.
+                                          IconButton(
+                                            key: Key(
+                                              'resolve-clear-${row['id']}',
+                                            ),
+                                            tooltip: 'Unlock: clear the '
+                                                'review flag and restore '
+                                                'the attempt to submitted '
+                                                'for marking',
+                                            onPressed: () => resolveAttempt(
+                                              row,
+                                              'clear',
+                                            ),
+                                            icon: const Icon(
+                                              Icons.lock_open_outlined,
+                                              color: Colors.green,
+                                            ),
+                                          ),
+                                          IconButton(
+                                            key: Key(
+                                              'resolve-disqualify-${row['id']}',
+                                            ),
+                                            tooltip: 'Disqualify this '
+                                                'attempt',
+                                            onPressed: () => resolveAttempt(
+                                              row,
+                                              'disqualify',
+                                            ),
+                                            icon: const Icon(
+                                              Icons.gavel,
+                                              color: Colors.redAccent,
+                                            ),
+                                          ),
+                                        ],
+                                      );
+                                    },
+                                  ),
+                                if (canResetAttempts && canResetThisExam)
+                                  Consumer(
+                                    builder: (context, watchRef, _) {
+                                      final resetting = watchRef.watch(
+                                        submissionResetInFlightProvider(
+                                          row['id'] as String,
+                                        ),
+                                      );
+                                      return IconButton(
+                                        key: Key(
+                                          'reset-attempt-${row['id']}',
+                                        ),
+                                        tooltip: 'Reset attempt',
+                                        onPressed: resetting
+                                            ? null
+                                            : () => resetAttempt(row),
+                                        icon: resetting
+                                            ? const SizedBox(
+                                                width: 18,
+                                                height: 18,
+                                                child:
+                                                    CircularProgressIndicator(
+                                                  strokeWidth: 2,
+                                                ),
+                                              )
+                                            : const Icon(
+                                                Icons.restart_alt,
+                                                color: Colors.redAccent,
+                                              ),
+                                      );
+                                    },
+                                  ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
                   ),
                 ),
               ],
@@ -742,6 +743,96 @@ class SupervisorDashboardPage extends ConsumerWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// The student status grid with its search bar.
+///
+/// Split out of [SupervisorDashboardPage] only so the query can be state: the
+/// page itself takes no state (everything else it draws comes from a stream), and
+/// the tile it renders is built by a closure over that page's locals, so the
+/// filter here decides *which* rows to draw and nothing else. Filtering is local
+/// because the roster is already streaming whole; the count above the list is
+/// therefore instant, and the live feed beside it is untouched.
+class _MonitorRoster extends StatefulWidget {
+  const _MonitorRoster({
+    required this.rows,
+    required this.nameById,
+    required this.flagsBySubmission,
+    required this.itemBuilder,
+    required this.emptyMessage,
+  });
+
+  /// Attempts in the order the page wants them (flagged first).
+  final List<Map<String, dynamic>> rows;
+
+  /// `student_id -> name`, so a surname typed into the box matches a row whose
+  /// raw data only carries a uuid.
+  final Map<String, String> nameById;
+
+  /// Incidents per attempt, so "3 flags" and "no flags" are searchable.
+  final Map<String, int> flagsBySubmission;
+
+  final Widget Function(BuildContext context, Map<String, dynamic> row)
+      itemBuilder;
+
+  /// Shown when the exam has no attempts at all — distinct from "nothing matches
+  /// these filters", which offers the reset.
+  final String emptyMessage;
+
+  @override
+  State<_MonitorRoster> createState() => _MonitorRosterState();
+}
+
+class _MonitorRosterState extends State<_MonitorRoster> {
+  SearchQuery _query = SearchQuery.empty;
+
+  void _resetQuery() => setState(() => _query = SearchQuery.empty);
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = widget.rows;
+    if (rows.isEmpty) return _FeedEmpty(message: widget.emptyMessage);
+
+    final visible = AttemptSearch.filter(
+      rows,
+      _query,
+      nameById: widget.nameById,
+      flagsBySubmission: widget.flagsBySubmission,
+    );
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+          child: AdminSearchBar(
+            key: const Key('monitor-roster-search'),
+            keyPrefix: 'monitor-roster-search',
+            query: _query,
+            groups: AttemptSearch.groupsFor(rows),
+            onChanged: (query) => setState(() => _query = query),
+            matchCount: visible.length,
+            totalCount: rows.length,
+            noun: 'attempts',
+            hintText: 'Search by student, status, score, id…',
+          ),
+        ),
+        Expanded(
+          child: visible.isEmpty
+              ? ListView(
+                  children: [
+                    AdminSearchEmpty(noun: 'attempts', onReset: _resetQuery),
+                  ],
+                )
+              : ListView.builder(
+                  itemCount: visible.length,
+                  itemBuilder: (context, i) =>
+                      widget.itemBuilder(context, visible[i]),
+                ),
+        ),
+      ],
     );
   }
 }

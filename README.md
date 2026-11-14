@@ -21,6 +21,19 @@ supabase/     Schema, migrations, seed data, and Edge Functions
   misspelt `faculty` / `department` / `level` is the usual reason a student never
   sees the paper set for their class, and repairing it is the administrator's job
   rather than theirs.
+- **Every admin list** — the accounts roster, Assign supervisors, and the live
+  monitor's roster — carries the same search-and-filter bar: one box that matches
+  every field the list knows (name, address, matric or staff number, paper title,
+  status, score, the formatted date), one chip per facet built from the rows
+  themselves (role, faculty, department, level, labels; published or draft,
+  assigned or nobody assigned; attempt status), a result count and one reset.
+  The matching is **local**: those rows are already in memory from the reads each
+  screen makes, so no query is re-issued and nothing about `profiles_admin_all`,
+  `exams_select` or `can_reach_exam` changes — the bar narrows a list its reader
+  could already see. Typed text is compared literally (`%`, `_`, `,`, brackets and
+  quotes are ordinary characters, which is what a matric number like
+  `CSC/2021/041` needs), and filters combine as AND across facets and OR within
+  one.
 - **Lecturers** author the papers they own — multiple-choice, true/false,
   fill-in-the-blank and essay questions — publish them when they are ready, and
   mark the essays that come back. Only the paper's owner (or an administrator)
