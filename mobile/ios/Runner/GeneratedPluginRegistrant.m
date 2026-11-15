@@ -48,10 +48,10 @@
 @import permission_handler_apple;
 #endif
 
-#if __has_include(<record_ios/RecordIosPlugin.h>)
-#import <record_ios/RecordIosPlugin.h>
+#if __has_include(<record_darwin/RecordDarwinPlugin.h>)
+#import <record_darwin/RecordDarwinPlugin.h>
 #else
-@import record_ios;
+@import record_darwin;
 #endif
 
 #if __has_include(<sentry_flutter/SentryFlutterPlugin.h>)
@@ -82,7 +82,7 @@
   [GoogleMlKitFaceDetectionPlugin registerWithRegistrar:[registry registrarForPlugin:@"GoogleMlKitFaceDetectionPlugin"]];
   [FPPPackageInfoPlusPlugin registerWithRegistrar:[registry registrarForPlugin:@"FPPPackageInfoPlusPlugin"]];
   [PermissionHandlerPlugin registerWithRegistrar:[registry registrarForPlugin:@"PermissionHandlerPlugin"]];
-  [RecordIosPlugin registerWithRegistrar:[registry registrarForPlugin:@"RecordIosPlugin"]];
+  [RecordDarwinPlugin registerWithRegistrar:[registry registrarForPlugin:@"RecordDarwinPlugin"]];
   [SentryFlutterPlugin registerWithRegistrar:[registry registrarForPlugin:@"SentryFlutterPlugin"]];
   [SharedPreferencesPlugin registerWithRegistrar:[registry registrarForPlugin:@"SharedPreferencesPlugin"]];
   [URLLauncherPlugin registerWithRegistrar:[registry registrarForPlugin:@"URLLauncherPlugin"]];
