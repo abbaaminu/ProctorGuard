@@ -169,7 +169,6 @@ jobs:
       - name: Check out the private source repository
         uses: actions/checkout@v7
 
-      # ADD THIS STEP HERE TO FREE UP ~20GB+ OF DISK SPACE
       - name: Free Disk Space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/sample-index
