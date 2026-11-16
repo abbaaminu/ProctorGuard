@@ -1,5 +1,6 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../../../../core/utils/read_timeout.dart';
 import '../../domain/entities/proctor_consent.dart';
 import '../../domain/repositories/consent_repository.dart';
 
@@ -13,9 +14,17 @@ import '../../domain/repositories/consent_repository.dart';
 /// direct insert would fail the "own row only" policy anyway, and would not stamp
 /// the transport User-Agent.
 class ConsentRepositoryImpl implements ConsentRepository {
-  ConsentRepositoryImpl(this._client);
+  ConsentRepositoryImpl(this._client, {this.readTimeout = defaultReadTimeout});
 
   final SupabaseClient _client;
+
+  /// The deadline on [hasCurrentConsent] and [currentServerVersion] - the two
+  /// reads that stand between a student and their paper. See
+  /// `core/utils/read_timeout.dart`.
+  ///
+  /// [recordConsent] is not bounded: it is the acceptance itself, and a timeout
+  /// that fired after the row was written would ask the student to accept again.
+  final Duration readTimeout;
 
   @override
   Future<bool> hasCurrentConsent(String examId) async {
@@ -24,24 +33,30 @@ class ConsentRepositoryImpl implements ConsentRepository {
     // would refuse everything anyway.
     if (uid == null) return false;
 
-    final rows = await _client
-        .from('proctoring_consents')
-        .select('id')
-        .eq('student_id', uid)
-        .eq('consent_version', ProctorConsentConfig.version)
-        // Either shape the policy accepts: this paper, or a general acceptance.
-        .or('exam_id.eq.$examId,exam_id.is.null')
-        .limit(1);
+    final rows = await withReadTimeout<PostgrestList>(
+      () => _client
+          .from('proctoring_consents')
+          .select('id')
+          .eq('student_id', uid)
+          .eq('consent_version', ProctorConsentConfig.version)
+          // Either shape the policy accepts: this paper, or a general acceptance.
+          .or('exam_id.eq.$examId,exam_id.is.null')
+          .limit(1),
+      timeout: readTimeout,
+    );
     return (rows as List).isNotEmpty;
   }
 
   @override
   Future<String?> currentServerVersion() async {
-    final row = await _client
-        .from('proctoring_consent_config')
-        .select('current_version')
-        .eq('id', 1)
-        .maybeSingle();
+    final row = await withReadTimeout<Map<String, dynamic>?>(
+      () => _client
+          .from('proctoring_consent_config')
+          .select('current_version')
+          .eq('id', 1)
+          .maybeSingle(),
+      timeout: readTimeout,
+    );
     return row?['current_version'] as String?;
   }
 

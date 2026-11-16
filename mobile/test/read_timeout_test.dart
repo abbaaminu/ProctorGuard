@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:proctorguard/core/utils/read_timeout.dart';
+import 'package:proctorguard/features/exam/data/repositories/consent_repository_impl.dart';
 import 'package:proctorguard/features/exam/data/repositories/exam_repository_impl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -135,6 +136,39 @@ void main() {
 
       expect(transport.requests.single.url.path, '/rest/v1/questions_public');
       expect(transport.requests.single.url.query, contains('exam_id=eq.exam-1'));
+    });
+  });
+
+  group('the consent reads', () {
+    test('the gating version gives up and says the server did not answer',
+        () async {
+      final transport = _HungTransport();
+      final repository = ConsentRepositoryImpl(
+        _clientOver(transport),
+        readTimeout: _testTimeout,
+      );
+
+      await expectLater(repository.currentServerVersion(), _throwsTheSentence);
+
+      expect(transport.requests, hasLength(1));
+      expect(
+        transport.requests.single.url.path,
+        '/rest/v1/proctoring_consent_config',
+      );
+    });
+
+    test('no session is answered without a request, so no deadline applies',
+        () async {
+      // `hasCurrentConsent` returns before it reads when there is no user - the
+      // one branch where a hung transport cannot strand the consent gate.
+      final transport = _HungTransport();
+      final repository = ConsentRepositoryImpl(
+        _clientOver(transport),
+        readTimeout: _testTimeout,
+      );
+
+      expect(await repository.hasCurrentConsent('exam-1'), isFalse);
+      expect(transport.requests, isEmpty);
     });
   });
 }
