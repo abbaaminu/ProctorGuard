@@ -7,6 +7,8 @@ import 'package:proctorguard/features/dashboard/data/repositories/dashboard_repo
 import 'package:proctorguard/features/dashboard/domain/repositories/dashboard_repository.dart';
 import 'package:proctorguard/features/exam/data/repositories/consent_repository_impl.dart';
 import 'package:proctorguard/features/exam/data/repositories/exam_repository_impl.dart';
+import 'package:proctorguard/features/supervision/data/repositories/supervision_repository_impl.dart';
+import 'package:proctorguard/features/supervision/domain/repositories/supervision_repository.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 /// A transport whose every request is accepted and never answered - the shape a
@@ -203,6 +205,49 @@ void main() {
           '/rest/v1/proctoring_logs',
         ]),
       );
+    });
+  });
+
+  group('the assignment console reads', () {
+    test('the assignment list gives up as an unreachable server', () async {
+      final transport = _HungTransport();
+      final repository = SupervisionRepositoryImpl(
+        _clientOver(transport),
+        readTimeout: _testTimeout,
+      );
+
+      // The deadline lands in the `catch (_)` the method already has, so an
+      // administrator sees exactly what a refused connection shows them.
+      await expectLater(
+        repository.listAssignments(),
+        throwsA(
+          isA<SupervisionException>()
+              .having((error) => error.message, 'message', readTimeoutMessage),
+        ),
+      );
+
+      expect(
+        transport.requests.single.url.path,
+        '/rest/v1/supervisor_exam_assignments',
+      );
+    });
+
+    test('the paper list does, on the same sentence', () async {
+      final transport = _HungTransport();
+      final repository = SupervisionRepositoryImpl(
+        _clientOver(transport),
+        readTimeout: _testTimeout,
+      );
+
+      await expectLater(
+        repository.listExams(),
+        throwsA(
+          isA<SupervisionException>()
+              .having((error) => error.message, 'message', readTimeoutMessage),
+        ),
+      );
+
+      expect(transport.requests.single.url.path, '/rest/v1/exams');
     });
   });
 }

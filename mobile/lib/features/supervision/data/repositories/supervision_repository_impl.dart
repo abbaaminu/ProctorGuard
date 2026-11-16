@@ -1,5 +1,6 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../../../../core/utils/read_timeout.dart';
 import '../../../exam/domain/entities/exam.dart';
 import '../../domain/entities/supervisor_assignment.dart';
 import '../../domain/repositories/supervision_repository.dart';
@@ -15,20 +16,34 @@ import '../../domain/repositories/supervision_repository.dart';
 /// it, so *who* assigned the paper is the database's answer rather than this client's
 /// claim (the rule `session_reset_logs.actor_id` follows).
 class SupervisionRepositoryImpl implements SupervisionRepository {
-  SupervisionRepositoryImpl(this._client);
+  SupervisionRepositoryImpl(
+    this._client, {
+    this.readTimeout = defaultReadTimeout,
+  });
 
   /// The table, named once so the console's messages and the query cannot drift.
   static const String assignmentsTable = 'supervisor_exam_assignments';
 
   final SupabaseClient _client;
 
+  /// The deadline on [listAssignments] and [listExams] - the two reads that fill
+  /// the assignment console. See `core/utils/read_timeout.dart`.
+  ///
+  /// [assign] and [unassign] are not bounded: both already report a lost response
+  /// through the same sentence, and re-sending an insert the server may have
+  /// applied would turn "already assigned" (`23505`) into a mystery.
+  final Duration readTimeout;
+
   @override
   Future<List<SupervisorAssignment>> listAssignments() async {
     try {
-      final rows = await _client
-          .from(assignmentsTable)
-          .select('exam_id, supervisor_id, assigned_at')
-          .order('assigned_at');
+      final rows = await withReadTimeout<PostgrestList>(
+        () => _client
+            .from(assignmentsTable)
+            .select('exam_id, supervisor_id, assigned_at')
+            .order('assigned_at'),
+        timeout: readTimeout,
+      );
       return (rows as List)
           .cast<Map<String, dynamic>>()
           .map(SupervisorAssignment.fromMap)
@@ -47,10 +62,13 @@ class SupervisionRepositoryImpl implements SupervisionRepository {
     try {
       // No `is_published` filter: an administrator may assign an invigilator to a
       // paper that is still a draft, and `exams_select` hands them every row.
-      final rows = await _client
-          .from('exams')
-          .select()
-          .order('created_at', ascending: false);
+      final rows = await withReadTimeout<PostgrestList>(
+        () => _client
+            .from('exams')
+            .select()
+            .order('created_at', ascending: false),
+        timeout: readTimeout,
+      );
       return (rows as List)
           .cast<Map<String, dynamic>>()
           .map(Exam.fromMap)
