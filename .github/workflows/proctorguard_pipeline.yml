@@ -18,6 +18,7 @@ jobs:
   analyze_and_test:
     name: analyze + contract tests + suite
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: mobile
@@ -49,6 +50,7 @@ jobs:
   typecheck_supabase:
     name: tsc (Deno types, no deployment)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: supabase/functions
@@ -69,10 +71,28 @@ jobs:
       - name: Type-check the Edge Functions
         run: npm run typecheck
 
-      - name: Free Disk Space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/sample-index
-          df -h 
+  # The detector's own suite: `tools/detector_eval` (the pose matrix, the judge,
+  # the label matcher, the report). It is JavaScript with no dependencies — no
+  # package.json, so no install step and nothing to cache — and until this job
+  # existed none of those tests ran anywhere.
+  detector_eval:
+    name: detector eval (node --test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      # Node 22 on purpose: the command below passes a *glob* to `--test`
+      # (`"test/*.test.mjs"`, quoted so the shell does not expand it), and the
+      # runner's own glob support is what expands it there.
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Run the detector tests
+        run: node --test "tools/detector_eval/test/*.test.mjs"
 
   build_web:
     name: build (web release)
