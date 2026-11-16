@@ -1,12 +1,13 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../../core/services/supabase_service.dart';
+import '../../../../core/utils/read_timeout.dart';
 import '../../domain/entities/analytics_report.dart';
 import '../../domain/entities/submission_reset_result.dart';
 import '../../domain/repositories/dashboard_repository.dart';
 
 class DashboardRepositoryImpl implements DashboardRepository {
-  DashboardRepositoryImpl(this._client);
+  DashboardRepositoryImpl(this._client, {this.readTimeout = defaultReadTimeout});
 
   /// The private evidence bucket, shared with the writer so a reset can never
   /// look in a different bucket from the one snapshots are uploaded to.
@@ -15,6 +16,17 @@ class DashboardRepositoryImpl implements DashboardRepository {
   static const pageSize = 500;
 
   final SupabaseClient _client;
+
+  /// The deadline on each page of [getAnalytics] and of the evidence read at the
+  /// start of [resetSubmission]. See `core/utils/read_timeout.dart`.
+  ///
+  /// Per page, not per call: 5,000 attempts is ten pages, and one budget over all
+  /// of them would fail a big read that is making progress on a slow link. A page
+  /// that stops answering fails the whole call either way.
+  ///
+  /// The writes here - the reset's `delete`, the Storage `remove`, the audit
+  /// insert - are not bounded by it.
+  final Duration readTimeout;
 
   @override
   Future<AnalyticsReport> getAnalytics() async {
@@ -286,7 +298,10 @@ class DashboardRepositoryImpl implements DashboardRepository {
   ) async {
     final rows = <Map<String, dynamic>>[];
     while (true) {
-      final page = await readPage(rows.length, rows.length + pageSize - 1);
+      final page = await withReadTimeout(
+        () => readPage(rows.length, rows.length + pageSize - 1),
+        timeout: readTimeout,
+      );
       rows.addAll(page);
       if (page.length < pageSize) return rows;
     }

@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:proctorguard/core/utils/read_timeout.dart';
+import 'package:proctorguard/features/dashboard/data/repositories/dashboard_repository_impl.dart';
+import 'package:proctorguard/features/dashboard/domain/repositories/dashboard_repository.dart';
 import 'package:proctorguard/features/exam/data/repositories/consent_repository_impl.dart';
 import 'package:proctorguard/features/exam/data/repositories/exam_repository_impl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -169,6 +171,38 @@ void main() {
 
       expect(await repository.hasCurrentConsent('exam-1'), isFalse);
       expect(transport.requests, isEmpty);
+    });
+  });
+
+  group('the console reads', () {
+    test('a hung analytics page reports through the dashboard error', () async {
+      final transport = _HungTransport();
+      final repository = DashboardRepositoryImpl(
+        _clientOver(transport),
+        readTimeout: _testTimeout,
+      );
+
+      await expectLater(
+        repository.getAnalytics(),
+        throwsA(
+          isA<DashboardException>().having(
+            (error) => error.message,
+            'message',
+            contains(readTimeoutMessage),
+          ),
+        ),
+      );
+
+      // All three rollup reads were sent and each gave up; `Future.wait` keeps
+      // the first failure and does not leave the other two unhandled.
+      expect(
+        transport.requests.map((request) => request.url.path),
+        containsAll(<String>[
+          '/rest/v1/exams',
+          '/rest/v1/exam_submissions',
+          '/rest/v1/proctoring_logs',
+        ]),
+      );
     });
   });
 }
