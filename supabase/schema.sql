@@ -283,6 +283,20 @@ as $$
   );
 $$;
 
+-- `anon` must not execute these predicates. A policy is evaluated with the
+-- *caller's* privileges, which is why `authenticated` holds EXECUTE - without it
+-- every staff read would answer 42501 - but no policy in this file applies to
+-- `anon` (all of them are `to authenticated`), so an anonymous request never
+-- reaches one of them and loses nothing when the bit goes. What the bit did buy was
+-- a callable endpoint: `POST /rest/v1/rpc/is_staff` with the anonymous key ran a
+-- SECURITY DEFINER function against `profiles`. The nine revokes from here to
+-- `guard_profile_labels()` are one rule;
+-- `20261113090000_predicate_execute_hardening.sql` is the same statement for a
+-- project that is already live, and `supabase/tests/predicate_execute_check.sql`
+-- is the proof that `authenticated` still works and `anon` cannot.
+revoke execute on function public.is_staff() from public, anon;
+grant execute on function public.is_staff() to authenticated, service_role;
+
 -- Admin-only. Used by the profiles policies and by guard_user_role_change();
 -- this is the tier the mobile admin console signs in as.
 create or replace function public.is_admin()
@@ -297,6 +311,9 @@ as $$
     where id = auth.uid() and role = 'admin'
   );
 $$;
+
+revoke execute on function public.is_admin() from public, anon;
+grant execute on function public.is_admin() to authenticated, service_role;
 
 -- The *intervention* tier: who may write to somebody else's attempt row (a
 -- status change or an after-the-fact re-grade) and who may read the incident
@@ -326,6 +343,9 @@ as $$
   );
 $$;
 
+revoke execute on function public.is_exam_supervisor() from public, anon;
+grant execute on function public.is_exam_supervisor() to authenticated, service_role;
+
 -- role = 'supervisor' exactly - the one staff label whose reach the assignment
 -- scope narrows.
 --
@@ -348,6 +368,9 @@ as $$
     where id = auth.uid() and role = 'supervisor'
   );
 $$;
+
+revoke execute on function public.is_supervisor_only() from public, anon;
+grant execute on function public.is_supervisor_only() to authenticated, service_role;
 
 comment on function public.is_supervisor_only() is
   'True only for a supervisor account - the staff label whose reach supervisor_exam_assignments narrows. Admin and lecturer are false, which is what keeps their policies unchanged.';
@@ -392,6 +415,9 @@ as $$
   );
 $$;
 
+revoke execute on function public.is_attempt_resetter() from public, anon;
+grant execute on function public.is_attempt_resetter() to authenticated, service_role;
+
 -- Does the caller own the paper a piece of evidence belongs to?
 --
 -- The read tier for *evidence* is deliberately narrower than the roster read.
@@ -427,6 +453,9 @@ as $$
     where id = p_exam_id and created_by = auth.uid()
   );
 $$;
+
+revoke execute on function public.owns_exam(uuid) from public, anon;
+grant execute on function public.owns_exam(uuid) to authenticated, service_role;
 
 -- "May this student sit this paper?" - published, and aimed at the caller either
 -- by the paper's faculty/department/level or by its borrow list.
@@ -520,6 +549,9 @@ set search_path = public
 as $$
   select public.is_staff();
 $$;
+
+revoke execute on function public.is_supervisor() from public, anon;
+grant execute on function public.is_supervisor() to authenticated, service_role;
 
 -- Drop legacy policies to ensure a clean state. The `users_*` names are what a
 -- pre-rename database still carries on this table, so they are dropped too - and so
@@ -764,6 +796,9 @@ begin
 end;
 $$;
 
+revoke execute on function public.guard_user_role_change() from public, anon;
+grant execute on function public.guard_user_role_change() to authenticated, service_role;
+
 drop trigger if exists users_guard_role_change on public.profiles;
 drop trigger if exists profiles_guard_role_change on public.profiles;
 create trigger profiles_guard_role_change
@@ -864,6 +899,9 @@ $$;
 
 comment on function public.guard_profile_labels() is
   'Refuses a self-service write to the profile labels a policy compares or a human reads: on INSERT the academic labels and identity numbers must be null and the email must be the session''s own; on UPDATE those five columns and email are immutable. Administrators, service_role and claims-less sessions (SQL editor, migrations) may write them.';
+
+revoke execute on function public.guard_profile_labels() from public, anon;
+grant execute on function public.guard_profile_labels() to authenticated, service_role;
 
 drop trigger if exists users_guard_labels on public.profiles;
 drop trigger if exists profiles_guard_labels on public.profiles;

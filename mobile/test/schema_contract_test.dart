@@ -873,12 +873,21 @@ void main() {
         ),
       );
 
-      // Exactly three mentions now: the definition, the snapshot purge, and its
+      // Exactly three *calls* now: the definition, the snapshot purge, and its
       // companion orphan-read policy that lets the purge's DELETE ... WHERE see the
       // rows. The audit row used to be a fourth and now asks the scope question
-      // instead; the DELETE itself never asked this predicate.
+      // instead; the DELETE itself never asked this predicate. The `revoke`/`grant`
+      // statements that `20261113090000_predicate_execute_hardening.sql` places
+      // beside the definition are not calls - they say which roles may execute the
+      // function - so they are removed before counting, keeping the count about call
+      // sites rather than about its ACL.
+      final callSites = sql
+          .split('\n')
+          .where((line) => !line.trimLeft().startsWith('revoke execute on function'))
+          .where((line) => !line.trimLeft().startsWith('grant execute on function'))
+          .join('\n');
       expect(
-        RegExp(r'public\.is_attempt_resetter\(\)').allMatches(sql).length,
+        RegExp(r'public\.is_attempt_resetter\(\)').allMatches(callSites).length,
         3,
         reason: 'the function definition, the snapshot purge and the orphan-read '
             'companion',

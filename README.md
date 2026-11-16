@@ -444,6 +444,7 @@ operator's decision. See
    supabase db query --linked -f supabase/migrations/20261111090000_single_session.sql
    supabase db query --linked -f supabase/migrations/20261111090100_lecturer_isolation.sql
    supabase db query --linked -f supabase/migrations/20261112090000_lecturer_roster_read.sql
+   supabase db query --linked -f supabase/migrations/20261113090000_predicate_execute_hardening.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -1020,6 +1021,21 @@ Things worth knowing before you turn it on:
   key, `curl`, the native app) never consult CORS and are unaffected — and the
   request still runs, which is why the warning in the function's logs is the
   visible symptom of a missing variable.
+- Apply `supabase/migrations/20261113090000_predicate_execute_hardening.sql` on
+  every project that already exists: it revokes `EXECUTE` on the nine predicates
+  the policies are written in (`is_staff()`, `is_admin()`, `is_exam_supervisor()`,
+  `is_supervisor_only()`, `is_attempt_resetter()`, `owns_exam(uuid)`,
+  `is_supervisor()`, and the two `profiles` guards `guard_user_role_change()` and
+  `guard_profile_labels()`) from `PUBLIC` and `anon`, and leaves it with
+  `authenticated` and `service_role`. Until it runs, the anonymous key can call them
+  over `/rest/v1/rpc/`; after it, only a signed-in caller or an Edge Function can.
+  It revokes no table privilege and creates, drops or alters no policy - `anon` still
+  reads `profiles` as an empty list, which is what
+  `.github/workflows/keep_alive.yml` pings for (no policy in `schema.sql` applies to
+  `anon`, so none of them calls a revoked predicate) - and
+  `supabase/tests/predicate_execute_check.sql` proves both halves: `authenticated`
+  still gets the same answers through the same policies, and `anon` gets `42501`. A
+  fresh `schema.sql` already carries the nine revokes.
 - Configure the Flutter app with the Supabase project URL and a publishable
   client key. Never embed a service-role or secret key in the app.
 - Review the private `proctor-snapshots` bucket's retention policy in
