@@ -531,6 +531,56 @@ operator's decision. See
    `…0905*`, `…0906*` and `…0908*` files if that ever happens.
    `optional_question_shuffling.sql` adds the `shuffle_questions` column and is
    independent of every other migration.
+   **Six files in `supabase/migrations/` are deliberately *not* in that list.**
+   None of them is a step a project installed from `schema.sql` is missing: each
+   is already in `schema.sql` (a baseline), replaced by a later file, or a
+   one-time repair that must not be run twice.
+   - `add_user_roles_and_profiles.sql` and
+     `secure_exam_access_and_deadlines.sql` are the **baseline for the four-role
+     account model and the hardened policies**, and both open with **DO NOT
+     RE-RUN**. They install the definitions they were written against;
+     `2026110309*.sql` and `20261104090100_weighted_strikes_and_flagged_review.sql`
+     are what replaced them, so re-running either file silently reinstates the
+     older policy or the two-column `register_violation()`/`submit_exam()` -
+     `42P13` once `…04090100` is installed.
+   - `lecturer_scoped_log_reads.sql` is **superseded**, in its own words. Its
+     `logs_select_own_or_supervisor` and `session_reset_logs_select_staff`
+     predate `can_supervise_exam()`, which is the predicate `schema.sql` and
+     `20261111090100_lecturer_isolation.sql` scope them with - so re-running it
+     narrows a supervisor's evidence read back to ownership alone.
+   - `staff_attempt_resets.sql` is a **one-time fix** whose wider reset tier is
+     already in `schema.sql`. It is also the file named above as a downgrade:
+     re-running it undoes `…090600_submissions_delete_supervisor` and
+     `…090800_snapshot_purge_not_live_attempt`.
+   - `grant_api_roles_public_schema.sql` is a **one-time repair** for a project
+     whose Data API had lost its `public` privileges (every read answering
+     `42501`). The same `grant`s are section 0 of `schema.sql`, and `grant` is
+     idempotent, so a project installed from `schema.sql` never needs it.
+   - `update_proctoring_action_types.sql` is a **baseline widening** of
+     `proctoring_logs_action_type_check`: `schema.sql` already allows every type
+     the clients send. It is the only file that adds the lockdown and device
+     signals to an *older* project's constraint - run it there, once, if a
+     violation insert is refused with `23514` naming that constraint.
+
+   **Do not use `supabase db push` or `supabase migration list` to apply this
+   project.** Fifteen of the 37 files in `supabase/migrations/` carry no
+   timestamp prefix - `retention_policy`, `session_reset_logs`,
+   `question_types_and_grading`, `optional_exam_scheduling`,
+   `optional_question_shuffling`, `private_proctor_snapshots`,
+   `academic_targeting`, `profile_identity_numbers`,
+   `strict_targeting_null_profiles`, `secure_exam_access_and_deadlines`,
+   `add_user_roles_and_profiles`, `grant_api_roles_public_schema`,
+   `lecturer_scoped_log_reads`, `staff_attempt_resets`,
+   `update_proctoring_action_types` - and the CLI's migration tracking only sees
+   names of the form `<timestamp>_<name>.sql`. It cannot tell that a project is
+   missing those fifteen, and `db push` leaves them out and orders the rest
+   itself, so both commands answer "up to date" for a database that is missing
+   most of the list above. The two scripts at the repository root are the
+   supported path, and both follow the order above: `apply_in_order.ps1` copies
+   each file to the clipboard, one at a time, for the SQL editor of a test
+   project, and `apply_live_cli.ps1 -StartAt N` runs them against the linked
+   project with `db query --linked -f`, one at a time, stopping at the first
+   failure. Neither calls `db push`.
 2. Deploy the account-management functions, and the snapshot purge:
    ```powershell
    supabase functions deploy admin-create-user
