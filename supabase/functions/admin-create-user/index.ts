@@ -46,7 +46,8 @@
 // is written to that row here rather than duplicated into a second table.
 //
 // Every requirement this function is expected to meet is visible in one read:
-//   * CORS: CORS_HEADERS answers the OPTIONS preflight (origin, headers, methods).
+//   * CORS: `corsHeaders()` (`../_shared/cors.ts`) answers the OPTIONS preflight
+//     and emits an allow-origin only for an origin listed in ALLOWED_ORIGIN.
 //   * Clients: `createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 //     auth: { persistSession: false } })` — no session is ever kept, because no
 //     request here is the service account signing itself in.
@@ -67,6 +68,8 @@
 // gates the account creation.
 
 import { createClient } from "npm:@supabase/supabase-js@2";
+
+import { corsHeaders } from "../_shared/cors.ts";
 
 /** The `public.user_role` enum, in its declaration order (see schema.sql). */
 const ROLES = ["admin", "lecturer", "supervisor", "student"] as const;
@@ -91,50 +94,6 @@ const MIN_PASSWORD_LENGTH = 10;
  * *and* reword the 403 below together; the Flutter suite mirrors that sentence.
  */
 const CREATOR_ROLES: readonly Role[] = ["admin"];
-
-/**
- * Builds CORS response headers that honour the ALLOWED_ORIGIN environment
- * variable.  The variable holds a comma-separated list of permitted origins;
- * when the request Origin is in that list it is echoed back and `Vary: Origin`
- * is added.  If the variable is unset the function keeps the previous
- * wide-open behaviour (all origins allowed) and logs a warning, so existing
- * deployments do not break before they configure it.
- *
- * The no-argument version always returns the fallback (or the first allowed
- * origin when configured) and is used by `json()` / `fail()` for error paths
- * where the request object is not threaded through.  The OPTIONS handler in
- * `Deno.serve` uses the request-aware overload so that the preflight response
- * echoes the actual Origin.
- */
-function corsHeaders(request?: Request): Record<string, string> {
-  const raw = Deno.env.get("ALLOWED_ORIGIN");
-  const requestOrigin = request?.headers.get("Origin") ?? null;
-
-  const baseHeaders: Record<string, string> = {
-    "Access-Control-Allow-Headers":
-      "authorization, x-client-info, apikey, content-type",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-  };
-
-  if (!raw) {
-    console.warn(
-      "ALLOWED_ORIGIN is not set — falling back to Access-Control-Allow-Origin: *."
-      + " Set this variable to a comma-separated list of allowed origins.",
-    );
-    return { ...baseHeaders, "Access-Control-Allow-Origin": "*" };
-  }
-
-  const allowed = raw.split(",").map((s) => s.trim()).filter(Boolean);
-  const origin = requestOrigin && allowed.includes(requestOrigin)
-    ? requestOrigin
-    : (allowed.length > 0 ? allowed[0] : "null");
-
-  return {
-    ...baseHeaders,
-    "Access-Control-Allow-Origin": origin,
-    "Vary": "Origin",
-  };
-}
 
 function json(
   body: unknown,

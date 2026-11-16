@@ -48,7 +48,7 @@ jobs:
         run: flutter test
 
   typecheck_supabase:
-    name: tsc (Deno types, no deployment)
+    name: tsc + CORS tests (Deno types, no deployment)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -58,10 +58,12 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v7
 
+      # Node 22, not 20: `npm test` imports a `.ts` file and Node 22 strips its
+      # types, which is what lets `_shared/cors.ts` be tested without Deno.
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: supabase/functions/package-lock.json
 
@@ -70,6 +72,13 @@ jobs:
 
       - name: Type-check the Edge Functions
         run: npm run typecheck
+
+      # `_shared/cors.ts` is the one piece of these functions that runs under
+      # Node: `test/cors.test.mjs` shims `Deno.env` and imports it, so both
+      # halves of the CORS contract (ALLOWED_ORIGIN set, and unset) are pinned
+      # here instead of only on a deployed project.
+      - name: Test the shared CORS helper
+        run: npm test
 
   # The detector's own suite: `tools/detector_eval` (the pose matrix, the judge,
   # the label matcher, the report). It is JavaScript with no dependencies — no

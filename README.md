@@ -592,6 +592,13 @@ operator's decision. See
    The project supplies `SUPABASE_URL`, `SUPABASE_ANON_KEY` (or
    `SUPABASE_PUBLISHABLE_KEY`), and `SUPABASE_SERVICE_ROLE_KEY` to the
    functions. The service-role key is used only on Supabase servers.
+   **Set `ALLOWED_ORIGIN` before deploying** - `supabase secrets set
+   ALLOWED_ORIGIN=https://console.example.com,https://admin.example.com` for the
+   project, or the same variable per function in the dashboard. A function
+   deployed without it sends no `Access-Control-Allow-Origin` header at all and
+   logs a warning, so the browser console is refused until the variable names
+   its origin (it used to answer `*` instead); see
+   [Production checklist](#production-checklist).
    `admin-update-profile` is what the console's Edit dialog and its corrections
    file call: it checks the labels against the app's academic catalogue before
    writing (the columns are free text, so an unvalidated `"computer science"`
@@ -1001,12 +1008,18 @@ Things worth knowing before you turn it on:
   [Scheduling the snapshot purge](#scheduling-the-snapshot-purge)).
 - Set the `ALLOWED_ORIGIN` environment variable on each deployed admin function
   **and on `purge-snapshots`** to a comma-separated list of permitted origins (for
-  example, `https://console.example.com,https://admin.example.com`). The
-  function's CORS response echoes the request's `Origin` header only when it is in
-  that list, and adds `Vary: Origin`. If the variable is not set the function logs
-  a warning and keeps the previous wide-open behaviour
-  (`Access-Control-Allow-Origin: *`), so existing deployments are not broken
-  before the variable is configured.
+  example, `https://console.example.com,https://admin.example.com`) — **before the
+  functions are deployed**, because a function deployed without it sends no
+  `Access-Control-Allow-Origin` at all. When the variable is set, the function's
+  CORS response echoes the request's `Origin` header only if it is in that list,
+  and adds `Vary: Origin`. When it is unset (or empty) the function sends no
+  allow-origin header and logs a warning instead of the `*` it used to send: the
+  browser then refuses to hand the response to the page, so an unconfigured
+  deployment fails closed for the console rather than being callable from any
+  site. Callers that are not browsers (a scheduler presenting the service-role
+  key, `curl`, the native app) never consult CORS and are unaffected — and the
+  request still runs, which is why the warning in the function's logs is the
+  visible symptom of a missing variable.
 - Configure the Flutter app with the Supabase project URL and a publishable
   client key. Never embed a service-role or secret key in the app.
 - Review the private `proctor-snapshots` bucket's retention policy in
@@ -1017,9 +1030,10 @@ Things worth knowing before you turn it on:
 - `.github/workflows/proctorguard_pipeline.yml` is the whole pipeline, in one
   file, on every push, pull request, `v*` tag and manual dispatch. Its gate jobs
   are `analyze_and_test` (analysis, the schema/Android manifest contract tests,
-  the full suite), `typecheck_supabase` (`npm run typecheck` in
-  `supabase/functions`, so a mis-resolved Deno import fails CI rather than
-  `supabase functions deploy` on a live project), `build_web`
+  the full suite), `typecheck_supabase` (`npm run typecheck` and `npm test` in
+  `supabase/functions`, so a mis-resolved Deno import or a change to the shared
+  CORS fallback fails CI rather than `supabase functions deploy` on a live
+  project), `build_web`
   (`flutter build web --release`), `build_android_debug`
   (`flutter build apk --debug`) and `build_ios` (unsigned, on a macOS runner).
   The build jobs `needs:` the analyze/test job and are otherwise independent of
@@ -1194,8 +1208,17 @@ them the way CI does, from `supabase/functions/`:
 ```powershell
 npm ci
 npm run typecheck
+npm test
 ```
 
 Zero TypeScript errors is the gate (`admin-reset-password` importing
 `https://esm.sh/...` was the one thing that failed it). It installs dev-only
 types from the checked-in `package-lock.json` and deploys nothing.
+
+`npm test` (Node 22, `node --test`) covers `_shared/cors.ts`, the CORS headers
+all five functions import: both halves of the contract — `ALLOWED_ORIGIN` set,
+which must behave exactly as before, and unset, which must send no
+`Access-Control-Allow-Origin` and log a warning — plus a check that every
+function still imports the helper instead of growing its own copy. It shims
+`Deno.env` and imports the `.ts` file directly, so it needs neither Deno nor a
+Supabase project.
