@@ -424,6 +424,38 @@ void main() {
       expect(monitor.message, contains('not reporting any sound levels'));
     });
 
+    test('a feed that goes quiet mid-session stops claiming to monitor',
+        () async {
+      // The other half of the failure above: the microphone opened and delivered
+      // (so the first-sample timer was satisfied), then stopped. Nothing ends the
+      // stream and no error is raised - a wedged capture thread or a pulled device
+      // looks exactly like this - so the only thing that can tell it apart from a
+      // silent room is a gap between samples. Left alone, the chip kept reporting
+      // "listening" while nothing was being judged for the rest of the sitting.
+      final source = _FakeSource(); // one sample on listen, then silence
+      final monitor = monitorWith(source);
+      addTearDown(monitor.dispose);
+
+      await monitor.start();
+      await pumpEventQueue();
+      expect(monitor.state, AudioMonitorState.monitoring);
+
+      await Future<void>.delayed(levelTimeout * 3);
+      // `unavailable`, not `interrupted`: from here a stalled feed and a dead
+      // microphone are indistinguishable, and the exam page blocks on the latter -
+      // so this gap is made visible on the chip without pausing the paper (a
+      // throttled browser timer heals itself the moment the next sample lands).
+      expect(monitor.state, AudioMonitorState.unavailable);
+      expect(monitor.state.needsAttention, isTrue);
+      expect(monitor.message, contains('stopped reporting'));
+
+      // ...and the feed coming back is what clears it: the watchdog reports the
+      // sensor, it does not condemn the attempt.
+      source.emit(_FakeSource.quiet);
+      await pumpEventQueue();
+      expect(monitor.state, AudioMonitorState.monitoring);
+    });
+
     test('a capture stream that fails mid-session is interrupted', () async {
       final source = _FakeSource();
       final monitor = monitorWith(source);

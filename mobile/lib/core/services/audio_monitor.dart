@@ -27,11 +27,19 @@ enum AudioMonitorState {
   permissionDenied,
 
   /// This platform/device cannot give us levels at all (no capture path, no
-  /// permission API, or the device reports silence forever).
+  /// permission API, a device that reports silence forever) or has stopped giving
+  /// them mid-session.
+  ///
+  /// Deliberately the state for "nothing is being judged right now" rather than
+  /// [interrupted]: it is visible on the chip but does not block the paper, because
+  /// a feed that goes quiet is not proof that the microphone is gone (see
+  /// `AudioMonitor._onLevelTimeout`).
   unavailable,
 
-  /// The stream stopped mid-session: headset unplugged, permission revoked while
-  /// the exam was running, or another app took the input device.
+  /// The capture stream itself stopped mid-session: headset unplugged, permission
+  /// revoked while the exam was running, or another app took the input device.
+  ///
+  /// The device said goodbye, so the exam page blocks until it is reopened.
   interrupted,
 
   /// Turned off on purpose with `--dart-define=AUDIO_MONITORING=false`.
@@ -257,6 +265,7 @@ class RecordAudioLevelSource implements AudioLevelSource {
 /// | Student/OS refuses access | [AudioMonitorState.permissionDenied] | "Mic blocked" + allow/settings action |
 /// | Device cannot be opened (busy, no input) | [AudioMonitorState.unavailable] | "Mic unavailable" + retry |
 /// | No levels at all for [levelTimeout] | [AudioMonitorState.unavailable] | never pretends to monitor |
+/// | Samples stop mid-session | [AudioMonitorState.unavailable] | "Mic unavailable" - visible, never blocks |
 /// | Stream dies mid-session | [AudioMonitorState.interrupted] | "Mic lost" + reconnect prompt |
 ///
 /// Nothing here throws and nothing here blocks: a microphone problem must never
@@ -289,9 +298,18 @@ class AudioMonitor {
   /// is honest and actionable.
   final Duration startTimeout;
 
-  /// How long to wait for the *first* level before concluding the device cannot
-  /// report them. Without this a broken microphone would look exactly like a
-  /// perfectly quiet room - the one failure mode proctoring must not have.
+  /// How long to wait for a level before concluding the device cannot report them.
+  /// Without this a broken microphone would look exactly like a perfectly quiet
+  /// room - the one failure mode proctoring must not have.
+  ///
+  /// Applied to **every** gap between samples, not only the first: a feed that
+  /// delivered for ten minutes and then went silent is the same failure, later. It
+  /// is deliberately far longer than the source's sample cadence (a quarter of a
+  /// second), so a stalled thread or a throttled browser timer has to be wedged for
+  /// a dozen ticks before this says anything - and even then it only turns the chip
+  /// to [AudioMonitorState.unavailable]. It never blocks the exam, because a silence
+  /// here is evidence about the *feed*, not about the microphone (see
+  /// [_onLevelTimeout]).
   final Duration levelTimeout;
 
   /// Upper bound on *releasing* the capture session.
@@ -498,16 +516,65 @@ class AudioMonitor {
     );
     // Levels are the proof of life: only the first sample moves the state to
     // `monitoring`.
-    _levelTimer = Timer(levelTimeout, () {
-      if (_state == AudioMonitorState.monitoring || _disposed) return;
+    _armLevelWatchdog();
+
+    return _state;
+  }
+
+  /// Re-arms the proof-of-life timer for the sample on its way.
+  ///
+  /// Armed on **every** level, not only the first: a capture feed that stops
+  /// mid-session - a wedged capture thread, a device pulled out without its stream
+  /// ending, a browser track stopped underneath the recorder - is otherwise
+  /// indistinguishable from a silent room, so the monitor kept a `monitoring` chip
+  /// on screen while nothing was being judged for the rest of the sitting. That is
+  /// the same failure the first-sample timer exists to prevent, only later. The
+  /// cadence ([RecordAudioLevelSource.sampleInterval] is 250 ms) leaves this window
+  /// room for a dozen missed samples before it concludes anything.
+  void _armLevelWatchdog() {
+    _levelTimer?.cancel();
+    _levelTimer = Timer(levelTimeout, _onLevelTimeout);
+  }
+
+  /// The watchdog fired: no sample arrived inside [levelTimeout].
+  void _onLevelTimeout() {
+    _levelTimer = null;
+    if (_disposed) return;
+
+    // Before the first sample the device simply never delivered: this is a
+    // microphone that cannot report levels on this platform, and the student is
+    // the one who can still act on it.
+    if (_state == AudioMonitorState.starting) {
       _transition(
         AudioMonitorState.unavailable,
         'The microphone is not reporting any sound levels on this device, so '
         'audio proctoring is off for this attempt.',
       );
-    });
+      return;
+    }
 
-    return _state;
+    // After it, the feed was alive and then stopped. This is reported as
+    // `unavailable` - "this device is not giving us levels" - and deliberately not
+    // as `interrupted`, because the two are not the same claim. A stream that errors
+    // is the device saying goodbye (headset out, grant revoked) and the exam page
+    // rightly blocks on it. A feed that merely stops talking is an *inference*: a
+    // throttled browser timer behind a backgrounded tab, a capture thread the OS
+    // paused, a platform bridge that misses its cadence for a moment, all look
+    // exactly like a dead microphone from here, and every one of them heals itself
+    // when the next sample lands. Blocking a paper on that would be a false
+    // positive of the kind this monitor exists to avoid, so the state stops short of
+    // a verdict and only makes the gap visible on the chip.
+    //
+    // The subscription is left in place on purpose: a feed that starts delivering
+    // again returns to `monitoring` by itself (see [_onLevel]).
+    if (_state == AudioMonitorState.monitoring) {
+      _transition(
+        AudioMonitorState.unavailable,
+        'The microphone stopped reporting sound levels, so audio proctoring has '
+        'paused for this attempt. Tap the microphone, or check the device is '
+        'still connected, to resume it.',
+      );
+    }
   }
 
   /// Closes a capture session that opened after the [start] attempt had already
@@ -548,8 +615,9 @@ class AudioMonitor {
     _peakLevel = _peakLevel == null
         ? level
         : (level > _peakLevel! ? level : _peakLevel);
-    _levelTimer?.cancel();
-    _levelTimer = null;
+    // The proof-of-life window restarts with the sample: this is also how a feed
+    // that stalled and came back clears its own state (see [_onLevelTimeout]).
+    _armLevelWatchdog();
     if (!_reportedFirstLevel) {
       _reportedFirstLevel = true;
       proctorLog(
