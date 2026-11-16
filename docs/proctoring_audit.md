@@ -38,16 +38,23 @@ commit each, so the tree has moved under some of the line numbers:
 | §8 P1-3 — no Android start-up grace | `f200a91` | `cameraStartupGrace` became a shared constant and the Android engine counts it from its **first streamed frame**, which is the web's own small bug fixed as well |
 | §8 P1-4 / §6.6 D4 — the suspected double count | `web_exam_guard.dart`, `web_exam_guard_test.dart` | one act now costs one strike: a fullscreen-exit countdown that belongs to an already-struck departure (a blur or a hidden tab inside the same 5 s) closes without charging again, and staying out of fullscreen is charged once per episode. Four unit tests pin it |
 | §8 P3-14 — the dangling test path | the lecturer-isolation migration (still uncommitted with the feature it belongs to) | the comment now names `supabase/tests/supervisor_scope_check.sql`, block (l) |
+| §8 P2-6 / §4.3 — a feed that goes quiet mid-session | `1073adb` | `AudioMonitor` re-arms the proof-of-life window on **every** sample, so a feed that stops delivering is no longer indistinguishable from a silent room. Expiry mid-session reports `unavailable` (visible on the chip, the paper keeps going), not `interrupted` as this report proposed: a throttled timer or a paused capture thread is an inference, and the first sample to arrive returns the state to `monitoring` by itself |
+| §6.5 — the heartbeat against a superseded session | `49ee204` | `ProctoringHeartbeatService` catches `SessionSupersededException` and stops the series instead of counting a failure and retrying a refusal every 15 s for the rest of the sitting. Nothing is surfaced from the heartbeat: `SessionGate` is what signs the device out |
 
-Everything else in §8 — liveness (P1-1), the frame-stall watchdog and the microphone
-re-arm (P2-5, P2-6), the devtools and split-screen notes (P2-7, P2-8), the queue cap,
-D3 and the three wording notes (P3-9 … P3-13) — is open and unchanged.
+Everything else in §8 — liveness (P1-1), the frame-stall watchdog (P2-5), the devtools
+and split-screen notes (P2-7, P2-8), the queue cap, D3 and the three wording notes
+(P3-9 … P3-13) — is open and unchanged.
 
 None of those commits changes a single number that §7 was written to measure, and
 none of them was observed on hardware: closing D4 *in the guard* was the only way to
 settle it without a browser, because it does not matter whether Chromium reports the
 pair — either it does and the second event is now free, or it does not and nothing
 was ever charged twice.
+
+The two newest (`1073adb`, `49ee204`) were checked the same way as the ones above:
+`flutter analyze` clean, the whole `flutter test` suite (941 tests, two of them new),
+no SQL touched. Neither changes a number §7 measures, but test 20 now has a companion
+question it did not have before: how long a *legitimate* stall is allowed to last.
 
 **Status vocabulary used throughout**
 
@@ -72,7 +79,7 @@ was ever charged twice.
 | 2 | Count-only fallback + message | works as designed | `analyze = false` → `ExamHeadTurnUnavailableNotice` for the student, `monitoring_ok = false` for the supervisor, no violation. |
 | 3 | Liveness (held-up photo / video) | **gap — nothing protects against it** | No blink, no turn challenge, no attestation. A printed photo or a looping clip passes as a present student. Design + effort in §3. |
 | 4 | Audio | works as designed | One calibration per session (median of 3 s), 6 dB margin clamped to −50…−32 dBFS, 2 s continuous, 300 ms bursts ×3 or 4 s total in 60 s, latch + 10 s cooldown, window emptied by the strike. |
-| 4 | Mic loss / revocation / reconnect | works as designed | Every failure is a visible state (`Mic lost`, `Mic blocked`, `Mic unavailable`), never a silent quiet room; reconnect recalibrates. |
+| 4 | Mic loss / revocation / reconnect | works as designed | Every failure is a visible state (`Mic lost`, `Mic blocked`, `Mic unavailable`), never a silent quiet room; reconnect recalibrates. Since `1073adb` a feed that goes *quiet* mid-session is one of those states too, instead of leaving the chip on `monitoring`. |
 | 5 | `app_minimized` | works as designed | Lifecycle observer (Android/iOS), tab-blur/fullscreen on web, kiosk-escape poll on Android — all one violation. |
 | 5 | Back-button / split screen | partial | Back is bound to the overlays (`PopScope`); split screen is **not detected** on Android. |
 | 5 | Second display / virtual camera | Android-only | Native channel, 15 s poll; web and iOS report "cannot see", which is silence, not a clean bill. |
@@ -569,46 +576,60 @@ the window so one conversation cannot stack two strikes (`:512-518`).
 
 The transport is `AudioMonitor` (`mobile/lib/core/services/audio_monitor.dart`); the
 governing requirement is that a microphone problem is **visible, never a silent
-quiet room** (`:9-14`, `:248-263`).
+quiet room** (`:9-14`, `:256-272`).
 
 | Situation | State | What the student sees |
 | --- | --- | --- |
-| `AUDIO_MONITORING=false` | `disabled` | "Audio off" (`:37-38`, `:60`, `:380-385`) |
-| No capture path | `unavailable` | "Mic unavailable" (`:386-391`, `:58`) |
-| Access refused | `permissionDenied` | Blocking overlay "Your microphone is switched off" + Try again / Open settings (`exam_taking_page.dart:1006-1020`) |
-| Device cannot open | `unavailable` | "could not be opened… in use by another app" (`:480-487`) |
-| No levels within 4 s | `unavailable` | "not reporting any sound levels… audio proctoring is off" (`:269`, `:501-508`) |
-| Stream errors mid-session (revoked, taken, unplugged) | `interrupted` | Blocking overlay "Your microphone was disconnected" + Reconnect (`:566-579`, `exam_taking_page.dart:1021-1031`) |
-| Stream closes mid-session | `interrupted` | same (`:581-594`) |
+| `AUDIO_MONITORING=false` | `disabled` | "Audio off" (`:45-46`, `:68`, `:399-402`) |
+| No capture path | `unavailable` | "Mic unavailable" (`:404-408`, `:66`) |
+| Access refused | `permissionDenied` | Blocking overlay "Your microphone is switched off" + Try again / Open settings (`:466-473`, `exam_taking_page.dart:1006-1020`) |
+| Device cannot open | `unavailable` | "could not be opened… in use by another app" (`:498-504`) |
+| No levels within 4 s of `start()` | `unavailable` | "not reporting any sound levels… audio proctoring is off" (`:278`, `:547-553`) |
+| **Samples stop mid-session** | `unavailable` | "stopped reporting sound levels… paused for this attempt" — chip only, the paper keeps going (`:539-578`, re-armed at `:534-537`, `:620`) |
+| Stream errors mid-session (revoked, taken, unplugged) | `interrupted` | Blocking overlay "Your microphone was disconnected" + Reconnect (`:634-647`, `exam_taking_page.dart:1021-1031`) |
+| Stream closes mid-session | `interrupted` | same (`:649-662`) |
 | Reconnect | `retry()` stops, **resets the detector** (recalibrates), starts | `audio_monitoring_provider.dart:177-183` |
 
 Two deliberate details: a `begin()` that outlives the timeout is closed when it
 lands, so a late session cannot hold the device (and the OS recording dot) for the
-rest of the sitting (`:459-487`, `:513-534`); and the release is time-boxed because
-`record` serialises platform calls through one permit (`:296-306`).
+rest of the sitting (`:484-497`, `:592-601`); and the release is time-boxed because
+`record` serialises platform calls through one permit (`:315-324`, `:695-697`).
 
 Status: **works as designed** at the state-machine level; **unverified on device**
 for every row of the table, because `record`'s behaviour differs per platform (§7,
 tests 20-22).
 
-**One gap found here.** `levelTimeout` only guards the *first* level: the timer is
-cancelled on the first sample and never re-armed (`:551-552`). A microphone that
-stalls **silently** after the first sample — no error, no `done`, the platform just
-stops pushing amplitudes — leaves the state at `monitoring`, with the detector
-receiving nothing. No violation, no `interrupted`, `monitoring_ok` still `true`.
-That is the exact failure mode the class exists to prevent, one tick later than it
-was written for. §8 item 6.
+**The one gap found here is closed (`1073adb`, §8 item 6).** `levelTimeout` used to
+guard only the *first* level: the timer was cancelled on the first sample and never
+re-armed, so a microphone that stalled **silently** afterwards — no error, no `done`,
+the platform just stops pushing amplitudes — left the state at `monitoring` with the
+detector receiving nothing: no violation, no `interrupted`, `monitoring_ok` still
+`true`. That is the failure mode the class exists to prevent, one tick later than it
+was written for.
+
+The window is now the gap *between* samples, re-armed by every one of them
+(`:534-537`, called from `:519` and `:620`), and an expiry after the first sample
+reports `unavailable` rather than the `interrupted` this report proposed. That part is
+deliberate, and it is the interesting half: an errored stream is the device saying
+goodbye and the exam page rightly blocks on it, but a feed that merely stops talking is
+an *inference* — a backgrounded tab throttles its timers, the OS can pause a capture
+thread, a platform bridge can miss a cadence — and every one of those heals itself on
+the next sample. Blocking a paper on an inference is the false positive this monitor
+exists to avoid, so the expiry only makes the gap visible on the chip, and the state
+returns to `monitoring` on its own because the subscription is never dropped. What is
+still unmeasured is the **number**: 4 s is a dozen missed 250 ms samples (`:119`),
+which is a guess about how long a legitimate stall may last (tests 20-22).
 
 ### 4.4 Web and mobile parity
 
 One implementation for every target: `RecordAudioLevelSource` uses the `record`
 package, which reports dBFS on Android, iOS, web, Windows, macOS and Linux through
 the same API, so there is **no per-platform branching**, only per-device capability
-discovered at runtime (`audio_monitor.dart:99-108`). Capture is locked shut where it
+discovered at runtime (`audio_monitor.dart:107-116`). Capture is locked shut where it
 matters: PCM16, 16 kHz, mono, `autoGain: false`, `echoCancel: false`,
-`noiseSuppress: false` (`:164-176`) — gain or suppression would flatten exactly the
-room-versus-voice difference the calibration is built on (`:170-172`). The PCM bytes
-are drained and discarded and **no file is written** (`:106-108`, `:183-187`); only
+`noiseSuppress: false` (`:172-184`) — gain or suppression would flatten exactly the
+room-versus-voice difference the calibration is built on (`:178-183`). The PCM bytes
+are drained and discarded and **no file is written** (`:114-116`, `:190-192`); only
 numbers travel (and the consent text says so — `proctor_contract.dart` aside, see
 `proctor_consent.dart:124`).
 
@@ -618,7 +639,7 @@ Where the platforms genuinely differ:
 | --- | --- | --- | --- |
 | What `record` reports | smoothed amplitude envelope | **peak** of a short analyser window | A browser reads several dB hotter and spikier for the same room — which is why the speech margin was raised 4→6 dB (`audio_noise_detector.dart:214-227`) |
 | Silence | `−160` when nothing to report | same sentinel | Both are clamped to −100 so the sentinel cannot become the room (`:251-259`) |
-| Permission model | OS dialog, `permission_handler` also pre-checked (`exam_taking_page.dart:509-527`) | browser prompt, no `permission_handler` status | Messages differ by `kIsWeb` (`audio_monitor.dart:436-439`, `:451-456`) |
+| Permission model | OS dialog, `permission_handler` also pre-checked (`exam_taking_page.dart:509-527`) | browser prompt, no `permission_handler` status | Messages differ by `kIsWeb` (`audio_monitor.dart:449-457`, `:466-473`) |
 | Background behaviour | app backgrounded = `app_minimized` | hidden tab = `app_minimized`, and the timer may be throttled | Sustains are measured on the clock, not on sample counts, so a throttled page is not made "quieter" (`:161-162` of the detector) |
 
 Status: **works as designed** as a single code path; **the calibration is not the
@@ -896,10 +917,10 @@ cannot be executed here (no `psql`/`supabase`/`docker` on this machine — §7 p
 
 ### 6.5 The heartbeat, and what it is not
 
-Every 15 s (`proctoring_heartbeat.dart:49-55`) with a 4 s per-beat deadline (`:57-63`)
+Every 15 s (`proctoring_heartbeat.dart:52-58`) with a 4 s per-beat deadline (`:60-66`)
 the client calls `record_heartbeat`, carrying `camera_ok` and `monitoring_ok`
 (`proctoring_provider.dart:212-219`, `:332-333`, `:371-376`). **Nothing is queued**:
-a late beat would fill the very gap it is meant to expose (`proctoring_heartbeat.dart:27-36`).
+a late beat would fill the very gap it is meant to expose (`proctoring_heartbeat.dart:28-39`).
 It stops with the session, not after it (`proctoring_provider.dart:794-800`). The
 server rate-limits to one stored beat per 8 s and stamps
 `exam_submissions.last_heartbeat_at`; `proctoring_coverage()` turns the series into
@@ -908,6 +929,17 @@ numbers for a supervisor, and it never touches `exam_submissions.status`
 
 Status: **works as designed**. Its limitation is the one it states about itself: it
 proves a client was running, not that it was watching.
+
+**One loop that used to retry a refusal, closed (`49ee204`).** `record_heartbeat`
+refuses a superseded session with `PT409` and the repository reports that as
+`SessionSupersededException` for exactly one reason — "so the beat loop stops hammering
+a session that cannot write" (`proctoring_repository_impl.dart:57-63`) — but the
+heartbeat had no branch for it and fell into the generic catch: one refused round trip
+every 15 s for the rest of the sitting, on every device that had been signed out
+mid-exam. It now counts the refusal, logs it, and stops the series (`:230-244`).
+Nothing is surfaced from the heartbeat, because `SessionGate` polls on its own and is
+what signs the device out; a later `start()` (a resume) re-arms it and is refused once
+more, which is the right answer from a session that is no longer current.
 
 ### 6.6 Every place a signal can be lost or double counted
 
@@ -923,7 +955,7 @@ proves a client was running, not that it was watching.
 | L6 | `proctoring_provider.dart:642-657` | The snapshot is discarded on timeout (3 s / 1.2 s); the row still goes | Yes — evidence is illustrative, the row is the record |
 | L7 | `offline_sync_service.dart:876-887` | Queue cap 200, oldest dropped first. A long offline sitting can lose its **earliest** strikes | By policy, but it is silent to everyone except the debug console |
 | L8 | `offline_sync_service.dart:106-124` | A queued row with an `action_type` this build does not know is dropped | Yes — mis-logging it would be false evidence |
-| L9 | `proctoring_heartbeat.dart:27-36` | Beats are never queued; an unreachable beat is gone | Yes, and correct: a replayed beat would fill the gap it exists to expose |
+| L9 | `proctoring_heartbeat.dart:28-39` | Beats are never queued; an unreachable beat is gone | Yes, and correct: a replayed beat would fill the gap it exists to expose |
 | L10 | `proctoring_provider.dart:579` | If the page is gone by the time the outbox answers, the local session does not apply the ruling | The **server** has the strike; only the local UI misses it (the next read of the attempt shows the status) |
 | L11 | `proctoring_provider.dart:609` | A deferred ruling for a session that is already torn down is ignored | Same as L10 |
 | L12 | `web_face_presence.dart:230` | Everything inside the 5 s web grace is dropped | Yes (§2.3) |
@@ -1209,7 +1241,7 @@ finish.
 *Expected:* `proctor_heartbeats` has a **gap** for those two minutes, the rosters
 show "proctoring silent", `proctoring_coverage()` reports it, and **no** violation is
 logged for it and the attempt's status is untouched.
-*Status:* `proctoring_heartbeat.dart:27-36`, `README.md:265-296`.
+*Status:* `proctoring_heartbeat.dart:28-39`, `README.md:265-296`.
 
 **31. Flagged → reviewed.**
 *Steps:* reach three counted strikes; as a supervisor open the attempt; "clear" it
@@ -1326,11 +1358,16 @@ timestamp in the engine and a 3-5 s watchdog that calls `setStreamActive(false)`
 which already does the right things — letting the existing "Your camera has stopped"
 overlay do the rest.
 
-**6. A microphone that stalls silently after the first sample (§4.3).** `levelTimeout`
-only guards the first level (`audio_monitor.dart:551-552`); after that, a platform
-that stops pushing amplitudes leaves the state at `monitoring` with nothing being
-judged. Fix: re-arm a "no sample for N seconds" timer while monitoring, and treat
-expiry as `interrupted`.
+**6. A microphone that stalls silently after the first sample (§4.3) — fixed
+(`1073adb`).** `levelTimeout` guarded only the first level (`audio_monitor.dart:551-552`
+in the audited tree); after that, a platform that stopped pushing amplitudes left the
+state at `monitoring` with nothing being judged. The window is now re-armed by every
+sample and an expiry mid-session reports `unavailable`, **not** the `interrupted`
+proposed here: from inside the monitor a dead feed and a throttled background tab look
+identical, and only one of them is the student's problem, so the state stops short of a
+verdict, the chip shows the gap, and the next sample returns the state to `monitoring`
+on its own. What is still open is the *number* — 4 s is a guess about how long a
+legitimate stall lasts (§7, tests 20-22).
 
 **7. Developer tools can be opened invisibly (§5.3).** Undocked panels, a second
 browser window, a shortcut the page does not intercept — none is visible to a page.
@@ -1417,6 +1454,15 @@ Run them in the order P1 → P3. §8 items 1, 11, 12 and 13, and tests 1, 11, 12
 merely confirm one. Test 11 is now the browser-level confirmation of a rule that is
 already enforced, not the discovery of one.
 
+The two most recent are the ones this report's own §8 asked for, and they are listed in
+the same table: `1073adb` (the microphone watchdog re-arms on every sample, and a feed
+that goes quiet is `unavailable`, not the `interrupted` the report proposed) and
+`49ee204` (the heartbeat stops when the server says the session was superseded, instead
+of retrying a refusal every 15 s). Verified the same way as the rest — `flutter analyze`
+clean, the whole `flutter test` suite (941 tests, two of them new), no SQL touched — and
+neither is a number §7 measures; the only new *question* for §7 is how long a legitimate
+stall may last before a chip is right to say `Mic unavailable` (test 20).
+
 ### One-paragraph summary for a reader who reads only this
 
 Proctoring today is a well-built **presence and behaviour** monitor: it knows
@@ -1431,4 +1477,6 @@ first item in the risk register and the first gap here. The three things it was 
 likely to get wrong in practice were the web's 300 ms glance window, the phone's
 missing start-of-session grace, and any camera or microphone that stops silently
 without saying so: the first two are now judged by one shared rule on both hosts, the
-third is still open, and none of the three can be settled without a real device.
+third now at least stops claiming to monitor (a feed that goes quiet turns the chip to
+`Mic unavailable` instead of `Mic live`), but *how long* a stall may last before that is
+still a guess, and none of the three can be settled without a real device.
