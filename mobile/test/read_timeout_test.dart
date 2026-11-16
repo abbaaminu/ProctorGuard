@@ -1,7 +1,43 @@
 import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 import 'package:proctorguard/core/utils/read_timeout.dart';
+import 'package:proctorguard/features/exam/data/repositories/exam_repository_impl.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+/// A transport whose every request is accepted and never answered - the shape a
+/// connection takes when a socket goes quiet without closing. Recorded, so a
+/// test can also see that the read was actually sent (and sent once).
+class _HungTransport extends http.BaseClient {
+  final List<http.BaseRequest> requests = <http.BaseRequest>[];
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    requests.add(request);
+    return Completer<http.StreamedResponse>().future;
+  }
+}
+
+/// The same client construction `schema_contract_test.dart` uses, with a
+/// transport that will not answer it.
+SupabaseClient _clientOver(http.BaseClient transport) => SupabaseClient(
+      'https://mock.supabase.co',
+      'sb_publishable_mock',
+      httpClient: transport,
+    );
+
+/// The deadline each repository test asks for: long enough not to race a slow
+/// machine, short enough that the run does not notice it.
+const Duration _testTimeout = Duration(milliseconds: 20);
+
+Matcher get _throwsTheSentence => throwsA(
+      isA<ReadTimeoutException>().having(
+        (error) => error.toString(),
+        'toString',
+        readTimeoutMessage,
+      ),
+    );
 
 /// The read deadline, and the repositories that apply it.
 ///
@@ -69,6 +105,36 @@ void main() {
       // Pinned so the documented figure and the applied one cannot drift; the
       // repositories pass it through unless a test asks for less.
       expect(defaultReadTimeout, const Duration(seconds: 12));
+    });
+  });
+
+  group('the exam reads', () {
+    test('the exam list gives up and says the server did not answer', () async {
+      final transport = _HungTransport();
+      final repository = ExamRepositoryImpl(
+        _clientOver(transport),
+        readTimeout: _testTimeout,
+      );
+
+      await expectLater(repository.getPublishedExams(), _throwsTheSentence);
+
+      // Sent once. A read that timed out does not re-enter the transport on its
+      // own: it fails to the page, and the page owns the retry.
+      expect(transport.requests, hasLength(1));
+      expect(transport.requests.single.url.path, '/rest/v1/exams');
+    });
+
+    test('the question feed does, through the safe view', () async {
+      final transport = _HungTransport();
+      final repository = ExamRepositoryImpl(
+        _clientOver(transport),
+        readTimeout: _testTimeout,
+      );
+
+      await expectLater(repository.getQuestions('exam-1'), _throwsTheSentence);
+
+      expect(transport.requests.single.url.path, '/rest/v1/questions_public');
+      expect(transport.requests.single.url.query, contains('exam_id=eq.exam-1'));
     });
   });
 }

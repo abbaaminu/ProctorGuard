@@ -1,6 +1,7 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../../core/services/supabase_service.dart';
+import '../../../../core/utils/read_timeout.dart';
 import '../../domain/entities/exam.dart';
 import '../../domain/entities/exam_submit_result.dart';
 import '../../domain/entities/question.dart';
@@ -8,16 +9,31 @@ import '../../domain/entities/submission.dart';
 import '../../domain/repositories/exam_repository.dart';
 
 class ExamRepositoryImpl implements ExamRepository {
+  ExamRepositoryImpl(this._client, {this.readTimeout = defaultReadTimeout});
+
   final SupabaseClient _client;
-  ExamRepositoryImpl(this._client);
+
+  /// The deadline on [getPublishedExams] and [getQuestions] - the two reads a
+  /// page waits on with nothing else it can show. See
+  /// `core/utils/read_timeout.dart`.
+  ///
+  /// Everything else here writes: `startOrResumeSubmission` inserts an attempt,
+  /// the answer RPCs and `submit_exam` write to one. Those are not abandoned on
+  /// a deadline, because after a timeout the client cannot tell "the server
+  /// refused" from "the server applied it and the answer was lost", and
+  /// re-sending `submit_exam` on that guess would hand in twice.
+  final Duration readTimeout;
 
   @override
   Future<List<Exam>> getPublishedExams() async {
-    final rows = await _client
-        .from('exams')
-        .select()
-        .eq('is_published', true)
-        .order('created_at', ascending: false);
+    final rows = await withReadTimeout<PostgrestList>(
+      () => _client
+          .from('exams')
+          .select()
+          .eq('is_published', true)
+          .order('created_at', ascending: false),
+      timeout: readTimeout,
+    );
     return (rows as List)
         .cast<Map<String, dynamic>>()
         .map(Exam.fromMap)
@@ -27,10 +43,10 @@ class ExamRepositoryImpl implements ExamRepository {
   @override
   Future<List<Question>> getQuestions(String examId) async {
     // Uses the safe view — correct_option never reaches the device.
-    final rows = await _client
-        .from('questions_public')
-        .select()
-        .eq('exam_id', examId);
+    final rows = await withReadTimeout<PostgrestList>(
+      () => _client.from('questions_public').select().eq('exam_id', examId),
+      timeout: readTimeout,
+    );
     return (rows as List)
         .cast<Map<String, dynamic>>()
         .map(Question.fromMap)
