@@ -1,5 +1,6 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../../../../core/utils/read_timeout.dart';
 import '../../../exam/domain/entities/exam.dart';
 import '../../../exam/domain/entities/submission.dart';
 import '../../domain/entities/attempt_grading.dart';
@@ -14,9 +15,21 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
   QuestionAuthoringRepositoryImpl(
     this._client, {
     this.currentUserId,
+    this.readTimeout = defaultReadTimeout,
   });
 
   final SupabaseClient _client;
+
+  /// The deadline on every read this console makes - the papers, the paper's
+  /// questions, the attempts and the two lookups that label them. See
+  /// `core/utils/read_timeout.dart`.
+  ///
+  /// The writes are not on it: `createExam`, `setPublished`, `deleteExam`, the
+  /// three question writes and `saveGrades` change a paper or a mark, and a
+  /// timeout cannot tell a refusal from an applied-but-unanswered write, so a
+  /// deadline there would only invite a second attempt at something that may
+  /// already have happened.
+  final Duration readTimeout;
 
   /// Injectable for tests, the same seam `RoleGate.currentUserId` uses: the
   /// default (null) reads the SDK's session, and nothing else in this class knows
@@ -42,7 +55,7 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
 
   @override
   Future<List<AuthoredExam>> listMyExams() async {
-    final rows = await _guard(() async {
+    final rows = await _read(() async {
       final data = await _client
           .from('exams')
           .select(
@@ -180,7 +193,7 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
 
   @override
   Future<List<AuthoredQuestion>> listQuestions(String examId) async {
-    final rows = await _guard(() async {
+    final rows = await _read(() async {
       final data = await _client
           .from('questions')
           .select(questionColumns)
@@ -291,7 +304,7 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
     // questions they belong to, and the questions carry the keys and the weights.
     final questions = await listQuestions(examId);
 
-    final submissions = await _guard(() async {
+    final submissions = await _read(() async {
       final data = await _client
           .from('exam_submissions')
           .select('id, student_id, exam_id, answers, status, score, started_at')
@@ -338,7 +351,7 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
   Future<Map<String, Map<String, Map<String, dynamic>>>> _gradesFor(
     List<String> submissionIds,
   ) async {
-    final rows = await _guard(() async {
+    final rows = await _read(() async {
       final data = await _client
           .from('question_grades')
           .select('submission_id, question_id, awarded, feedback, graded_at')
@@ -364,7 +377,7 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
   Future<Map<String, String>> _namesFor(List<String> studentIds) async {
     if (studentIds.isEmpty) return const <String, String>{};
 
-    final rows = await _guard(() async {
+    final rows = await _read(() async {
       final data = await _client
           .from('profiles')
           .select('id, full_name, email')
@@ -443,6 +456,15 @@ class QuestionAuthoringRepositoryImpl implements QuestionAuthoringRepository {
 
     return GradingOutcome.fromMap(row);
   }
+
+  /// Runs a **read** through [_guard] with the read deadline applied.
+  ///
+  /// Composed so a read cannot pick up one without the other: [_guard] is what
+  /// turns a failure into the sentence the console prints, and the deadline is
+  /// what makes a connection that has gone silent fail at all. Writes call
+  /// [_guard] alone - see [readTimeout].
+  Future<T> _read<T>(Future<T> Function() read) =>
+      _guard(() => withReadTimeout(read, timeout: readTimeout));
 
   /// Runs a call and converts every failure into [AuthoringException], so the
   /// console has one error type to render.

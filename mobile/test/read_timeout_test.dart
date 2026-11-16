@@ -4,7 +4,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:proctorguard/features/admin/data/repositories/admin_user_repository_impl.dart';
 import 'package:proctorguard/features/admin/domain/repositories/admin_user_repository.dart';
+import 'package:proctorguard/features/authoring/data/repositories/question_authoring_repository_impl.dart';
 import 'package:proctorguard/core/utils/read_timeout.dart';
+import 'package:proctorguard/features/authoring/domain/repositories/question_authoring_repository.dart';
 import 'package:proctorguard/features/dashboard/data/repositories/dashboard_repository_impl.dart';
 import 'package:proctorguard/features/dashboard/domain/repositories/dashboard_repository.dart';
 import 'package:proctorguard/features/exam/data/repositories/consent_repository_impl.dart';
@@ -272,6 +274,51 @@ void main() {
       );
 
       expect(transport.requests.single.url.path, '/rest/v1/profiles');
+    });
+  });
+
+  group('the authoring console reads', () {
+    QuestionAuthoringRepositoryImpl repositoryOver(
+      http.BaseClient transport,
+    ) =>
+        QuestionAuthoringRepositoryImpl(
+          _clientOver(transport),
+          // The seam `RoleGate.currentUserId` uses: the console's reads are
+          // filtered by owner, and this is the owner.
+          currentUserId: () => 'user-1',
+          readTimeout: _testTimeout,
+        );
+
+    test('the paper list gives up as an unreachable server', () async {
+      final transport = _HungTransport();
+
+      await expectLater(
+        repositoryOver(transport).listMyExams(),
+        throwsA(
+          isA<AuthoringException>()
+              .having((error) => error.message, 'message', readTimeoutMessage),
+        ),
+      );
+
+      expect(transport.requests.single.url.path, '/rest/v1/exams');
+      expect(
+        transport.requests.single.url.query,
+        contains('created_by=eq.user-1'),
+      );
+    });
+
+    test('the paper\'s questions do, on the same sentence', () async {
+      final transport = _HungTransport();
+
+      await expectLater(
+        repositoryOver(transport).listQuestions('exam-1'),
+        throwsA(
+          isA<AuthoringException>()
+              .having((error) => error.message, 'message', readTimeoutMessage),
+        ),
+      );
+
+      expect(transport.requests.single.url.path, '/rest/v1/questions');
     });
   });
 }
