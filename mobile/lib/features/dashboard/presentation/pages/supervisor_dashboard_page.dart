@@ -20,8 +20,14 @@ import 'analytics_page.dart';
 /// attempts and the logs of the papers they were assigned
 /// (`submissions_select_own_or_supervisor` → `can_supervise_exam()` in
 /// `supabase/schema.sql`), a student only their own.
-final examSubmissionsStreamProvider =
-    StreamProvider.family<List<Map<String, dynamic>>, String>((ref, examId) {
+///
+/// `autoDispose`, because this stream *is* an open Realtime subscription. The
+/// monitor is its only reader, and nothing outside that page watches the family,
+/// so leaving the page closes the provider - and the channel with it. Without
+/// this the provider lived as long as the `ProviderScope`, which kept one channel
+/// open per exam a supervisor had ever opened for the rest of the session.
+final examSubmissionsStreamProvider = StreamProvider.autoDispose
+    .family<List<Map<String, dynamic>>, String>((ref, examId) {
   return SupabaseService.instance.client
       .from('exam_submissions')
       .stream(primaryKey: ['id'])
@@ -47,7 +53,11 @@ final examSubmissionsStreamProvider =
 /// asked about, so the roster still names every row it shows - another account's
 /// profile is not readable at all, where it used to be readable
 /// institution-wide.
-final accountNamesProvider = StreamProvider<Map<String, String>>((ref) {
+///
+/// `autoDispose` for the same reason as the roster stream above: this is a
+/// Realtime channel over `profiles`, and the monitor page is its only reader.
+final accountNamesProvider =
+    StreamProvider.autoDispose<Map<String, String>>((ref) {
   return SupabaseService.instance.client.from('profiles').stream(
         primaryKey: ['id'],
       ).map((rows) => {
@@ -67,8 +77,11 @@ final accountNamesProvider = StreamProvider<Map<String, String>>((ref) {
 /// applied on the stream, so a new submission is picked up without dropping
 /// buffered rows. For very large exams, put the join in a Postgres view and
 /// stream that instead.
-final liveViolationFeedProvider =
-    StreamProvider.family<List<Map<String, dynamic>>, String>((ref, examId) {
+///
+/// `autoDispose`: it watches [examSubmissionsStreamProvider], so it is disposed
+/// with the page that read it and its `proctoring_logs` channel closes then too.
+final liveViolationFeedProvider = StreamProvider.autoDispose
+    .family<List<Map<String, dynamic>>, String>((ref, examId) {
   final submissionIds = ref.watch(examSubmissionsStreamProvider(examId)).maybeWhen(
         data: (rows) => rows.map((row) => row['id'] as String).toSet(),
         orElse: () => const <String>{},

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:proctorguard/features/dashboard/data/repositories/dashboard_repository_impl.dart';
@@ -147,6 +148,106 @@ void main() {
       expect(find.text('open monitor'), findsOneWidget);
       expect(find.byKey(const Key('analytics-home')), findsNothing);
       expect(find.byKey(const Key('monitor-home')), findsNothing);
+    });
+  });
+
+  group('live subscription lifetime', () {
+    testWidgets('leaving the monitor cancels the three live streams', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1200, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      final roster = StreamController<List<Map<String, dynamic>>>();
+      final feed = StreamController<List<Map<String, dynamic>>>();
+      final names = StreamController<Map<String, String>>();
+      var rosterCancelled = false;
+      var feedCancelled = false;
+      var namesCancelled = false;
+      // `onCancel` is the evidence: it fires when the last subscriber lets go,
+      // which for a `StreamProvider` is exactly when the provider is disposed.
+      roster.onCancel = () => rosterCancelled = true;
+      feed.onCancel = () => feedCancelled = true;
+      names.onCancel = () => namesCancelled = true;
+      addTearDown(() async {
+        await roster.close();
+        await feed.close();
+        await names.close();
+      });
+
+      // What the monitor is showing when it is left: one ongoing attempt, named.
+      roster.add([
+        {
+          'id': 'attempt-1',
+          'student_id': 'student-1',
+          'status': 'ongoing',
+          'score': null,
+          'last_heartbeat_at': DateTime.now().toUtc().toIso8601String(),
+        },
+      ]);
+      feed.add(<Map<String, dynamic>>[]);
+      names.add({'student-1': 'Aisha Bello'});
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            examSubmissionsStreamProvider(
+              'exam-1',
+            ).overrideWith((ref) => roster.stream),
+            liveViolationFeedProvider(
+              'exam-1',
+            ).overrideWith((ref) => feed.stream),
+            accountNamesProvider.overrideWith((ref) => names.stream),
+            dashboardRepositoryProvider.overrideWithValue(
+              _FakeDashboardRepository(),
+            ),
+          ],
+          child: MaterialApp(
+            home: Builder(
+              builder: (context) => Scaffold(
+                body: Center(
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const SupervisorDashboardPage(
+                          examId: 'exam-1',
+                          examTitle: 'Biology',
+                        ),
+                      ),
+                    ),
+                    child: const Text('open monitor'),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('open monitor'));
+      await tester.pumpAndSettle();
+
+      // Same data as before the lifetime change: the roster row and the name the
+      // `profiles` stream delivered, painted from the live streams.
+      expect(find.textContaining('Aisha Bello'), findsWidgets);
+      expect(find.textContaining('1 attempt(s)'), findsOneWidget);
+      expect(rosterCancelled, isFalse, reason: 'the monitor is still open');
+
+      // Leaving the page pops back to the landing route. The `ProviderScope` stays
+      // mounted (it is above the `MaterialApp`), so anything not `autoDispose` would
+      // stay subscribed here and hold its Realtime channel for the rest of the
+      // session - which is what the three providers did.
+      await tester.tap(find.byKey(const Key('monitor-home')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('open monitor'), findsOneWidget);
+      expect(rosterCancelled, isTrue);
+      expect(feedCancelled, isTrue);
+      expect(namesCancelled, isTrue);
     });
   });
 
