@@ -3,6 +3,7 @@ import 'dart:async';
 import '../../features/proctoring/domain/repositories/proctoring_repository.dart';
 import '../utils/proctor_log.dart';
 import '../utils/uuid.dart';
+import 'supabase_service.dart' show SessionSupersededException;
 
 /// The positive signal that a sitting is being proctored at all.
 ///
@@ -33,7 +34,9 @@ import '../utils/uuid.dart';
 /// dropped and the next tick tries again - a missing beat is honest, a replayed
 /// one is not. Failures are counted and logged, and never thrown: a heartbeat is
 /// the least important thing the client does, and it must never be able to
-/// interrupt an exam.
+/// interrupt an exam. The one failure that is *not* retried is a superseded
+/// session (`PT409`): the server refuses that device for good, so the series stops
+/// rather than repeating a request it already has an answer to.
 class ProctoringHeartbeatService {
   ProctoringHeartbeatService(
     this._repository, {
@@ -194,7 +197,9 @@ class ProctoringHeartbeatService {
   ///
   /// Public so a resume, a manual refresh or a test can beat out of band. Never
   /// throws: every failure is counted in [failures] and logged, because a
-  /// heartbeat that can break an exam is worse than no heartbeat at all.
+  /// heartbeat that can break an exam is worse than no heartbeat at all. A
+  /// superseded session is the exception that ends the series instead of retrying
+  /// on the next tick.
   /// Overlapping calls collapse into the in-flight one, so a slow socket cannot
   /// pile up requests behind a fast timer.
   Future<void> beatNow() async {
@@ -222,6 +227,21 @@ class ProctoringHeartbeatService {
       if (ack.outcome.stored) _stored++;
       _lastAckAt = _now();
       _lastError = null;
+    } on SessionSupersededException {
+      // The one refusal that is final: another device signed in, so every later
+      // beat for this attempt would be a round trip the server has already said no
+      // to (§1b). The series stops instead of retrying a session that cannot
+      // write - the repository reports the refusal as itself for exactly this
+      // (see `ProctoringRepository.recordHeartbeat`). Nothing is surfaced here:
+      // `SessionGate` polls on its own and is what signs the device out, so the
+      // exam page does not need the heartbeat to tell it.
+      _failures++;
+      _lastError = 'session superseded by a newer sign-in';
+      proctorLog(
+        'ProctorGuard heartbeat: $submissionId was superseded - stopping the '
+        'series.',
+      );
+      stop();
     } on TimeoutException {
       _failures++;
       _lastError = 'heartbeat timed out after $_deadline';

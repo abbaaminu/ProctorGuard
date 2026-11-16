@@ -1,6 +1,8 @@
 import 'dart:async';
 
 import 'package:proctorguard/core/services/proctoring_heartbeat.dart';
+import 'package:proctorguard/core/services/supabase_service.dart'
+    show SessionSupersededException;
 import 'package:proctorguard/features/proctoring/domain/entities/heartbeat.dart';
 import 'package:proctorguard/features/proctoring/domain/entities/violation.dart';
 import 'package:proctorguard/features/proctoring/domain/repositories/proctoring_repository.dart';
@@ -277,6 +279,36 @@ void main() {
       expect(service.beatsStored, 0);
       expect(service.failures, 0);
       expect(service.lastError, isNull);
+    });
+    test('a superseded session stops the series instead of retrying forever',
+        () async {
+      // `PT409` is the one refusal that is final: another device signed in, so the
+      // server refuses every write from this one. Retrying it on the cadence would
+      // be a request per 15 s for the rest of the sitting that the server has
+      // already answered - and the repository reports the refusal as its own
+      // exception precisely so this loop can stop (see
+      // `ProctoringRepository.recordHeartbeat`). The student still learns about it
+      // from `SessionGate`, which polls on its own.
+      final repo = _FakeProctoringRepository()
+        ..answer = (beat) async => throw const SessionSupersededException();
+      final service = ProctoringHeartbeatService(
+        repo,
+        cadence: const Duration(milliseconds: 10),
+      );
+      addTearDown(service.dispose);
+
+      service.start('sub-1'); // the immediate beat is the one that is refused
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(service.isBeating, isFalse);
+      expect(service.submissionId, isNull);
+      expect(service.failures, 1);
+      expect(service.lastError, contains('superseded'));
+
+      // No timer is left behind: three cadences later the server has still been
+      // asked exactly once.
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      expect(repo.beats, hasLength(1));
     });
   });
 }
