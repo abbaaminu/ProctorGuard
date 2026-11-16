@@ -40,6 +40,7 @@ commit each, so the tree has moved under some of the line numbers:
 | §8 P3-14 — the dangling test path | the lecturer-isolation migration (still uncommitted with the feature it belongs to) | the comment now names `supabase/tests/supervisor_scope_check.sql`, block (l) |
 | §8 P2-6 / §4.3 — a feed that goes quiet mid-session | `1073adb` | `AudioMonitor` re-arms the proof-of-life window on **every** sample, so a feed that stops delivering is no longer indistinguishable from a silent room. Expiry mid-session reports `unavailable` (visible on the chip, the paper keeps going), not `interrupted` as this report proposed: a throttled timer or a paused capture thread is an inference, and the first sample to arrive returns the state to `monitoring` by itself |
 | §6.5 — the heartbeat against a superseded session | `49ee204` | `ProctoringHeartbeatService` catches `SessionSupersededException` and stops the series instead of counting a failure and retrying a refusal every 15 s for the rest of the sitting. Nothing is surfaced from the heartbeat: `SessionGate` is what signs the device out |
+| §1.4 — the web pose matrix, unverified arithmetic | `580fdd8` | `matrixPose()` now has a test that builds rotation matrices from known angles and reads them back, including a scaled one and a rolled one. It confirms the documented column-major layout and the `Ry·Rx·Rz` decomposition, and shows that a row-major flattening would turn the same 20° pitch into −20°. The sign convention stays unverifiable without a real face — and unused, since Dart judges absolute angles |
 
 Everything else in §8 — liveness (P1-1), the frame-stall watchdog (P2-5), the devtools
 and split-screen notes (P2-7, P2-8), the queue cap, D3 and the three wording notes
@@ -201,7 +202,19 @@ immediately (`proctor_face_detector.js:1646-1658`). It polls every
   normalised by half the eye span, smoothed by a median over `POSE_WINDOW = 3`
   samples (`:212`, `:216-218`, `:920-970`).
 * From MediaPipe's facial transformation matrix, Euler angles are derived
-  (`:1285-1305`).
+  (`:1268-1309`): the 4x4 is read **column-major**—element (row, column) at
+  `column * 4 + row`—and decomposed as R = Ry(yaw)·Rx(pitch)·Rz(roll), so
+  `pitch = asin(-R[1][2])` and `yaw = atan2(R[0][2], R[2][2])`. The arithmetic is
+  pinned by `tools/detector_eval/test/pose_matrix.test.mjs` (`580fdd8`), which builds
+  matrices from angles known in advance and compares what comes back: both axes,
+  both signs, roll moving neither angle, a uniformly scaled matrix reading the same,
+  the 90° collapse reported as yaw 0 rather than invented, a value past `asin`'s
+  domain clamped rather than NaN, and no matrix answering null. That test also shows
+  the layout is load-bearing: flattened row-major, the same 20° pitch reads −20°.
+  What it cannot settle is the sign convention, and which of the model's axes is
+  called yaw — that needs a real face (§7 B), and it is deliberately not corrected
+  here because Dart judges `abs(yaw)` and `abs(pitch)`, where a mirrored angle is
+  the same evidence.
 * The page emits **angles, not a verdict** — `pose:<yaw>,<pitch>` — so the
   threshold applied is the app's, not the page's (`:37-42`, `:1496-1501`). A page
   that cannot measure says `centered` for a live picture and reports
@@ -1438,7 +1451,8 @@ start-up grace from the first frame), the `web_exam_guard.dart` commit that clos
 with four new unit tests, and a comment fix in the lecturer-isolation migration, which
 is still uncommitted with the rest of that feature and will ride with it. Each change
 was checked with `flutter analyze` (no issues), the whole `flutter test` suite (880
-tests) and `node --test "tools/detector_eval/test/*.test.mjs"` (52 tests); the only
+tests) and `node --test "tools/detector_eval/test/*.test.mjs"` (52 tests then; 62
+today, the ten pose-matrix ones added below); the only
 SQL edited was a comment, so `supabase/tests/*.sql` was not re-run.
 
 One caveat for anyone checking this with `git status`: the working tree already held
@@ -1462,6 +1476,18 @@ of retrying a refusal every 15 s). Verified the same way as the rest — `flutte
 clean, the whole `flutter test` suite (941 tests, two of them new), no SQL touched — and
 neither is a number §7 measures; the only new *question* for §7 is how long a legitimate
 stall may last before a chip is right to say `Mic unavailable` (test 20).
+
+The last one is not a fix but a proof, and it is the one item on this list that could
+not have been settled by reading code: `580fdd8`. The web detector reads yaw and pitch
+out of MediaPipe's 4x4 head-pose matrix, and a 4x4 printed in a log has no visible
+handedness — row-major or column-major, both look like a matrix, and a wrong choice
+turns a real head the wrong way while a level head still reads level. So the test builds
+rotations from angles known in advance, flattens them the way `Matrix.data` does, and
+compares: the layout is column-major as documented, the decomposition is `Ry·Rx·Rz`,
+roll moves neither angle, and the same 20° pitch flattened row-major reads −20°. Ten
+tests, no browser and no model; with them the node suite is 62 tests. Nothing under
+`mobile/` changed, so the Dart suite and its 941 tests are untouched by that commit,
+and the sign convention it cannot settle is not used: the app compares absolute angles.
 
 ### One-paragraph summary for a reader who reads only this
 
