@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
+import 'package:proctorguard/features/admin/data/repositories/admin_user_repository_impl.dart';
+import 'package:proctorguard/features/admin/domain/repositories/admin_user_repository.dart';
 import 'package:proctorguard/core/utils/read_timeout.dart';
 import 'package:proctorguard/features/dashboard/data/repositories/dashboard_repository_impl.dart';
 import 'package:proctorguard/features/dashboard/domain/repositories/dashboard_repository.dart';
@@ -248,6 +250,28 @@ void main() {
       );
 
       expect(transport.requests.single.url.path, '/rest/v1/exams');
+    });
+  });
+
+  group('the account roster read', () {
+    test('an unanswered roster read reports an unreachable server', () async {
+      final transport = _HungTransport();
+      final repository = AdminUserRepositoryImpl(
+        _clientOver(transport),
+        readTimeout: _testTimeout,
+      );
+
+      // `_guard` already converts everything except an `AdminAccountException`
+      // into this sentence, so the deadline needed no new branch.
+      await expectLater(
+        repository.listAccounts(),
+        throwsA(
+          isA<AdminAccountException>()
+              .having((error) => error.message, 'message', readTimeoutMessage),
+        ),
+      );
+
+      expect(transport.requests.single.url.path, '/rest/v1/profiles');
     });
   });
 }

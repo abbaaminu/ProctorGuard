@@ -1,5 +1,6 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../../../../core/utils/read_timeout.dart';
 import '../../../auth/domain/entities/user_profile.dart';
 import '../../domain/entities/managed_account.dart';
 import '../../domain/entities/profile_labels.dart';
@@ -15,7 +16,7 @@ import '../../domain/repositories/admin_user_repository.dart';
 ///   - listing and re-roling are plain PostgREST calls, authorised by the
 ///     `profiles_admin_all` policy and the `guard_user_role_change()` trigger.
 class AdminUserRepositoryImpl implements AdminUserRepository {
-  AdminUserRepositoryImpl(this._client);
+  AdminUserRepositoryImpl(this._client, {this.readTimeout = defaultReadTimeout});
 
   static const String createAccountFunction = 'admin-create-user';
   static const String deleteAccountFunction = 'admin-delete-user';
@@ -31,6 +32,16 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
   static const int minPasswordLength = 10;
 
   final SupabaseClient _client;
+
+  /// The deadline on [listAccounts], the only read this repository makes. See
+  /// `core/utils/read_timeout.dart`.
+  ///
+  /// The rest is writes: `updateRole`, `resetPassword`, `deleteAccount`, and the
+  /// Edge Functions that create accounts and repair labels. Those are not
+  /// abandoned on a deadline - `_guard` already turns a lost response into the
+  /// same sentence, and re-issuing a create or a delete on a guess is how one
+  /// account becomes two, or a deleted one comes back as an error.
+  final Duration readTimeout;
 
   @override
   Future<ManagedAccount> createAccount({
@@ -273,12 +284,15 @@ class AdminUserRepositoryImpl implements AdminUserRepository {
   @override
   Future<List<ManagedAccount>> listAccounts() async {
     final rows = await _guard(() async {
-      final data = await _client
-          .from('profiles')
-          .select()
-          // Oldest first: the seeded/bootstrap admin stays at the top, which is
-          // where an administrator looks for "the account that made mine".
-          .order('created_at', ascending: true);
+      final data = await withReadTimeout<PostgrestList>(
+        () => _client
+            .from('profiles')
+            .select()
+            // Oldest first: the seeded/bootstrap admin stays at the top, which is
+            // where an administrator looks for "the account that made mine".
+            .order('created_at', ascending: true),
+        timeout: readTimeout,
+      );
       return (data as List).cast<Map<String, dynamic>>();
     });
 
