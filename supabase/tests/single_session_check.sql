@@ -51,6 +51,13 @@
 --   and no block below asserts that this file's clock advanced. What they assert
 --   is the row - its `session_id`, its `issued_at`, its label, and a `claimed_at`
 --   that never moves backwards - because that is what a client can see.
+--
+--   Every count below is pinned to this fixture - its account ids, its session ids,
+--   or the submission the question is about. `active_sessions` and
+--   `session_supersessions` are live tables: a project with real usage already holds
+--   claims and takeovers that have nothing to do with this run, so an unscoped
+--   `count(*)` grows with the database instead of answering "what did *this* fixture
+--   write?".
 -- =====================================================================
 
 begin;
@@ -164,9 +171,9 @@ begin
   if not public.is_current_session() then
     raise exception 'FAIL (a): an account that never claimed was locked out of its own attempt';
   end if;
-  select count(*) into v_n from public.active_sessions;
+  select count(*) into v_n from public.active_sessions where user_id = auth.uid();
   if v_n <> 0 then
-    raise exception 'FAIL (a): active_sessions held % row(s) before the first claim', v_n;
+    raise exception 'FAIL (a): active_sessions held % row(s) for this account before the first claim', v_n;
   end if;
 
   select * into r from public.claim_session('android');
@@ -242,9 +249,9 @@ begin
     raise exception 'FAIL (b): a repeat claim with no label was refused';
   end if;
 
-  select count(*) into v_n from public.active_sessions;
+  select count(*) into v_n from public.active_sessions where user_id = auth.uid();
   if v_n <> 1 then
-    raise exception 'FAIL (b): active_sessions held % row(s) after two repeat claims', v_n;
+    raise exception 'FAIL (b): active_sessions held % row(s) for this account after two repeat claims', v_n;
   end if;
 
   select * into v_row from public.active_sessions where user_id = auth.uid();
@@ -327,17 +334,26 @@ select set_config('request.jwt.claims', '', true);
 -- the paper's owner/supervisor), so it is read here as postgres - the same rows a
 -- supervisor's query would return. It also proves the count: one takeover, one row,
 -- so neither the first claim in (a) nor the repeats in (b) were audited.
+--
+-- Both reads are pinned to this fixture's account. `session_supersessions` is a live
+-- trail: a project with real usage already holds takeovers that have nothing to do
+-- with this run, and an unscoped count grows with the database instead of answering
+-- "how many rows did *this* takeover write?".
 do $$
 declare
   v_log public.session_supersessions;
   v_n   int;
 begin
-  select count(*) into v_n from public.session_supersessions;
+  select count(*) into v_n
+    from public.session_supersessions
+   where user_id = current_setting('test.a')::uuid;
   if v_n <> 1 then
     raise exception 'FAIL (c)ii: % audit row(s) for one takeover', v_n;
   end if;
 
-  select * into v_log from public.session_supersessions;
+  select * into v_log
+    from public.session_supersessions
+   where user_id = current_setting('test.a')::uuid;
   if v_log.user_id is distinct from current_setting('test.a')::uuid then
     raise exception 'FAIL (c)ii: the audit row names user %', v_log.user_id;
   end if;
@@ -413,13 +429,15 @@ end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);
 
--- The refusal wrote nothing: still exactly one audit row, and it still points the
--- same way.
+-- The refusal wrote nothing: still exactly one audit row for this fixture's account,
+-- and it still points the same way.
 do $$
 declare
   v_n int;
 begin
-  select count(*) into v_n from public.session_supersessions;
+  select count(*) into v_n
+    from public.session_supersessions
+   where user_id = current_setting('test.a')::uuid;
   if v_n <> 1 then
     raise exception 'FAIL (d): a refused claim added an audit row (% rows)', v_n;
   end if;
@@ -754,9 +772,9 @@ begin
     raise exception 'FAIL (g)ii: B cannot write its own attempt';
   end if;
 
-  select count(*) into v_n from public.active_sessions;
+  select count(*) into v_n from public.active_sessions where user_id = auth.uid();
   if v_n <> 1 then
-    raise exception 'FAIL (g)ii: active_sessions holds % row(s), expected one account''s', v_n;
+    raise exception 'FAIL (g)ii: active_sessions holds % row(s) for this account, expected 1', v_n;
   end if;
 
   raise notice 'PASS (g)ii: B''s older token wins B''s own account';
@@ -811,8 +829,12 @@ begin
     raise exception 'FAIL (h): a client write left the account gated against itself';
   end if;
 
-  -- The audit is staff-only: the student it happened to cannot read it back.
-  select count(*) into v_n from public.session_supersessions;
+  -- The audit is staff-only: the student it happened to cannot read it back. Pinned
+  -- to the fixture's account, so a live project's own takeovers are not part of the
+  -- question; the expected answer stays 0.
+  select count(*) into v_n
+    from public.session_supersessions
+   where user_id = current_setting('test.a')::uuid;
   if v_n <> 0 then
     raise exception 'FAIL (h): a student can read % session_supersessions row(s)', v_n;
   end if;
