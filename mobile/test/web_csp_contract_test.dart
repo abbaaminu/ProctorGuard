@@ -141,6 +141,33 @@ void main() {
       }
     });
 
+    test('lets the shipped face model read the blobs it created', () {
+      // The failure this pins: `web/mediapipe/` is served from this origin, so
+      // `connect-src` looked complete without it - but MediaPipe's Emscripten
+      // runtime writes the downloaded bytes into a `Blob`, mints a `blob:` URL
+      // and reads it back with a **synchronous XHR**. An XHR is a `connect-src`
+      // fetch, so the policy refused it with
+      // "Connecting to 'blob:https://<origin>/...' violates the following
+      // Content Security Policy directive: connect-src ..." twice per attempt,
+      // and a desktop browser lost head-pose measurement while every byte of
+      // the model had already arrived. `blob:` is minted by this document only.
+      final connect = csp['connect-src'] ?? const <String>[];
+
+      expect(
+        connect,
+        contains('blob:'),
+        reason: 'without blob: the face model cannot read its own wasm/model '
+            'bytes and every desktop exam logs a CSP violation instead of '
+            'measuring a head pose',
+      );
+      expect(
+        connect,
+        isNot(contains('https:')),
+        reason: 'blob: is a self-minted scheme; a blanket https: entry would '
+            'let an injected script post frames anywhere',
+      );
+    });
+
     test('addresses the realtime and storage endpoints, not just REST', () {
       // Auth and PostgREST are https; Realtime is a websocket, and a
       // connect-src without `wss:` leaves the live monitor silently dead.
@@ -265,6 +292,14 @@ const Set<String> _fontSources = <String>{
 /// local Supabase stack: a production deployment can drop them, and this test
 /// then fails until it is updated deliberately.
 ///
+/// `blob:` is the shipped face model, not a widening: MediaPipe's Emscripten
+/// runtime reads the `.wasm`/`.task` bytes it was handed back out of its own
+/// virtual filesystem with a synchronous `XMLHttpRequest` on a `Blob` URL that
+/// this document created. An XHR is a `connect-src` fetch, so without the entry
+/// the browser refuses the read ("Connecting to 'blob:...' violates ...") and a
+/// desktop exam loses head-pose measurement with every byte already downloaded.
+/// A `blob:` URL is minted by and readable only from this document.
+///
 /// `fonts.gstatic.com` is here for the *engine*, not for `google_fonts`: the
 /// web engine's fallback font downloader resolves a code point no bundled face
 /// covers by fetching `https://fonts.gstatic.com/s/<family>/<version>/<hash>.woff2`
@@ -277,6 +312,7 @@ const Set<String> _fontSources = <String>{
 /// `style-src` load and its faces are `font-src` loads.
 const Set<String> _connectSources = <String>{
   "'self'",
+  'blob:',
   'https://*.supabase.co',
   'wss://*.supabase.co',
   'https://*.supabase.in',

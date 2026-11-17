@@ -88,6 +88,17 @@
         Realtime socket. A **self-hosted** Supabase is served from its own
         domain and must be added here by the host; there is no way to template
         `--dart-define=SUPABASE_URL` into this static file.
+      * `connect-src blob:` - the face model's own loader, and only that. The
+        MediaPipe runtime this build ships (`web/mediapipe/`) fetches its
+        `.wasm` and `.task` bytes, hands them to Emscripten's virtual filesystem
+        as `Blob`s, and Emscripten reads those bytes back with a **synchronous
+        `XMLHttpRequest` on the blob URL** it minted. An XHR is governed by
+        `connect-src`, so without this entry Chrome refuses each read -
+        `Connecting to 'blob:https://...' violates the following Content
+        Security Policy directive: "connect-src ..."` - and the model fails to
+        initialise even though every byte arrived from this origin. A `blob:`
+        URL is created by this document and cannot leave it, so the entry grants
+        nothing to a third party; it is not a widening to `https:`.
       * `https://*.ingest.sentry.io` - crash reports, and only when the build was
         given `--dart-define=SENTRY_DSN` (see `lib/core/services/
         crash_reporting.dart`). A self-hosted Sentry needs its ingest origin
@@ -105,7 +116,7 @@
     DENY`) on whatever serves `build/web`. `test/web_csp_contract_test.dart`
     pins the directives above so a relaxed policy fails CI rather than shipping.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://www.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob: https://*.supabase.co https://*.supabase.in; font-src 'self' data: https://fonts.gstatic.com; media-src 'self' blob: data:; worker-src 'self' blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://*.supabase.in wss://*.supabase.in https://*.ingest.sentry.io https://*.ingest.us.sentry.io https://*.ingest.de.sentry.io https://www.gstatic.com https://fonts.gstatic.com http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://www.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob: https://*.supabase.co https://*.supabase.in; font-src 'self' data: https://fonts.gstatic.com; media-src 'self' blob: data:; worker-src 'self' blob:; connect-src 'self' blob: https://*.supabase.co wss://*.supabase.co https://*.supabase.in wss://*.supabase.in https://*.ingest.sentry.io https://*.ingest.us.sentry.io https://*.ingest.de.sentry.io https://www.gstatic.com https://fonts.gstatic.com http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
   <meta name="description" content="ProctorGuard student client — take AI-proctored exams with on-device face and microphone monitoring.">
   <meta name="theme-color" content="#3F51B5">
