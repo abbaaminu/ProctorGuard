@@ -41,6 +41,7 @@ void main() {
     Future<bool?> Function()? isCurrentSession,
     Future<AuthOutcome> Function()? signOut,
     List<Duration> claimRetryDelays = defaultClaimRetryDelays,
+    Widget? child,
   }) =>
       MaterialApp(
         home: SessionLiveness(
@@ -56,7 +57,7 @@ void main() {
           // A Scaffold, because the message has to be *shown*: the SnackBar is
           // posted to the root messenger and rendered by whichever Scaffold is
           // registered with it.
-          child: const Scaffold(body: Text('signed in')),
+          child: child ?? const Scaffold(body: Text('signed in')),
         ),
       );
 
@@ -242,6 +243,64 @@ void main() {
     expect(find.text(reason), findsOneWidget);
 
     await tester.pump(const Duration(seconds: 9));
+  });
+
+  testWidgets('a superseded device is taken back off the pushed page',
+      (tester) async {
+    var signOuts = 0;
+
+    await tester.pumpWidget(
+      harness(
+        signedIn: Stream<bool>.value(true),
+        // What every staff workspace looks like: the role gate's page, with the
+        // console pushed on top of it.
+        child: Scaffold(
+          body: Builder(
+            builder: (context) => TextButton(
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => const Scaffold(body: Text('live monitor')),
+                ),
+              ),
+              child: const Text('open monitor'),
+            ),
+          ),
+        ),
+        isCurrentSession: () async => false,
+        signOut: () async {
+          signOuts++;
+          return const AuthOutcome.success();
+        },
+      ),
+    );
+    await settle(tester);
+
+    await tester.tap(find.text('open monitor'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.text('live monitor'), findsOneWidget);
+
+    // The poll is what notices it, one interval after the sign-in.
+    await tester.pump(const Duration(seconds: 31));
+    await settle(tester);
+    expect(signOuts, 1);
+
+    // The popped route's own exit transition (Material 3's fade-forwards page
+    // transition runs 800ms), then the frame that finalises it.
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+
+    expect(
+      find.text('live monitor'),
+      findsNothing,
+      reason: 'a pushed workspace must not outlive the session it belongs to',
+    );
+    expect(find.text('open monitor'), findsOneWidget, reason: 'back at the root');
+    expect(find.text(reason), findsOneWidget, reason: 'and told why');
+
+    // The SnackBar's own timer, so the test ends with nothing pending.
+    await tester.pump(const Duration(seconds: 9));
+    await tester.pumpWidget(const SizedBox());
   });
 
   testWidgets('a claim the server could not answer is asked again',

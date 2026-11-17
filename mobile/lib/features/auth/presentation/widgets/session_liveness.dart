@@ -250,6 +250,15 @@ class _SessionLivenessState extends State<SessionLiveness> {
     _claimRetry?.cancel();
     _claimRetry = null;
     _gate.stop();
+
+    // Back to the root before the sign-out. `signOut()` is local, so it only
+    // re-points what `MaterialApp.home:` builds - and every staff workspace sits
+    // one route deeper (the live monitor, the authoring console, the roster are
+    // all pushed on top of this widget's child), so a pushed page would stay on
+    // screen with its cached roster and the only sign this device lost the
+    // account would be the eight-second message below. Popped first, so the pop
+    // is not racing the rebuild the sign-out itself starts.
+    Navigator.maybeOf(context)?.popUntil((route) => route.isFirst);
     final outcome = await _requestSignOut();
     if (!outcome.ok) {
       proctorLog('SessionLiveness: local sign-out failed: ${outcome.message}');
