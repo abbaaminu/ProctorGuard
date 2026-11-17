@@ -46,7 +46,9 @@ function table(headers, rows, aligns) {
 export function describeRules(rules) {
   return [
     `yaw > ${rules.yawDegrees}°`,
-    `pitch > ${rules.pitchDegrees}°`,
+    `pitch > ${rules.pitchDegrees}° up`,
+    `pitch > ${rules.pitchDownDegrees}° down`,
+    `near-sideways ${rules.immediateYawDegrees}° in ${rules.immediateConfirmations} detections`,
     `look-away hold ${rules.lookAwaySustainMs}ms`,
     `no-face hold ${rules.noFaceSustainMs}ms`,
     `grace ${rules.graceMs}ms`,

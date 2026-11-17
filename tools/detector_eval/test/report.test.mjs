@@ -17,14 +17,18 @@ import {
   toJsonReport,
 } from '../lib/report.mjs';
 
-// Deliberately *not* the app's pair (15 / 15): this is a formatter fixture, and the
-// assertion below is that whatever numbers a run was scored under come back out
-// labelled with the right axis. Distinct values keep that check honest - a
-// `describeRules` that printed the yaw twice would pass on an equal pair. The real
-// numbers are `DEFAULT_RULES` in `judge.mjs`, read from the Dart.
+// Deliberately *not* the app's numbers (15 / 15 / 20): this is a formatter fixture,
+// and the assertion below is that whatever numbers a run was scored under come back
+// out labelled with the right axis and the right direction. Distinct values keep that
+// check honest - a `describeRules` that printed the yaw twice, or the upward pitch
+// where the downward one belongs, would pass on equal values. The real numbers are
+// `DEFAULT_RULES` in `judge.mjs`, read from the Dart.
 const RULES = {
   yawDegrees: 25,
   pitchDegrees: 18,
+  pitchDownDegrees: 24,
+  immediateYawDegrees: 40,
+  immediateConfirmations: 3,
   lookAwaySustainMs: 2000,
   noFaceSustainMs: 300,
   graceMs: 0,
@@ -68,7 +72,9 @@ function report(overrides = {}) {
 test('describeRules names every number the score was produced under', () => {
   const text = describeRules(RULES);
   assert.match(text, /yaw > 25°/);
-  assert.match(text, /pitch > 18°/);
+  assert.match(text, /pitch > 18° up/);
+  assert.match(text, /pitch > 24° down/);
+  assert.match(text, /near-sideways 40° in 3 detections/);
   assert.match(text, /look-away hold 2000ms/);
   assert.match(text, /no-face hold 300ms/);
   assert.match(text, /grace 0ms/);

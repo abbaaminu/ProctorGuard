@@ -55,9 +55,14 @@ Two holds, not one. A head that has turned waits `lookAwaySustainMs` (the app's 
 at 15°, shared with the phone), while a missing face waits `noFaceSustainMs` (300 ms):
 "the head went past the gate and stayed there" and "the camera stopped showing a
 face" are different questions, and the browser has always answered them with
-different numbers. There is no angle at which a turn is reported on sight — a 60°
-estimate can come from a single bad frame, so every angle past the gate waits out
-the hold.
+different numbers. Past `immediateYawDegrees` (30° of yaw) the hold gives way to the
+monitor's near-sideways start: two consecutive detections (`immediateConfirmations`)
+are the whole of the evidence, the same count the phone uses, because one bad Euler
+estimate can read 60° and one detection is a frame rather than a student. Pitch keeps
+the hold at every angle, and it is the one *signed* gate: 20° down
+(`pitchDownDegrees`, `lookAwayWebDownwardPitchDegrees` in the Dart) against 15° up,
+because a positive pitch is a chin down and the keyboard a browser student reads is
+below the screen.
 
 **Known gap: the repeated-glance window is not ported yet.** `WebFacePresenceMonitor`
 now also banks short glances — three of at least 500 ms, or 5 s off screen in total,

@@ -3,9 +3,10 @@
  *
  * `createJudge` is a port of `WebFacePresenceMonitor`, so these tests are about
  * the parts a reviewer would check against the Dart: a sustained `no_face` is one
- * violation however long it lasts, a turned head - at any angle - has to hold, a
- * second person latches across a cooldown, and the startup grace can be switched
- * back on.
+ * violation however long it lasts, a turned head has to hold unless it is near
+ * sideways (two detections past 30 degrees), a second person latches across a
+ * cooldown, the pitch gate is signed (20 degrees down, 15 up) and the startup grace
+ * can be switched back on.
  */
 
 import assert from 'node:assert/strict';
@@ -42,20 +43,11 @@ test('a face coming back re-arms the episode', () => {
   assert.equal(judge.feed('no_face', 900), 'no_face');
 });
 
-test('looking_away waits for the hold, and no angle skips it', () => {
+test('looking_away waits for the hold, and no ordinary angle skips it', () => {
   const sustained = createJudge(rules({ lookAwaySustainMs: 300 }));
   assert.equal(sustained.feed('looking_away', 0), null);
   assert.equal(sustained.feed('looking_away', 299), null);
   assert.equal(sustained.feed('looking_away', 300), 'looking_away');
-
-  // A near-sideways head used to report on the first detection here (past 30
-  // degrees, no sustain). The monitor no longer has that exemption - one bad frame
-  // can read 60 degrees - so neither does its port: 45 degrees waits out the hold
-  // exactly like 20.
-  const wide = createJudge(rules({ lookAwaySustainMs: 300 }));
-  assert.equal(wide.feed('pose:45,0', 0), null);
-  assert.equal(wide.feed('pose:45,0', 299), null);
-  assert.equal(wide.feed('pose:45,0', 300), 'looking_away');
 
   // Just over the gate waits too, and the gate is the app's 15 degrees.
   const nearly = createJudge(rules({ lookAwaySustainMs: 300 }));
@@ -63,13 +55,35 @@ test('looking_away waits for the hold, and no angle skips it', () => {
   assert.equal(nearly.feed('pose:20,0', 300), 'looking_away');
 });
 
-test('the pose gate is symmetric on both axes', () => {
-  // `Math.abs()` on the yaw and the pitch, like the Dart: how far the head went is
-  // the evidence, which way it went is not. The 15 / 15 pair is what makes "either
-  // way" the same rule rather than two rules 7 degrees apart.
+test('a near-sideways turn is confirmed by two detections, not two seconds', () => {
+  // The monitor's one speed-up, and its port has it too: past 30 degrees of yaw a
+  // head is not in any reading position, so two consecutive detections are the whole
+  // of the evidence - the second one reports, well inside the hold.
+  const judge = createJudge(rules({ lookAwaySustainMs: 300 }));
+  assert.equal(judge.feed('pose:45,0', 0), null, 'one detection is a frame');
+  assert.equal(judge.feed('pose:45,0', 150), 'looking_away');
+
+  // One detection, then a centred frame, then one more: two bad frames are not two
+  // consecutive ones, so nothing has been earned.
+  const flicker = createJudge(rules({ lookAwaySustainMs: 300 }));
+  assert.equal(flicker.feed('pose:45,0', 0), null);
+  assert.equal(flicker.feed('pose:0,0', 100), null);
+  assert.equal(flicker.feed('pose:45,0', 200), null);
+  assert.equal(flicker.feed('pose:45,0', 300), 'looking_away');
+
+  // A deep nod has no fast path: pitch is reading, not another screen, so 70 degrees
+  // of it waits out the hold like any other glance.
+  const nod = createJudge(rules({ lookAwaySustainMs: 300 }));
+  assert.equal(nod.feed('pose:0,70', 0), null);
+  assert.equal(nod.feed('pose:0,70', 150), null, 'two detections are not two seconds');
+  assert.equal(nod.feed('pose:0,70', 300), 'looking_away');
+});
+
+test('the yaw gate is symmetric, and the pitch gate is not', () => {
+  // Yaw is judged on the absolute angle: how far the head went is the evidence,
+  // which way it went is not.
   for (const [there, back] of [
     ['pose:20,0', 'pose:-20,0'],
-    ['pose:0,20', 'pose:0,-20'],
   ]) {
     const judge = createJudge(rules({ lookAwaySustainMs: 300 }));
     assert.equal(judge.feed(there, 0), null);
@@ -78,6 +92,25 @@ test('the pose gate is symmetric on both axes', () => {
     assert.equal(mirrored.feed(back, 0), null);
     assert.equal(mirrored.feed(back, 300), 'looking_away', `${back} should report`);
   }
+
+  // Pitch is signed, and the sign is the page's: positive is a chin down. A chin
+  // 18 degrees *down* is the keyboard and is not evidence, however long it holds;
+  // 18 degrees *up* is a screen above the monitor and is. That is the browser's one
+  // asymmetry, 15 up against 20 down.
+  const down = createJudge(rules({ lookAwaySustainMs: 300 }));
+  assert.equal(down.feed('pose:0,18', 0), null);
+  assert.equal(down.feed('pose:0,18', 300), null, '18 down is inside the wider gate');
+  assert.equal(down.feed('pose:0,18', 5000), null);
+
+  const up = createJudge(rules({ lookAwaySustainMs: 300 }));
+  assert.equal(up.feed('pose:0,-18', 0), null);
+  assert.equal(up.feed('pose:0,-18', 300), 'looking_away', '18 up is past the 15 gate');
+
+  const desk = createJudge(rules({ lookAwaySustainMs: 300 }));
+  assert.equal(desk.feed('pose:0,20', 0), null);
+  assert.equal(desk.feed('pose:0,20', 300), null, 'the widened gate is strict, like the old one');
+  assert.equal(desk.feed('pose:0,22', 400), null);
+  assert.equal(desk.feed('pose:0,22', 700), 'looking_away', '22 down is past 20');
 });
 
 test('a pose inside the box ends the episode and re-arms it', () => {

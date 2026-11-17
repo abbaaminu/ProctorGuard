@@ -5,7 +5,8 @@
  * (mobile/lib/core/services/web_face_presence.dart): it sustains a `no_face` or a
  * `looking_away`, says `multiple_faces` at once and latches it, reports one episode
  * once, and judges every measured head by one rule — how far the head turned *and
- * how long it stayed there*, with no near-sideways exemption. Measuring raw page
+ * how long it stayed there* — with the near-sideways start (past 30° of yaw, two
+ * detections) as its one speed-up. Measuring raw page
  * verdicts instead would score a detector the app does not ship: a hundred `no_face`
  * ticks in a row are worth exactly one violation, and a clip is labelled with
  * violations.
@@ -40,10 +41,17 @@ export const MESSAGES = {
  * a covered or abandoned camera waits before it says so.
  */
 export const DEFAULT_RULES = Object.freeze({
-  // 15 degrees on both axes, judged on the absolute angle: the same pair
+  // 15 degrees of yaw and of *upward* pitch, judged on the absolute angle, and 20
+  // degrees of *downward* pitch: the browser's one asymmetry, because the keyboard a
+  // browser student reads is below the screen. The same numbers
   // `proctoring_thresholds.dart` states, and the test below fails if they drift.
   yawDegrees: 15,
   pitchDegrees: 15,
+  pitchDownDegrees: 20,
+  // Past this much yaw the head is near-sideways and two consecutive detections are
+  // the whole of the evidence, instead of the hold - the phone's rule, shared.
+  immediateYawDegrees: 30,
+  immediateConfirmations: 2,
   lookAwaySustainMs: 2000,
   noFaceSustainMs: 300,
   graceMs: 0,
@@ -103,6 +111,21 @@ export function readAppRules({ thresholdsSource, presenceSource }) {
   return {
     yawDegrees: numberIn(thresholdsSource, 'lookAwayYawDegrees', 'proctoring_thresholds.dart'),
     pitchDegrees: numberIn(thresholdsSource, 'lookAwayPitchDegrees', 'proctoring_thresholds.dart'),
+    pitchDownDegrees: numberIn(
+      thresholdsSource,
+      'lookAwayWebDownwardPitchDegrees',
+      'proctoring_thresholds.dart',
+    ),
+    immediateYawDegrees: numberIn(
+      thresholdsSource,
+      'lookAwayImmediateYawDegrees',
+      'proctoring_thresholds.dart',
+    ),
+    immediateConfirmations: numberIn(
+      thresholdsSource,
+      'lookAwayImmediateFrames',
+      'proctoring_thresholds.dart',
+    ),
     lookAwaySustainMs: constantDurationIn(
       thresholdsSource,
       'lookAwaySustain',
@@ -142,6 +165,7 @@ export function createJudge(rules = DEFAULT_RULES) {
   let awayFlagged = false;
   let missingFlagged = false;
   let multiFlagged = false;
+  let immediateDetections = 0;
 
   function endMultiFace(now) {
     if (!multiFlagged) return;
@@ -152,9 +176,11 @@ export function createJudge(rules = DEFAULT_RULES) {
 
   function onMissing(now) {
     // Without a face there is no head pose to judge, so an away episode is over
-    // (and re-armable) rather than paused.
+    // (and re-armable) rather than paused - and so is a near-sideways run: the next
+    // detection of a turned head starts its confirmation again.
     awaySince = null;
     awayFlagged = false;
+    immediateDetections = 0;
     if (missingSince === null) missingSince = now;
     if (missingFlagged) return null;
     if (now - missingSince < missingSustain) return null;
@@ -162,15 +188,23 @@ export function createJudge(rules = DEFAULT_RULES) {
     return MESSAGES.noFace;
   }
 
-  function onAway(now) {
+  /**
+   * One off-centre detection. `confirmed` is the near-sideways path: the caller has
+   * already counted `rules.immediateConfirmations` detections past
+   * `rules.immediateYawDegrees`, so the hold is satisfied by that count instead of by
+   * the clock.
+   */
+  function onAway(now, confirmed = false) {
     missingSince = null;
     missingFlagged = false;
     endMultiFace(now);
     if (awaySince === null) awaySince = now;
     if (awayFlagged) return null;
-    if (now - awaySince < awaySustain) return null;
-    awayFlagged = true;
-    return MESSAGES.lookingAway;
+    if (confirmed || now - awaySince >= awaySustain) {
+      awayFlagged = true;
+      return MESSAGES.lookingAway;
+    }
+    return null;
   }
 
   function onCentered(now) {
@@ -178,6 +212,7 @@ export function createJudge(rules = DEFAULT_RULES) {
     missingSince = null;
     awayFlagged = false;
     missingFlagged = false;
+    immediateDetections = 0;
     endMultiFace(now);
     return null;
   }
@@ -197,6 +232,7 @@ export function createJudge(rules = DEFAULT_RULES) {
         missingSince = null;
         awayFlagged = false;
         missingFlagged = false;
+        immediateDetections = 0;
         return MESSAGES.multipleFaces;
       }
       if (text === MESSAGES.noFace) return onMissing(atMs);
@@ -210,11 +246,21 @@ export function createJudge(rules = DEFAULT_RULES) {
       // know. Ignoring it is the only honest reading: it is not evidence.
       if (pose === null) return null;
 
-      // One rule for a measured head, at every angle past the gate: how far it
-      // turned is the gate, how long it stayed there is the finding. The
-      // near-sideways shortcut that used to sit here (past 30 degrees reported on
-      // sight) is gone from the monitor, so it is gone from its port.
-      if (Math.abs(pose.yaw) > rules.yawDegrees || Math.abs(pose.pitch) > rules.pitchDegrees) {
+      // One rule for a measured head, with two ways to have enough evidence. How far
+      // it turned is the gate, how long it stayed there is the finding - unless the
+      // turn is near-sideways, where the monitor (and the phone) report on the second
+      // consecutive detection instead of waiting out the hold.
+      const nearSideways = Math.abs(pose.yaw) > rules.immediateYawDegrees;
+      immediateDetections = nearSideways ? immediateDetections + 1 : 0;
+      if (nearSideways && immediateDetections >= rules.immediateConfirmations) {
+        return onAway(atMs, true);
+      }
+      // Pitch is signed: a chin *up* past the phone's gate is a screen above the
+      // monitor, a chin *down* has five degrees more, because the keyboard is down
+      // there. `parsePose` reports positive for chin down, the sign the page sends.
+      const pitchedAway =
+        pose.pitch < -rules.pitchDegrees || pose.pitch > rules.pitchDownDegrees;
+      if (nearSideways || Math.abs(pose.yaw) > rules.yawDegrees || pitchedAway) {
         return onAway(atMs);
       }
       return onCentered(atMs);
