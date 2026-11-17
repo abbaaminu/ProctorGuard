@@ -13,6 +13,7 @@ import 'package:proctorguard/features/exam/data/repositories/consent_repository_
 import 'package:proctorguard/features/exam/data/repositories/exam_repository_impl.dart';
 import 'package:proctorguard/features/supervision/data/repositories/supervision_repository_impl.dart';
 import 'package:proctorguard/features/supervision/domain/repositories/supervision_repository.dart';
+import 'package:proctorguard/core/services/supabase_service.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 /// A transport whose every request is accepted and never answered - the shape a
@@ -319,6 +320,42 @@ void main() {
       );
 
       expect(transport.requests.single.url.path, '/rest/v1/questions');
+    });
+  });
+
+  group('the session reads', () {
+    // The singleton, because these two RPCs are what `SessionLiveness` asks and
+    // there is no repository between it and `SupabaseService`.
+    final service = SupabaseService.instance;
+
+    setUp(() {
+      service.debugSessionReadTimeout = _testTimeout;
+      service.debugSetClient(_clientOver(_HungTransport()));
+    });
+
+    tearDown(() {
+      service.debugSessionReadTimeout = null;
+      service.debugSetClient(null);
+    });
+
+    test('a claim nobody answers is "could not ask", not a lost account',
+        () async {
+      // The sign-in that hangs on a quiet socket: without the deadline this
+      // future never completes, so the 30-second watch that starts after it never
+      // starts at all.
+      final claim = await service.claimSession(deviceLabel: 'android');
+
+      expect(claim.measured, isFalse);
+      expect(
+        claim.accepted,
+        isTrue,
+        reason: 'only a measured false may sign a device out',
+      );
+    });
+
+    test('a liveness check nobody answers is null, so nobody is signed out',
+        () async {
+      expect(await service.isCurrentSession(), isNull);
     });
   });
 }

@@ -7,6 +7,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'crash_reporting.dart';
 import '../utils/proctor_log.dart';
+import '../utils/read_timeout.dart';
 
 /// Contract for the evidence uploader that the proctoring notifier depends on.
 ///
@@ -566,16 +567,26 @@ class SupabaseService {
   ///
   /// Never throws, and never returns a hard "no" it cannot back up — a project
   /// without the migration (`PGRST202`), a token with no `session_id` claim
-  /// (`22023`) or a dropped connection all come back
-  /// [SessionClaim.unmeasured]. Only an explicit `false` means another device
-  /// signed in later and this one has to go.
+  /// (`22023`), a dropped connection or a request still unanswered after
+  /// [defaultReadTimeout] all come back [SessionClaim.unmeasured]. Only an
+  /// explicit `false` means another device signed in later and this one has to go.
+  ///
+  /// The deadline matters more here than it does for a page read: the widget that
+  /// calls this starts its 30-second watch only once the attempt has settled, so
+  /// an answer that never arrives used to mean an account nobody was watching.
   Future<SessionClaim> claimSession({String? deviceLabel}) async {
     final client = _client;
     if (client == null) return const SessionClaim.unmeasured();
     try {
-      final response = await client.rpc(
-        'claim_session',
-        params: {'p_device_label': deviceLabel},
+      // One row, answered in milliseconds when the stack is healthy, and safe to
+      // ask again for the same session (`claim_session` is idempotent for a token
+      // that already holds the account), so an abandoned request costs nothing.
+      final response = await withReadTimeout(
+        () => client.rpc(
+          'claim_session',
+          params: {'p_device_label': deviceLabel},
+        ),
+        timeout: _sessionReadTimeout,
       );
       return SessionClaim.fromRpc(response);
     } on PostgrestException catch (error) {
@@ -602,16 +613,22 @@ class SupabaseService {
 
   /// Asks the server whether this token still holds the account (§1b).
   ///
-  /// `null` means "could not ask" — no client, offline, or the function is not
-  /// deployed — and every caller treats that as "carry on", exactly like the SQL
-  /// gate does for a request with no claim row.
+  /// `null` means "could not ask" — no client, offline, an answer that did not
+  /// arrive within [defaultReadTimeout], or the function is not deployed — and
+  /// every caller treats that as "carry on", exactly like the SQL gate does for a
+  /// request with no claim row.
   Future<bool?> isCurrentSession() async {
     final client = _client;
     if (client == null) return null;
     try {
       // A `null`, an empty body or a project answering something else entirely is
       // "could not ask", never "no": the gate signs a device out on `false` alone.
-      final response = await client.rpc('is_current_session');
+      // The deadline is shorter than the gate's own 30-second poll, so a dead
+      // socket loses its turn instead of holding the next one shut.
+      final response = await withReadTimeout(
+        () => client.rpc('is_current_session'),
+        timeout: _sessionReadTimeout,
+      );
       return response is bool ? response : null;
     } catch (error) {
       proctorLog('SupabaseService: is_current_session unavailable: $error');
@@ -686,6 +703,17 @@ class SupabaseService {
         onError: (Object error, StackTrace _) => onError(error),
         cancelOnError: false,
       );
+
+  /// How long [claimSession] and [isCurrentSession] wait for an answer.
+  ///
+  /// A field rather than the constant alone for the reason `read_timeout.dart`
+  /// gives: a test that has to wait twelve seconds to watch a deadline fire is a
+  /// test nobody runs. Null everywhere but a test, where the default applies.
+  @visibleForTesting
+  Duration? debugSessionReadTimeout;
+
+  Duration get _sessionReadTimeout =>
+      debugSessionReadTimeout ?? defaultReadTimeout;
 
   /// Points the singleton at a client built over a fake HTTP transport so tests
   /// can assert the exact PostgREST/Storage payloads. Production code must never
