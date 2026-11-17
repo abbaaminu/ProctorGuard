@@ -10,6 +10,23 @@ on:
 permissions:
   contents: read
 
+# The Flutter SDK is pinned, not floated on `stable`.
+#
+# Flutter 3.47 deprecated the Material library: `package:flutter/material.dart`
+# is now a deprecated re-export of `package:material_ui/material_ui.dart`
+# (warned on every one of the 56 files that imports it). That is an upstream
+# library split, not a lint violation: adopting it means a new dependency and a
+# repository-wide import migration, which is a deliberate change and not
+# something an unrelated commit should be forced into by a floating channel.
+#
+# 3.44.6 is the patch this app is developed and validated against (and the
+# `>=3.44.0` floor in mobile/pubspec.yaml). Pin the same SDK here so CI and a
+# developer machine analyze, test and build with identical toolchains. Raise
+# this pin in its own change, together with the pubspec floor, when the
+# material_ui migration is scheduled.
+env:
+  FLUTTER_VERSION: '3.44.6'
+
 concurrency:
   group: proctorguard-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
@@ -29,7 +46,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2.23.0
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Install dependencies
@@ -118,7 +135,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2.23.0
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Free Disk Space
@@ -157,7 +174,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2.23.0
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Free Disk Space
@@ -213,7 +230,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2.23.0
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Show the toolchain (informational)
