@@ -108,6 +108,76 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('no check runs while this device\'s own claim is in flight',
+      (tester) async {
+    final hang = Completer<SessionClaim>();
+    var checks = 0;
+
+    await tester.pumpWidget(
+      harness(
+        signedIn: Stream<bool>.value(true),
+        claimSession: ({String? deviceLabel}) => hang.future,
+        isCurrentSession: () async {
+          checks++;
+          return true;
+        },
+      ),
+    );
+    await settle(tester);
+
+    // The account's active_sessions row still names the *previous* session until
+    // this claim lands, so a check now would read that row and sign this device
+    // out of the session it is about to win.
+    await tester.pump(const Duration(seconds: 31));
+    expect(checks, 0, reason: 'nothing is asked while the claim is in flight');
+
+    hang.complete(accepted());
+    await settle(tester);
+
+    await tester.pump(const Duration(seconds: 31));
+    expect(checks, 1, reason: 'the settled claim is what starts the watch');
+    expect(find.text('signed in'), findsOneWidget);
+
+    // Unmounts the gate: a live periodic timer would outlive the test.
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('a claim that throws still leaves the device watched',
+      (tester) async {
+    var checks = 0;
+    var signOuts = 0;
+
+    await tester.pumpWidget(
+      harness(
+        signedIn: Stream<bool>.value(true),
+        claimSession: ({String? deviceLabel}) async =>
+            throw TimeoutException('claim_session'),
+        isCurrentSession: () async {
+          checks++;
+          return true;
+        },
+        signOut: () async {
+          signOuts++;
+          return const AuthOutcome.success();
+        },
+        claimRetryDelays: const <Duration>[],
+      ),
+    );
+    await settle(tester);
+
+    expect(find.text('signed in'), findsOneWidget);
+    expect(signOuts, 0, reason: 'a claim nobody answered is not a refusal');
+
+    await tester.pump(const Duration(seconds: 31));
+    expect(
+      checks,
+      1,
+      reason: 'the watch starts after the attempt settles, however it settles',
+    );
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('a refused claim signs out at once and says why', (tester) async {
     var signOuts = 0;
     var checks = 0;

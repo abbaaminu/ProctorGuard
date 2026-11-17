@@ -184,35 +184,59 @@ class _SessionLivenessState extends State<SessionLiveness> {
   /// which is indistinguishable from "single-login does not work" for the whole
   /// of an exam. Only an *unmeasured* answer is retried: a measured `false` is a
   /// supersession and signs out immediately, and a measured `true` needs nothing.
+  ///
+  /// The watch is started in the `finally`, never before the ask. The account's
+  /// `active_sessions` row still names the *previous* session until this claim
+  /// lands, so a check that ran while the ask was in flight would read that row
+  /// and sign this device out of a session it is about to win. Starting it after
+  /// the attempt has settled - accepted, refused, unmeasured, timed out or thrown
+  /// - is what keeps a claim that never came back from leaving the account
+  /// unwatched: `SupabaseService.claimSession`'s read deadline is what turns that
+  /// hang into a settled answer, and this `finally` is what then starts the gate.
   Future<void> _claim() async {
-    final claim = await _requestClaim(sessionDeviceLabel());
-    if (!mounted || !_signedIn) return;
-
-    if (!claim.accepted) {
-      // Another device signed in later (ordering is by token `iat`), so this one
-      // is already refused on every write: sign out now rather than at the first
-      // answer the student tries to save.
-      await _onSuperseded();
-      return;
-    }
-    _gate.start();
-
-    if (claim.measured) return; // the server answered; nothing to re-ask
-    if (_claimRetries >= widget.claimRetryDelays.length) {
-      proctorLog(
-        'SessionLiveness: claim_session could not be asked '
-        '($_claimRetries retries); the 30-second gate still watches this device.',
-      );
-      return;
-    }
-
-    final delay = widget.claimRetryDelays[_claimRetries++];
-    _claimRetry?.cancel();
-    _claimRetry = Timer(delay, () {
-      _claimRetry = null;
+    var refused = false;
+    try {
+      final claim = await _requestClaim(sessionDeviceLabel());
       if (!mounted || !_signedIn) return;
-      unawaited(_claim());
-    });
+
+      if (!claim.accepted) {
+        // Another device signed in later (ordering is by token `iat`), so this
+        // one is already refused on every write: sign out now rather than at the
+        // first answer the student tries to save.
+        refused = true;
+        await _onSuperseded();
+        return;
+      }
+
+      if (claim.measured) return; // the server answered; nothing to re-ask
+      if (_claimRetries >= widget.claimRetryDelays.length) {
+        proctorLog(
+          'SessionLiveness: claim_session could not be asked '
+          '($_claimRetries retries); the 30-second gate still watches this device.',
+        );
+        return;
+      }
+
+      final delay = widget.claimRetryDelays[_claimRetries++];
+      _claimRetry?.cancel();
+      _claimRetry = Timer(delay, () {
+        _claimRetry = null;
+        if (!mounted || !_signedIn) return;
+        unawaited(_claim());
+      });
+    } catch (error) {
+      // `SupabaseService.claimSession` reports "could not ask" instead of
+      // throwing, so this only guards an injected or future claim function: the
+      // error would otherwise leave through `unawaited(_onSignedIn())` as an
+      // unhandled async error with nothing said about what failed.
+      proctorLog('SessionLiveness: claim_session failed: $error');
+    } finally {
+      // A device that just lost the account is being signed out by
+      // `_onSuperseded`, which stops the gate itself; every other outcome - a
+      // measured `true`, an unmeasured answer awaiting a retry, a throw - is
+      // watched from here on.
+      if (!refused && mounted && _signedIn) _gate.start();
+    }
   }
 
   void _onResume() {

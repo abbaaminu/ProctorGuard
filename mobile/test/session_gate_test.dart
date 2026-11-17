@@ -140,6 +140,45 @@ void main() {
       expect(signOuts, 0);
     });
 
+    test('a question that never comes back does not wedge the gate', () async {
+      final hang = Completer<bool?>();
+      var checks = 0;
+      var signOuts = 0;
+
+      final gate = SessionGate(
+        // The first ask is a socket that never answers; the second is another
+        // device taking the account.
+        isCurrent: () {
+          checks++;
+          return checks == 1 ? hang.future : Future<bool?>.value(false);
+        },
+        onSuperseded: () async => signOuts++,
+        interval: const Duration(milliseconds: 20),
+      );
+      addTearDown(gate.dispose);
+
+      expect(
+        await gate.check(),
+        isTrue,
+        reason: 'an unanswered question is "could not ask", not a supersession',
+      );
+      expect(gate.superseded, isFalse);
+
+      // The hung ask was abandoned at the interval, so this one is really asked.
+      // Without the deadline `_checking` would still be `true` and every later
+      // check would answer `true` without asking anything at all - a device that
+      // stops policing its own session after one bad packet.
+      expect(await gate.check(), isFalse);
+      expect(checks, 2, reason: 'the gate kept asking after the hang');
+      expect(gate.superseded, isTrue);
+      expect(signOuts, 1);
+
+      // The abandoned answer arriving late changes nothing.
+      hang.complete(true);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(signOuts, 1);
+    });
+
     test('the poll itself signs the device out when the answer turns false',
         () async {
       var checks = 0;

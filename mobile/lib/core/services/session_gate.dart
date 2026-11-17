@@ -102,6 +102,15 @@ class SessionGate {
   /// account; by then [onSuperseded] has been awaited. `true` covers both "still
   /// mine" and "could not ask", because the caller cannot act on the difference
   /// and being wrong in that direction only means the next check decides.
+  ///
+  /// The question itself is abandoned at [interval]. That is not a second
+  /// timeout around the caller's own (they are expected to bound their request
+  /// too) but the guard on [_checking]: a question that never comes back would
+  /// otherwise leave it `true` for the life of the process, and every later
+  /// check — the timer, a resume, the next sign-in — would answer `true`
+  /// without asking at all, which is a device that silently stops policing
+  /// itself. Abandoning it lands in the same `catch` an unreachable server
+  /// does, so the next tick simply asks again.
   Future<bool> check() async {
     if (_superseded) return false;
 
@@ -111,7 +120,7 @@ class SessionGate {
     if (_checking) return true;
     _checking = true;
     try {
-      final current = await isCurrent();
+      final current = await isCurrent().timeout(interval);
       if (current != false) return true;
 
       _superseded = true;
