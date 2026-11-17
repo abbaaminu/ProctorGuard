@@ -310,6 +310,15 @@
   // built is then visible in a phone's remote devtools instead of silent.
   var warnedNoPreview = false;
 
+  // When this page last had a hook and no preview at all, or 0 while a preview is
+  // being watched. It is what makes [warnNoPreview] a statement about the page
+  // rather than about a single tick: the exam page installs the hook before its
+  // `CameraPreview` has an initialised controller, so the first ticks of a healthy
+  // attempt legitimately find no `<video>` yet. Only a page that has stayed that
+  // way for [STALL_MS] - the same grace a preview that exists but has no frame
+  // gets - is worth a warning in the console.
+  var noPreviewSince = 0;
+
   // What this page last told Dart about its ability to measure an angle: `null`
   // until it knows, then `true` or `false` (see [publishAnalysis]). Kept so the
   // hook hears about a *change* rather than once per tick.
@@ -1328,6 +1337,7 @@
     frozenTicks = 0;
     watched = null;
     inactiveSince = 0;
+    noPreviewSince = 0;
     poseSamples = [];
     // The model's last reading goes with them. The model itself stays loaded: an
     // attempt that ends and another that starts minutes later should not pay for
@@ -1415,20 +1425,31 @@
     try {
       var element = findVideo();
       if (!element) {
-        // A page with no camera element at all - the login screen, a mock
-        // session, a host that replaced the preview. There is nothing to judge,
-        // and no absence to accuse anyone of.
+        // A page with no camera element at all - the first ticks of an attempt
+        // whose preview is still initialising, a mock session, a host that
+        // replaced the preview. There is nothing to judge, and no absence to
+        // accuse anyone of.
         seenLive = null;
         watched = null;
         inactiveSince = 0;
         lastVerdict = null;
-        if (!warnedNoPreview) {
+        // Not yet a finding: the exam page installs this hook before
+        // `CameraPreview` has a controller to draw, so a healthy sitting finds no
+        // `<video>` for its first tick or two. Only a page that stays that way for
+        // [STALL_MS] is the failure [warnNoPreview] describes, and only then is the
+        // page session's one warning spent.
+        if (!noPreviewSince) noPreviewSince = Date.now();
+        if (!warnedNoPreview && Date.now() - noPreviewSince >= STALL_MS) {
           warnedNoPreview = true;
           warnNoPreview();
         }
         finished(null, session);
         return;
       }
+
+      // A preview is on screen again (or for the first time): the next absence
+      // starts its own grace window rather than inheriting this one.
+      noPreviewSince = 0;
 
       if (inactiveReason(element)) {
         // A camera this page has shown a live frame of is evidence the moment it

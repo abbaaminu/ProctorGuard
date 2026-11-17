@@ -538,6 +538,38 @@ void main() {
       expect(js, contains("'no-preview'"));
     });
 
+    test('a preview that is still initialising is not a failure', () {
+      // The failure this pins: the exam page installs the hook before its
+      // `CameraPreview` has an initialised controller, so the first ticks of a
+      // healthy attempt find no `<video>` at all. The warning was spent on that
+      // first tick - `warnedNoPreview = true` for the rest of the page session -
+      // and every console of a working exam carried "an attempt is open and no
+      // camera preview can be found" beside a preview that was, a moment later,
+      // on screen. It is a `console.warn` a supervisor reads as "this student is
+      // unproctored", so it has to mean the page has no preview, not that the
+      // page has not drawn one yet.
+      final js = detector();
+
+      expect(
+        js,
+        contains('noPreviewSince'),
+        reason: 'nothing records how long the page has had no preview, so the '
+            'warning cannot tell a startup gap from a missing preview',
+      );
+      expect(
+        js,
+        contains('Date.now() - noPreviewSince >= STALL_MS'),
+        reason: 'the warning is not held off for the same grace a preview with '
+            'no frame gets, so the ordinary start of a sitting spends it',
+      );
+      expect(
+        js,
+        contains('noPreviewSince = 0'),
+        reason: 'the window is not cleared when a preview appears (or between '
+            'attempts), so the next absence inherits the last one\'s clock',
+      );
+    });
+
     test('only a camera that has shown a live frame can go dark', () {
       final js = detector();
       expect(
