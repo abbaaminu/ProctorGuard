@@ -41,6 +41,8 @@ class MediaPipeProctoringService {
     this.offCenterThresholdDegrees = thresholds.lookAwayYawDegrees,
     this.pitchThresholdDegrees = thresholds.lookAwayPitchDegrees,
     this.lookAwaySustain = thresholds.lookAwaySustain,
+    this.immediateYawDegrees = thresholds.lookAwayImmediateYawDegrees,
+    this.immediateFrameThreshold = thresholds.lookAwayImmediateFrames,
     this.startupGrace = thresholds.cameraStartupGrace,
     this.consecutiveFrameThreshold = 1,
     this.missingFaceFrameThreshold = 3,
@@ -61,6 +63,14 @@ class MediaPipeProctoringService {
         assert(
           !lookAwaySustain.isNegative,
           'a negative sustain would report a look-away it has not seen yet',
+        ),
+        assert(
+          immediateYawDegrees >= offCenterThresholdDegrees,
+          'a fast path inside the tolerance would report every off-centre frame',
+        ),
+        assert(
+          immediateFrameThreshold > 1,
+          'a single near-sideways frame is what this path exists to confirm',
         ),
         assert(
           !startupGrace.isNegative,
@@ -88,10 +98,11 @@ class MediaPipeProctoringService {
   /// degree turn at a normal viewing distance, comfortably past this). The false
   /// positives that a strict angle brings in - a glance at the keyboard, a nod - are
   /// answered by the *duration*, not by loosening the angle: anything past this has
-  /// to be *held* for [lookAwaySustain] before it is reported. An earlier version
-  /// widened the angle to 25 instead while keeping a single frame as a strike,
-  /// which flagged turns a student could not explain and taught them to ignore the
-  /// warning.
+  /// to be *held* for [lookAwaySustain] before it is reported, unless it is
+  /// near-sideways ([immediateYawDegrees]), where two frames are enough. An earlier
+  /// version widened the angle to 25 instead while keeping a single frame as a
+  /// strike, which flagged turns a student could not explain and taught them to
+  /// ignore the warning.
   ///
   /// Judged on the absolute angle, so a turn to either side is one rule.
   final double offCenterThresholdDegrees;
@@ -124,7 +135,37 @@ class MediaPipeProctoringService {
   /// separately (three glances, or five seconds off screen, inside a minute), so
   /// this rule catches the turn that is held and the window catches the student who
   /// keeps returning to the same off-screen place.
+  ///
+  /// The hold is not the *only* route to a strike: a turn past [immediateYawDegrees]
+  /// is near-sideways and is confirmed in [immediateFrameThreshold] frames, which is
+  /// what keeps the detector feeling immediate for the turns that have no innocent
+  /// reading. Everything below that angle still has to earn this duration.
   final Duration lookAwaySustain;
+
+  /// Yaw past which a turn is *near-sideways*, and so is confirmed in
+  /// [immediateFrameThreshold] consecutive frames instead of being held for
+  /// [lookAwaySustain].
+  ///
+  /// [thresholds.lookAwayImmediateYawDegrees]: 30 degrees. This is the responsiveness
+  /// half of the rule. At 30 degrees the head is no longer pointing at the screen at
+  /// all - a second screen beside the laptop, a phone in the lap, someone being
+  /// spoken to - and making that student wait two seconds is what made the detection
+  /// feel asleep; waiting two frames (~0.3 s at the default frame rate) is enough to
+  /// know it is not a single bad estimate.
+  ///
+  /// Yaw only. "Sideways" is what yaw measures, pitch is where the two detectors
+  /// disagree about sign, and a 30 degree *nod* is not evidence of another screen.
+  /// Judged on the absolute angle, so either side is the same rule.
+  final double immediateYawDegrees;
+
+  /// How many consecutive frames past [immediateYawDegrees] confirm the turn - two.
+  ///
+  /// A count rather than a duration, so the same number means the same thing to this
+  /// engine (~150 ms apart) and to `WebFacePresenceMonitor` (a 350 ms tick), and
+  /// asserted above to be more than one: the whole point of the path is that one
+  /// frame is never enough. Unlike [consecutiveFrameThreshold] it is *not* a floor
+  /// under a duration - it is the complete evidence for a near-sideways turn.
+  final int immediateFrameThreshold;
 
   /// How long after the sitting's first frame nothing is judged at all.
   ///
@@ -218,6 +259,12 @@ class MediaPipeProctoringService {
   int _faceMissingFrames = 0;
   bool _lookAwayFlagged = false;
   bool _noFaceFlagged = false;
+
+  /// Consecutive frames past [immediateYawDegrees] - the evidence for the
+  /// near-sideways fast path, counted separately from [_offCenterFrames] because it
+  /// is confirmed by a count rather than by [_lookAwaySince], and reset wherever
+  /// the head is no longer near-sideways (or is no longer there at all).
+  int _immediateFrames = 0;
 
   /// When the current off-centre episode began - the first frame in the unbroken
   /// run whose head was past the tolerances.
@@ -335,6 +382,9 @@ class MediaPipeProctoringService {
     _lookAwayFlagged = false;
     _noFaceFlagged = false;
     _multipleFacesFlagged = false;
+    // The near-sideways count is evidence about frames that were seen, so it goes
+    // with the counters: a feed that comes back must not inherit half a confirmation.
+    _immediateFrames = 0;
     // The episode clock goes with the counters: a feed that comes back has seen
     // nothing for the whole gap, so a turn it finds on the next frame must start
     // its two seconds there rather than inherit the seconds before the drop.
@@ -571,11 +621,14 @@ class MediaPipeProctoringService {
   /// enough for [lookAwaySustain] is not banked by it, so a held turn is still one
   /// strike rather than two.
   ///
-  /// There is no "unambiguous turn" bypass any more. A near-sideways head is
-  /// unambiguous about the *frame*, not about the student - the detector can put a
-  /// face 60 degrees off from one bad estimate - and the two seconds is what
-  /// separates "reading from another screen" from "an artefact". It is also
-  /// short enough that the cheater is still at it when the strike lands.
+  /// A turn past [immediateYawDegrees] is the one exception, and it is a *confirmation*
+  /// rather than an exemption: the head is far enough round that no reading position
+  /// explains it, so [immediateFrameThreshold] consecutive frames past that line report
+  /// it without waiting for [lookAwaySustain] - about 0.3 s on a phone, instead of the
+  /// two seconds that made an obviously turned head look unjudged. Two frames rather
+  /// than one, because the detector can put a face 60 degrees off from one bad estimate;
+  /// and yaw only, because a deep nod is reading, not another screen. Below the line
+  /// nothing changes: the hold is what separates a glance from a look-away.
   ///
   /// [GazeSignal.noFace] still waits for [missingFaceFrameThreshold] frames without
   /// a face, because a working detector drops a single frame (a blink behind
@@ -625,6 +678,7 @@ class MediaPipeProctoringService {
       // becomes noFace. Without a face the head can no longer be "off centre", so
       // those counters - and the look-away episode clock - start over.
       _offCenterFrames = 0;
+      _immediateFrames = 0;
       _lookAwaySince = null;
       _lookAwayFlagged = false;
       _lookAwayBurst.abandonEpisode();
@@ -651,6 +705,7 @@ class MediaPipeProctoringService {
       // is how a single second of it used to reach the server's three-strike
       // limit and disqualify the attempt.
       _offCenterFrames = 0;
+      _immediateFrames = 0;
       _lookAwaySince = null;
       _lookAwayFlagged = false;
       _lookAwayBurst.abandonEpisode();
@@ -684,6 +739,7 @@ class MediaPipeProctoringService {
       // clock restarts from the next off-centre frame, which is what makes the
       // sustain "consecutive frames" rather than "total time in the sitting".
       _offCenterFrames = 0;
+      _immediateFrames = 0;
       _lookAwaySince = null;
       _lookAwayFlagged = false;
       // A return inside the tolerances *ends* a glance rather than pausing it,
@@ -706,17 +762,27 @@ class MediaPipeProctoringService {
     }
 
     _offCenterFrames++;
+    // The near-sideways path's own evidence: consecutive frames past
+    // [immediateYawDegrees], broken by any frame that is not (which is also every
+    // frame inside the tolerances, so the reset above covers the common case).
+    final nearSideways = yaw.abs() > immediateYawDegrees;
+    _immediateFrames = nearSideways ? _immediateFrames + 1 : 0;
+
     // The first frame of the run starts the clock; every later frame in the same
     // run leaves it alone.
     final since = _lookAwaySince ??= now;
     final sustained = now.difference(since) >= lookAwaySustain;
 
-    // Both halves of the rule: held for [lookAwaySustain] *and* seen on at least
-    // [consecutiveFrameThreshold] frames. One episode is one strike - the latch
-    // keeps a held turn from becoming one violation per inference.
-    if (!_lookAwayFlagged &&
-        sustained &&
-        _offCenterFrames >= consecutiveFrameThreshold) {
+    // Two ways to have enough evidence: held for [lookAwaySustain] on at least
+    // [consecutiveFrameThreshold] frames, or near-sideways on
+    // [immediateFrameThreshold] frames in a row. Both are "seen more than once",
+    // which is the line between a person and a detector artefact. One episode is
+    // one strike - the latch keeps a held turn from becoming one violation per
+    // inference, whichever route confirmed it.
+    final confirmed = nearSideways
+        ? _immediateFrames >= immediateFrameThreshold
+        : sustained && _offCenterFrames >= consecutiveFrameThreshold;
+    if (!_lookAwayFlagged && confirmed) {
       _lookAwayFlagged = true;
       // This turn is the sustained rule's strike, so it stops being counted in the
       // rolling window: one turn is one strike, not two, and the next burst has to

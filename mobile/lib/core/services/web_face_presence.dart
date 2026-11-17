@@ -30,6 +30,13 @@ abstract final class WebFaceMessages {
   /// Optional head pose instead of a verdict: `pose:<yaw>,<pitch>` in degrees.
   /// A detector that measures angles lets this class apply the same tolerances
   /// the on-device engine does, instead of trusting the page's own threshold.
+  ///
+  /// The sign is part of the message, because the browser's tolerances are not
+  /// symmetric: **positive pitch is a chin down**, the convention the shipped
+  /// `web/proctor_face_detector.js` reports on both of its measurement routes, and
+  /// [WebFacePresenceMonitor.downwardPitchDegrees] is the wider side. Yaw's sign is
+  /// unused - it is judged on the absolute angle - so a host may pick either
+  /// handedness there.
   static const String posePrefix = 'pose:';
 }
 
@@ -47,6 +54,10 @@ abstract final class WebFaceMessages {
 ///  * `looking_away` has to hold for [lookAwaySustain] before it is reported, and
 ///    each episode reports once - so one look away is one strike, not one per
 ///    detection, while a blink or a single dropped frame is nothing;
+///  * **unless the turn is near-sideways** (yaw past [immediateYawDegrees]): two
+///    consecutive detections are enough there, the same count the engine uses -
+///    a head that far round is not a reading position, so the strike lands while
+///    the student is still turned instead of two seconds later;
 ///  * `looking_away` is *also* reported by the rolling window beside that rule
 ///    ([thresholds.lookAwayBurstCount] separate glances, or
 ///    [thresholds.lookAwayBurstCumulative] of off-screen time, inside
@@ -65,17 +76,22 @@ abstract final class WebFaceMessages {
 ///    five seconds in rather than one of them on its first detection.
 ///
 /// The tolerances, the look-away window and the start-up window are the engine's own,
-/// shared rather than copied (`proctoring_thresholds.dart`): "turned" has to mean the
-/// same 15 degrees on both axes, in either direction, "held" the same two seconds, and
-/// "starting" the same five, on both platforms - or a browser session and a phone
-/// session judge the same head differently, and an appeal is decided by which device
-/// the student happened to sit in front of. Both engines compare the absolute angle, so
-/// which direction a particular detector calls positive cannot change the verdict.
+/// shared rather than copied (`proctoring_thresholds.dart`): "turned" means 15 degrees
+/// of yaw, "held" the same two seconds, and "starting" the same five, on both
+/// platforms - or a browser session and a phone session judge the same head
+/// differently, and an appeal is decided by which device the student happened to sit
+/// in front of.
 ///
-/// Only the *anchor* of those five seconds differs, and it has to: a page knows when
-/// the attempt opened ([start]), while the engine sees nothing until a camera hands it
-/// a frame. Both windows end five seconds after the first thing the platform could
-/// judge.
+/// One tolerance is deliberately not shared: [downwardPitchDegrees]. A browser allows
+/// a chin five degrees further down than a phone does, because the keyboard a browser
+/// student reads lies below the screen while a screen *above* the monitor does not.
+/// Yaw and the upward half of the pitch are the engine's numbers exactly, and the
+/// phone still compares the absolute pitch in both directions.
+///
+/// Only the *anchor* of the start-up window has to differ, and it does: a page knows
+/// when the attempt opened ([start]), while the engine sees nothing until a camera
+/// hands it a frame. Both windows end five seconds after the first thing the platform
+/// could judge.
 ///
 /// The difference is the unit of "held", not its length. The engine counts *frames*
 /// for the tick of evidence and then requires [thresholds.lookAwaySustain] of them,
@@ -85,16 +101,18 @@ abstract final class WebFaceMessages {
 /// word) is therefore only filled by a host that keeps sending it, which is what the
 /// shipped `web/proctor_face_detector.js` does on every tick.
 ///
-/// **There is no near-sideways shortcut.** Until the parity fix this class reported a
-/// `pose:` past 30 degrees of yaw on the first detection, on the theory that a head
-/// that far round cannot be reading the screen. The engine has no such rule - its own
-/// near-sideways exemption was removed precisely because a 60 degree estimate can come
-/// from one bad frame, so the angle is unambiguous about the *frame*, not about the
-/// student - and the difference made the browser stricter than the phone for the same
-/// head (a 30 degree turn was a strike in 0.3 s on the web and 2 s on Android). The
-/// sustained window is the rule on both platforms now: a turn past the gate is one
-/// strike once it has been *held*, whatever the angle - and a turn that is not held
-/// still counts as a glance in the shared rolling window, on both.
+/// **The near-sideways start is shared, and bounded twice.** A `pose:` past
+/// [immediateYawDegrees] of yaw is reported after [immediateConfirmations]
+/// consecutive detections instead of after [lookAwaySustain]: this is the speed the
+/// web used to get from a 30 degree exemption that reported on the *first*
+/// detection, which made a browser several times quicker than the phone for the same
+/// head. Two confirmations keep the responsiveness and drop the guess - one bad
+/// Euler estimate can read 60 degrees, and one detection is a frame, not a student.
+/// Below the line nothing changes: the angle says how far, and the hold is still the
+/// whole of the finding, with a turn that is not held counted as a glance in the
+/// shared rolling window. The rule is yaw only, like the engine's, because a deep nod
+/// is reading rather than another screen - which is the case for a wider tolerance
+/// and a full hold (see [downwardPitchDegrees]), not for reporting faster.
 
 class WebFacePresenceMonitor {
   WebFacePresenceMonitor({
@@ -103,12 +121,26 @@ class WebFacePresenceMonitor {
     this.noFaceSustain = const Duration(milliseconds: 300),
     this.startupGrace = thresholds.cameraStartupGrace,
     this.multipleFacesCooldown = const Duration(seconds: 30),
-    // The engine's tolerances, from the one file that states the rule: 15 degrees
-    // on each axis, absolute, so `pose:15,0` and `pose:-15,0` are both a glance
-    // and `pose:16,0` is not. Shared rather than restated - a browser that judged
-    // a head differently from the phone would make the platform decide the appeal.
+    // The engine's tolerances, from the one file that states the rule: 15 degrees of
+    // yaw, judged absolute, so `pose:15,0` and `pose:-15,0` are both a glance and
+    // `pose:16,0` is not. Shared rather than restated - a browser that judged a head
+    // differently from the phone would make the platform decide the appeal.
     this.offCenterYawDegrees = thresholds.lookAwayYawDegrees,
+    // Pitch's upward half: the engine's 15 degrees, kept exactly, because a chin
+    // raised past it is a screen mounted above the monitor. The downward half is the
+    // next parameter, and it is the only number here the phone does not share.
     this.offCenterPitchDegrees = thresholds.lookAwayPitchDegrees,
+    // The one number a browser does not share with the phone: a chin this far down
+    // is still reading, because the keyboard and the paper are below the screen.
+    // Web-only by design - the engine keeps 15 in both directions, where ML Kit's
+    // pitch sign is unverified - and read from the same file, so it has one home.
+    this.downwardPitchDegrees = thresholds.lookAwayWebDownwardPitchDegrees,
+    // The near-sideways start, from the same file: past 30 degrees of yaw two
+    // consecutive detections are enough. Shared rather than restated, for the same
+    // reason as the tolerances - a browser that was quicker than the phone for the
+    // same head is the drift this file exists to stop.
+    this.immediateYawDegrees = thresholds.lookAwayImmediateYawDegrees,
+    this.immediateConfirmations = thresholds.lookAwayImmediateFrames,
     DateTime Function()? clock,
   })  : assert(
           lookAwaySustain > Duration.zero,
@@ -129,6 +161,18 @@ class WebFacePresenceMonitor {
         assert(
           offCenterYawDegrees > 0 && offCenterPitchDegrees > 0,
           'a zero tolerance would call every head position off centre',
+        ),
+        assert(
+          downwardPitchDegrees >= offCenterPitchDegrees,
+          'a tighter downward tolerance would judge a desk glance harder than a look up',
+        ),
+        assert(
+          immediateYawDegrees >= offCenterYawDegrees,
+          'a fast path inside the tolerance would report every off-centre detection',
+        ),
+        assert(
+          immediateConfirmations > 1,
+          'a single near-sideways detection is what this path exists to confirm',
         ),
         _source = source,
         _awayBurst = LookAwayBurstWindow(sustain: lookAwaySustain),
@@ -181,21 +225,58 @@ class WebFacePresenceMonitor {
   final Duration multipleFacesCooldown;
 
   /// Head-pose tolerances, used only for `pose:` messages (a detector that sends
-  /// a verdict has already applied its own). The engine's own numbers - 15 deg on
-  /// each axis, absolute, from `proctoring_thresholds.dart` - so the same head is
-  /// judged the same way whichever platform it is sitting in front of.
+  /// a verdict has already applied its own). The engine's numbers - 15 deg of yaw,
+  /// 15 deg of pitch up - from `proctoring_thresholds.dart`, so the same head is
+  /// judged the same way on either platform apart from the one documented
+  /// difference below.
   ///
-  /// **Pitch is symmetric, deliberately.** A web-only "a chin 20 degrees down counts
-  /// sooner than 20 degrees up" rule was requested and is **deferred**, not
-  /// implemented: it is asymmetric in a way the phone build is not, and it needs the
-  /// *sign* of the pitch a browser detector reports (the shipped FaceLandmarker's
-  /// matrix Euler angles, or a host page's `pose:` message) to be verified on real
-  /// devices first - the sign is the one thing a unit test cannot settle, and a rule
-  /// that guesses it would flag one direction of head movement and ignore the other.
-  /// Until then pitch stays absolute at [offCenterPitchDegrees] on both platforms.
-  /// The deferral is listed under "not verified" in the root README.
+  /// Yaw is absolute: a turn to either side is one rule. Pitch is *signed* on the
+  /// browser, because the two directions do not mean the same thing at a desk: down
+  /// is the keyboard and the paper ([downwardPitchDegrees]), up is a screen mounted
+  /// above the monitor, which is the second monitor this rule exists to catch. The
+  /// sign is stated by the detector that measures it - **positive is a chin down**,
+  /// on both routes of `web/proctor_face_detector.js` (its `matrixPose` docblock has
+  /// the derivation from MediaPipe's canonical face and its column-major matrix, and
+  /// `measurePose` is aligned to it) - and a host page that speaks `pose:` has to
+  /// use the same convention. What a *real* face produces is still unverified on
+  /// hardware (the root README keeps that risk open), and this rule is shaped so
+  /// that being wrong about it costs the five degrees of slack rather than the rule:
+  /// the desk glance would then be judged at [offCenterPitchDegrees], exactly as it
+  /// is today.
   final double offCenterYawDegrees;
   final double offCenterPitchDegrees;
+
+  /// How far the chin may drop before a browser counts it as looking away:
+  /// [thresholds.lookAwayWebDownwardPitchDegrees], five degrees more than
+  /// [offCenterPitchDegrees] and only on that side.
+  ///
+  /// The phone keeps 15 in both directions, so this is the one place where the same
+  /// head is judged differently by the two builds - deliberately, and only in the
+  /// direction a desk explains. A browser student looks down at a keyboard that lies
+  /// below the screen, often on a camera that sits below it too, and the rule that
+  /// catches a second screen does not need to catch that; 20 still catches a head
+  /// that has stopped reading the paper. The upward half stays at
+  /// [offCenterPitchDegrees], and the near-sideways start
+  /// ([immediateYawDegrees]) is untouched.
+  final double downwardPitchDegrees;
+
+  /// Yaw past which a turn is *near-sideways*: [immediateConfirmations] consecutive
+  /// detections report it instead of [lookAwaySustain].
+  ///
+  /// [thresholds.lookAwayImmediateYawDegrees]: 30 degrees, twice the gate - the head
+  /// is no longer facing the screen at all, so making the student wait two seconds
+  /// is what made a browser feel unjudged. Yaw only, absolute, and shared with the
+  /// engine, so the same head costs the same strike on either platform.
+  final double immediateYawDegrees;
+
+  /// How many consecutive detections past [immediateYawDegrees] confirm the turn -
+  /// two, the same count `MediaPipeProctoringService.immediateFrameThreshold` uses.
+  ///
+  /// A detection is not a unit of time here (a page's detector may burst or stall),
+  /// which is why the sustained rule measures a duration and this one counts
+  /// evidence: "seen twice" means the same thing on both platforms, and it is what
+  /// keeps a single bad Euler estimate from being a strike.
+  final int immediateConfirmations;
 
   final WebFaceSignalSource _source;
   final DateTime Function() _now;
@@ -224,6 +305,11 @@ class WebFacePresenceMonitor {
   bool _missingFlagged = false;
   bool _multipleFacesFlagged = false;
   bool _disposed = false;
+
+  /// Consecutive `pose:` detections past [immediateYawDegrees] - the near-sideways
+  /// evidence, reset by any detection that is not past that line (including a
+  /// centered one, a missing face and a second person).
+  int _immediateDetections = 0;
 
   /// True once the host hook exists and the monitor is listening.
   bool get isSupported => _source.isSupported;
@@ -273,6 +359,7 @@ class WebFacePresenceMonitor {
       _missingSince = null;
       _awayFlagged = false;
       _missingFlagged = false;
+      _immediateDetections = 0;
       _awayBurst.abandonEpisode();
       _emit(GazeSignal.multipleFaces);
       return;
@@ -300,13 +387,29 @@ class WebFacePresenceMonitor {
     // not know. Ignoring it is the only honest reading: it is not evidence.
     if (pose == null) return;
 
-    // One rule for a measured head, at every angle past the gate: the angle says
-    // how far, and how *long* is the whole of the finding. The near-sideways
-    // shortcut that used to sit here (`pose:` past 30 deg reported on sight) is
-    // gone - see the class doc - so a host that measures angles is judged exactly
-    // like the phone's engine is.
-    if (pose.$1.abs() > offCenterYawDegrees ||
-        pose.$2.abs() > offCenterPitchDegrees) {
+    // One rule for a measured head, with two ways to have enough evidence. The
+    // angle says how far; past [immediateYawDegrees] the head is near-sideways and
+    // [immediateConfirmations] detections in a row are enough, which is the speed the
+    // old 30 degree exemption had without its single-detection guess. Everywhere else
+    // the hold is the whole of the finding: the angle decides whether the rule applies,
+    // and [lookAwaySustain] decides whether it has been earned.
+    //
+    // Pitch is *signed* here, and only here: negative is a chin up, judged at
+    // [offCenterPitchDegrees] because a screen mounted above the monitor is the second
+    // screen this rule exists to catch; positive is a chin down, judged at the wider
+    // [downwardPitchDegrees] because the keyboard and the paper are down there. Which
+    // way round the sign runs is the detector's to state - see
+    // [WebFaceMessages.posePrefix] - and it is the one thing this class cannot check.
+    final nearSideways = pose.$1.abs() > immediateYawDegrees;
+    final pitchedAway = pose.$2 < -offCenterPitchDegrees ||
+        pose.$2 > downwardPitchDegrees;
+    _immediateDetections = nearSideways ? _immediateDetections + 1 : 0;
+
+    if (nearSideways && _immediateDetections >= immediateConfirmations) {
+      _onAway(now, confirmed: true);
+      return;
+    }
+    if (nearSideways || pose.$1.abs() > offCenterYawDegrees || pitchedAway) {
       _onAway(now);
     } else {
       _onCentered(now);
@@ -318,6 +421,9 @@ class WebFacePresenceMonitor {
     // (and re-armable) rather than paused.
     _awaySince = null;
     _awayFlagged = false;
+    // Nor is there a near-sideways run: the next frame that finds a turned head
+    // starts its confirmation again rather than completing one begun before the gap.
+    _immediateDetections = 0;
     // ...and the open glance is over too: it is not evidence of anything, so it is
     // abandoned rather than closed. The glances already recorded stay - they are
     // about the student, not about the frame that happened to be empty.
@@ -330,7 +436,14 @@ class WebFacePresenceMonitor {
     _emit(GazeSignal.noFace);
   }
 
-  void _onAway(DateTime now) {
+  /// Judges one off-centre detection.
+  ///
+  /// [confirmed] is the near-sideways path: the caller has already seen the head past
+  /// [immediateYawDegrees] on [immediateConfirmations] consecutive detections, so the
+  /// hold is satisfied by that count rather than by the clock. Everything else about
+  /// the episode - the latch, the emptied burst window, the open glance - is the same,
+  /// because it is the same strike.
+  void _onAway(DateTime now, {bool confirmed = false}) {
     // A visible head means the absence episode is over, so a later one is
     // reported again - and a second person in frame may have left.
     _missingSince = null;
@@ -339,7 +452,7 @@ class WebFacePresenceMonitor {
 
     _awaySince ??= now;
     if (_awayFlagged) return;
-    if (now.difference(_awaySince!) >= lookAwaySustain) {
+    if (confirmed || now.difference(_awaySince!) >= lookAwaySustain) {
       _awayFlagged = true;
       // The sustained rule's strike: this run is not also banked as a glance.
       _awayBurst.clear();
@@ -361,6 +474,9 @@ class WebFacePresenceMonitor {
     _missingSince = null;
     _awayFlagged = false;
     _missingFlagged = false;
+    // The head is back inside the tolerances, so any near-sideways run is over: a
+    // later turn has to be confirmed twice of its own.
+    _immediateDetections = 0;
     _endMultiFaceEpisode(now);
     // A return inside the tolerances ends the glance, which is what the rolling
     // window needs to know to count it - and the closing message is the one that

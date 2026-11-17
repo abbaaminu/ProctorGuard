@@ -656,21 +656,21 @@ void main() {
       expect(find.text('Warning 1'), findsOneWidget);
     });
 
-    testWidgets('a near-sideways head is held like any other turn',
+    testWidgets('a near-sideways head is struck in two ticks, not two seconds',
         (tester) async {
       await openPastGrace(tester);
 
-      // 70 deg is past the point where anything on the screen could be read, and it
-      // is still not a strike on sight: the web's old "near-sideways" shortcut (a
-      // `pose:` past 30 deg reported on the first detection) is gone, because the
-      // phone engine has no such rule and the same head has to cost the same strike
-      // on both platforms.
+      // `proctor_face_detector.js` sends a measured pose on every 350 ms tick, so two
+      // `pose:` messages are two consecutive detections. 70 deg is past the point
+      // where anything on the screen could be read, so the monitor confirms it on the
+      // second one - the responsiveness the old 30 deg shortcut had, without the
+      // single-detection guess that could come from one bad estimate.
       faces.emit('pose:70,0');
       await tester.pump();
       await tester.pump();
       expect(proctoring.violations, isEmpty);
 
-      now = now.add(const Duration(milliseconds: 2100));
+      now = now.add(const Duration(milliseconds: 350));
       faces.emit('pose:70,5');
       await tester.pump();
       await tester.pump();

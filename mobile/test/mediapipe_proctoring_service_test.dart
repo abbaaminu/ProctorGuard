@@ -270,30 +270,27 @@ void main() {
       );
     });
 
-    test('even a near-sideways turn has to be held for the sustain', () async {
+    test('a near-sideways turn is confirmed by two frames, not two seconds',
+        () async {
       final engine = clocked();
       final seen = <GazeSignal>[];
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      // There is no "unambiguous turn" bypass any more. 60 deg is past the point
-      // where the student could still be reading the screen, and it is still
-      // measured against the same two seconds - one estimate can be 60 deg wrong,
-      // and a warning that lands on a detector artefact is worse than one that
-      // lands 2s later on a real turn.
+      // Past 30 degrees of yaw the head is no longer pointing at the screen at all,
+      // so waiting the full hold made the detector look asleep. Two consecutive
+      // frames are enough - and two, not one: a single estimate can be 60 degrees
+      // wrong, and a strike on a detector artefact is worse than one frame later.
       const turned = FaceFrameResult(faceCount: 1, yawDegrees: 60);
       engine.handleResult(turned);
-      now = now.add(const Duration(seconds: 1));
-      engine.handleResult(turned);
-
       await pumpEventQueue();
       expect(
         seen.where((signal) => signal == GazeSignal.lookingAway),
         isEmpty,
-        reason: 'one second into a two-second rule',
+        reason: 'one frame is a guess, however far round it reads',
       );
 
-      now = now.add(const Duration(seconds: 1));
+      now = now.add(engine.inferenceInterval);
       engine.handleResult(turned);
       await pumpEventQueue();
       expect(
@@ -301,12 +298,60 @@ void main() {
         hasLength(1),
       );
 
-      // The latch still applies: one episode is one strike.
+      // Two frames of it - not a second and a half - and one strike, not one per
+      // inference while the head stays there.
       feed(engine, turned, 20);
       await pumpEventQueue();
       expect(
         seen.where((signal) => signal == GazeSignal.lookingAway),
         hasLength(1),
+      );
+
+      // A frame back inside the tolerances ends it, and the next turn has to be
+      // confirmed twice of its own.
+      engine.handleResult(const FaceFrameResult(faceCount: 1));
+      now = now.add(engine.inferenceInterval);
+      engine.handleResult(turned);
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+        reason: 'one frame of the new episode confirms nothing',
+      );
+      now = now.add(engine.inferenceInterval);
+      engine.handleResult(turned);
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(2),
+      );
+    });
+
+    test('a deep nod has no fast path: only a sideways turn does', () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      // 60 degrees of *pitch* is unambiguous about the frame as well - and it is
+      // still the hold, because looking down at the desk is how a student reads a
+      // printed sheet. The fast path is a yaw rule on both platforms: a nod is a
+      // reason to give pitch a longer hold, not to confirm it sooner.
+      const nodded = FaceFrameResult(faceCount: 1, pitchDegrees: 60);
+      feed(engine, nodded, 5);
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        isEmpty,
+        reason: 'five frames of a nod is a second of reading, not a strike',
+      );
+
+      hold(engine, nodded, duration: lookAwaySustain);
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+        reason: 'a nod that is actually held is still a look-away',
       );
     });
 
@@ -362,8 +407,9 @@ void main() {
       // Halfway out, back, halfway out again: two glances of 1.5s are not one
       // look-away of 3s. This is the "across consecutive frames" half of the rule,
       // and the reason glancing at notes every few seconds cannot accumulate into a
-      // strike.
-      const turned = FaceFrameResult(faceCount: 1, yawDegrees: 40);
+      // strike. 25 degrees keeps the test on the sustained rule: past 30 the turn
+      // would be near-sideways and confirmed in two frames by design.
+      const turned = FaceFrameResult(faceCount: 1, yawDegrees: 25);
       engine.handleResult(turned);
       hold(engine, turned, duration: const Duration(milliseconds: 1500));
       engine.handleResult(const FaceFrameResult(faceCount: 1));
@@ -400,14 +446,15 @@ void main() {
       );
 
       // Back to centered, then away again: a new episode, which has to earn its own
-      // two seconds.
+      // evidence - one frame is a guess whether the hold or the near-sideways count
+      // is the rule that will confirm it.
       feed(engine, const FaceFrameResult(faceCount: 1), 1);
       engine.handleResult(away);
       await pumpEventQueue();
       expect(
         seen.where((signal) => signal == GazeSignal.lookingAway),
         hasLength(1),
-        reason: 'the new episode has not been sustained yet',
+        reason: 'the new episode has one frame and no hold yet',
       );
 
       hold(engine, away, duration: const Duration(seconds: 2));
@@ -798,7 +845,10 @@ void main() {
       }
     }
 
-    const turned = FaceFrameResult(faceCount: 1, yawDegrees: 40);
+    // 25 degrees, not 40: this group is about the *window*, and a near-sideways turn
+    // would be confirmed two frames after it ends, which is a different (tested)
+    // rule. Below 30 the head is judged by the hold, exactly as the group describes.
+    const turned = FaceFrameResult(faceCount: 1, yawDegrees: 25);
 
     test('a head turned while the student sets up is not a strike', () async {
       final engine = starting();
@@ -960,6 +1010,12 @@ void main() {
       expect(engine.offCenterThresholdDegrees, lookAwayYawDegrees);
       expect(engine.pitchThresholdDegrees, lookAwayPitchDegrees);
       expect(engine.lookAwaySustain, lookAwaySustain);
+      // The near-sideways start, shared with the browser monitor: past 30 deg of yaw
+      // two consecutive frames confirm the turn, so an obviously turned head no longer
+      // waits out the hold - and one frame is still not enough, so a 60 deg estimate
+      // from a bad frame is only a candidate.
+      expect(engine.immediateYawDegrees, lookAwayImmediateYawDegrees);
+      expect(engine.immediateFrameThreshold, lookAwayImmediateFrames);
       // The frame floor under the sustain - one frame is enough evidence for the
       // *frames* half of the rule, so the timing is what decides.
       expect(engine.consecutiveFrameThreshold, 1);

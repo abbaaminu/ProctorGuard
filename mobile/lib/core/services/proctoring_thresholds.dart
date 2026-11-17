@@ -12,12 +12,19 @@
 ///
 /// The rule, in full:
 ///
-///   * a frame is *off screen* when the head is turned past
-///     [lookAwayYawDegrees] left or right, or tilted past [lookAwayPitchDegrees]
-///     up or down - one angle, the same on both axes and in both directions,
-///     compared as an absolute value;
+///   * a frame is *off screen* when the head is turned past [lookAwayYawDegrees]
+///     left or right, or tilted past [lookAwayPitchDegrees] up or down - one
+///     angle, the same on both axes and in both directions, compared as an
+///     absolute value. The browser is the one exception, and only downwards: it
+///     allows a chin [lookAwayWebDownwardPitchDegrees] down before a frame counts;
 ///   * it is a **look-away** when the head has stayed off screen for
 ///     [lookAwaySustain] *without a single frame back inside the tolerances*;
+///   * **unless the turn is near-sideways** - past [lookAwayImmediateYawDegrees]
+///     of yaw - where [lookAwayImmediateFrames] consecutive frames are enough.
+///     A head that far round is not a reading position, so a student working
+///     from a second screen hears about it in a fraction of a second instead of
+///     two; the confirmation is what keeps one bad Euler estimate (which can
+///     read 60 degrees) from being that strike;
 ///   * beside that, a **window**: [lookAwayBurstCount] glances of at least
 ///     [lookAwayMinEpisode] each, or [lookAwayBurstCumulative] of off-screen time
 ///     in total, inside [lookAwayBurstWindow] are also one look-away - the shape
@@ -43,6 +50,27 @@
 /// up was not - and still flagged a student who simply sat turned for a moment.
 /// The duration is the honest lever, so the angle can be strict.
 ///
+/// The browser's downward allowance is not a return to that pair. That one had two
+/// different numbers on *both* axes and applied to the phone as well, so one head
+/// was judged two ways on one device; this one moves a single direction on a single
+/// platform, and the direction it moves is the one a desk explains: a browser
+/// student reads a keyboard and a paper that lie below the screen, often on a
+/// camera that sits below the screen too. A chin *raised* past 15 degrees is a
+/// screen above the monitor, which is the second monitor this rule exists to catch,
+/// and it stays at [lookAwayPitchDegrees]. The phone keeps 15 in both directions,
+/// so a downward tilt of 18 degrees is a strike there after two seconds and is not
+/// one in a browser: that difference is real, it is the price of the browser's
+/// slack, and it is stated here rather than left to be discovered in an appeal.
+/// The parity that decides an appeal - one platform, one rule, the same head judged
+/// the same way every time - is untouched.
+///
+/// The near-sideways start is the one place where speed beats the hold, and it is
+/// bounded twice: past 30 degrees the head is visibly off the screen rather than
+/// glancing at a keyboard, and it still has to be seen on two frames, so a single
+/// estimate that reads 60 degrees because the detector slipped is not a strike on
+/// its own. It is a *yaw* rule: "sideways" is what yaw measures, and the sign of a
+/// browser's pitch is the one thing this file cannot state for both detectors.
+///
 /// These are defaults, not laws: `MediaPipeProctoringService` takes each one as a
 /// constructor argument so a device with a noisy Euler estimate can be made
 /// looser, and `test/proctoring_thresholds_test.dart` pins the values and the
@@ -60,19 +88,69 @@ library;
 const double lookAwayYawDegrees = 15.0;
 
 /// Pitch (up/down head tilt) past which a frame counts as looking away, in
-/// degrees.
+/// degrees - absolute, in both directions, on the phone; on the web the *upward*
+/// half only, where [lookAwayWebDownwardPitchDegrees] is the other.
 ///
-/// Equal to [lookAwayYawDegrees] on purpose, and also absolute: which direction a
-/// detector calls "chin down" differs between ML Kit and the web's
-/// FaceLandmarker, so a tolerance that differed by direction would judge the same
-/// head differently on a phone and in a browser. The false positives a tight
-/// pitch could otherwise cause - reading a question, glancing at the keyboard -
-/// are what [lookAwaySustain] is for.
+/// Equal to [lookAwayYawDegrees] on purpose. The false positives a tight pitch
+/// could otherwise cause - reading a question, glancing at the keyboard - are what
+/// [lookAwaySustain] is for, and a chin *raised* past this is a screen above the
+/// monitor rather than a reading position, which is why the web keeps it there.
+/// Which direction ML Kit calls "chin down" is not something this file can state,
+/// so the phone goes on comparing the absolute value; the browser knows its own
+/// sign, and `web_face_presence.dart` says where it comes from.
 const double lookAwayPitchDegrees = 15.0;
+
+/// The browser's tolerance for a *downward* tilt, in degrees: five more than
+/// [lookAwayPitchDegrees], and only on that side.
+///
+/// A browser student reads a keyboard and a paper that lie below the screen, and
+/// the camera is often below the screen as well - so a chin a little down is what
+/// reading and typing look like - while the same five degrees up is a screen
+/// mounted above the monitor, which is the thing the rule exists to catch. 20
+/// clears an ordinary glance at the keyboard without clearing a head that has
+/// stopped reading: past it the head is angled at the desk rather than at the
+/// paper.
+///
+/// Two things about it are deliberate. It is **web only** - `WebFacePresenceMonitor`
+/// reads it and the engine never does - because ML Kit's pitch sign has never been
+/// verified, so a signed rule on the phone would be a guess. And it rests on the
+/// sign the browser detector reports, which `web/proctor_face_detector.js` states
+/// and both of its measurement routes now share: **positive is a chin down**. What
+/// a real face produces on a real camera is still unverified (the root README keeps
+/// that risk open), which is why the guess, such as it is, points at the direction
+/// that *helps* a student: if the sign is the other way round, an 18 degree glance
+/// is judged exactly as it is today, at 15.
+const double lookAwayWebDownwardPitchDegrees = 20.0;
 
 /// How long the head has to stay past [lookAwayYawDegrees] / [lookAwayPitchDegrees],
 /// across consecutive frames, before the look-away is reported.
 const Duration lookAwaySustain = Duration(seconds: 2);
+
+/// Yaw past which a turn is *near-sideways*, and so is confirmed by
+/// [lookAwayImmediateFrames] consecutive frames instead of by [lookAwaySustain].
+///
+/// 30 degrees - twice [lookAwayYawDegrees] - is where the head is no longer
+/// pointing at the screen at all: a second screen beside the laptop, a phone in the
+/// lap, or a person being talked to. Waiting two seconds for that turn is what made
+/// the detector feel unresponsive, so this is the shortest honest answer: a student
+/// who has actually turned away hears about it in about 0.3 s on the phone (two
+/// frames at ~7 FPS) and in about 0.7 s in a browser (two 350 ms ticks).
+///
+/// It cannot be a *single* frame: one bad Euler estimate can read 60 degrees, and a
+/// strike on a detector artefact is worse than one 150 ms later on a real turn. It
+/// is *yaw only* - pitch is judged by the sustained rule at every angle - because a
+/// deep nod is a student reading the paper or the keyboard, which is the case for a
+/// wider tolerance and a full hold (see [lookAwayWebDownwardPitchDegrees]), not for
+/// reporting faster.
+const double lookAwayImmediateYawDegrees = 30.0;
+
+/// How many consecutive near-sideways detections confirm a turn past
+/// [lookAwayImmediateYawDegrees] - two, on both platforms.
+///
+/// A *count*, not a duration, so it means the same thing to an engine that judges
+/// frames (~150 ms apart) and to a browser whose detector ticks every 350 ms; and
+/// two, because the rule is "seen twice", not "seen once".
+const int lookAwayImmediateFrames = 2;
 
 // ---------------------------------------------------------------------
 // The look-away rule, second half - the same question asked in a *window*:

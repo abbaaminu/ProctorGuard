@@ -146,13 +146,15 @@ rather than left to be mistaken for more than it is.
   `looking_away`. It performs **no** face recognition and matches no template, so
   it cannot tell a student apart from a similarly-shaped stand-in, and there is
   no liveness challenge (no blink / turn / read-a-phrase prompt). `looking_away`
-  is raised two ways, both on the same 15° gate: a head past **15° on either
-  axis, held for two seconds**, and — for a student reading paper and screen in
-  turn, whose turns never last that long — **three glances of at least 500 ms, or
-  5 s off screen in total, inside a rolling 60-second window**. Either is **one**
-  strike, the burst window is emptied by the strike it produces, and a run that
-  did reach two seconds is not also banked as a glance, so one long turn cannot
-  become two strikes.
+  is raised three ways, all on the same 15° gate: a head past **15° on either
+  axis, held for two seconds**; **two consecutive frames past 30° of yaw**, the
+  angle where nothing on the screen is readable any more, because making that
+  turn wait out the full hold made an obviously turned head look unjudged; and —
+  for a student reading paper and screen in turn, whose turns never last that
+  long — **three glances of at least 500 ms, or 5 s off screen in total, inside a
+  rolling 60-second window**. Any one of them is **one** strike, the burst window
+  is emptied by the strike it produces, and a run that did reach two seconds is
+  not also banked as a glance, so one long turn cannot become two strikes.
 - **Audio is loudness, not content.** The microphone is sampled for level
   (dBFS) only, and `audio_noise` is raised two ways, both on that level: energy
   above the room's measured floor held for **two seconds without dropping below
@@ -238,15 +240,20 @@ rather than left to be mistaken for more than it is.
 
 **What is *not* verified — read this before trusting a number**
 
-Four things are written down here rather than left implicit, because each is the
+Five things are written down here rather than left implicit, because each is the
 kind of detail a pilot finds out the hard way:
 
 - **The look-away gate has never been measured on a device.** The rule (15 deg of
-  yaw or 15 deg of pitch, absolute, held for two seconds) is unit-tested against
-  both engines, including the boundary and the symmetry, but no real head has been
-  put in front of it here. The number that decides whether it is safe is the
-  false-positive rate: a candidate who works with the laptop low, or who reads a
-  printed answer sheet on the desk, is the case to measure before a
+  yaw or 15 deg of pitch, absolute, held for two seconds — or past 30 deg of yaw,
+  two consecutive frames, because no reading position explains that turn) is
+  unit-tested against both engines, including the boundary and the symmetry, but no
+  real head has been put in front of it here. The one asymmetry is a browser's
+  downward pitch - 20 deg instead of 15, because the keyboard a browser student reads
+  is below the screen (`lookAwayWebDownwardPitchDegrees`) - so five of those degrees
+  exist for a gesture the phone never sees, and the desk case below is the one to
+  measure rather than assume. The number that decides whether it is
+  safe is the false-positive rate: a candidate who works with the laptop low, or who
+  reads a printed answer sheet on the desk, is the case to measure before a
   timer-driven disqualification is trusted. **The repeated-glance half is the same
   story, and it is the half more likely to fire**: three glances of at least
   500 ms, or 5 s off screen in total, inside a rolling minute, is a rule about a
@@ -271,16 +278,26 @@ kind of detail a pilot finds out the hard way:
   disqualification, and a supervisor can clear it), while a student whose phrases
   are shorter than a burst and more spaced out than three a minute may still never
   reach either rule. Measure both directions before a pilot relies on either.
-- **The sign of the pitch a browser detector reports is unverified.** The shipped
-  FaceLandmarker path reads a rotation matrix, a host page sends `pose:` degrees,
-  and the two need not agree on which direction is "up". The app therefore compares
-  the **absolute** pitch, so a wrong sign costs nothing — and keeps no rule that
-  would depend on one.
-- **A web-only "a chin 20 deg down counts sooner than 20 deg up" rule was requested
-  and is deferred**, for exactly the reason above: it is asymmetric in a way the
-  phone build is not, and shipping it before the sign is confirmed on real devices
-  would flag one direction of head movement and ignore the other. Pitch stays
-  symmetric at 15 deg until that is measured.
+- **The pitch sign has a convention, but no real face has confirmed it.** The shipped
+  FaceLandmarker reads a rotation matrix and a host page sends `pose:` degrees; both
+  routes now report **positive for a chin down**, derived in
+  `web/proctor_face_detector.js` from MediaPipe's canonical face and its column-major
+  matrix and stated at every place a reader would look for it — but no real face has
+  been measured through a real camera to confirm the derivation matches what a student
+  produces. A wrong sign is kept cheap on both sides. The phone still compares the
+  **absolute** pitch, so no rule there depends on it, and the browser's single signed
+  rule is a *widening* - a chin 20 deg down is inside the tolerance where the phone
+  stops at 15 (`lookAwayWebDownwardPitchDegrees`) - so if the sign runs the other way,
+  an 18 deg glance is still judged at 15 deg, exactly as it is today, and no head
+  anywhere becomes stricter than it was. That is also why the allowance is *web only*:
+  a signed rule on the phone would rest on a sign ML Kit has never had verified at all.
+- **The 20 deg downward allowance is a false-positive fix, not a measured number.**
+  It exists because a browser student reads a keyboard and a paper below the screen
+  and the rule exists for the second screen, not the desk; 20 is where "a glance at
+  the keys" stops and "a head angled at the desk" begins, and that boundary has not
+  been checked against real students either. If a pilot shows it is too generous, the
+  number to move is `lookAwayWebDownwardPitchDegrees` - one constant, read by the
+  monitor and stated beside the phone's in `proctoring_thresholds.dart`.
 - **Whether a browser has really handed the lens back cannot be observed.** The
   device check stops every `MediaStreamTrack` it opened before the exam route is
   pushed, and the phone build's release is awaited, but "the OS has finished
@@ -1110,8 +1127,11 @@ Both signals count now
 candidate reading a second screen and a candidate talking the paper through with
 somebody in the room are exactly what a camera-and-microphone proctor is good at —
 and neither used to move the score at all. Neither is a single frame or a single
-sample. A look-away is reported two ways, both on the same 15° gate — a head past
-15° on **either** axis held for 2 seconds, **or** three glances of at least 500 ms,
+sample. A look-away is reported three ways, all on the same 15° gate — a head past
+15° on **either** axis held for 2 seconds; **two consecutive detections past 30° of
+yaw**, the angle past which no reading position explains the turn, which is what
+keeps an obviously turned head from waiting out the hold; **or** three glances of
+at least 500 ms,
 or 5 s off screen in total, inside a rolling 60-second window, which is the shape
 the 2 s rule cannot see: a student reading paper and screen in turn never holds a
 turn long enough. A noisy room likewise in one of two ways, both on the measured
@@ -1125,7 +1145,8 @@ reached the sustained rule — cannot stack a burst strike and a sustained one.
 A glance shorter than 500 ms is measured (it adds to the 5 s total) without counting
 as a glance, which is what makes the total reachable without a single counted
 glance. Every number there is a named constant in `proctoring_thresholds.dart`
-(`lookAwaySustain`, `lookAwayMinEpisode`, `lookAwayBurstWindow`,
+(`lookAwaySustain`, `lookAwayImmediateYawDegrees`, `lookAwayImmediateFrames`,
+`lookAwayMinEpisode`, `lookAwayBurstWindow`,
 `lookAwayBurstCount`, `lookAwayBurstCumulative`, `audioNoiseSustain`,
 `audioNoiseMinBurst`, `audioNoiseBurstWindow`, `audioNoiseBurstCount`,
 `audioNoiseBurstTotal`). The old values, for a project comparing notes with an older
@@ -1141,7 +1162,8 @@ Every signal is still stored in `proctoring_logs` and still shown to the
 supervisor; the weight only decides which ones may end an attempt on their own.
 
 **Some of these numbers have not been tested with real people.** The 15° / 2 s
-look-away rule, the repeated-glance window beside it and the audio rules (the room's
+look-away rule (with its two-detection 30° near-sideways start), the
+repeated-glance window beside it and the audio rules (the room's
 median floor plus 6 dB, clamped to −50…−32 dBFS, held for 2 s, and the
 repeated-burst window beside it) are unit-tested and pinned, but no real head has
 been put in front of one here and no real room or microphone behind the others. The

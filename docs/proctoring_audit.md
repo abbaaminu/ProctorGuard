@@ -35,6 +35,8 @@ commit each, so the tree has moved under some of the line numbers:
 | Item | Commit | What changed |
 | --- | --- | --- |
 | §8 P1-2 — the web's 300 ms glance | `e37739e` | `web_face_presence.dart` now requires the phone's 2 s for a look-away, read from the shared `lookAwaySustain`; `no_face` stays 300 ms, because absence and direction are different questions |
+| §1.4 / §8 P1-2 follow-up — the 30° exemption was removed rather than shared | working tree (with the shared-constant change) | the near-sideways turn is back, but as a **shared** rule instead of a browser-only shortcut: past `lookAwayImmediateYawDegrees` (30° of yaw) `lookAwayImmediateFrames` (2) consecutive detections confirm a `looking_away` on **both** hosts, so an obviously turned head no longer waits out the 2 s hold. The browser reports it on the second detection instead of the first, which is the single bad Euler estimate the exemption used to trust |
+| §1.4 follow-up — the pitch sign is used, one way, in a browser | working tree (with the pitch-sign change) | the web's pitch rule is now **signed**: `lookAwayWebDownwardPitchDegrees` (20°) lets a chin drop five degrees further in a browser than the phone's 15°, because the keyboard a browser student reads is below the screen, while a chin *raised* past 15° is a monitor mounted above it and keeps `lookAwayPitchDegrees`. The phone still compares the absolute pitch at 15° both ways (ML Kit's sign is unverified), so this is one direction on one platform. `proctor_face_detector.js` states the sign on both of its routes — positive is chin down — and the landmark route was flipped to agree with the matrix one. A wrong sign costs only the five degrees of slack, never a stricter rule |
 | §8 P1-3 — no Android start-up grace | `f200a91` | `cameraStartupGrace` became a shared constant and the Android engine counts it from its **first streamed frame**, which is the web's own small bug fixed as well |
 | §8 P1-4 / §6.6 D4 — the suspected double count | `web_exam_guard.dart`, `web_exam_guard_test.dart` | one act now costs one strike: a fullscreen-exit countdown that belongs to an already-struck departure (a blur or a hidden tab inside the same 5 s) closes without charging again, and staying out of fullscreen is charged once per episode. Four unit tests pin it |
 | §8 P3-14 — the dangling test path | the lecturer-isolation migration (still uncommitted with the feature it belongs to) | the comment now names `supabase/tests/supervisor_scope_check.sql`, block (l) |
@@ -1093,11 +1095,18 @@ MediaPipe); no row at 10°; **one** `looking_away` at 25° after about 0.3-0.7 s
 *Status:* `proctor_face_detector.js:1575-1602` (diagnostics),
 `web_face_presence.dart:77`, `:273-275`.
 
-**9. The near-sideways exemption.**
-*Steps:* turn 40° and hold only 0.2 s.
-*Expected:* one `looking_away` anyway — the deliberate shortcut
-(`web_face_presence.dart:268-272`). If ordinary 15-20° turns produce rows this fast,
-`immediateAwayYawDegrees` is being applied too eagerly.
+**9. The near-sideways start.**
+*Steps:* turn 40° for a single detection (under 150 ms on the phone, one 350 ms tick
+in a browser); face the screen again; then turn 40° and stay there for a second.
+*Expected:* the first turn is **no** row — one detection is a frame, not a student —
+and the second is one `looking_away`, landing within about 0.3 s on the phone and
+0.7 s in the browser rather than after the 2 s hold: past
+`lookAwayImmediateYawDegrees` (30°) two consecutive detections confirm the turn, and
+both hosts read the same two constants. If ordinary 15-20° turns produce rows this
+fast, the angle is being applied below the gate it belongs to.
+*Status:* `mediapipe_proctoring_service.dart` (`immediateYawDegrees`,
+`immediateFrameThreshold`), `web_face_presence.dart` (`immediateYawDegrees`,
+`immediateConfirmations`), both defaulted from `proctoring_thresholds.dart`.
 
 **10. Covered, dark and frozen camera.**
 *Steps:* cover the lens for 3 s; uncover; turn the lights off for 5 s; then hold a

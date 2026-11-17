@@ -154,12 +154,13 @@ void main() {
       expect(
         signals.last,
         GazeSignal.lookingAway,
-        reason: 'pitch past 15° even with the yaw inside its tolerance',
+        reason: 'a chin 45° down, even with the yaw inside its tolerance',
       );
 
-      // The same tilt the other way is the same evidence: pitch is judged on the
-      // absolute angle, so "chin down" and "chin up" are one rule even though the
-      // two detectors do not agree on which is positive.
+      // The other direction is judged at the engine's angle, and that direction is
+      // the one it exists for: a chin *raised* past 15° is a screen above the
+      // monitor. Positive is chin down - the sign the detector states and both of
+      // its routes now share - so the wider allowance is the down side only.
       report('pose:0,0');
       await flush();
       sustain('pose:-12,-45');
@@ -167,7 +168,7 @@ void main() {
       expect(
         signals.last,
         GazeSignal.lookingAway,
-        reason: 'a tilt up past 15° is a look away exactly like a tilt down',
+        reason: 'a chin 45° up is a look away at the stricter of the two angles',
       );
 
       // Case and padding are the host's business: the monitor reads the numbers.
@@ -177,6 +178,43 @@ void main() {
         signals.last,
         GazeSignal.centered,
         reason: 'inside both tolerances, whatever the spelling',
+      );
+    });
+
+    test('a glance at the keyboard is not a look-away; a stare at the desk is',
+        () async {
+      // The one asymmetry in the browser's rule, and the reason for it: a student in
+      // front of a keyboard reads a keyboard, and the paper beside it, below the
+      // screen. Five degrees of slack (15 -> 20) covers the glance and does not cover
+      // a head that has stopped reading.
+      report('pose:0,18');
+      hold('pose:0,18');
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        isEmpty,
+        reason: '18° down is where the keyboard is, held or not',
+      );
+
+      // The same 18° *up* keeps the engine's 15°: a screen mounted above the monitor
+      // is not the keyboard, and the slack is downward only.
+      sustain('pose:0,-18');
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+        reason: 'a look up is still judged at 15°',
+      );
+
+      // Past the widened line, and held: the desk stare the rule still catches.
+      report('pose:0,0');
+      report('pose:0,22');
+      hold('pose:0,22');
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(2),
+        reason: '22° down is past 20°, and it was held for two seconds',
       );
     });
 
@@ -220,31 +258,34 @@ void main() {
       expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
     });
 
-    test('a near-sideways turn is held exactly like any other', () async {
-      // 70 deg of yaw is past the point where anything on the screen could still
-      // be read, and it is still *not* a strike on sight: the web used to report it
-      // on the first detection (a 'near-sideways shortcut' at 30 deg yaw), which
-      // made a browser three times quicker than the phone for the same head. The
-      // engine has no such exemption and the audit asked for parity, so how long is
-      // the whole rule and the angle only decides whether the rule applies.
+    test('a near-sideways turn is confirmed by two detections, not two seconds',
+        () async {
+      // 70 deg of yaw is past the point where anything on the screen could still be
+      // read, so it is not held for two seconds: two consecutive detections confirm
+      // it, which is the speed the old 30 deg exemption had (it reported the first
+      // detection) without its guess. The count is the engine's, so the same head is
+      // the same strike on the phone.
       report('pose:70,0');
       await flush();
       expect(
         signals,
         isEmpty,
-        reason: 'one detection is a glance, however far round it is',
+        reason: 'one detection is a frame, however far round it is',
       );
 
-      hold('pose:70,0');
+      now = now.add(const Duration(milliseconds: 350));
+      report('pose:70,0');
       await flush();
       expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
 
       // Still one strike while the head stays there.
-      hold('pose:70,0');
+      now = now.add(const Duration(seconds: 2));
+      report('pose:70,0');
       await flush();
       expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
 
-      // Facing the screen ends it, and the next turn is a fresh episode.
+      // Facing the screen ends it, and the next turn is a fresh episode with its own
+      // two detections to earn.
       report('pose:0,0');
       now = now.add(const Duration(seconds: 2));
       report('pose:70,0');
@@ -252,14 +293,35 @@ void main() {
       expect(
         signals.where((signal) => signal == GazeSignal.lookingAway),
         hasLength(1),
-        reason: 'the new turn has only just started',
+        reason: 'the new turn has only been seen once',
       );
 
-      hold('pose:70,0');
+      now = now.add(const Duration(milliseconds: 350));
+      report('pose:70,0');
       await flush();
       expect(
         signals.where((signal) => signal == GazeSignal.lookingAway),
         hasLength(2),
+      );
+    });
+
+    test('a deep nod has no fast path: only a sideways turn does', () async {
+      // 70 deg of pitch is unambiguous about the detection as well, and it is still
+      // the hold: looking down is how a student reads a printed sheet, which is the
+      // case for a fuller hold and a wider tolerance, not for a confirmation count.
+      // The fast path is yaw only, on both platforms.
+      report('pose:0,70');
+      now = now.add(const Duration(milliseconds: 350));
+      report('pose:0,70');
+      await flush();
+      expect(signals, isEmpty, reason: 'two detections are not two seconds');
+
+      sustain('pose:0,70');
+      await flush();
+      expect(
+        signals.last,
+        GazeSignal.lookingAway,
+        reason: 'a nod that is actually held is still a look-away',
       );
     });
   });

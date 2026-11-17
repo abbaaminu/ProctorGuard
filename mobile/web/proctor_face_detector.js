@@ -37,9 +37,13 @@
     * `pose:<yaw>,<pitch>` when a face model finds exactly one face and gives
       enough of it to measure. The angle is *measured*, and only the angle: Dart
       applies its own tolerances to it
-      (`WebFacePresenceMonitor.offCenterYawDegrees`) and decides whether the head
-      is off the screen. This is the only way a desktop web sitting can produce a
-      `looking_away` at all - the app's own ML Kit does not run in a browser.
+      (`WebFacePresenceMonitor.offCenterYawDegrees`, and
+      `downwardPitchDegrees` for the downward half of the pitch) and decides
+      whether the head is off the screen. Positive pitch is a chin down on either
+      route ([measurePose], [matrixPose]), because a tolerance that differs by
+      direction cannot be applied to a sign the detector leaves to chance. This is
+      the only way a desktop web sitting can produce a `looking_away` at all - the
+      app's own ML Kit does not run in a browser.
     * `multiple_faces` when that model counts more than one face. Reported on the
       tick it is seen; Dart latches it.
 
@@ -216,9 +220,11 @@
 
   // Where the nose sits between the eyes on a face looking straight at the
   // screen, in units of the distance between the eyes. A proportion of the face,
-  // so it survives a small or a large picture; the pitch is the deviation from it.
-  // Rough by design - it is a second opinion, and it can never be the reason a
-  // single frame is called a turned head (only a sustained one).
+  // so it survives a small or a large picture; the pitch is the deviation from it,
+  // positive when the nose has dropped below it (a chin down, the sign
+  // [matrixPose] reports too). Rough by design - it is a second opinion, and it
+  // can never be the reason a single frame is called a turned head (only a
+  // sustained one).
   var FRONTAL_NOSE_DROP = 0.6;
 
   // The landmarks of the shipped model's canonical mesh that carry a head pose:
@@ -928,6 +934,15 @@
   /// against where it sits on a face looking at the screen
   /// ([FRONTAL_NOSE_DROP]): an approximation, reported as one - and it is Dart's
   /// tolerance, never this script, that decides whether either angle matters.
+  ///
+  /// Pitch is reported **positive when the chin is down** - the nose dropping
+  /// further below the eye line in image coordinates, where y grows downwards.
+  /// That is the sign [matrixPose] derives from the model's rotation, and the two
+  /// routes have to agree on it: Dart applies a *signed* tolerance to the downward
+  /// half (`WebFacePresenceMonitor.downwardPitchDegrees`), exactly because a chin
+  /// on the chest is the keyboard and the desk while a chin up is a screen above
+  /// the monitor. A route that reported the opposite sign would put that five
+  /// degrees of forgiveness on the wrong direction.
   function measurePose(face) {
     var eyes = landmarkPoints(face, 'eye');
     var nose = landmarkPoints(face, 'nose');
@@ -951,7 +966,9 @@
 
     return {
       yaw: (Math.asin(offset) * 180) / Math.PI,
-      pitch: (FRONTAL_NOSE_DROP - (tip.y - midY) / span) * 100
+      // (nose below the frontal drop) is a chin down, which is the positive sign
+      // [matrixPose] reports; see the sign note above.
+      pitch: ((tip.y - midY) / span - FRONTAL_NOSE_DROP) * 100
     };
   }
 
@@ -1284,11 +1301,23 @@
   ///
   ///     pitch = asin(-R[1][2])        yaw = atan2(R[0][2], R[2][2])
   ///
-  /// The sign of both depends on which way the model's camera axes point, and it is
-  /// deliberately not corrected for: Dart judges `abs(yaw)` and `abs(pitch)`
-  /// (see `WebFacePresenceMonitor.offCenterYawDegrees`), so a mirrored angle is the
-  /// same evidence, while inventing a sign convention here would be a claim this
-  /// file cannot check against a real face.
+  /// The sign of the pitch is load-bearing now, so it is stated rather than left
+  /// to the reader: **positive is a chin down**. That follows from the model's own
+  /// axes - the canonical face looks along +Z (its nose tip sits at z = +6 cm,
+  /// `canonical_face_model.obj`), the camera's +Y is up, and `MatrixData` packs
+  /// column-major - so `Ry(yaw) * Rx(pitch)` sends the face's forward vector to
+  /// `(sin(yaw), -sin(pitch), cos(yaw)cos(pitch))`, which points below the horizon
+  /// for a positive pitch. [measurePose] is flipped to match, so both routes into
+  /// `pose:` speak one convention; `tools/detector_eval/test/pose_matrix.test.mjs`
+  /// pins this arithmetic, and shows that reading the same matrix row-major would
+  /// invert the sign. What is still unverified is the sign a *real* face produces
+  /// on a real camera (the root README keeps that risk open): the app's answer is
+  /// a tolerance five degrees wider downwards, so the worst case is that the
+  /// allowance lands on the other direction - a glance judged exactly as it is
+  /// today - rather than a glance becoming a strike.
+  ///
+  /// Yaw's sign is still unused: Dart compares `abs(yaw)`, so which side of the
+  /// head the model calls positive cannot change a verdict.
   ///
   /// One limit is real: with the head at ninety degrees up or down the two axes
   /// collapse and yaw is not observable. That is reported as zero rather than as a
@@ -1519,9 +1548,10 @@
           }
           var pose = smoothedPose(reading.yaw, reading.pitch);
           // The angles, not a verdict: whether 20 degrees is a look away is this
-          // app's rule (`WebFacePresenceMonitor.offCenterYawDegrees`), applied to
-          // the same numbers the on-device engine produces, rather than a
-          // threshold this script guessed at and cannot be audited on.
+          // app's rule (`WebFacePresenceMonitor.offCenterYawDegrees`, and
+          // `downwardPitchDegrees` for the downward half), applied to the same
+          // numbers the on-device engine produces, rather than a threshold this
+          // script guessed at and cannot be audited on.
           finished(poseMessage(pose), session);
         },
         function () {

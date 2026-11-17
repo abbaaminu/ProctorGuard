@@ -20,16 +20,32 @@ import 'package:flutter_test/flutter_test.dart';
 /// instead of keeping its own.
 void main() {
   group('look-away rule', () {
-    test('one angle, absolute, on both axes', () {
+    test('one angle, absolute, on both axes - and one web-only exception', () {
       expect(lookAwayYawDegrees, 15.0);
       expect(lookAwayPitchDegrees, 15.0);
-      // Symmetric by construction: the same angle left and right, up and down,
+      // Absolute by construction: the same angle left and right, and up and down,
       // compared against the absolute value. The asymmetric pair this replaced (25
       // yaw, 18 pitch) made a tilt down a strike where the same tilt up was not,
       // and ML Kit and the web's FaceLandmarker do not even agree on which
       // direction is positive - so two numbers also meant two verdicts for one
       // head on two platforms.
       expect(lookAwayPitchDegrees, lookAwayYawDegrees);
+      // The exception, and it is narrow on purpose: the *browser* allows a chin five
+      // degrees further down, because the keyboard a browser student reads is below
+      // the screen - and only downwards, because a chin *raised* past 15 degrees is a
+      // monitor mounted above the screen, which is the second screen this rule exists
+      // to catch. The phone has no such number: ML Kit's pitch sign has never been
+      // verified, so a signed rule there would be a guess, and the engine goes on
+      // judging the absolute angle.
+      expect(lookAwayWebDownwardPitchDegrees, 20.0);
+      expect(lookAwayWebDownwardPitchDegrees, greaterThan(lookAwayPitchDegrees));
+      // Wide enough that the keyboard a browser student reads does not reach it,
+      // narrow enough that a head which has stopped reading still does.
+      expect(
+        lookAwayWebDownwardPitchDegrees - lookAwayPitchDegrees,
+        lessThanOrEqualTo(5.0),
+      );
+      expect(lookAwayWebDownwardPitchDegrees, lessThan(30.0));
       // A gate, not zero: a tolerance at zero would call every head position off
       // centre. And still tight enough that a second screen beside the laptop (a
       // 25-45 degree turn at a normal viewing distance) is comfortably past it.
@@ -72,18 +88,53 @@ void main() {
       // its own while still agreeing with the constants.
       expect(engine.offCenterThresholdDegrees, engine.pitchThresholdDegrees);
       expect(web.offCenterYawDegrees, web.offCenterPitchDegrees);
+      // The one number that is *not* shared, and it is a widening rather than a
+      // tightening: the browser allows a chin 20 degrees down where the phone allows
+      // 15. Yaw, the upward half and the hold are the engine's own, so this is one
+      // side of one axis on one platform - not the 25/18 pair above, which moved both
+      // axes and applied to the phone as well.
+      expect(web.downwardPitchDegrees, lookAwayWebDownwardPitchDegrees);
+      expect(web.downwardPitchDegrees, greaterThan(web.offCenterPitchDegrees));
+      expect(web.downwardPitchDegrees, greaterThan(web.offCenterYawDegrees));
+      // ...and it cannot be narrowed into something tighter than a look up: a monitor
+      // that judged a keyboard glance harder than a raised chin would be the old
+      // asymmetry coming in through the constructor instead of the constants.
+      expect(
+        () => WebFacePresenceMonitor(
+          source: _SilentSource(),
+          offCenterPitchDegrees: 20.0,
+          downwardPitchDegrees: 15.0,
+        ),
+        throwsA(isA<AssertionError>()),
+      );
       // The *hold* is shared too, and this is the parity the audit asked for: 15
-      // degrees of yaw or pitch, absolute, held for two seconds, on both platforms.
-      // The web measures that two seconds on a clock where the engine measures it
-      // over consecutive frames, but the finding, and the number in it, is one.
+      // degrees of yaw or pitch up - 20 down, in a browser - held for two seconds, on
+      // both platforms. The web measures that two seconds on a clock where the engine
+      // measures it over consecutive frames, but the finding, and the number in it,
+      // is one.
       expect(web.lookAwaySustain, lookAwaySustain);
       expect(web.lookAwaySustain, engine.lookAwaySustain);
-      // There is no near-sideways exemption on either platform. The web used to
-      // report a `pose:` past 30 deg on the first detection, three times sooner
-      // than the phone; that shortcut is removed rather than equalised, because the
-      // engine's own exemption was removed for a reason that applies to a browser
-      // detector too (one bad frame can read 60 deg).
+      // Cross-platform equality of the gate itself, restated as one line rather than
+      // inferred from the two constants above.
       expect(web.offCenterYawDegrees, engine.offCenterThresholdDegrees);
+      // The near-sideways start is shared too, and it is a confirmation rather than
+      // an exemption: past 30 degrees of yaw - twice the gate - two consecutive
+      // detections are enough. Both numbers come from the one file so a browser
+      // cannot be quicker than the phone for the same head again (it used to report
+      // that turn on the *first* detection), and the count is what keeps one bad
+      // Euler estimate - which can read 60 degrees - from being a strike.
+      expect(web.immediateYawDegrees, lookAwayImmediateYawDegrees);
+      expect(engine.immediateYawDegrees, lookAwayImmediateYawDegrees);
+      expect(web.immediateConfirmations, lookAwayImmediateFrames);
+      expect(engine.immediateFrameThreshold, lookAwayImmediateFrames);
+      expect(lookAwayImmediateYawDegrees, greaterThan(lookAwayYawDegrees));
+      // Not so wide that a real glance reaches it: a second screen beside the laptop
+      // is a 25-45 degree turn, and 30 is where "no reading position explains this"
+      // starts. Past 45 and a cheater would be free.
+      expect(lookAwayImmediateYawDegrees, lessThanOrEqualTo(45.0));
+      // "Seen twice" is the whole rule; a single detection is a frame, not a student.
+      expect(lookAwayImmediateFrames, greaterThan(1));
+      expect(lookAwayImmediateFrames, lessThanOrEqualTo(3));
       // Absence is the one window that is *not* the look-away's: a covered, muted
       // or unplugged camera has to say so at once, and the engine confirms it over
       // three frames (~0.45 s) rather than two seconds. Pinned, so a future tidy-up
@@ -195,6 +246,48 @@ void main() {
       // signals, so an appeal reads the same on either platform.
       expect(fromEngine.indexOf(GazeSignal.lookingAway), 2);
       expect(fromWeb.indexOf(GazeSignal.lookingAway), 2);
+    });
+
+    test('a near-sideways turn is two detections on either platform', () async {
+      // The responsiveness half of the rule, stated as parity rather than as a
+      // comment: the same head, two consecutive detections, one strike - and nothing
+      // from the first one, because one detection is a frame, not a student. The
+      // browser used to report that turn on a single detection, which is both the
+      // speed this keeps and the guess it drops.
+      var now = DateTime(2026, 1, 1, 12);
+      final engine = MediaPipeProctoringService(
+        clock: () => now,
+        startupGrace: Duration.zero,
+      );
+      addTearDown(engine.dispose);
+      final fromEngine = <GazeSignal>[];
+      final engineSub = engine.signals.listen(fromEngine.add);
+      addTearDown(engineSub.cancel);
+
+      final web = WebFacePresenceMonitor(
+        source: _SilentSource(),
+        clock: () => now,
+        startupGrace: Duration.zero,
+      )..start(at: now);
+      addTearDown(web.dispose);
+      final fromWeb = <GazeSignal>[];
+      final webSub = web.signals.listen(fromWeb.add);
+      addTearDown(webSub.cancel);
+
+      const sideways = FaceFrameResult(faceCount: 1, yawDegrees: 60);
+      now = now.add(engine.inferenceInterval);
+      engine.handleResult(sideways);
+      web.handleMessage('pose:60.0,0.0');
+      await pumpEventQueue();
+      expect(fromEngine, isEmpty, reason: 'one frame is a guess');
+      expect(fromWeb, isEmpty, reason: 'one detection is the same guess');
+
+      now = now.add(engine.inferenceInterval);
+      engine.handleResult(sideways);
+      web.handleMessage('pose:60.0,0.0');
+      await pumpEventQueue();
+      expect(fromEngine, <GazeSignal>[GazeSignal.lookingAway]);
+      expect(fromWeb, <GazeSignal>[GazeSignal.lookingAway]);
     });
   });
 

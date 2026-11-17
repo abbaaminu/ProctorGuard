@@ -1474,9 +1474,10 @@ It reports `looking_away` only from a **measured** pose, never from a bounding
 box: the MediaPipe landmarks give yaw (how far the nose has swung from the
 midpoint between the eyes) and pitch (its drop below the eye line), smoothed over
 a few ticks and judged by `WebFacePresenceMonitor` with the phone build's own
-tolerances (`15°` yaw / `15°` pitch, absolute on both axes so either direction
-counts the same) **and the phone build's own hold** (`lookAwaySustain`, two
-seconds). A count
+tolerances — `15°` of yaw, `15°` of pitch **up**, and `20°` down
+(`lookAwayWebDownwardPitchDegrees`: the keyboard and the paper a browser student
+reads are below the screen, a monitor mounted above it is not) — **and the phone
+build's own hold** (`lookAwaySustain`, two seconds). A count
 with no angle stays a count. A host running a different detector (WASM/WebGPU, or
 a remote service) keeps using the bridge below and can say `looking_away` or
 `pose:<yaw>,<pitch>` itself.
@@ -1523,7 +1524,7 @@ window.proctorGuardFaceSignal('centered');
 | `looking_away` | face visible, head turned away | `looking_away`, if it holds for 2s (`lookAwaySustain`) — so keep sending it while it holds |
 | `no_face` | nothing in frame | `no_face`, if it holds for 300ms (`noFaceSustain`) |
 | `multiple_faces` | a second person in frame | `multiple_faces`, at once (latched 30s) |
-| `pose:<yaw>,<pitch>` | head pose in degrees, instead of a verdict | this app applies the same tolerances as the phone build (`15°` yaw / `15°` pitch on the absolute angle) and the same 2s hold |
+| `pose:<yaw>,<pitch>` | head pose in degrees, instead of a verdict - **positive pitch is chin down**, the sign the shipped page detector sends | this app applies the phone build's tolerances (`15°` yaw on the absolute angle, `15°` pitch up, `20°` down) and the same 2s hold |
 
 `WebFacePresenceMonitor` (`web_face_presence.dart`) is the judgement, not the
 detection: it sustains a condition before reporting it, re-arms after `centered`,
@@ -1811,9 +1812,10 @@ two seconds of consecutive frames (`proctoring_thresholds.dart`:
 `lookAwayYawDegrees`, `lookAwayPitchDegrees`, `lookAwaySustain`), because a single
 frame past a tolerance is a blink, a notification or one bad Euler estimate — the
 earlier rule turned every one of those into a strike, and a student warned for
-glancing at their own keyboard learns to ignore the warning. Both tolerances are
-compared on the **absolute** angle, so the rule is symmetric: 15 deg left counts
-exactly as 15 deg right, and a chin raised 15 deg as a chin dropped 15 deg. That is
+glancing at their own keyboard learns to ignore the warning. On the phone both
+tolerances are compared on the **absolute** angle, so the rule there is symmetric:
+15 deg left counts exactly as 15 deg right, and a chin raised 15 deg as a chin
+dropped 15 deg. That is
 deliberate. The pair used to be asymmetric — 25 deg of yaw against 18 of pitch —
 which put the yaw gate past the point where the paper is still readable, and made
 the verdict depend on *which way* a student was off-task instead of whether they
@@ -1824,6 +1826,13 @@ false-positive rate against before trusting a timer-driven disqualification. The
 two-second sustain is what has to carry that weight — it is long enough that no
 reading position holds it, and short enough that a student working from a second
 screen is caught while they are still doing it.
+
+The browser widens one number, and only downwards: there a chin may drop 20 deg
+before it counts (`lookAwayWebDownwardPitchDegrees`), because that student reads a
+keyboard and a paper that lie below the screen, while a chin *raised* past 15 deg is a
+monitor mounted above it — the second screen this rule exists for — and keeps the
+engine's number. One direction on one platform, not the old two-number pair, and the
+phone is unchanged at 15 in both directions.
 
 **The second way of asking the same question is repeated glances, and it exists
 because the first one is blind to a student's normal rhythm.** A candidate working
@@ -1860,12 +1869,15 @@ open. Four numbers, one rule, all named in `proctoring_thresholds.dart`
 three-a-minute are guesses about reading behaviour, and they are the numbers most
 likely to need tuning in a pilot.
 
-A web-only "a chin 20 deg **down** counts sooner than a chin 20 deg up" rule was
-asked for and is deliberately **not** implemented: it is asymmetric in a way the
-phone build is not, and it depends on the sign a browser detector gives pitch (the
-shipped FaceLandmarker reads a matrix, a host page sends `pose:` degrees), which
-is not yet verified on real hardware. Pitch therefore stays symmetric — absolute
-15 deg, both directions, both platforms — and the deferral is listed under
+That wider downward pitch is the one number the two builds do not share, and it
+depends on a sign: `web/proctor_face_detector.js` states **positive is a chin down**,
+on both of its measurement routes (the matrix route derives it from MediaPipe's
+canonical face and its column-major layout; the landmark route is aligned to it), and a
+host page that speaks `pose:` has to use the same convention. No real face has
+confirmed it through a real camera yet — which is why the rule only ever *widens*: if
+the sign runs the other way, the desk glance is judged at 15 deg, exactly as it is
+today, and no head becomes stricter anywhere. The phone has no signed rule at all, so
+ML Kit's sign cannot matter there. Both open risks are listed under
 [not verified](../README.md#proctoring-boundaries-and-risk-register) in the root
 README.
 
