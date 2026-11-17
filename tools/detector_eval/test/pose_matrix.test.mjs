@@ -16,10 +16,13 @@
  * OpenGL-style matrix (column-major: element (row, column) at `column * 4 + row`),
  * and the answer is compared with the angles that went in.
  *
- * What this cannot settle is the sign convention, or which of the model's axes it
- * calls yaw: that needs a real face on a real camera, and the detector deliberately
- * does not correct for it because the app judges `abs(yaw)` and `abs(pitch)`
- * (`WebFacePresenceMonitor`), where a mirrored angle is the same evidence.
+ * What this cannot settle is which of the model's axes it calls yaw: that needs a
+ * real face on a real camera. The *sign* of the pitch is different — it is a
+ * convention now, because Dart applies a signed tolerance to it (20° down against
+ * 15° up, `WebFacePresenceMonitor.downwardPitchDegrees`) — so the second half of this
+ * file measures a synthetic face through the landmark route and checks the two routes
+ * report a chin down the same way. A real face has still never been put in front of
+ * either route, which is why the app's signed rule only ever *widens*.
  *
  * `matrixPose` is not exported — the detector is one IIFE — so it is sliced out of
  * the shipped file rather than copied here, the way `page.test.mjs` reads its
@@ -54,6 +57,18 @@ const toDegrees = new Function(`${sliced('toDegrees')}; return toDegrees;`)();
 const matrixPose = new Function('toDegrees', `${sliced('matrixPose')}; return matrixPose;`)(
   toDegrees,
 );
+
+/// The detector's own idea of where a frontal nose sits, so the synthetic faces
+/// below are built on the same proportion the measurement uses rather than a copy of
+/// its number.
+const frontalNoseDrop = new Function(
+  `${/var FRONTAL_NOSE_DROP = [^;]+;/.exec(source)[0]}; return FRONTAL_NOSE_DROP;`,
+)();
+
+const measurePose = new Function(
+  'FRONTAL_NOSE_DROP',
+  `${sliced('landmarkPoints')}; ${sliced('measurePose')}; return measurePose;`,
+)(frontalNoseDrop);
 
 // --- building the matrices ---------------------------------------------------
 
@@ -189,5 +204,58 @@ test('no matrix, a short one, or a non-numeric element answers null', () => {
   const nonNumeric = flattened(rotation(0, 0, 0));
   nonNumeric.data[2 * 4] = 'x';
   assert.equal(matrixPose(nonNumeric), null);
+});
+
+// --- the landmark route, and the sign the two routes share -------------------
+
+/// A synthetic face with the eyes 0.2 apart and the nose [drop] × that distance
+/// below the eye line, in image coordinates (y grows downwards).
+///
+/// `drop === frontalNoseDrop` is a face looking straight at the screen - the
+/// proportion `measurePose` subtracts - so more is a chin down and less a chin up,
+/// exactly as a photograph would read.
+function faceWithNoseDrop(drop) {
+  return {
+    landmarks: [
+      {
+        type: 'eye',
+        locations: [
+          { x: 0.4, y: 0.4 },
+          { x: 0.6, y: 0.4 },
+        ],
+      },
+      {
+        type: 'nose',
+        locations: [{ x: 0.5, y: 0.4 + drop * 0.2 }],
+      },
+    ],
+  };
+}
+
+test('a face looking straight at the screen reads level, from its landmarks', () => {
+  const pose = measurePose(faceWithNoseDrop(frontalNoseDrop));
+  assert.ok(pose !== null, 'two eyes and a nose are measurable');
+  assertAngles(pose, { yaw: 0, pitch: 0 });
+});
+
+test('both routes call a chin down positive, which is the sign Dart reads', () => {
+  // Dart applies a *signed* tolerance to the pitch - 20° down against 15° up
+  // (`WebFacePresenceMonitor.downwardPitchDegrees`) - so a route that reported the
+  // opposite sign would put the browser's five degrees of forgiveness on the wrong
+  // direction, and nothing but a real head would ever show it. The matrix route's
+  // convention is asserted above (a positive pitch sends the face's forward vector
+  // below the horizon); this is the landmark route agreeing with it.
+  const down = measurePose(faceWithNoseDrop(frontalNoseDrop + 0.2));
+  assert.ok(down !== null, 'a chin down is measurable');
+  assert.ok(down.pitch > 0, `a chin down read ${down.pitch}, which is the wrong sign`);
+  assert.ok(Math.abs(down.pitch - 20) <= 1e-9, `a chin down read ${down.pitch}, not 20`);
+
+  const up = measurePose(faceWithNoseDrop(frontalNoseDrop - 0.2));
+  assert.ok(up !== null, 'a chin up is measurable');
+  assert.ok(up.pitch < 0, `a chin up read ${up.pitch}, which is the wrong sign`);
+  assert.ok(Math.abs(up.pitch + 20) <= 1e-9, `a chin up read ${up.pitch}, not -20`);
+
+  // The same head through the matrix route: pitch 20 is the same direction.
+  assertAngles(matrixPose(flattened(rotation(0, 20, 0))), { yaw: 0, pitch: 20 });
 });
 
