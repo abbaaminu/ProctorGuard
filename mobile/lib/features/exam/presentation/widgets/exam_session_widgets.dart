@@ -164,9 +164,16 @@ class ExamWarningChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Never more than the door it measures. The number behind this is a sum of
+    // weights, and a session that has passed the threshold is one the server is
+    // closing - so "6 of 3" is arithmetic no student can act on, and it read that
+    // way while queued violation rows were being refused by the backend (the
+    // banner now names that instead). The extra signals are not hidden: they are
+    // on the record and in the risk index beside this chip.
+    final shown = count > total ? total : count;
     // The last warning before the attempt closes is the one that has to look
     // different: it is the only one a student can still act on.
-    final lastOne = count >= total - 1;
+    final lastOne = shown >= total - 1;
     final color = lastOne ? Colors.redAccent : Colors.amber.shade800;
 
     return Tooltip(
@@ -179,7 +186,7 @@ class ExamWarningChip extends StatelessWidget {
             Icon(Icons.warning_amber_rounded, size: 18, color: color),
             const SizedBox(width: 4),
             Text(
-              '$count of $total warnings${noted == 0 ? '' : ' · $noted noted'}',
+              '$shown of $total warnings${noted == 0 ? '' : ' · $noted noted'}',
               style: Theme.of(context).textTheme.labelMedium?.copyWith(
                     color: color,
                     fontWeight: lastOne ? FontWeight.w700 : null,
