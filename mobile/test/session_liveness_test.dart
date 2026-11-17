@@ -179,6 +179,113 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('an accepted claim is what revokes the other devices',
+      (tester) async {
+    var otherSignOuts = 0;
+
+    await tester.pumpWidget(
+      harness(
+        signedIn: Stream<bool>.value(true),
+        signOutOtherDevices: () async {
+          otherSignOuts++;
+          return const AuthOutcome.success();
+        },
+      ),
+    );
+    await settle(tester);
+
+    expect(otherSignOuts, 1, reason: 'the accepted claim holds the account');
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('a refused claim revokes nothing: it is the loser',
+      (tester) async {
+    var otherSignOuts = 0;
+
+    await tester.pumpWidget(
+      harness(
+        signedIn: Stream<bool>.value(true),
+        claimSession: ({String? deviceLabel}) async => refused(),
+        signOutOtherDevices: () async {
+          otherSignOuts++;
+          return const AuthOutcome.success();
+        },
+      ),
+    );
+    await settle(tester);
+
+    expect(
+      otherSignOuts,
+      0,
+      reason: 'revoking here could revoke the token of the device that just won',
+    );
+
+    // The SnackBar's own timer, so the test ends with nothing pending.
+    await tester.pump(const Duration(seconds: 9));
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('a claim nobody answered revokes nothing either', (tester) async {
+    var otherSignOuts = 0;
+
+    await tester.pumpWidget(
+      harness(
+        signedIn: Stream<bool>.value(true),
+        claimSession: ({String? deviceLabel}) async =>
+            const SessionClaim.unmeasured(),
+        signOutOtherDevices: () async {
+          otherSignOuts++;
+          return const AuthOutcome.success();
+        },
+        claimRetryDelays: const <Duration>[],
+      ),
+    );
+    await settle(tester);
+
+    expect(
+      otherSignOuts,
+      0,
+      reason: 'an unanswered claim does not say whose token this is',
+    );
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('a claim accepted on a retry revokes them then, once',
+      (tester) async {
+    var otherSignOuts = 0;
+    var claims = 0;
+
+    await tester.pumpWidget(
+      harness(
+        signedIn: Stream<bool>.value(true),
+        claimSession: ({String? deviceLabel}) async {
+          claims++;
+          // The first answer is lost on a bad link; the retry is the one that
+          // puts this device in `active_sessions`.
+          return claims == 1 ? const SessionClaim.unmeasured() : accepted();
+        },
+        signOutOtherDevices: () async {
+          otherSignOuts++;
+          return const AuthOutcome.success();
+        },
+        claimRetryDelays: const <Duration>[Duration(seconds: 1)],
+      ),
+    );
+    await settle(tester);
+
+    expect(otherSignOuts, 0, reason: 'nothing is known yet');
+
+    await tester.pump(const Duration(seconds: 1));
+    await settle(tester);
+
+    expect(claims, 2);
+    expect(otherSignOuts, 1);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('a refused claim signs out at once and says why', (tester) async {
     var signOuts = 0;
     var checks = 0;

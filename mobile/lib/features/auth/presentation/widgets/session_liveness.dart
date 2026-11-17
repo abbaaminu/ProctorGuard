@@ -14,11 +14,7 @@ const Key sessionSupersededMessageKey = Key('session-superseded-message');
 ///
 /// Three jobs, all of them about the *same* session:
 ///
-/// 1. After a sign-in, ask the server to revoke the account's other refresh
-///    tokens ([SupabaseService.signOutOtherDevices]). Not awaited: the sign-in is
-///    already complete, and `signOut()` in this app is a *local* sign-out, so
-///    without this an older device would keep a usable token.
-/// 2. Claim the account's single active session for this device
+/// 1. Claim the account's single active session for this device
 ///    ([SupabaseService.claimSession]). A refusal means another device signed in
 ///    later and this one is already locked out of every write, so it signs out
 ///    immediately instead of letting the student fill in an exam that cannot be
@@ -27,6 +23,14 @@ const Key sessionSupersededMessageKey = Key('session-superseded-message');
 ///    claims leaves the account's `active_sessions` row naming nobody - and then
 ///    nothing on this device is superseded by anything until another device
 ///    claims it.
+/// 2. Once the server has **answered** that this device holds the account, ask it
+///    to revoke the account's other refresh tokens
+///    ([SupabaseService.signOutOtherDevices]). Not awaited: the sign-in is already
+///    complete, and `signOut()` in this app is a *local* sign-out, so without this
+///    an older device would keep a usable token. After the acceptance and not
+///    before: a device that was refused - or whose claim was never answered -
+///    must not revoke anything, because it cannot tell whether the token it would
+///    revoke belongs to the device that just won.
 /// 3. Keep asking, every [sessionCheckInterval] and on every resume, whether
 ///    this token still holds the account (see [SessionGate]) — a superseded
 ///    device keeps a valid access token until `exp`, which is far too long for a
@@ -52,7 +56,8 @@ class SessionLiveness extends StatefulWidget {
   /// Signed-in status; defaults to [SupabaseService.signedInChanges].
   final Stream<bool>? signedInChanges;
 
-  /// Defaults to [SupabaseService.signOutOtherDevices].
+  /// Defaults to [SupabaseService.signOutOtherDevices]; only called once this
+  /// device's claim is accepted.
   final Future<AuthOutcome> Function()? signOutOtherDevices;
 
   /// Defaults to [SupabaseService.claimSession].
@@ -166,7 +171,6 @@ class _SessionLivenessState extends State<SessionLiveness> {
   }
 
   Future<void> _onSignedIn() async {
-    unawaited(_requestSignOutOthers());
     _claimRetry?.cancel();
     _claimRetry = null;
     _claimRetries = 0;
@@ -208,7 +212,18 @@ class _SessionLivenessState extends State<SessionLiveness> {
         return;
       }
 
-      if (claim.measured) return; // the server answered; nothing to re-ask
+      if (claim.measured) {
+        // Accepted, and the server said so: this device holds the account, so the
+        // account's other refresh tokens can go. That is the half of "one login"
+        // the SQL gate cannot do - a displaced device's token stays spendable
+        // until it is revoked - and it is only safe on a measured answer: a refusal
+        // was returned above, and an unmeasured claim (`accepted` `true`, but only
+        // because "could not ask" never signs anybody out) cannot tell whose token
+        // it would be revoking. A claim accepted on a retry lands here too, once.
+        unawaited(_requestSignOutOthers());
+        return; // the server answered; nothing to re-ask
+      }
+
       if (_claimRetries >= widget.claimRetryDelays.length) {
         proctorLog(
           'SessionLiveness: claim_session could not be asked '
