@@ -252,6 +252,16 @@ class DirectViolationOutbox implements ViolationOutbox {
       const Stream<ViolationRuling>.empty();
 }
 
+/// What the banner says when the *server* refused a queued proctoring log.
+///
+/// Not "Offline": the network carried the call and the database answered. The
+/// distinction is the whole point of [ViolationWriteRejected] - a project missing
+/// the current `register_violation`, a permission error or a raise inside the RPC
+/// used to make an online exam claim it was offline, which hides the one fact a
+/// developer needs ("the backend said no") behind a fact that is not true.
+const String violationRefusedMessage =
+    'A proctoring log has not been accepted by the server yet - retrying.';
+
 /// What the exam chrome renders about local work that has not reached the
 /// server: the banner, and whether it is safe to close the attempt.
 class SyncState {
@@ -303,12 +313,23 @@ class SyncState {
 
   /// The headline the exam banner shows: the work is safe on this device but has
   /// not reached the server.
+  ///
+  /// Three states, not two: a *refusal* is neither "syncing" nor "offline". When
+  /// the last pass was stopped by something the server said - a rejected answer,
+  /// a refused proctoring log, a superseded session - the banner repeats that
+  /// reason, because "Offline - syncing locally" beside a working connection is
+  /// the one sentence that sends a supervisor looking in the wrong place (it is
+  /// what a backend missing an RPC, a revoked grant and a proxy all used to look
+  /// like).
   String get label {
     if (hasRejectedAnswers) {
       final answerNoun = rejectedAnswers == 1 ? 'answer was' : 'answers were';
       return '$rejectedAnswers $answerNoun not accepted before the attempt closed.';
     }
-    return online ? 'Syncing your answers...' : 'Offline - syncing locally';
+    if (!online) return 'Offline - syncing locally';
+    final reason = lastError;
+    if (reason != null && reason.isNotEmpty) return reason;
+    return 'Syncing your answers...';
   }
 
   @override
@@ -648,6 +669,12 @@ class OfflineSyncService implements ViolationOutbox {
     var deliveredAny = false;
     var failures = 0;
 
+    // Whether the *server* refused a row in this pass. Distinct from `failures`
+    // (the network did not carry it): a refusal leaves the connection healthy and
+    // has its own sentence for the banner, which the tidy-up below must not wipe
+    // just because every other row in the same pass landed.
+    var refused = false;
+
     // One write per pass rather than one per row. Each `_persist*` re-encodes the
     // whole queue and writes it through the store, and the store is the slowest
     // thing in a pass whose entire job is to be quick: a queue of ten answers used
@@ -693,6 +720,19 @@ class OfflineSyncService implements ViolationOutbox {
           _online = true;
           _notify();
           return;
+        } on ViolationWriteRejected catch (error) {
+          // The server refused this row (a schema gap, a permission error, a raise
+          // inside the RPC). It is not a lost connection, so the banner must not
+          // say "Offline", and one refused row must not stop the pass: evidence
+          // queued behind it can still be delivered. The row itself stays queued
+          // for the pass after a project is repaired.
+          proctorLog(
+            'ProctorGuard: register_violation refused '
+            '(${pending.violation.type.dbValue}) '
+            '${error.code ?? '(no code)'}: ${error.message ?? ''}',
+          );
+          refused = true;
+          _refused(violationRefusedMessage);
         } catch (error) {
           proctorLog('ProctorGuard: violation still queued ($error)');
           _offline('Could not deliver a proctoring log yet.');
@@ -756,8 +796,9 @@ class OfflineSyncService implements ViolationOutbox {
 
     // Only a pass that finished cleanly proves the connection is back: one that
     // delivered *and* failed is still a device with something stuck, and the
-    // banner has to keep saying so.
-    if (deliveredAny && failures == 0) {
+    // banner has to keep saying so. A pass that had a row refused is clean on the
+    // wire but not finished on the server, so the refusal keeps its sentence too.
+    if (deliveredAny && failures == 0 && !refused) {
       _lastSyncedAt = _now();
       _lastError = null;
       _online = true;
@@ -769,6 +810,17 @@ class OfflineSyncService implements ViolationOutbox {
   void _offline(String reason) {
     _lastError = reason;
     _online = false;
+    _notify();
+  }
+
+  /// Records that the server *answered* and refused a row.
+  ///
+  /// The queue keeps the row and keeps retrying (a repaired project accepts it on
+  /// the next pass), but connectivity is not in question and saying it is would be
+  /// a lie the student cannot act on: the banner repeats [reason] instead.
+  void _refused(String reason) {
+    _lastError = reason;
+    _online = true;
     _notify();
   }
 
@@ -831,6 +883,26 @@ class OfflineSyncService implements ViolationOutbox {
         disqualified: result.disqualified,
         flagged: result.flagged,
       );
+    } on ViolationWriteRejected catch (error) {
+      // The database refused this row. Not a lost connection: the request and the
+      // answer both travelled. The row is kept - a project can be repaired while
+      // the sitting continues - but the banner must not claim the device is
+      // offline, and there is no point spending a second immediate pass on a
+      // permanent "no".
+      proctorLog(
+        'ProctorGuard: register_violation refused ${error.code ?? '(no code)'}: '
+        '${error.message ?? ''}',
+      );
+      _violations.add(
+        PendingViolation(submissionId: submissionId, violation: violation),
+      );
+      _trimViolations();
+      await _persistViolations();
+      _refused(violationRefusedMessage);
+      _retryDelay = minRetryDelay;
+      _cancelRetry();
+      _scheduleRetry();
+      return null;
     } catch (error) {
       proctorLog(
         'ProctorGuard: violation queued for retry '

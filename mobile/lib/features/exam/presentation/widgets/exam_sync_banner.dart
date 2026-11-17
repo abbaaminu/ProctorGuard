@@ -76,7 +76,12 @@ class _ExamSyncBannerState extends State<ExamSyncBanner> {
 
     final theme = Theme.of(context);
     final offline = !_state.online;
-    final warning = _state.hasRejectedAnswers;
+    // Amber means "somebody has to look at this": an answer the server refused, or
+    // a log it refused while the connection is fine. Blue is "on its way", which
+    // is only true when nothing has been turned down (`lastError` is cleared by a
+    // pass that finished cleanly).
+    final warning =
+        _state.hasRejectedAnswers || (!offline && _state.lastError != null);
     final color = offline || warning
         ? Colors.amber.shade800
         : theme.colorScheme.primary;

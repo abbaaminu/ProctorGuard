@@ -287,6 +287,46 @@ void main() {
       expect(proctoring.violations, isEmpty);
     });
 
+    test('a row the server refuses is queued without claiming to be offline',
+        () async {
+      // The live failure this pins: a project whose `register_violation` is an
+      // older overload (or is missing) answers every call, and the queue used to
+      // read *any* exception as a lost connection. The exam page then said
+      // "Offline - syncing locally" on a working network while `proctoring_logs`
+      // stayed empty and the student's warning chip climbed past the threshold -
+      // three symptoms, one wrong sentence.
+      proctoring.refuse = true;
+
+      final ruling = await sync.log(
+        submissionId: 'sub-1',
+        violation: _violation(ViolationType.lookingAway),
+      );
+
+      expect(ruling, isNull, reason: 'null is "queued", not "delivered"');
+      expect(proctoring.refusals, 1);
+      expect(
+        sync.state.online,
+        isTrue,
+        reason: 'the server answered, so the connection is not in question',
+      );
+      expect(
+        sync.state.label,
+        violationRefusedMessage,
+        reason: 'the banner has to name the refusal instead of blaming the '
+            'network, which is what sent a supervisor looking in the wrong place',
+      );
+      expect(sync.state.pendingViolations, 1, reason: 'the evidence is kept');
+
+      // A repaired project accepts it on a later pass, with the same event id.
+      proctoring.refuse = false;
+      await sync.retryNow();
+
+      expect(proctoring.violations, hasLength(1));
+      expect(sync.state.pendingViolations, 0);
+      expect(sync.state.online, isTrue);
+      expect(sync.state.lastError, isNull);
+    });
+
     test('the retry replays the same event id and reports the ruling', () async {
       proctoring.online = false;
       final violation = Violation(
@@ -591,6 +631,11 @@ class _FlakyExamRepository implements ExamRepository {
 class _FlakyProctoringRepository implements ProctoringRepository {
   bool online = true;
 
+  /// Refuses every row the way a database does when the function it calls is an
+  /// older overload, is missing, or raises: an answer, not a dropped connection.
+  bool refuse = false;
+  int refusals = 0;
+
   /// Accepts the connection and then never answers - a socket that stays open on a
   /// server that has stopped replying, which is neither a success nor a failure
   /// until something puts a clock on it.
@@ -606,6 +651,13 @@ class _FlakyProctoringRepository implements ProctoringRepository {
     required Violation violation,
   }) async {
     if (hang) return Completer<({int warningCount, bool disqualified, bool flagged})>().future;
+    if (refuse) {
+      refusals++;
+      throw const ViolationWriteRejected(
+        code: 'PGRST202',
+        message: 'Could not find the public.register_violation function',
+      );
+    }
     if (!online) throw const _Offline();
     violations.add(violation);
     final count = warningCount + violations.length - 1;

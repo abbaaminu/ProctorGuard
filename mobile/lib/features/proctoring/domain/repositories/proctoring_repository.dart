@@ -1,6 +1,36 @@
 import '../entities/heartbeat.dart';
 import '../entities/violation.dart';
 
+/// The database answered, and refused this evidence row.
+///
+/// Distinct from a delivery failure on purpose. The network carried the call and
+/// the server said no - `42501` for a submission that is not the caller's,
+/// `PGRST202` for a project whose `register_violation` is an older overload than
+/// the client calls, `42883` for one where the function is missing altogether,
+/// `P0001`/`XX000` for a raise inside it. Retrying will not change the answer
+/// until the project is repaired, so the queue must not treat the row as "waiting
+/// for the network": that is what turned a schema gap into an exam page stuck on
+/// *"Offline - syncing locally"* while the connection was perfectly healthy and
+/// the evidence never appeared in `proctoring_logs`.
+///
+/// The row is still kept and still retried - a project can be repaired under a
+/// sitting - but the banner says what happened instead of blaming the connection.
+/// [code] is PostgREST's SQLSTATE, kept for the debug log and never shown to a
+/// student.
+class ViolationWriteRejected implements Exception {
+  const ViolationWriteRejected({this.code, this.message});
+
+  /// The SQLSTATE/PostgREST code the server answered with, when it gave one.
+  final String? code;
+
+  /// The server's own sentence, for the debug log only.
+  final String? message;
+
+  @override
+  String toString() => 'ViolationWriteRejected(${code ?? 'unknown'}: '
+      '${message ?? 'no message'})';
+}
+
 abstract class ProctoringRepository {
   /// Calls the `register_violation` RPC, so the weighted escalation rule is
   /// enforced server-side and can't be bypassed by a patched client.

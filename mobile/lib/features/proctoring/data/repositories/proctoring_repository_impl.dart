@@ -59,7 +59,13 @@ class ProctoringRepositoryImpl implements ProctoringRepository {
       // RPC refuses it because another device signed in later (schema.sql §1b),
       // and the log will never be accepted from this session.
       if (error.code == 'PT409') throw const SessionSupersededException();
-      rethrow;
+      // Everything else PostgREST says is the *database* refusing this row, not
+      // the network failing to carry it: a project whose `register_violation` is
+      // an older overload (`PGRST202`), one where the function is missing, a
+      // permission error, a raise inside the RPC. Reported as itself so the queue
+      // keeps the row without telling the student they are offline (see
+      // [ViolationWriteRejected]).
+      throw ViolationWriteRejected(code: error.code, message: error.message);
     }
 
     final row = rows.first as Map<String, dynamic>;
