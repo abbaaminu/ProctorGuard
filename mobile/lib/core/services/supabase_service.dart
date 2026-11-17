@@ -579,7 +579,20 @@ class SupabaseService {
       );
       return SessionClaim.fromRpc(response);
     } on PostgrestException catch (error) {
-      proctorLog('SupabaseService: claim_session answered ${error.code}');
+      // A project that has not had
+      // `supabase/migrations/20261111090000_single_session.sql` applied answers
+      // `PGRST202`/`42883` here, and a token the auth server did not mint a
+      // `session_id` for raises `22023`. Neither is a reason to lock a student out
+      // of an exam, so both are reported and carried on from - but the first one
+      // means nothing on this project enforces the rule until the migration is
+      // applied, which is exactly what this line is for.
+      final undeployed = error.code == 'PGRST202' || error.code == '42883';
+      proctorLog(
+        'SupabaseService: claim_session answered ${error.code}'
+        '${undeployed ? ' - supabase/migrations/20261111090000_single_session.sql '
+            'is not applied to this project, so no session is claimed' : ''}'
+        ' (${error.message})',
+      );
       return const SessionClaim.unmeasured();
     } catch (error) {
       proctorLog('SupabaseService: claim_session failed: $error');

@@ -40,6 +40,7 @@ void main() {
     Future<SessionClaim> Function({String? deviceLabel})? claimSession,
     Future<bool?> Function()? isCurrentSession,
     Future<AuthOutcome> Function()? signOut,
+    List<Duration> claimRetryDelays = defaultClaimRetryDelays,
   }) =>
       MaterialApp(
         home: SessionLiveness(
@@ -51,6 +52,7 @@ void main() {
           isCurrentSession: isCurrentSession ?? () async => true,
           signOut: signOut ?? () async => const AuthOutcome.success(),
           message: reason,
+          claimRetryDelays: claimRetryDelays,
           // A Scaffold, because the message has to be *shown*: the SnackBar is
           // posted to the root messenger and rendered by whichever Scaffold is
           // registered with it.
@@ -170,6 +172,48 @@ void main() {
     expect(find.text(reason), findsOneWidget);
 
     await tester.pump(const Duration(seconds: 9));
+  });
+
+  testWidgets('a claim the server could not answer is asked again',
+      (tester) async {
+    // The failure this covers: `claim_session` on a flaky link, or on a project
+    // the single-session migration has not reached yet, answers "unmeasured".
+    // Asking once per sign-in meant that device never claimed the account, so
+    // nothing superseded anything for the rest of the sitting - the exact shape
+    // of "one login works for the admin but not for this class".
+    var claims = 0;
+
+    await tester.pumpWidget(
+      harness(
+        signedIn: Stream<bool>.value(true),
+        claimRetryDelays: const <Duration>[Duration(seconds: 1)],
+        claimSession: ({String? deviceLabel}) async {
+          claims++;
+          return claims == 1 ? const SessionClaim.unmeasured() : accepted();
+        },
+      ),
+    );
+    await settle(tester);
+
+    expect(claims, 1, reason: 'the first ask is at the sign-in');
+    expect(
+      find.text(reason),
+      findsNothing,
+      reason: 'an unmeasured claim is not a supersession: carry on',
+    );
+
+    await tester.pump(const Duration(seconds: 1));
+    await settle(tester);
+
+    expect(claims, 2, reason: 'the unanswered claim is re-asked on the schedule');
+    expect(find.text(reason), findsNothing);
+
+    // The schedule is finite: a device that stays offline is not asked for ever.
+    await tester.pump(const Duration(seconds: 1));
+    await settle(tester);
+    expect(claims, 2);
+
+    await tester.pumpWidget(const SizedBox());
   });
 
   testWidgets('a token refresh is not a new sign-in, so it claims nothing',
