@@ -159,9 +159,9 @@ class RoleGate extends ConsumerWidget {
 /// screen can legitimately be up for a second or two, and after [hintDelay] it
 /// says so rather than looking frozen. It never turns into the error screen by
 /// itself — only a real [ProfileLookupException] does that, and the last one on
-/// that way is [profileLoadTimeout]: a lookup that never answers at all becomes
-/// one after ten seconds, so the spinner cannot outlive the sign-in it belongs
-/// to.
+/// that way is [profileLoadTimeout] — thirty seconds as shipped — which turns a
+/// lookup that never answers at all into one, so the spinner cannot outlive the
+/// sign-in it belongs to.
 class _ProfileLoading extends StatefulWidget {
   const _ProfileLoading();
 

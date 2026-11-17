@@ -510,8 +510,9 @@ void main() {
     });
 
     testWidgets('a load that outlasts the retry window says so', (tester) async {
-      // The repository is still inside its silent retry window (`ProfileRepositoryImpl`,
-      // 2.45s in total) with the profile still unread.
+      // The repository is still inside its silent retry window
+      // (`ProfileRepositoryImpl`: 0.25 + 0.75 + 1.5 + 3 s, about 5.5 s in total)
+      // with the profile still unread.
       final pending = Completer<UserProfile>();
       profiles.behaviour = () => pending.future;
 

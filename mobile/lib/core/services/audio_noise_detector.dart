@@ -263,12 +263,12 @@ class AudioNoiseDetector {
 
   /// The most readings the calibration median is built from.
   ///
-  /// The window is five seconds and [AudioMonitor] samples every 250 ms, so the
-  /// shipped defaults only ever collect about sixteen - but a source with a
-  /// different rate (a test, a host feeding frames) must not be able to turn a
-  /// once-per-session calculation into an unbounded buffer. Once the cap is
-  /// reached the oldest reading is dropped, so the median describes the *recent*
-  /// room, which is the one the student is sitting in.
+  /// The window is [calibrationWindow] - three seconds as shipped, which against
+  /// [AudioMonitor]'s 250 ms sampling is about twelve readings, well under this cap
+  /// - but a source with a different rate (a test, a host feeding frames) must not
+  /// be able to turn a once-per-session calculation into an unbounded buffer. Once
+  /// the cap is reached the oldest reading is dropped, so the median describes the
+  /// *recent* room, which is the one the student is sitting in.
   ///
   /// A cap below [minCalibrationSamples] is honoured, but the minimum is clamped
   /// down to it: calibration then takes the whole [calibrationWindow] and every
