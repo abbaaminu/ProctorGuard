@@ -904,6 +904,23 @@ Things worth knowing before you turn it on:
   seconds and on resume. `supabase/tests/single_session_check.sql` proves the whole
   sequence, and `mobile/test/schema_contract_test.dart` fails the build if this file
   and `schema.sql` section 1b drift apart.
+  Two things to check on a live project when "one login" looks like it is not
+  working, because neither of them is a client bug:
+  * **Was the claim ever made?** After two sign-ins, ask the project
+    `select user_id, session_id, issued_at, device_label from public.active_sessions;`.
+    An empty table means `public.claim_session()` is not deployed there (or every
+    claim was refused), and the app *by design* carries on rather than locking a
+    student out of an exam over a deployment gap: it logs `claim_session answered
+    PGRST202` and treats the answer as "could not ask". Run
+    `supabase/tests/single_session_check.sql` on the project to prove the SQL half
+    end to end. The client does re-ask a claim whose answer was unmeasured (three
+    attempts over a sign-in, `SessionLiveness.claimRetryDelays`), because a sign-in
+    that never claims leaves that account unenforced until another device claims it.
+  * **Two tabs are one login.** A browser profile shares its session storage across
+    tabs, so signing in twice there yields one token with one `session_id` - there is
+    nothing to supersede. The rule counts two *devices* (or two browser profiles /
+    one normal and one private window), which is what `device_label` in the audit row
+    is for.
 - Apply `supabase/migrations/20261111090100_lecturer_isolation.sql` after it, on every
   project: it is the file that stops one lecturer reading another lecturer's paper.
   Until it runs, `is_staff()` is the roster gate, so any lecturer account can list

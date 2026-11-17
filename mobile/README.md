@@ -319,7 +319,7 @@ proctoring row that silently vanished. `core/services/offline_sync_service.dart`
 | Student types | `cacheTextDraft` mirrors the keystroke into the draft cache (no network write — the server does not need every character) |
 | "Save & next" / keyboard done | `cacheText` does the same, plus a queue row |
 | The write reaches Supabase | the queue row is dropped, the banner disappears |
-| The write fails | the row stays queued, the banner turns into **"Offline - syncing locally"**, and the session carries on |
+| The write fails | the row stays queued and the session carries on; the banner says **"Offline - syncing locally"** if the connection went, and names the *server's* refusal ("A proctoring log has not been accepted by the server yet - retrying.") if it did not |
 | The connection comes back | the queue drains by itself: the browser's `online` event, the app's resume hook (`AppLifecycleListener`), or the retry backoff (2s, doubling to 60s) |
 | Submit, with the queue still full | the attempt is *held*, not lost: a "Waiting for a connection" screen with **Submit again** / **Leave**, and leaving keeps the attempt `ongoing` with its answers on the device |
 
@@ -377,9 +377,19 @@ Details worth knowing:
   own `timestamp`, so a violation delivered late is still placed correctly in the
   audit trail without trusting a device clock for ordering.
 - **The banner says what it knows.** It appears only while something is queued, and
-  it distinguishes "Syncing your answers…" from "Offline - syncing locally"; it
-  repaints only when what it renders actually changes, so an offline exam does not
-  spin frames for as long as the connection is down.
+  it distinguishes three states rather than two: "Syncing your answers…", **"Offline
+  - syncing locally"** (a delivery really did fail on the wire), and the *server's*
+  own refusal - `ViolationWriteRejected`, an answer the RPC turned down (`55000`), or
+  a superseded session - repeated in words. That third state exists because every
+  exception used to read as "offline": a project whose `register_violation` is an
+  older overload (`PGRST202`), one where the function is missing, a revoked grant, an
+  exception raised inside the RPC and a proxy all produced **"Offline - syncing
+  locally"** on a perfectly healthy connection, while `proctoring_logs` stayed empty
+  and the student's chip climbed past its threshold. The refused row is still kept
+  and still retried (a project can be repaired mid-sitting), but the sentence the
+  student and the supervisor read is now the truth. It repaints only when what it
+  renders actually changes, so an offline exam does not spin frames for as long as
+  the connection is down.
 
 `mobile/test/offline_sync_service_test.dart` covers the queue rules (durability
 before the network, drain on recovery with the violations first, backoff without
@@ -1454,7 +1464,11 @@ listening), `video` (was the preview found), `reason` (which state it is in),
 `lastVerdict` (what the page last said) and `analysis` (can this page measure a
 head angle at all — the same answer the second hook publishes, so the console and
 the app cannot disagree about a sitting). A page that never finds a preview warns
-once on the console instead of staying silent.
+once on the console instead of staying silent — but only after the preview has been
+missing for the same five seconds a preview with no frame gets, because the exam page
+installs the hook *before* `CameraPreview` has an initialised controller and a
+healthy sitting's first ticks legitimately find no `<video>` yet. The warning is a
+statement about the page ("this attempt has no preview"), not about one tick.
 
 It reports `looking_away` only from a **measured** pose, never from a bounding
 box: the MediaPipe landmarks give yaw (how far the nose has swung from the
@@ -1651,7 +1665,7 @@ project.
 | `script-src` | `'self' 'unsafe-inline' 'wasm-unsafe-eval' https://www.gstatic.com` | The app's own scripts (the face sensor, the lockdown bootstrap and Flutter's loader) plus CanvasKit's canvas/font payload. `'unsafe-inline'` is what the exam-lockdown script in `index.html` needs; a host serving this as a **response header** can move that script into its own file and drop the keyword. `'wasm-unsafe-eval'` is the narrow WebAssembly allowance — not `'unsafe-eval'`. |
 | `style-src` | `'self' 'unsafe-inline' https://fonts.googleapis.com` | Flutter writes element styles directly (`'unsafe-inline'`), and a Google Fonts stylesheet is the one external stylesheet allowed. The list is exhaustive because injected CSS can call home through `url()` and `@import`. |
 | `font-src` | `'self' data: https://fonts.gstatic.com` | The app's own fonts, the `data:` sources Flutter inlines, and the `@font-face` files a Google Fonts stylesheet names. `fonts.googleapis.com` in `style-src` + `fonts.gstatic.com` here are a **pair**: without the first the stylesheet is refused, without the second every `@font-face` inside it fails and the app quietly renders in the system face. |
-| `connect-src` | `'self'`, `https://*.supabase.co`, `wss://*.supabase.co`, the `.supabase.in` mirror, Sentry ingest, `https://www.gstatic.com`, `https://fonts.gstatic.com`, localhost | Auth, PostgREST, Storage and the Realtime socket; crash reports only when `SENTRY_DSN` was compiled in; `flutter run -d chrome` and a local Supabase stack. Both gstatic entries belong to the **engine**, not to app code: `www.gstatic.com` is CanvasKit, and `fonts.gstatic.com` is its fallback font downloader — when a rendered code point has no face behind it, the engine `fetch`es a Noto subset from `https://fonts.gstatic.com/s/…`, and a `fetch` is `connect-src`, not `font-src`. Dropping it does not remove the download, it makes the browser refuse it (`Fetch API cannot load … Refused to connect because it violates the document's Content Security Policy`), after which the engine reports the family as permanently unavailable and the glyph renders as tofu. `fonts.googleapis.com` stays out of `connect-src`: the stylesheet is a `style-src` load, and nothing fetches CSS from Dart. |
+| `connect-src` | `'self'`, `blob:`, `https://*.supabase.co`, `wss://*.supabase.co`, the `.supabase.in` mirror, Sentry ingest, `https://www.gstatic.com`, `https://fonts.gstatic.com`, localhost | Auth, PostgREST, Storage and the Realtime socket; crash reports only when `SENTRY_DSN` was compiled in; `flutter run -d chrome` and a local Supabase stack. `blob:` is the **shipped face model only**: MediaPipe's Emscripten runtime stores the bytes it downloaded in a `Blob` and reads them back with a synchronous XHR on the `blob:` URL it minted, and an XHR is governed by `connect-src` — without it Chrome refuses the read (`Connecting to 'blob:...' violates ...`) and a desktop exam loses head-pose measurement after downloading the whole model. A `blob:` URL is created by this document and cannot leave it, so nothing is opened to a third party (it is not an `https:` widening). Both gstatic entries belong to the **engine**, not to app code: `www.gstatic.com` is CanvasKit, and `fonts.gstatic.com` is its fallback font downloader — when a rendered code point has no face behind it, the engine `fetch`es a Noto subset from `https://fonts.gstatic.com/s/…`, and a `fetch` is `connect-src`, not `font-src`. Dropping it does not remove the download, it makes the browser refuse it (`Fetch API cannot load … Refused to connect because it violates the document's Content Security Policy`), after which the engine reports the family as permanently unavailable and the glyph renders as tofu. `fonts.googleapis.com` stays out of `connect-src`: the stylesheet is a `style-src` load, and nothing fetches CSS from Dart. |
 | `img-src` | `'self' data: blob:` + the Supabase hosts | Evidence stills are short-lived signed URLs on the project host. |
 | `object-src` / `base-uri` / `form-action` | `'none'` / `'self'` / `'self'` | No plugins, `<base>` is this document's own `--base-href`, and nothing is posted as a form. |
 
@@ -1666,11 +1680,24 @@ Two limits are deliberate and documented in the file itself:
   `build/web` (`Content-Security-Policy: frame-ancestors 'none'` or
   `X-Frame-Options: DENY`).
 
+A host that injects its own scripts is a fourth limit, and the one that produced a
+console full of errors on a deployment of this app: **Vercel Web Analytics**, when it
+is enabled for the project, appends `<script src="/_vercel/insights/script.js" defer>`
+to the served page and the script beacons to `/_vercel/insights/view`. Neither is in
+`build/web`, neither is this app's code, and both answer `403`/`400` on a project
+where the analytics pipeline is not provisioned (or on a protected/preview
+deployment) - so the console shows a failed script and a failed request on every
+load, neither of which a CSP change can fix (`script-src 'self'` already allows a
+same-origin path, and dropping `'self'` is not an option). Turn *Web Analytics* off
+in the Vercel project (Project → Analytics), or provision it. Nothing in this
+repository requests it, and no test pretends to.
+
 `test/web_csp_contract_test.dart` pins the policy: the exhaustive lists of allowed
 script, connect, style and font sources, the `wss:` realtime host, the
-`'wasm-unsafe-eval'` allowance, and that the meta tag appears **before** the first
-`<script>` (a policy declared after a script does not apply to it). Widening the
-policy is a deliberate edit to that file, not an accident in `index.html`.
+`'wasm-unsafe-eval'` allowance, that `blob:` is allowed for the shipped model but
+`https:` is not, and that the meta tag appears **before** the first `<script>` (a
+policy declared after a script does not apply to it). Widening the policy is a
+deliberate edit to that file, not an accident in `index.html`.
 
 ## Responsive layout (Android phone + desktop browser)
 
