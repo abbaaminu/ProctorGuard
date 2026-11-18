@@ -143,6 +143,11 @@ class WebFacePresenceMonitor {
     this.missingFrameTolerance = thresholds.missingFaceFrameThreshold,
     this.startupGrace = thresholds.cameraStartupGrace,
     this.multipleFacesCooldown = const Duration(seconds: 30),
+    // How long the head has to be back inside the tolerances before an open episode
+    // is over: `thresholds.lookAwayWebReturnDwell`, two detector ticks. The one
+    // number here that exists because of a *sampling rate* - see [_onInsideTolerances]
+    // for why a single centred tick must not cancel a hold.
+    this.returnDwell = thresholds.lookAwayWebReturnDwell,
     // The engine's tolerances, from the one file that states the rule: 15 degrees of
     // yaw, judged absolute, so `pose:15,0` and `pose:-15,0` are both a glance and
     // `pose:16,0` is not. Shared rather than restated - a browser that judged a head
@@ -200,6 +205,10 @@ class WebFacePresenceMonitor {
           immediateConfirmations > 1,
           'a single near-sideways detection is what this path exists to confirm',
         ),
+        assert(
+          returnDwell >= Duration.zero && returnDwell < lookAwaySustain,
+          'a dwell at or past the hold would count a returned head as time away',
+        ),
         _source = source,
         _awayBurst = LookAwayBurstWindow(sustain: lookAwaySustain),
         _now = clock ?? DateTime.now {
@@ -220,15 +229,42 @@ class WebFacePresenceMonitor {
   /// filled by the *second* detection, so one glance, one nod or one bad Euler
   /// estimate that happened to be sampled twice was a counted strike.
   ///
-  /// Two seconds also survives the thing a browser detector is worst at - a pose that
-  /// flickers across the 15 degree line while a head is genuinely moving - because
-  /// any detection back inside the tolerance resets the window, exactly as a
-  /// `centered` frame does in the engine. Only an unbroken run counts.
+  /// Two seconds also has to survive the thing a browser detector is worst at - a
+  /// pose that flickers across the 15 degree line while a head is genuinely moving.
+  /// The engine sees a frame every 150 ms, so a detection back inside the tolerances
+  /// costs it an eighth of the hold; a page's detector is polled every 350 ms, and one
+  /// `centered` tick - one sample the model could not measure, one estimate that
+  /// landed between two turns - would otherwise cancel a real two-second look-away so
+  /// that *nothing* was ever reported. So the browser measures this hold as
+  /// accumulated off-screen time (see [_awaySpan]) and only a [returnDwell] spent back
+  /// inside the tolerances ends the run (see [_onInsideTolerances]): the same two
+  /// seconds, sampled coarsely. A head that has really come back re-arms in about a
+  /// second.
   ///
   /// A run that ends early is not lost, though: it is one glance in [_awayBurst],
-  /// and the window is what makes repeated glances add up. Resetting this clock is
-  /// what keeps two seconds meaning "held", not "wandering".
+  /// and the window is what makes repeated glances add up. Ending this clock is what
+  /// keeps two seconds meaning "held", not "wandering".
   final Duration lookAwaySustain;
+
+  /// How long the head has to be back inside the tolerances before an open episode
+  /// is over: [thresholds.lookAwayWebReturnDwell], two detector ticks.
+  ///
+  /// The one number in this class that exists because of a *sampling rate* rather
+  /// than a behaviour, and the difference between the web's 15 degree rule reporting
+  /// and never reporting at all. The shipped detector answers `centered` for a tick
+  /// the model could not measure a pose on as well as for a head that is facing the
+  /// screen, so a single such tick used to end a real look-away: at a 350 ms tick a
+  /// turned head is regularly sampled between two turns, and the phone - which sees
+  /// seven frames a second and forgives one of them for *absence* - reported the same
+  /// head that the browser did not. Confirming a return over [returnDwell] of time
+  /// spent inside the tolerances - a tick or two, at the detector's rate - is the
+  /// browser's version of that three-frame buffer, in the other direction.
+  ///
+  /// Zero disables it: every detection back inside the tolerances ends the episode at
+  /// once, which is what a host whose detector really does sample at frame rate wants,
+  /// and what this class did before the dwell existed (the tests that pin one-tick
+  /// sampling use it).
+  final Duration returnDwell;
 
   /// How long an empty frame has to hold before it is reported as `no_face`.
   ///
@@ -356,6 +392,29 @@ class WebFacePresenceMonitor {
 
   DateTime? _startedAt;
   DateTime? _awaySince;
+
+  /// The first detection of the run currently back inside the tolerances, or null
+  /// when the last detection was off centre. What [returnDwell] is measured
+  /// against, and the moment an episode that is closed after a confirmed return
+  /// *ended* (see [_onInsideTolerances]).
+  DateTime? _insideSince;
+
+  /// Off-screen time accumulated inside the open episode: what [lookAwaySustain]
+  /// is actually compared against.
+  ///
+  /// Credited only across two detections that both said the head was away, so a
+  /// flicker costs the student the time they were turned and not the tick that
+  /// looked up. On an unbroken run this equals `now - _awaySince`, which is what it
+  /// replaced - the difference is that a run interrupted by a tick the detector
+  /// could not measure keeps its seconds instead of losing the whole hold.
+  Duration _awaySpan = Duration.zero;
+
+  /// When the last off-centre detection arrived: the other end of the interval
+  /// [_awaySpan] credits, and null while the head is inside the tolerances (so the
+  /// tick that ends a run is credited once, by [_onInsideTolerances], and never
+  /// again).
+  DateTime? _lastAwayAt;
+
   DateTime? _missingSince;
   DateTime? _secondPersonAt;
   bool _awayFlagged = false;
@@ -418,6 +477,9 @@ class WebFacePresenceMonitor {
       // One face is no longer the subject: the single-face episodes start over,
       // exactly as they do in the engine.
       _awaySince = null;
+      _insideSince = null;
+      _awaySpan = Duration.zero;
+      _lastAwayAt = null;
       _missingSince = null;
       _awayFlagged = false;
       _missingFlagged = false;
@@ -441,7 +503,7 @@ class WebFacePresenceMonitor {
     }
 
     if (text == WebFaceMessages.centered) {
-      _onCentered(now);
+      _onInsideTolerances(now);
       return;
     }
 
@@ -477,7 +539,7 @@ class WebFacePresenceMonitor {
     if (nearSideways || pose.$1.abs() > offCenterYawDegrees || pitchedAway) {
       _onAway(now);
     } else {
-      _onCentered(now);
+      _onInsideTolerances(now);
     }
   }
 
@@ -522,6 +584,9 @@ class WebFacePresenceMonitor {
   void _onPageResumed() {
     if (_disposed) return;
     _awaySince = null;
+    _insideSince = null;
+    _awaySpan = Duration.zero;
+    _lastAwayAt = null;
     _missingSince = null;
     _immediateDetections = 0;
     _consecutiveMissingFrames = 0;
@@ -534,6 +599,9 @@ class WebFacePresenceMonitor {
     // Without a face there is no head pose to judge, so an away episode is over
     // (and re-armable) rather than paused.
     _awaySince = null;
+    _insideSince = null;
+    _awaySpan = Duration.zero;
+    _lastAwayAt = null;
     _awayFlagged = false;
     // Nor is there a near-sideways run: the next frame that finds a turned head
     // starts its confirmation again rather than completing one begun before the gap.
@@ -577,9 +645,33 @@ class WebFacePresenceMonitor {
     _consecutiveMissingFrames = 0;
     _endMultiFaceEpisode(now);
 
+    // A return may already have been proved: the head was inside the tolerances for
+    // [returnDwell], and this detection is a *new* run rather than a flicker inside
+    // the old one. Settling it first is what keeps the rolling window's count honest
+    // - the glance is banked at the detection it really ended on - and it is why a
+    // student who looks back at the screen and then away again collects two glances
+    // rather than being stuck in one run that never closes.
+    _settleReturn(now);
+
+    // The head is off centre again. If it had come back inside the tolerances
+    // briefly, this detection ends that run: [_awaySpan] gets the tick that ended
+    // the off-screen stretch, and the stretch itself *continues* rather than
+    // restarting - that is the whole fix for a detector polled every 350 ms (see
+    // [_onInsideTolerances]).
+    final lastAwayAt = _lastAwayAt;
+    if (lastAwayAt != null) {
+      final gap = now.difference(lastAwayAt);
+      if (gap > Duration.zero) _awaySpan += gap;
+    }
+    _lastAwayAt = now;
+    _insideSince = null;
+
     _awaySince ??= now;
     if (_awayFlagged) return;
-    if (confirmed || now.difference(_awaySince!) >= lookAwaySustain) {
+    // The hold, on time the head was actually away: identical to
+    // `now - _awaySince` for an unbroken run, and still true for a run whose
+    // detections flickered back inside the tolerances between two turns.
+    if (confirmed || _awaySpan >= lookAwaySustain) {
       _awayFlagged = true;
       // The sustained rule's strike: this run is not also banked as a glance.
       _awayBurst.clear();
@@ -596,8 +688,112 @@ class WebFacePresenceMonitor {
     }
   }
 
-  void _onCentered(DateTime now) {
+  /// Judges one detection that has the head facing the screen again.
+  ///
+  /// A *single* one is not yet a return, and that is the difference between the web
+  /// flagging a look-away and never flagging one at all.
+  ///
+  /// The shipped detector ticks every 350 ms, and it answers `centered` for a tick in
+  /// which the model could not measure a pose as well as for a head that is facing
+  /// the screen (`inspectWithMediaPipe` has no angle to send, so it says the one thing
+  /// it can prove: a face is there). A head that is turned for a second or two - the
+  /// run [lookAwaySustain] is waiting for - is exactly the head that gets sampled
+  /// between two turns, so ending the episode on the first such detection threw the
+  /// whole hold away, and the same student a phone reported was never reported here.
+  /// The phone's exposure is one frame in seven, and it forgives the same flicker for
+  /// *absence* (`missingFrameTolerance` frames); this is that hysteresis in the
+  /// other direction, and it is what makes the web's 15 degree rule reachable.
+  ///
+  /// The dwell is a *time*, not a count of samples, so it means the same thing to a
+  /// detector that ticks twice a second and to one that ticks twenty times: the head
+  /// has to be seen inside the tolerances and then not seen outside them for
+  /// [returnDwell]. That makes the first detection back a question rather than an
+  /// answer - this method only records that it arrived and returns ([_settleReturn],
+  /// on the next detection, is what answers it) - so a student who looks back at the
+  /// screen for two seconds and then away again ends the run where it really ended,
+  /// which is what the rolling window counts.
+  ///
+  /// Nothing is charged for the flicker: the run's seconds are only credited across
+  /// detections that both said the head was away ([_awaySpan]), and an episode that
+  /// ends after a confirmed return is closed at the *first* detection back inside the
+  /// tolerances - so the glance [LookAwayBurstWindow] banks is the time the head was
+  /// actually turned, not the time it took to be sure it had come back.
+  ///
+  /// With [returnDwell] at zero this is the previous behaviour: one detection back
+  /// inside the tolerances ends the episode.
+  void _onInsideTolerances(DateTime now) {
+    final awaySince = _awaySince;
+    // Nothing open to end, or a host that asked for no hysteresis: an ordinary
+    // centred detection.
+    if (awaySince == null || returnDwell <= Duration.zero) {
+      _onCentered(now);
+      return;
+    }
+
+    if (_insideSince == null) {
+      // The first detection back inside the tolerances. The tick *before* it is
+      // still time the head was turned, so it is credited now; the interval from
+      // here to the next off-centre detection is not, because whether the head was
+      // away for it is the question the dwell is asking.
+      final lastAwayAt = _lastAwayAt;
+      if (lastAwayAt != null) {
+        final gap = now.difference(lastAwayAt);
+        if (gap > Duration.zero) _awaySpan += gap;
+      }
+      _lastAwayAt = null;
+      _insideSince = now;
+      return;
+    }
+    // Still inside the tolerances, and the run has not been back outside them for
+    // the dwell: another sample of the same return. [_settleReturn] ends the episode
+    // as soon as the dwell is satisfied, whether that is answered by this detection
+    // or by the next one.
+    _settleReturn(now);
+  }
+
+  /// Answers the question [_onInsideTolerances] opened: has the head been inside the
+  /// tolerances for [returnDwell]?
+  ///
+  /// Called on every detection that is about to be judged, so the answer is not left
+  /// waiting for the next `centered`: a head that comes back for two seconds and then
+  /// turns again produced one centred detection and one off-centre one, and the run
+  /// between them ended where the centred one was.
+  void _settleReturn(DateTime now) {
+    final insideSince = _insideSince;
+    if (insideSince == null || returnDwell <= Duration.zero) return;
+    if (now.difference(insideSince) < returnDwell) return;
+    _confirmReturn(insideSince);
+  }
+
+  /// Ends the episodes at [insideSince], the first detection back inside the
+  /// tolerances.
+  ///
+  /// The sustained rule is judged here on what the run accumulated, so a look-away
+  /// that flickered for two seconds is the strike an unbroken two seconds would have
+  /// been - reported at the moment the return is confirmed, because the run's last
+  /// credited tick is the one that ended it and no off-centre detection may follow to
+  /// report it.
+  void _confirmReturn(DateTime insideSince) {
+    final sustained = !_awayFlagged && _awaySpan >= lookAwaySustain;
+    if (sustained) {
+      _awayFlagged = true;
+      _awayBurst.clear();
+      _emit(GazeSignal.lookingAway);
+    }
+    _onCentered(insideSince, announce: !sustained);
+  }
+
+  /// Ends the single-face episodes: the head is inside the tolerances, at [now] (the
+  /// first detection back, when the caller has already waited out [returnDwell]).
+  ///
+  /// [announce] is false when the same detection produced a [GazeSignal.lookingAway]:
+  /// one detection, one verdict, exactly as the struck paths above return before
+  /// emitting `centered`.
+  void _onCentered(DateTime now, {bool announce = true}) {
     _awaySince = null;
+    _insideSince = null;
+    _awaySpan = Duration.zero;
+    _lastAwayAt = null;
     _missingSince = null;
     _awayFlagged = false;
     _missingFlagged = false;
@@ -624,6 +820,7 @@ class WebFacePresenceMonitor {
     // Emitted like the engine's per-frame `centered`: the notifier ignores it,
     // and it is the observable "the episode is over" for anything that wants to
     // show the student they are being seen.
+    if (!announce) return;
     _emit(GazeSignal.centered);
   }
 

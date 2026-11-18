@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:proctorguard/core/services/mediapipe_proctoring_service.dart'
     show GazeSignal;
+import 'package:proctorguard/core/services/proctoring_thresholds.dart';
 import 'package:proctorguard/core/services/web_face_presence.dart';
 import 'package:proctorguard/core/services/web_face_signal_source.dart';
 
@@ -53,6 +54,21 @@ void main() {
     hold(message);
   }
 
+  /// A return to the screen the monitor can believe: a detection inside the
+  /// tolerances, and then - `returnDwell` later - another one still inside them.
+  ///
+  /// One centred detection is deliberately not a return (see
+  /// [WebFacePresenceMonitor._onInsideTolerances]): the shipped detector says
+  /// `centered` for a tick in which it could not measure a pose at all, so a single
+  /// one is the flicker that must not end a hold. Every test that ends a look-away
+  /// and expects the episode to close - and to re-arm - comes back this way, which is
+  /// also what the real page's 350 ms tick produces for a student who has turned back.
+  void backToScreen([String message = WebFaceMessages.centered]) {
+    report(message);
+    now = now.add(monitor.returnDwell);
+    report(message);
+  }
+
   /// The shipped detector's cadence: `web/proctor_face_detector.js` re-sends its
   /// verdict every tick, so 350 ms is the spacing of the empty frames a browser
   /// actually produces.
@@ -74,15 +90,21 @@ void main() {
 
   /// The monitor under test, with the start-up grace removed: these tests are
   /// about the episode rules, and a later group covers the grace itself.
+  ///
+  /// [returnDwell] defaults to the shipped `lookAwayWebReturnDwell` - the hysteresis
+  /// the page's 350 ms tick needs - and a test can set it to zero to get the older
+  /// single-tick rule back.
   WebFacePresenceMonitor buildMonitor({
     Duration startupGrace = Duration.zero,
     Duration multipleFacesCooldown = const Duration(seconds: 30),
+    Duration returnDwell = lookAwayWebReturnDwell,
   }) {
     final built = WebFacePresenceMonitor(
       source: source,
       clock: () => now,
       startupGrace: startupGrace,
       multipleFacesCooldown: multipleFacesCooldown,
+      returnDwell: returnDwell,
     )..start(at: now);
     built.signals.listen(signals.add);
     return built;
@@ -167,7 +189,10 @@ void main() {
         reason: 'yaw well past the 15° tolerance',
       );
 
-      report('pose:0,0');
+      // Turning back is two detections, not one: a single `centered` may be a tick
+      // the model could not measure (see [backToScreen] and
+      // `lookAwayWebReturnDwell`), so the episode closes on the second.
+      backToScreen('pose:0,0');
       await flush();
       expect(signals.last, GazeSignal.centered);
 
@@ -183,7 +208,7 @@ void main() {
       // the one it exists for: a chin *raised* past 15° is a screen above the
       // monitor. Positive is chin down - the sign the detector states and both of
       // its routes now share - so the wider allowance is the down side only.
-      report('pose:0,0');
+      backToScreen('pose:0,0');
       await flush();
       sustain('pose:-12,-45');
       await flush();
@@ -194,7 +219,7 @@ void main() {
       );
 
       // Case and padding are the host's business: the monitor reads the numbers.
-      report(' POSE: -10 , 5 ');
+      backToScreen(' POSE: -10 , 5 ');
       await flush();
       expect(
         signals.last,
@@ -229,7 +254,9 @@ void main() {
       );
 
       // Past the widened line, and held: the desk stare the rule still catches.
-      report('pose:0,0');
+      // The return has to be a confirmed one, or the hold would continue across it
+      // and the 22° stare would ride on the earlier look-up's episode.
+      backToScreen('pose:0,0');
       report('pose:0,22');
       hold('pose:0,22');
       await flush();
@@ -266,7 +293,7 @@ void main() {
 
       // Smoothing can land on either side of zero; a fraction of a degree is
       // still a head facing the screen.
-      report('pose:-0.0,-0.0');
+      backToScreen('pose:-0.0,-0.0');
       await flush();
       expect(signals.last, GazeSignal.centered);
     });
@@ -308,7 +335,7 @@ void main() {
 
       // Facing the screen ends it, and the next turn is a fresh episode with its own
       // two detections to earn.
-      report('pose:0,0');
+      backToScreen('pose:0,0');
       now = now.add(const Duration(seconds: 2));
       report('pose:70,0');
       await flush();
@@ -421,7 +448,7 @@ void main() {
       await flush();
       expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
 
-      report(WebFaceMessages.centered);
+      backToScreen();
       await flush();
       expect(
         signals,
@@ -481,7 +508,7 @@ void main() {
         <GazeSignal>[GazeSignal.noFace, GazeSignal.lookingAway],
       );
 
-      report(WebFaceMessages.centered);
+      backToScreen();
       sustainAbsence();
       await flush();
       expect(
@@ -522,6 +549,160 @@ void main() {
         lessThan(monitor.lookAwaySustain),
         reason: 'the absence rule must fire inside the look-away window, or it is '
             'not a faster rule at all',
+      );
+    });
+  });
+
+  group('a flickering detector', () {
+    // Why this group exists: `web/proctor_face_detector.js` re-sends its verdict
+    // every 350 ms, and a tick in which the model could not measure a pose comes back
+    // as `centered` - `inspectWithMediaPipe` has no angle to send, so it says the one
+    // thing it can prove, which is that a face is there. A head turned for a second
+    // or two is sampled between two turns, so ending the episode on a single centred
+    // tick made the two-second rule unreachable in a browser: the phone flagged the
+    // head, and the page never did. `lookAwayWebReturnDwell` is the answer, and these
+    // tests pin it to the cadence it was written for.
+
+    /// One tick of the page's detector, at the shipped 350 ms cadence.
+    void nextTick(String message) {
+      now = now.add(tick);
+      report(message);
+    }
+
+    test('a centred tick inside a turn does not end it', () async {
+      report(WebFaceMessages.lookingAway); // t = 0
+      nextTick(WebFaceMessages.centered); // t = 350: a tick with no measured pose
+      for (var i = 0; i < 5; i++) {
+        nextTick(WebFaceMessages.lookingAway); // t = 700 ... 2100
+      }
+      await flush();
+      expect(
+        signals,
+        isEmpty,
+        reason: '1750 ms of a turned head is still not two seconds - and the flicker '
+            'is not a return, so it must not be announced as one',
+      );
+
+      nextTick(WebFaceMessages.lookingAway); // t = 2450: the second that was owed
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.lookingAway],
+        reason: 'an unbroken turn of this length would have been reported, so a '
+            'turn the model blinked during has to be reported as well',
+      );
+    });
+
+    test('the return it waits for is not counted as time away', () async {
+      report(WebFaceMessages.lookingAway); // t = 0
+      now = now.add(const Duration(milliseconds: 1500));
+      report(WebFaceMessages.centered); // t = 1500: the head is back
+      await flush();
+      expect(signals, isEmpty, reason: 'the head was turned for 1.5 s');
+
+      now = now.add(lookAwayWebReturnDwell); // t = 2200
+      report(WebFaceMessages.centered);
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.centered],
+        reason: '2200 ms after the turn began the episode ends - as the return it '
+            'was, not as a look-away the dwell pushed over two seconds',
+      );
+
+      // ...and it ended at 1.5 s, where the head came back: two more turns of that
+      // length are the third glance the rolling window is waiting for.
+      for (var i = 0; i < 2; i++) {
+        report(WebFaceMessages.lookingAway);
+        now = now.add(const Duration(milliseconds: 1500));
+        report(WebFaceMessages.centered);
+        now = now.add(lookAwayWebReturnDwell);
+        report(WebFaceMessages.centered);
+      }
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[
+          GazeSignal.centered,
+          GazeSignal.centered,
+          GazeSignal.lookingAway,
+        ],
+        reason: 'three turns of a second and a half inside a minute are one '
+            'look-away, which is only true if the first was banked where it ended',
+      );
+    });
+
+    test('a flicker does not hand out a second strike for the same turn', () async {
+      sustain(WebFaceMessages.lookingAway); // t = 0 ... 2100
+      nextTick(WebFaceMessages.centered); // t = 2450
+      nextTick(WebFaceMessages.lookingAway); // t = 2800
+      nextTick(WebFaceMessages.lookingAway); // t = 3150
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.lookingAway],
+        reason: 'a head that never really came back is one episode, however many '
+            'times the model blinked',
+      );
+    });
+
+    test('a return is also proved by the detection that follows it', () async {
+      // A page that reports on change - or a `pose:` reading that goes from 40
+      // degrees to 0 and back - can put a whole return between two off-centre
+      // detections. The dwell is a time, so the detection that arrives after it is
+      // what answers the question, and the run ends where the head came back.
+      report(WebFaceMessages.lookingAway); // t = 0
+      now = now.add(const Duration(milliseconds: 600));
+      report(WebFaceMessages.centered); // t = 600
+      now = now.add(const Duration(milliseconds: 900));
+      report(WebFaceMessages.lookingAway); // t = 1500
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.centered],
+        reason: 'the 600 ms turn is over and banked as a glance, and the detection '
+            'that proved it is also the first of the next turn',
+      );
+
+      for (var i = 0; i < 2; i++) {
+        now = now.add(const Duration(milliseconds: 600));
+        report(WebFaceMessages.centered);
+        now = now.add(const Duration(milliseconds: 900));
+        report(WebFaceMessages.lookingAway);
+      }
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[
+          GazeSignal.centered,
+          GazeSignal.centered,
+          GazeSignal.lookingAway,
+        ],
+        reason: 'each turn is its own episode, so the third closes the window',
+      );
+    });
+
+    test('a host that asks for no dwell gets the single-tick rule', () async {
+      monitor.dispose();
+      monitor = buildMonitor(returnDwell: Duration.zero);
+
+      sustain(WebFaceMessages.lookingAway);
+      report(WebFaceMessages.centered);
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.lookingAway, GazeSignal.centered],
+        reason: 'the dwell is hysteresis for a slow page, not part of the rule: a '
+            'caller that sees every frame may switch it off',
+      );
+
+      // The episode really is closed, so the next turn is a new one.
+      report(WebFaceMessages.lookingAway);
+      hold(WebFaceMessages.lookingAway);
+      await flush();
+      expect(
+        signals.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(2),
       );
     });
   });
@@ -782,14 +963,22 @@ void main() {
   group('repeated glances', () {
 
 
-    /// One glance of [length] that never reaches the sustain, ended by a centred
-    /// detection - the shape the two-second rule cannot see, because no single run
+    /// One glance of [length] that never reaches the sustain, ended by a confirmed
+    /// return - the shape the two-second rule cannot see, because no single run
     /// lasts long enough.
+    ///
+    /// The return is two centred detections a `returnDwell` apart, as the page's
+    /// 350 ms tick makes it (see [backToScreen]): the first says the head is back,
+    /// the second says it stayed, and it is the second that banks the glance. The
+    /// remainder of [gap] follows it, so a glance still costs its gaps' worth of
+    /// time - which is what the minute the window judges is made of.
     void glance(Duration length, {Duration gap = const Duration(seconds: 2)}) {
       report(WebFaceMessages.lookingAway);
       now = now.add(length);
       report(WebFaceMessages.centered);
-      now = now.add(gap);
+      now = now.add(monitor.returnDwell);
+      report(WebFaceMessages.centered);
+      now = now.add(gap - monitor.returnDwell);
     }
 
     test('three glances inside a minute are one look away', () async {
@@ -887,7 +1076,7 @@ void main() {
       await flush();
       expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
 
-      report(WebFaceMessages.centered);
+      backToScreen();
       await flush();
       expect(
         signals,

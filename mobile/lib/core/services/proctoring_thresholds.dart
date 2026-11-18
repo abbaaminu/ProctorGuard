@@ -152,6 +152,40 @@ const double lookAwayImmediateYawDegrees = 30.0;
 /// two, because the rule is "seen twice", not "seen once".
 const int lookAwayImmediateFrames = 2;
 
+/// How long a browser's head has to be *back inside* the tolerances before a
+/// look-away episode is judged over: two detector ticks, ~700 ms.
+///
+/// This is the one number here that exists because of a *sampling rate* rather
+/// than a behaviour, and it is what makes [lookAwaySustain] mean the same thing on
+/// the web as on a phone.
+///
+/// The phone judges ~7 frames a second, so a head that is past 15 degrees is seen
+/// past it six or seven times inside [lookAwaySustain], and a single frame back
+/// inside the tolerances costs 150 ms of the hold. A browser's detector ticks every
+/// 350 ms (`web/proctor_face_detector.js`), so *one* `centered` - one tick the model
+/// could not measure, or one sample that landed between two turns - would otherwise
+/// throw away the whole hold, and a real two-second look-away that flickers across
+/// the line would never be reported at all. That is the failure this constant fixes.
+///
+/// So a return is *confirmed* rather than assumed: the head has to be seen inside
+/// the tolerances and then not seen outside them for this long before the episode
+/// ends. It is the browser's version of the phone's three-frame absence buffer -
+/// the same idea, in the other direction: the phone does not report a face as
+/// missing on one frame, and the web does not report a student as back on one
+/// tick.
+///
+/// A *time*, not a count of samples, so it means the same thing to a detector that
+/// ticks twice a second and to one that ticks twenty times - and so a page that
+/// only sends a message when its verdict *changes* is judged the same way: a head
+/// that goes from turned to facing and is still facing this long afterwards has
+/// returned, whether or not a second `centered` ever arrived.
+///
+/// It stays far below [lookAwaySustain], so a student who genuinely faces the screen
+/// is re-armed in about a second, and an episode that is still open when the return
+/// is confirmed is measured to the *first* sample back inside - the flicker is not
+/// added to the student's time away.
+const Duration lookAwayWebReturnDwell = Duration(milliseconds: 700);
+
 // ---------------------------------------------------------------------
 // The look-away rule, second half - the same question asked in a *window*:
 // **a glance that never lasts two seconds is still looking away, when it keeps

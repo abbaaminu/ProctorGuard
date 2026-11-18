@@ -43,6 +43,7 @@ commit each, so the tree has moved under some of the line numbers:
 | §8 P2-6 / §4.3 — a feed that goes quiet mid-session | `1073adb` | `AudioMonitor` re-arms the proof-of-life window on **every** sample, so a feed that stops delivering is no longer indistinguishable from a silent room. Expiry mid-session reports `unavailable` (visible on the chip, the paper keeps going), not `interrupted` as this report proposed: a throttled timer or a paused capture thread is an inference, and the first sample to arrive returns the state to `monitoring` by itself |
 | §6.5 — the heartbeat against a superseded session | `49ee204` | `ProctoringHeartbeatService` catches `SessionSupersededException` and stops the series instead of counting a failure and retrying a refusal every 15 s for the rest of the sitting. Nothing is surfaced from the heartbeat: `SessionGate` is what signs the device out |
 | §1.4 — the web pose matrix, unverified arithmetic | `580fdd8` | `matrixPose()` now has a test that builds rotation matrices from known angles and reads them back, including a scaled one and a rolled one. It confirms the documented column-major layout and the `Ry·Rx·Rz` decomposition, and shows that a row-major flattening would turn the same 20° pitch into −20°. The sign convention stays unverifiable without a real face — and unused, since Dart judges absolute angles |
+| Found on the deployed build — the web flagged **no** look-away at all | working tree | `web_face_presence.dart` ended an episode on the **first** `centered` detection. The shipped detector ticks every 350 ms and answers `centered` for any tick in which MediaPipe could not measure a pose — which is exactly what a head held turned produces — so one flicker cancelled the whole 2 s hold and the browser's 15° rule was unreachable: the phone flagged the same head, the page never did. A return is now *confirmed* over `lookAwayWebReturnDwell` (700 ms, a shared constant) instead of on one tick; the hold is measured on accumulated off-screen time (`_awaySpan`), credited only across consecutive away detections; and the episode still closes at the **first** detection back inside the tolerances, so the dwell is never charged to the student. `returnDwell: Duration.zero` restores the old single-tick rule for a caller that sees every frame. Five tests in `web_face_presence_test.dart` ("a flickering detector") and the cross-platform glance parity test in `proctoring_thresholds_test.dart` pin it |
 
 Everything else in §8 — liveness (P1-1), the frame-stall watchdog (P2-5), the devtools
 and split-screen notes (P2-7, P2-8), the queue cap, D3 and the three wording notes
@@ -1094,6 +1095,19 @@ MediaPipe); no row at 10°; **one** `looking_away` at 25° after about 0.3-0.7 s
 (300 ms sustain plus a 350 ms tick).
 *Status:* `proctor_face_detector.js:1575-1602` (diagnostics),
 `web_face_presence.dart:77`, `:273-275`.
+
+**8a. The turn that flickers (the reason the web flagged nothing).**
+*Steps:* in Chrome on the laptop, hold the head ~20° turned for 3 s twice — once fully
+in frame in good light, once so that the model drops a pose every few ticks (part of
+the face near the edge of frame, or a dim room). Watch the pose source in
+`ProctorGuardFaceDetector.diagnostics()` flap between a pose and none.
+*Expected:* **one** `looking_away` in each case, about 2 s after the turn starts. No
+row in the second case is the regression this fix closed: a tick the model cannot
+measure is sent as `centered`, and one such tick used to end the episode before the
+hold had filled - so the phone flagged the head and the page did not.
+*Status:* `web_face_presence.dart` (`returnDwell`, `_onInsideTolerances`,
+`_settleReturn`), `lookAwayWebReturnDwell` (700 ms), pinned on the VM by the
+"a flickering detector" group in `web_face_presence_test.dart`.
 
 **9. The near-sideways start.**
 *Steps:* turn 40° for a single detection (under 150 ms on the phone, one 350 ms tick

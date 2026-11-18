@@ -223,11 +223,20 @@ void main() {
           }
           engine.handleResult(turned);
         }
-        // ...and back at the screen, once for each host, at the same instant.
+        // ...and back at the screen, once for each host, at the same instant. The
+        // browser is told twice, because its detector ticks every 350 ms and one
+        // tick of `centered` is not a return (`lookAwayWebReturnDwell` - the page
+        // says `centered` for a tick it could not measure a pose in): the second
+        // message, 700 ms later, is the head *still* facing the screen, and it is
+        // the one that ends the glance. The gap that follows is shortened by the
+        // same 700 ms, so the two hosts see the same sequence in the same two
+        // seconds.
         now = now.add(engine.inferenceInterval);
         web.handleMessage(WebFaceMessages.centered);
         engine.handleResult(facing);
-        now = now.add(const Duration(seconds: 2));
+        now = now.add(lookAwayWebReturnDwell);
+        web.handleMessage(WebFaceMessages.centered);
+        now = now.add(const Duration(seconds: 2) - lookAwayWebReturnDwell);
       }
 
       await pumpEventQueue();
