@@ -28,6 +28,12 @@ class UnsupportedWebFaceSignalSource implements WebFaceSignalSource {
   @override
   Stream<bool> get analysis => const Stream<bool>.empty();
 
+  /// Empty as well: there is no page here to hide and come back. A phone's
+  /// backgrounding reaches proctoring through `ExamLifecycleObserver`, not through
+  /// a detector that stopped ticking.
+  @override
+  Stream<void> get pageResumed => const Stream<void>.empty();
+
   @override
   void dispose() {}
 }

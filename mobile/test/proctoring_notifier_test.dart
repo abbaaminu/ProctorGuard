@@ -427,6 +427,39 @@ void main() {
       expect(notifier.state.warningCount, 2);
     });
 
+    test('two live rulings that arrive out of order never walk the count back',
+        () async {
+      // The evidence step (still grab + upload) is awaited before the log call,
+      // so two violations of different types can be on the wire at once and the
+      // server can answer the later one first. Neither answer may lower the
+      // count: the overlay's "Warning N" and the risk chip both read it.
+      final outbox = _OutOfOrderOutbox();
+      final notifier = _notifier(
+        proctoringRepo: _RecordingProctoringRepository(),
+        outbox: outbox,
+      );
+      addTearDown(notifier.dispose);
+
+      notifier.reportAppMinimized();
+      notifier.reportCopyPasteAttempt();
+      await pumpEventQueue();
+      expect(outbox.logged, hasLength(2), reason: 'both types are logged');
+
+      // The second event's ruling lands first, carrying the server's count of 2.
+      outbox.complete(index: 1, warningCount: 2);
+      await pumpEventQueue();
+      expect(notifier.state.warningCount, 2);
+
+      // ...and the first event's ruling arrives last, with the older count.
+      outbox.complete(index: 0, warningCount: 1);
+      await pumpEventQueue();
+      expect(
+        notifier.state.warningCount,
+        2,
+        reason: 'a stale live ruling must not walk the ladder back down',
+      );
+    });
+
     test('a third strike delivered late ends the attempt', () async {
       final examRepo = _RecordingExamRepository();
       var forcedExits = 0;
@@ -1123,6 +1156,45 @@ class _FakeOutbox implements ViolationOutbox {
 
   @override
   Stream<ViolationRuling> get deferredRulings => _rulings.stream;
+}
+
+/// A [ViolationOutbox] that answers each live delivery on demand, so a test can
+/// put two violations on the wire at once and release their rulings in the
+/// reverse order - which is what a slow evidence upload on one event and a fast
+/// one on the next produce in the field.
+class _OutOfOrderOutbox implements ViolationOutbox {
+  final List<Violation> logged = <Violation>[];
+  final List<Completer<ViolationRuling?>> _pending =
+      <Completer<ViolationRuling?>>[];
+
+  @override
+  Future<ViolationRuling?> log({
+    required String submissionId,
+    required Violation violation,
+  }) {
+    logged.add(violation);
+    final completer = Completer<ViolationRuling?>();
+    _pending.add(completer);
+    return completer.future;
+  }
+
+  /// Answers the [index]th live delivery, as the backend would once it has
+  /// counted it.
+  void complete({required int index, required int warningCount}) =>
+      _pending[index].complete(
+        ViolationRuling(
+          submissionId: 'sub-1',
+          violation: logged[index],
+          warningCount: warningCount,
+          disqualified: false,
+        ),
+      );
+
+  /// No queued deliveries in this fake: the test drives the live answers it
+  /// needs, and a stray deferred ruling would only blur which path it proved.
+  @override
+  Stream<ViolationRuling> get deferredRulings =>
+      const Stream<ViolationRuling>.empty();
 }
 
 /// A [ViolationOutbox] whose live delivery hangs until the test releases it.

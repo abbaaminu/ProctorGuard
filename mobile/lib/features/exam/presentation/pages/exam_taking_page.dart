@@ -1720,6 +1720,13 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                   question,
                   audioState,
                   proctoring: proctoringState,
+                  // The floating self-view covers the paper's top-right corner,
+                  // so the paper stops before it: a line of the question
+                  // scrolling under a camera would be unreadable, and on the web
+                  // the platform view paints above the text anyway.
+                  rightInset: wide
+                      ? _selfViewFloatSize.width + _selfViewFloatInset
+                      : 0,
                 );
 
                 return Column(
@@ -1734,29 +1741,21 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                       const ExamHeadTurnUnavailableNotice(),
                     Expanded(
                       child: wide
-                          // Desktop / tablet landscape: the self-view sits
-                          // beside the question instead of on top of it.
-                          ? Row(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                          // Desktop / tablet landscape: the self-view floats in
+                          // the paper's top-right corner instead of taking a
+                          // column of its own.
+                          ? Stack(
+                              fit: StackFit.expand,
                               children: [
-                                Expanded(child: questionPane),
-                                Padding(
-                                  padding: EdgeInsets.fromLTRB(
-                                    0,
-                                    16,
-                                    gutter,
-                                    16,
-                                  ),
-                                  child: SizedBox(
-                                    width: 300,
-                                    height: 220,
-                                    child: _buildCameraPane(),
-                                  ),
-                                ),
+                                questionPane,
+                                _buildFloatingSelfView(),
                               ],
                             )
                           // Phone portrait: a compact strip above the question,
-                          // right-aligned so the text keeps the full width.
+                          // right-aligned so the text keeps the full width, and
+                          // *in* the flow — a 260 dp float would cover most of a
+                          // 360 dp screen's paper and there is no margin to pin
+                          // it in.
                           : Column(
                               children: [
                                 Padding(
@@ -1769,6 +1768,7 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
                                   child: Align(
                                     alignment: Alignment.centerRight,
                                     child: SizedBox(
+                                      key: const Key('exam-self-view'),
                                       width: 128,
                                       height: 96,
                                       child: _buildCameraPane(),
@@ -1900,18 +1900,26 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// a non-scrollable body, so a five-option question on a phone in landscape (or
   /// any large accessibility text scale) overflowed — and the overflow banner
   /// covered the last option.
+  ///
+  /// [rightInset] is extra right padding for whatever floats over the pane's
+  /// top-right corner (the wide viewport's self-view, see
+  /// [_buildFloatingSelfView]); zero when nothing does.
   Widget _buildQuestionPane(
     ExamSessionState session,
     Question question,
     AudioMonitoringState audioState, {
     required ProctoringState proctoring,
+    double rightInset = 0,
   }) {
     final theme = Theme.of(context);
     final gutter = ResponsiveSizing.horizontalPadding(context);
     final selectedOption = session.answers[question.id];
 
     return SingleChildScrollView(
-      padding: EdgeInsets.fromLTRB(gutter, 16, gutter, 16),
+      // `rightInset` is the floating self-view's footprint: reserved for the
+      // whole column rather than just its top, so the text keeps one readable
+      // width instead of widening again below the pane.
+      padding: EdgeInsets.fromLTRB(gutter, 16, gutter + rightInset, 16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -2063,6 +2071,39 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
     );
   }
 
+  /// Size of the self-view when it floats on a wide viewport, and its distance
+  /// from the page's top and right edges.
+  ///
+  /// 4:3, the shape a low-resolution lens reports, so the preview covers the box
+  /// with almost no crop.
+  static const Size _selfViewFloatSize = Size(260, 195);
+  static const double _selfViewFloatInset = 24;
+
+  /// Corner radius of the self-view, shared by the Flutter clip around it and
+  /// the browser-side clip inside it (see [ExamSelfViewPreview]).
+  static const double _selfViewCornerRadius = 10;
+
+  /// The self-view, pinned in the paper's top-right corner.
+  ///
+  /// Floated rather than laid out beside the paper: at 260x195 a side column
+  /// costs the question a third of a 900 dp window, and the pane is a *status*
+  /// readout - it should sit in the same place whatever the question's length.
+  /// It floats inside the paper's own stack, not the page's, so it cannot end up
+  /// over the sync banner or the head-turn notice above; the paper reserves its
+  /// footprint (see [_buildQuestionPane]'s `rightInset`), and the proctoring
+  /// overlays are pushed above this whole region so a warning is never hidden
+  /// behind a camera.
+  Widget _buildFloatingSelfView() => Positioned(
+        top: _selfViewFloatInset,
+        right: _selfViewFloatInset,
+        child: SizedBox(
+          key: const Key('exam-self-view'),
+          width: _selfViewFloatSize.width,
+          height: _selfViewFloatSize.height,
+          child: _buildCameraPane(),
+        ),
+      );
+
   /// The proctoring self-view.
   ///
   /// Three states, and only one of them is a placeholder: mock mode (an explicit
@@ -2071,14 +2112,16 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
   /// notice. There is deliberately no silent crossed-out stand-in for a real
   /// camera that failed — that made an unproctored session look normal.
   ///
-  /// `BoxFit.cover` inside the caller's fixed box means the preview can never
-  /// distort: whatever preview size the platform reports, the frame fills the box
-  /// and crops the excess.
+  /// Built in two shapes ([_buildFloatingSelfView] on a wide viewport, the strip
+  /// above the question on a phone), and `BoxFit.cover` in
+  /// [ExamSelfViewPreview] means neither can distort the picture: whatever
+  /// preview size the platform reports, the frame fills the box and crops the
+  /// excess.
   Widget _buildCameraPane() {
     final controller = _cameraController;
 
     return ClipRRect(
-      borderRadius: BorderRadius.circular(10),
+      borderRadius: BorderRadius.circular(_selfViewCornerRadius),
       child: ColoredBox(
         color: Colors.black,
         child: widget.mockMode
@@ -2086,13 +2129,9 @@ class _ExamTakingPageState extends ConsumerState<ExamTakingPage> {
             : controller != null &&
                   controller.value.isInitialized &&
                   !controller.value.hasError
-            ? FittedBox(
-                fit: BoxFit.cover,
-                child: SizedBox(
-                  width: controller.value.previewSize?.height ?? 480,
-                  height: controller.value.previewSize?.width ?? 640,
-                  child: CameraPreview(controller),
-                ),
+            ? ExamSelfViewPreview(
+                controller: controller,
+                cornerRadius: _selfViewCornerRadius,
               )
             : const ExamCameraOfflineNotice(),
       ),

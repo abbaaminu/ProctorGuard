@@ -71,6 +71,24 @@ abstract class WebFaceSignalSource {
   /// Empty where there is no page to ask ([isSupported] is false).
   Stream<bool> get analysis;
 
+  /// Fires when the page is being watched again after it stopped being watched.
+  ///
+  /// A hidden tab is neither a student refusing to look at the screen nor
+  /// silence: Chromium does not run `requestAnimationFrame` in a hidden document,
+  /// so the detector's tick stops and *no* detection arrives for as long as the
+  /// tab is away - while the wall clock keeps going. A hold that was open when the
+  /// page went quiet therefore comes back to a clock that is minutes old, and a
+  /// look away that had lasted half a second reports itself on the first tick
+  /// after the return, on time the app never watched. `WebFacePresenceMonitor`
+  /// subscribes to this stream to start measuring again from the moment the page
+  /// can actually see (see its resume handler); the tab switch itself is the
+  /// guards' business, and they charge for it on their own.
+  ///
+  /// Fires on `visibilitychange` into `visible`, which is also what a minimised
+  /// window and a page the browser froze and restored produce. Empty where there
+  /// is no page to watch ([isSupported] is false).
+  Stream<void> get pageResumed => const Stream<void>.empty();
+
   /// Removes the global hook. Safe to call more than once.
   void dispose();
 }

@@ -238,6 +238,31 @@ const Duration lookAwayBurstCumulative = Duration(seconds: 5);
 const Duration cameraStartupGrace = Duration(seconds: 5);
 
 // ---------------------------------------------------------------------
+// Absence, where the count is the lever: **an empty frame is only evidence
+// once it has been seen three times in a row.**
+// ---------------------------------------------------------------------
+// The look-away rule forgives a flicker with *time*, because a head that moves
+// and comes back is a glance. Absence has no such shape - there is nothing to
+// watch move back - so it is forgiven with a count instead: a blink, an encoder
+// that drops one frame, a detector whose box slipped for a tick.
+
+/// How many consecutive detections without a face are one `no_face`.
+///
+/// Three, on both platforms, and both halves of what "consecutive" can mean:
+/// the on-device engine counts its own ~150 ms frames, and the browser counts the
+/// host detector's `no_face` ticks - which is why this number is quoted by
+/// `MediaPipeProctoringService.missingFaceFrameThreshold` *and* by
+/// `WebFacePresenceMonitor.missingFrameTolerance` rather than written twice. A
+/// student who is genuinely not in front of the lens produces an unbroken run;
+/// one who blinked, or whose detector lost the box for a single sample, does not.
+///
+/// It is a floor *beside* a duration, not a replacement for one. The browser also
+/// measures `noFaceSustain`, and both have to be satisfied: a detector that bursts
+/// three verdicts inside one instant has not yet been empty long enough, and one
+/// that reports once every two seconds still has to report three times.
+const int missingFaceFrameThreshold = 3;
+
+// ---------------------------------------------------------------------
 // The audio rule - the same shape, one sentence:
 // **a noisy room is reported only after the level has stayed above the room's
 // own measured threshold for two seconds without dropping below it.**

@@ -396,6 +396,11 @@ class _SilentSource implements WebFaceSignalSource {
   @override
   Stream<bool> get analysis => const Stream<bool>.empty();
 
+  /// Nothing becomes visible again where nothing was hidden: these tests are
+  /// about the rules, and the monitor is driven by [messages].
+  @override
+  Stream<void> get pageResumed => const Stream<void>.empty();
+
   @override
   void dispose() => _messages.close();
 }

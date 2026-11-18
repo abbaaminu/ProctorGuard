@@ -586,7 +586,18 @@ class ProctoringNotifier extends StateNotifier<ProctoringState> {
 
     // Reconcile with the server's authoritative count (source of truth -
     // protects against a client that raced ahead or fell behind).
-    state = state.copyWith(warningCount: ruling.warningCount);
+    //
+    // Only ever *raises* it, exactly like the deferred path
+    // ([_handleDeferredRuling]) and for the same reason: the evidence step above
+    // is awaited, so two violations of different types can be in flight at once
+    // and their rulings can come back in the other order. Assigning blindly let a
+    // ruling for the earlier event - one the server had already counted past -
+    // walk the counter backwards, which the overlay ("Warning 1") and the risk
+    // chip beside it would then show to a student the server had already counted
+    // twice.
+    if (ruling.warningCount > state.warningCount) {
+      state = state.copyWith(warningCount: ruling.warningCount);
+    }
 
     // The server decides how the attempt ended, and the two outcomes are different
     // screens: a disqualification says the paper does not count, a flag says a

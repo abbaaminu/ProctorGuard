@@ -65,8 +65,9 @@ abstract final class WebFaceMessages {
 ///    on-device engine runs, so a student reading paper and screen in turn is
 ///    judged the same way on either platform. A held two seconds is the sustained
 ///    rule's and is not banked by the window, and a strike empties the window;
-///  * `no_face` has to hold for [noFaceSustain], on the same one-report-per-episode
-///    rule;
+///  * `no_face` has to hold for [noFaceSustain] *and* be seen
+///    [missingFrameTolerance] times in a row, on the same one-report-per-episode
+///    rule - the count is what forgives a blink or one dropped frame;
 ///  * a `centered` message ends the episode and re-arms it, so a *later* look
 ///    away is reported again;
 ///  * `multiple_faces` is not sustained (two people need no measuring): it is
@@ -101,6 +102,23 @@ abstract final class WebFaceMessages {
 /// word) is therefore only filled by a host that keeps sending it, which is what the
 /// shipped `web/proctor_face_detector.js` does on every tick.
 ///
+/// Absence is the one rule that counts as well as times, because time alone cannot
+/// tell a blink from a covered lens: `no_face` needs [noFaceSustain] *and*
+/// [missingFrameTolerance] consecutive empty detections (the engine's
+/// [thresholds.missingFaceFrameThreshold], both platforms). The count is a floor
+/// beside the window rather than a replacement for it - a detector that bursts three
+/// verdicts in one instant has not been empty long enough, and one that reports every
+/// two seconds still has to report three times - so a genuinely absent student is
+/// caught while a flicker is not.
+///
+/// **A hidden tab measures nothing.** The page's detector is driven by the page:
+/// `requestAnimationFrame` stops in a hidden document, so a hold that was open when
+/// the tab went away would otherwise be measured against a clock that kept running,
+/// and the first detection after the return would report a look away held for half
+/// a second as a full two. [WebFaceSignalSource.pageResumed] is what starts the open
+/// episodes over (see [_onPageResumed]); the tab switch itself is already a strike of
+/// its own, charged by `WebGuards`.
+///
 /// **The near-sideways start is shared, and bounded twice.** A `pose:` past
 /// [immediateYawDegrees] of yaw is reported after [immediateConfirmations]
 /// consecutive detections instead of after [lookAwaySustain]: this is the speed the
@@ -119,6 +137,10 @@ class WebFacePresenceMonitor {
     required WebFaceSignalSource source,
     this.lookAwaySustain = thresholds.lookAwaySustain,
     this.noFaceSustain = const Duration(milliseconds: 300),
+    // The absence *count*: the engine's three consecutive frames, shared, so a
+    // browser that needed one empty sample or five would judge the same student
+    // differently from a phone.
+    this.missingFrameTolerance = thresholds.missingFaceFrameThreshold,
     this.startupGrace = thresholds.cameraStartupGrace,
     this.multipleFacesCooldown = const Duration(seconds: 30),
     // The engine's tolerances, from the one file that states the rule: 15 degrees of
@@ -151,6 +173,10 @@ class WebFacePresenceMonitor {
           'a zero sustain would flag the first empty frame',
         ),
         assert(
+          missingFrameTolerance > 1,
+          'a single empty detection is exactly what the absence buffer forgives',
+        ),
+        assert(
           startupGrace >= Duration.zero,
           'a negative grace would time out before the session starts',
         ),
@@ -178,6 +204,10 @@ class WebFacePresenceMonitor {
         _awayBurst = LookAwayBurstWindow(sustain: lookAwaySustain),
         _now = clock ?? DateTime.now {
     _subscription = source.messages.listen(handleMessage);
+    // A hidden tab stops the page's detector (see
+    // [WebFaceSignalSource.pageResumed]): the return is the moment the holds that
+    // were open when it went quiet stop being evidence of anything.
+    _pageResumedSubscription = source.pageResumed.listen((_) => _onPageResumed());
   }
 
   /// How long an off-centre head has to hold before it is reported.
@@ -209,7 +239,31 @@ class WebFacePresenceMonitor {
   /// past it - and it is unchanged by the parity fix because the audit found nothing
   /// wrong with it: a camera that is covered, muted, unplugged or pointed at an empty
   /// chair should say so at once, and no student earns `no_face` by moving.
+  ///
+  /// It is only half of the absence rule: [missingFrameTolerance] empty detections
+  /// have to have been *seen* as well, which is what the second tick alone cannot
+  /// prove. The window therefore decides "long enough" and the count decides "not a
+  /// flicker"; at the shipped detector's cadence a covered lens is a strike on the
+  /// third tick, about a second in.
   final Duration noFaceSustain;
+
+  /// How many consecutive empty detections are one `no_face`:
+  /// [thresholds.missingFaceFrameThreshold], the engine's three.
+  ///
+  /// The hysteresis the audit asked for. A browser's detector is a page script
+  /// sampling a `<video>`: one blink, one frame the encoder dropped, one tick where
+  /// the model's box slipped, and it reports `no_face` for an instant. Timing alone
+  /// cannot forgive that - at a 350 ms tick two consecutive reports are already older
+  /// than [noFaceSustain] - so absence is confirmed by *count* as well, exactly as
+  /// the on-device engine confirms a missing face over three frames instead of one
+  /// (`MediaPipeProctoringService.missingFaceFrameThreshold`, the same constant).
+  ///
+  /// Only an unbroken run counts: any detection that shows a face - `centered`,
+  /// `looking_away`, a `pose:` - or a second person resets the buffer, so a student
+  /// who leans out and back in is not reported on the third message of two separate
+  /// absences. A reported episode does not reset the run either way, because
+  /// [noFaceSustain] already latches it until a face returns.
+  final int missingFrameTolerance;
 
   /// How long after [start] detections are ignored.
   ///
@@ -297,6 +351,9 @@ class WebFacePresenceMonitor {
 
   StreamSubscription<String>? _subscription;
 
+  /// The page-visible-again channel, released with the rest of the session.
+  StreamSubscription<void>? _pageResumedSubscription;
+
   DateTime? _startedAt;
   DateTime? _awaySince;
   DateTime? _missingSince;
@@ -310,6 +367,11 @@ class WebFacePresenceMonitor {
   /// evidence, reset by any detection that is not past that line (including a
   /// centered one, a missing face and a second person).
   int _immediateDetections = 0;
+
+  /// Consecutive detections without a face - the absence buffer (see
+  /// [missingFrameTolerance]). Reset by every detection that shows a face, so two
+  /// separate one-frame gaps cannot add up to a covered lens.
+  int _consecutiveMissingFrames = 0;
 
   /// True once the host hook exists and the monitor is listening.
   bool get isSupported => _source.isSupported;
@@ -360,6 +422,9 @@ class WebFacePresenceMonitor {
       _awayFlagged = false;
       _missingFlagged = false;
       _immediateDetections = 0;
+      // Two faces are two people, not an empty frame: the absence buffer starts
+      // again when one of them leaves and the lens has an empty chair to judge.
+      _consecutiveMissingFrames = 0;
       _awayBurst.abandonEpisode();
       _emit(GazeSignal.multipleFaces);
       return;
@@ -416,6 +481,55 @@ class WebFacePresenceMonitor {
     }
   }
 
+  /// The page is being watched again after a hidden tab (or a minimised window,
+  /// or the browser having frozen and restored it).
+  ///
+  /// A hidden document is not watched: `requestAnimationFrame` does not run, so
+  /// the detector's tick stops and no detection arrives for as long as the page is
+  /// away - while the wall clock keeps going. Every clock an open episode is
+  /// measured against is therefore stale on the way back, and two of them produce
+  /// a strike for time nothing observed:
+  ///
+  ///  * a look away that had been held for half a second comes back to an
+  ///    [_awaySince] minutes old and reports `lookingAway` on the very first
+  ///    detection, held no longer than a glance;
+  ///  * a lens that was empty for two ticks before the switch reports `no_face` on
+  ///    the third, which happened after it, because [_missingSince] still carries
+  ///    the old start and [_consecutiveMissingFrames] still carries the old run.
+  ///
+  /// The tab switch itself is already charged for by `WebGuards` (`tabHidden`), so
+  /// without this a single tap on another tab costs two strikes, one of them for a
+  /// behaviour the app never saw.
+  ///
+  /// What is dropped is the *open* measuring - the two clocks, the near-sideways
+  /// run, the absence buffer and the open glance - and nothing that has already
+  /// been decided:
+  ///
+  ///  * [_awayFlagged] and [_missingFlagged] stay set, because they are "this
+  ///    episode has already cost a strike" latches rather than clocks, and the
+  ///    episode has not ended just because the tab did. A student who is still
+  ///    looking away on the way back is not charged twice;
+  ///  * the glances already banked in [_awayBurst] stay, because they are
+  ///    observations of the student rather than of the clock, and the window is
+  ///    what makes repeated glances add up;
+  ///  * the two-face latch stays for the same reason as the flags: that episode
+  ///    ended when the student was alone again, not when the tab changed;
+  ///  * [_startedAt] stays, because the grace window is about the camera coming up
+  ///    and not about visibility.
+  ///
+  /// A run that was genuinely held when the page went away is caught again after
+  /// the return - which costs one more hold rather than granting a strike.
+  void _onPageResumed() {
+    if (_disposed) return;
+    _awaySince = null;
+    _missingSince = null;
+    _immediateDetections = 0;
+    _consecutiveMissingFrames = 0;
+    // The open glance is abandoned, not closed: closing it would bank the
+    // off-screen time it spent inside a hidden tab, which nobody watched.
+    _awayBurst.abandonEpisode();
+  }
+
   void _onMissing(DateTime now) {
     // Without a face there is no head pose to judge, so an away episode is over
     // (and re-armable) rather than paused.
@@ -429,8 +543,18 @@ class WebFacePresenceMonitor {
     // about the student, not about the frame that happened to be empty.
     _awayBurst.abandonEpisode();
 
+    _consecutiveMissingFrames++;
     _missingSince ??= now;
     if (_missingFlagged) return;
+    // The buffer, before the clock: a blink, a frame the encoder dropped or one
+    // tick of motion blur is one or two empty detections, and reporting that is
+    // the false `no_face` the audit found on a page whose detector samples a
+    // `<video>`. Only an unbroken run of [missingFrameTolerance] is a lens with
+    // nobody in front of it.
+    if (_consecutiveMissingFrames < missingFrameTolerance) return;
+    // ...and a run still has to have *lasted*: three verdicts inside one instant
+    // (a detector bursting results from a buffered frame) are not three empty
+    // frames' worth of time.
     if (now.difference(_missingSince!) < noFaceSustain) return;
     _missingFlagged = true;
     _emit(GazeSignal.noFace);
@@ -445,9 +569,12 @@ class WebFacePresenceMonitor {
   /// because it is the same strike.
   void _onAway(DateTime now, {bool confirmed = false}) {
     // A visible head means the absence episode is over, so a later one is
-    // reported again - and a second person in frame may have left.
+    // reported again - and a second person in frame may have left. The absence
+    // buffer starts over too: whatever gap came before this face was two unrelated
+    // half-absences, not one covered lens.
     _missingSince = null;
     _missingFlagged = false;
+    _consecutiveMissingFrames = 0;
     _endMultiFaceEpisode(now);
 
     _awaySince ??= now;
@@ -474,6 +601,9 @@ class WebFacePresenceMonitor {
     _missingSince = null;
     _awayFlagged = false;
     _missingFlagged = false;
+    // A face back inside the tolerances ends the absence run: the next empty
+    // detection is the first of a new one, not the third of the last.
+    _consecutiveMissingFrames = 0;
     // The head is back inside the tolerances, so any near-sideways run is over: a
     // later turn has to be confirmed twice of its own.
     _immediateDetections = 0;
@@ -547,6 +677,8 @@ class WebFacePresenceMonitor {
     _disposed = true;
     unawaited(_subscription?.cancel());
     _subscription = null;
+    unawaited(_pageResumedSubscription?.cancel());
+    _pageResumedSubscription = null;
     unawaited(_signals.close());
     _source.dispose();
   }

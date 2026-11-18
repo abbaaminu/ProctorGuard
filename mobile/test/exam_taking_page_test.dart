@@ -702,8 +702,10 @@ void main() {
       await openPastGrace(tester);
 
       // `web/proctor_face_detector.js` re-sends `no_face` on every 350 ms tick it
-      // holds, which is what this is: the first verdict is one dropped frame, the
-      // second - one tick inside the monitor's sustain - is a covered lens.
+      // holds, which is what this is. One verdict is a blink, two are a blink and
+      // a frame the encoder dropped - the monitor wants three in a row
+      // (`missingFrameTolerance`) - and only then, past its 300 ms window, is it a
+      // covered lens.
       faces.emit('no_face');
       await tester.pump();
       await tester.pump();
@@ -711,6 +713,17 @@ void main() {
         proctoring.violations,
         isEmpty,
         reason: 'a single no_face is a camera that blinked, not a student hiding',
+      );
+
+      now = now.add(const Duration(milliseconds: 350));
+      faces.emit('no_face');
+      await tester.pump();
+      await tester.pump();
+      expect(
+        proctoring.violations,
+        isEmpty,
+        reason: 'two empty ticks are a blink plus a dropped frame, not a seat '
+            'nobody is in',
       );
 
       now = now.add(const Duration(milliseconds: 350));
@@ -726,14 +739,14 @@ void main() {
         (tester) async {
       await openPastGrace(tester);
 
-      // The student leans out of frame and stays out: two detections 350ms apart
-      // are past the monitor's sustain, so this is a covered lens rather than a
-      // blink.
-      faces.emit('no_face');
-      await tester.pump();
-      faces.emit('no_face');
-      now = now.add(const Duration(milliseconds: 350));
-      await tester.pump();
+      // The student leans out of frame and stays out: three detections 350 ms
+      // apart fill the monitor's buffer and clear its 300 ms window, so this is a
+      // covered lens rather than a blink.
+      for (var tick = 0; tick < 3; tick++) {
+        faces.emit('no_face');
+        await tester.pump();
+        now = now.add(const Duration(milliseconds: 350));
+      }
       await tester.pumpAndSettle();
 
       // The strike is logged (it is an event) *and* the paper is covered (it is
@@ -832,8 +845,11 @@ void main() {
       proctoring.flagAt = 1;
       await openPastGrace(tester);
 
-      // A covered lens, held for a tick (see the test above), which now also ends
-      // the attempt.
+      // A covered lens, held for three ticks (see the test above), which now also
+      // ends the attempt.
+      faces.emit('no_face');
+      await tester.pump();
+      now = now.add(const Duration(milliseconds: 350));
       faces.emit('no_face');
       await tester.pump();
       now = now.add(const Duration(milliseconds: 350));
@@ -1524,6 +1540,62 @@ void main() {
       expect(find.byKey(const Key('option-1')), findsOneWidget);
       expect(tester.takeException(), isNull);
     });
+
+    testWidgets('floats the self-view in the paper\'s top-right corner',
+        (tester) async {
+      tester.view.physicalSize = const Size(1440, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      final selfView = tester.getRect(find.byKey(const Key('exam-self-view')));
+      expect(selfView.size, const Size(260, 195));
+      // 24 dp inside the body's top-right corner: the body starts under the app
+      // bar, so the pane never covers the question number or the clock.
+      expect(selfView.right, 1440 - 24);
+      expect(
+        selfView.top,
+        greaterThanOrEqualTo(tester.getRect(find.byType(AppBar)).bottom),
+      );
+
+      // The paper stops before it: a line of the question - or an option's tap
+      // target - under the camera is one the student cannot read or reach (and
+      // on the web the platform view paints over the text regardless).
+      final option = tester.getRect(find.byKey(const Key('option-1')));
+      expect(option.right, lessThanOrEqualTo(selfView.left));
+      final questionText = tester.getRect(
+        find.text('Which data structure is FIFO?'),
+      );
+      expect(questionText.right, lessThanOrEqualTo(selfView.left));
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('keeps the self-view above the paper on a phone viewport',
+        (tester) async {
+      tester.view.physicalSize = const Size(360, 640);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(pageUnderTest());
+      await tester.tap(find.text('open exam'));
+      await tester.pumpAndSettle();
+
+      // In the flow and compact: a 260 dp float would cover three quarters of
+      // this screen's paper, so the strip is what a phone gets.
+      final selfView = tester.getRect(find.byKey(const Key('exam-self-view')));
+      expect(selfView.size, const Size(128, 96));
+      expect(selfView.right, lessThanOrEqualTo(360));
+      expect(
+        tester.getRect(find.text('Which data structure is FIFO?')).top,
+        greaterThanOrEqualTo(selfView.bottom),
+      );
+      expect(tester.takeException(), isNull);
+    });
   });
 
   group('review marker and candidate identity', () {
@@ -2045,12 +2117,23 @@ class _FakeFaceSource implements WebFaceSignalSource {
   /// detector still reporting into an attempt that has already ended.
   bool disposed = false;
 
+  /// The page becoming visible again after a hidden tab
+  /// (`WebFaceSignalSource.pageResumed`), which the monitor resets its open
+  /// episodes against.
+  final StreamController<void> resumedController =
+      StreamController<void>.broadcast();
+
   void emit(String message) {
     if (!controller.isClosed) controller.add(message);
   }
 
   void emitAnalysis(bool available) {
     if (!analysisController.isClosed) analysisController.add(available);
+  }
+
+  /// The student came back to the tab.
+  void resumePage() {
+    if (!resumedController.isClosed) resumedController.add(null);
   }
 
   @override
@@ -2063,10 +2146,14 @@ class _FakeFaceSource implements WebFaceSignalSource {
   Stream<bool> get analysis => analysisController.stream;
 
   @override
+  Stream<void> get pageResumed => resumedController.stream;
+
+  @override
   void dispose() {
     disposed = true;
     if (!controller.isClosed) controller.close();
     if (!analysisController.isClosed) analysisController.close();
+    if (!resumedController.isClosed) resumedController.close();
   }
 }
 

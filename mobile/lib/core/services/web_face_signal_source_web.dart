@@ -31,6 +31,10 @@ class WebFaceSignalSourceImpl implements WebFaceSignalSource {
   WebFaceSignalSourceImpl() {
     _sink = _handleMessage.toJS;
     _analysisSink = _handleAnalysis.toJS;
+    // Kept as a field so [dispose] detaches exactly this closure: an anonymous
+    // `.toJS` could not be removed, and a second session would leave the first
+    // one's listener on the page.
+    _visibilityListener = _handleVisibilityChange.toJS;
     try {
       _window.setProperty(WebFaceSignalSource.globalName.toJS, _sink);
       _window.setProperty(WebFaceSignalSource.analysisGlobalName.toJS, _analysisSink);
@@ -41,6 +45,10 @@ class WebFaceSignalSourceImpl implements WebFaceSignalSource {
       // does not wait for signals that cannot arrive.
       _installed = false;
     }
+    // Installed whether or not the hooks went in: this one is on `document`, and
+    // a page that hides the hook does not stop hiding its own tab. It only ever
+    // reports that the page is back, so it can only be right.
+    web.document.addEventListener('visibilitychange', _visibilityListener);
   }
 
   /// [web.window] as a plain [JSObject]: the receiver the
@@ -55,6 +63,12 @@ class WebFaceSignalSourceImpl implements WebFaceSignalSource {
   /// that subscribes late misses only the answers of an attempt that has ended.
   final StreamController<bool> _analysis = StreamController<bool>.broadcast();
 
+  /// The page coming back into view (see [WebFaceSignalSource.pageResumed]).
+  ///
+  /// A controller rather than a fan-out to one listener, because the monitor may
+  /// be rebuilt and the page does not care who is listening.
+  final StreamController<void> _resumed = StreamController<void>.broadcast();
+
   /// The exported Dart callback, kept so [dispose] removes exactly this one
   /// (an anonymous `.toJS` could not be un-set, and a second session would
   /// export a second closure).
@@ -62,6 +76,9 @@ class WebFaceSignalSourceImpl implements WebFaceSignalSource {
 
   /// The same, for the sensor-capability hook.
   late final JSFunction _analysisSink;
+
+  /// The `visibilitychange` listener, kept for the same reason as [_sink].
+  late final JSFunction _visibilityListener;
 
   bool _installed = false;
   bool _disposed = false;
@@ -74,6 +91,9 @@ class WebFaceSignalSourceImpl implements WebFaceSignalSource {
 
   @override
   Stream<bool> get analysis => _analysis.stream;
+
+  @override
+  Stream<void> get pageResumed => _resumed.stream;
 
   /// One host call: `proctorGuardFaceSignal('no_face')`.
   ///
@@ -106,10 +126,28 @@ class WebFaceSignalSourceImpl implements WebFaceSignalSource {
     _analysis.add(available);
   }
 
+  /// `visibilitychange`: the page is being watched again.
+  ///
+  /// Only the return is published. The departure already reaches the app twice
+  /// over - `WebGuards` reports `tabHidden` for it, and the detector stops
+  /// ticking - so a hidden-half message here would be a third, unused copy of it.
+  void _handleVisibilityChange(web.Event _) {
+    if (_disposed) return;
+    if (web.document.visibilityState != 'visible') return;
+    if (_resumed.isClosed) return;
+    _resumed.add(null);
+  }
+
   @override
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    try {
+      web.document.removeEventListener('visibilitychange', _visibilityListener);
+    } catch (_) {
+      // A page that has frozen `document` (see the constructor): the listener is
+      // gone with the page it could not be attached to.
+    }
     if (_installed) {
       try {
         _window.setProperty(WebFaceSignalSource.globalName.toJS, null);
@@ -121,5 +159,6 @@ class WebFaceSignalSourceImpl implements WebFaceSignalSource {
     }
     unawaited(_messages.close());
     unawaited(_analysis.close());
+    unawaited(_resumed.close());
   }
 }

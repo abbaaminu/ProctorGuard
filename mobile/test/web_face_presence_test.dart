@@ -18,7 +18,8 @@ import 'package:proctorguard/core/services/web_face_signal_source.dart';
 ///
 /// The rules are the ones `MediaPipeProctoringService` applies, with elapsed time
 /// standing in for consecutive frames (a page's detector has no guaranteed frame
-/// rate).
+/// rate) - and, for absence only, a frame *count* beside the clock: `no_face` needs
+/// three empty detections in a row, exactly as the engine's three missing frames.
 void main() {
   late _FakeFaceSource source;
   late DateTime now;
@@ -37,7 +38,9 @@ void main() {
   /// depend on the exact boundary.
   ///
   /// The look-away window is the longer of the two, so holding for it also fills
-  /// the shorter `no_face` one - which is what the episode tests want either way.
+  /// the shorter `no_face` window - though absence also needs its three-frame count
+  /// (see [sustainAbsence]), so a single `hold` of `no_face` only re-reports when
+  /// the run is already that long.
   void hold(String message) {
     now = now.add(monitor.lookAwaySustain + const Duration(milliseconds: 100));
     report(message);
@@ -48,6 +51,25 @@ void main() {
   void sustain(String message) {
     report(message);
     hold(message);
+  }
+
+  /// The shipped detector's cadence: `web/proctor_face_detector.js` re-sends its
+  /// verdict every tick, so 350 ms is the spacing of the empty frames a browser
+  /// actually produces.
+  const tick = Duration(milliseconds: 350);
+
+  /// An absence long enough to be reported: `monitor.missingFrameTolerance` empty
+  /// detections in a row, one tick apart - which is both the count the buffer asks
+  /// for and more than the 300 ms window.
+  ///
+  /// Deliberately *not* [sustain]: a look-away is filled by time alone, absence is
+  /// also counted, and the count is the whole point of these tests.
+  void sustainAbsence() {
+    report(WebFaceMessages.noFace);
+    for (var i = 1; i < monitor.missingFrameTolerance; i++) {
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+    }
   }
 
   /// The monitor under test, with the start-up grace removed: these tests are
@@ -430,7 +452,7 @@ void main() {
 
     test('an absent face is its own signal, reported once per episode',
         () async {
-      sustain(WebFaceMessages.noFace);
+      sustainAbsence();
       await flush();
       expect(signals, <GazeSignal>[GazeSignal.noFace]);
 
@@ -439,7 +461,7 @@ void main() {
       expect(signals, <GazeSignal>[GazeSignal.noFace], reason: 'one episode');
 
       report(WebFaceMessages.centered);
-      sustain(WebFaceMessages.noFace);
+      sustainAbsence();
       await flush();
       expect(
         signals,
@@ -451,7 +473,7 @@ void main() {
       // Both mean "not looking at the screen", but they are different evidence,
       // and either one proves the other is over - so a student who leaves and
       // then returns and turns is reported for both.
-      sustain(WebFaceMessages.noFace);
+      sustainAbsence();
       sustain(WebFaceMessages.lookingAway);
       await flush();
       expect(
@@ -460,7 +482,7 @@ void main() {
       );
 
       report(WebFaceMessages.centered);
-      sustain(WebFaceMessages.noFace);
+      sustainAbsence();
       await flush();
       expect(
         signals,
@@ -484,18 +506,15 @@ void main() {
       expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
     });
 
-    test('a covered camera is reported on the shorter absence window', () async {
+    test('a covered camera is reported inside the look-away window', () async {
       // `no_face` is deliberately not the look-away window: a lens that is covered,
       // muted or unplugged is not a reading position, and the engine confirms it over
-      // three frames (~0.45 s) rather than two seconds. Two detections at the shipped
-      // detector's 350 ms tick fill it; one does not.
+      // three frames (~0.45 s) rather than two seconds. The shipped detector's 350 ms
+      // tick satisfies both halves of the rule - the three-empty-frame count and the
+      // 300 ms window - by its third report, so a covered lens is still a finding well
+      // inside the look-away window.
       final start = now;
-      report(WebFaceMessages.noFace);
-      await flush();
-      expect(signals, isEmpty, reason: 'the first empty frame opens the episode');
-
-      now = now.add(monitor.noFaceSustain);
-      report(WebFaceMessages.noFace);
+      sustainAbsence();
       await flush();
       expect(signals, <GazeSignal>[GazeSignal.noFace]);
       expect(
@@ -507,7 +526,262 @@ void main() {
     });
   });
 
+  group('the absence buffer', () {
+    // The hysteresis: `no_face` is the one signal a working detector also produces
+    // by accident, so it is confirmed over three consecutive empty detections - the
+    // engine's three frames, counted here as well as timed.
+
+    test('one empty frame is a blink, not an absence', () async {
+      report(WebFaceMessages.noFace);
+      now = now.add(tick);
+      report(WebFaceMessages.centered);
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.centered],
+        reason: 'a blink is one empty tick between two faces',
+      );
+    });
+
+    test('two empty frames are still not an absence', () async {
+      report(WebFaceMessages.noFace);
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      await flush();
+      expect(
+        signals,
+        isEmpty,
+        reason: 'past the 300 ms window, but the count is what a dropped frame '
+            'cannot fill',
+      );
+    });
+
+    test('the third in a row is', () async {
+      sustainAbsence();
+      await flush();
+      expect(signals, <GazeSignal>[GazeSignal.noFace]);
+    });
+
+    test('three in one instant are not three frames', () async {
+      // A detector bursting results from one buffered frame reports three times at
+      // the same moment. The count is a floor beside the window, not instead of it:
+      // the clock still has to move.
+      for (var i = 0; i < monitor.missingFrameTolerance; i++) {
+        report(WebFaceMessages.noFace);
+      }
+      await flush();
+      expect(signals, isEmpty, reason: 'no time has passed');
+
+      now = now.add(monitor.noFaceSustain);
+      report(WebFaceMessages.noFace);
+      await flush();
+      expect(signals, <GazeSignal>[GazeSignal.noFace]);
+    });
+
+    test('a face between two gaps starts the count again', () async {
+      report(WebFaceMessages.noFace);
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      now = now.add(tick);
+      report(WebFaceMessages.centered);
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.centered],
+        reason: 'two separate one-frame gaps are not a covered lens',
+      );
+    });
+
+    test('a turned head resets the count too', () async {
+      report(WebFaceMessages.noFace);
+      now = now.add(tick);
+      // A head that is visible and turned proves a face is in front of the lens,
+      // even though the student is not looking at the screen.
+      report(WebFaceMessages.lookingAway);
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      await flush();
+      expect(
+        signals,
+        isEmpty,
+        reason: 'the glance was too short to report, and neither absence ran '
+            'three frames',
+      );
+    });
+
+    test('a second person in frame resets the count', () async {
+      report(WebFaceMessages.noFace);
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      now = now.add(tick);
+      report(WebFaceMessages.multipleFaces);
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.multipleFaces],
+        reason: 'two people are not an empty chair',
+      );
+    });
+  });
+
+  group('a hidden tab', () {
+    // A hidden document is not watched: `requestAnimationFrame` stops, so the
+    // page's detector sends nothing for as long as the tab is away while the wall
+    // clock keeps going. Whatever was open when it went quiet is measured against
+    // a clock that now belongs to nobody, and the guard has already charged the
+    // tab switch itself (`WebGuardEvent.tabHidden`) - so the episodes start over
+    // rather than finishing themselves on the way back.
+
+    test('an absence half-observed before the switch is not reported after it',
+        () async {
+      report(WebFaceMessages.noFace);
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      await flush();
+      expect(signals, isEmpty, reason: 'two empty frames are not an absence');
+
+      // The student leaves the tab for a minute and comes back to an empty lens.
+      now = now.add(const Duration(minutes: 1));
+      source.resumePage();
+      await flush();
+
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      await flush();
+      expect(
+        signals,
+        isEmpty,
+        reason:
+            'the two frames before the switch were a run that has already '
+            'been interrupted by a minute of nothing being watched, and the '
+            'guard charged the switch',
+      );
+
+      // The lens is still empty, so it is caught again - by its own three frames,
+      // all of them in view.
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      await flush();
+      expect(signals, isEmpty, reason: 'two frames after the return');
+
+      now = now.add(tick);
+      report(WebFaceMessages.noFace);
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.noFace],
+        reason: 'three empty frames in view is an absence, whenever it began',
+      );
+    });
+
+    test('a look away held across the switch is held again from the return',
+        () async {
+      report(WebFaceMessages.lookingAway);
+      await flush();
+      expect(signals, isEmpty, reason: 'half a second is a glance');
+
+      now = now.add(const Duration(minutes: 1));
+      source.resumePage();
+      await flush();
+
+      report(WebFaceMessages.lookingAway);
+      await flush();
+      expect(
+        signals,
+        isEmpty,
+        reason:
+            'the minute belonged to another tab, not to the head: a turn '
+            'seen once on the way back is a glance',
+      );
+
+      hold(WebFaceMessages.lookingAway);
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.lookingAway],
+        reason:
+            'a full hold after the return is the same finding the phone '
+            'would make',
+      );
+    });
+
+    test('a strike already charged is not charged again for the same episode',
+        () async {
+      sustain(WebFaceMessages.lookingAway);
+      await flush();
+      expect(signals, <GazeSignal>[GazeSignal.lookingAway]);
+
+      // Still away on the way back: one episode, one strike. The switch is the
+      // guards' to charge, and did.
+      now = now.add(const Duration(minutes: 2));
+      source.resumePage();
+      await flush();
+
+      hold(WebFaceMessages.lookingAway);
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.lookingAway],
+        reason: 'the latch is about the episode, and the episode never ended',
+      );
+    });
+
+    test('a held absence is not reported twice for one covered lens', () async {
+      sustainAbsence();
+      await flush();
+      expect(signals, <GazeSignal>[GazeSignal.noFace]);
+
+      now = now.add(const Duration(minutes: 2));
+      source.resumePage();
+      await flush();
+
+      // The lens is still covered, so the buffer fills again - and says nothing,
+      // because this absence has already cost its strike.
+      sustainAbsence();
+      sustainAbsence();
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.noFace],
+        reason: 'the covered lens was charged once, and one lens is one episode',
+      );
+    });
+
+    test('a face back in view re-arms the next absence as usual', () async {
+      sustainAbsence();
+      await flush();
+      expect(signals, <GazeSignal>[GazeSignal.noFace]);
+
+      // The student uncovers the lens, switches tab, comes back and covers it
+      // again: a new absence, reported on its own.
+      report(WebFaceMessages.centered);
+      now = now.add(const Duration(minutes: 2));
+      source.resumePage();
+      await flush();
+
+      sustainAbsence();
+      await flush();
+      expect(
+        signals,
+        <GazeSignal>[GazeSignal.noFace, GazeSignal.centered, GazeSignal.noFace],
+        reason: 'a face between the two absences is what re-arms the rule',
+      );
+    });
+  });
+
   group('repeated glances', () {
+
+
     /// One glance of [length] that never reaches the sustain, ended by a centred
     /// detection - the shape the two-second rule cannot see, because no single run
     /// lasts long enough.
@@ -780,12 +1054,23 @@ class _FakeFaceSource implements WebFaceSignalSource {
   final StreamController<bool> analysisController =
       StreamController<bool>.broadcast();
 
+  /// The page becoming visible again after a hidden tab (see
+  /// `WebFaceSignalSource.pageResumed`): what the monitor measures its open
+  /// episodes against, and what these tests use in place of a tab switch.
+  final StreamController<void> resumedController =
+      StreamController<void>.broadcast();
+
   /// How many times the monitor released the hook; a session that leaves the
   /// global installed is a session a finished page can keep reporting into.
   int disposes = 0;
 
   void emit(String message) {
     if (!controller.isClosed) controller.add(message);
+  }
+
+  /// The student came back to the tab.
+  void resumePage() {
+    if (!resumedController.isClosed) resumedController.add(null);
   }
 
   @override
@@ -798,10 +1083,14 @@ class _FakeFaceSource implements WebFaceSignalSource {
   Stream<bool> get analysis => analysisController.stream;
 
   @override
+  Stream<void> get pageResumed => resumedController.stream;
+
+  @override
   void dispose() {
     disposes++;
     if (!controller.isClosed) controller.close();
     if (!analysisController.isClosed) analysisController.close();
+    if (!resumedController.isClosed) resumedController.close();
   }
 }
 

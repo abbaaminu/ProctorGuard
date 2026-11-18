@@ -1,6 +1,8 @@
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 
 import '../../../../core/services/kiosk_service.dart';
+import '../../../../core/services/web_camera_preview_style.dart';
 import '../../../../core/widgets/responsive_layout.dart';
 import '../../domain/entities/question.dart';
 
@@ -211,7 +213,122 @@ class ExamWarningChip extends StatelessWidget {
   }
 }
 
-/// Shown in place of the self-view when a **real** session has no live camera.
+/// The live self-view: the platform's preview, cropped to fill the box it is
+/// given.
+///
+/// `BoxFit.cover` over a `SizedBox` of the platform's own preview size is what
+/// keeps the picture undistorted: whatever aspect ratio the lens reports, the
+/// frame fills the caller's box and crops the excess instead of stretching a
+/// face into it.
+///
+/// On the web that crop is also the browser's job, and only the browser can do
+/// it: the preview is a DOM `<video>` layered above Flutter's canvas, so the
+/// `ClipRRect` and `SizedBox` around this widget are guidelines to the Flutter
+/// layer, not clamps on the element. [WebCameraPreviewStyle] restates the crop,
+/// the 100% size and the corner clip on the element *after* it has attached -
+/// post-frame, because `HtmlElementView` only creates it in the frame after the
+/// widget that asks for it - so a stylesheet, a re-attach or a plugin whose
+/// defaults drift cannot leave the pane half-stretched or square-cornered.
+///
+/// Off the web none of that runs: the preview is a texture painted inside the
+/// widget tree, and `ClipRRect` already does the whole job.
+class ExamSelfViewPreview extends StatefulWidget {
+  const ExamSelfViewPreview({
+    super.key,
+    required this.controller,
+    this.cornerRadius = 10,
+  });
+
+  final CameraController controller;
+
+  /// Radius the browser's element is clipped to, so the platform view's corners
+  /// match the `ClipRRect` drawn around this widget.
+  final double cornerRadius;
+
+  @override
+  State<ExamSelfViewPreview> createState() => _ExamSelfViewPreviewState();
+}
+
+class _ExamSelfViewPreviewState extends State<ExamSelfViewPreview> {
+  /// How many frames the element may take to appear. The platform view is built
+  /// the frame *after* the widget that asks for it, and a camera that is still
+  /// starting can take one more; past that `camera_web`'s own inline styles are
+  /// the only sizing the pane has, and retrying forever would be a busy loop.
+  static const int _maxStyleAttempts = 4;
+
+  final WebCameraPreviewStyle _style = WebCameraPreviewStyle();
+
+  int _attempts = 0;
+
+  /// True once the element was found and styled. Nothing Flutter paints depends
+  /// on it, so it is deliberately not state.
+  bool _styled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scheduleStyleApply();
+  }
+
+  @override
+  void didUpdateWidget(covariant ExamSelfViewPreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // A different controller is a different platform view, and a different
+    // `<video>` to style.
+    if (!identical(oldWidget.controller, widget.controller)) {
+      _attempts = 0;
+      _styled = false;
+      _scheduleStyleApply();
+    }
+  }
+
+  /// Applies the browser's own styles to the element, after the frame that
+  /// attached it.
+  ///
+  /// A no-op off the web (see [WebCameraPreviewStyle.isSupported]), which is
+  /// also why the widget tests never reach a DOM.
+  void _scheduleStyleApply() {
+    if (!_style.isSupported || _styled || _attempts >= _maxStyleAttempts) {
+      return;
+    }
+    _attempts++;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _styled) return;
+      if (_style.apply(cornerRadius: widget.cornerRadius) > 0) {
+        _styled = true;
+        return;
+      }
+      _scheduleStyleApply();
+    });
+    // A post-frame callback runs at the end of a frame; it does not ask for one.
+    // Without this the retry chain would advance only on the next frame some
+    // other part of the page happens to request - the exam clock ticks once a
+    // second, so a preview that attached late could stay un-styled (letterboxed,
+    // square-cornered) for seconds, and a page that draws no frames at all would
+    // never finish the chain. Requesting the frame makes the retries actually
+    // happen; the attempt cap keeps that bounded.
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final preview = widget.controller.value.previewSize;
+
+    return FittedBox(
+      fit: BoxFit.cover,
+      child: SizedBox(
+        // The preview's own frame, in the camera package's rotation-aware
+        // terms: `height` x `width` is the picture as it is shown, not as it is
+        // stored.
+        width: preview?.height ?? 480,
+        height: preview?.width ?? 640,
+        child: CameraPreview(widget.controller),
+      ),
+    );
+  }
+}
+
+
 ///
 /// Deliberately *not* a neutral camera placeholder: the blocking error above
 /// already explains what went wrong, and this tile says plainly that the feed is

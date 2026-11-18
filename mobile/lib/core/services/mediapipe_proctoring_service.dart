@@ -45,7 +45,7 @@ class MediaPipeProctoringService {
     this.immediateFrameThreshold = thresholds.lookAwayImmediateFrames,
     this.startupGrace = thresholds.cameraStartupGrace,
     this.consecutiveFrameThreshold = 1,
-    this.missingFaceFrameThreshold = 3,
+    this.missingFaceFrameThreshold = thresholds.missingFaceFrameThreshold,
     this.multipleFacesCooldown = const Duration(seconds: 30),
     this.sensorOrientation = 90,
     this.lensDirection = CameraLensDirection.front,
@@ -197,12 +197,15 @@ class MediaPipeProctoringService {
   /// How many **consecutive frames** without a face before [GazeSignal.noFace] is
   /// reported.
   ///
-  /// Three, unlike [consecutiveFrameThreshold]: a missing *face* is the one signal
-  /// a working detector also produces by accident - a blink behind glasses, a hand
-  /// passing the lens, one frame of motion blur - so it is worth confirming, and
-  /// three frames is ~0.45 s at the default rate, far short of the time it takes to
-  /// actually leave the camera's view. Any frame with a face in it resets the
-  /// count, so only an unbroken absence is reported.
+  /// `thresholds.missingFaceFrameThreshold` - three, unlike
+  /// [consecutiveFrameThreshold]: a missing *face* is the one signal a working
+  /// detector also produces by accident - a blink behind glasses, a hand passing the
+  /// lens, one frame of motion blur - so it is worth confirming, and three frames is
+  /// ~0.45 s at the default rate, far short of the time it takes to actually leave
+  /// the camera's view. Any frame with a face in it resets the count, so only an
+  /// unbroken absence is reported. The browser bridge quotes the same constant (see
+  /// [WebFacePresenceMonitor.missingFrameTolerance] in `web_face_presence.dart`), so
+  /// the two platforms cannot drift apart on the count.
   final int missingFaceFrameThreshold;
 
   /// How long the student has to be *alone* in frame before a second person can

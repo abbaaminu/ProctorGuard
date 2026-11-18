@@ -1143,5 +1143,8 @@ class _SilentSource implements WebFaceSignalSource {
   Stream<bool> get analysis => const Stream<bool>.empty();
 
   @override
+  Stream<void> get pageResumed => const Stream<void>.empty();
+
+  @override
   void dispose() {}
 }
