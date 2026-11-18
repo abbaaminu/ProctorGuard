@@ -159,20 +159,20 @@ const int lookAwayImmediateFrames = 2;
 /// than a behaviour, and it is what makes [lookAwaySustain] mean the same thing on
 /// the web as on a phone.
 ///
-/// The phone judges ~7 frames a second, so a head that is past 15 degrees is seen
-/// past it six or seven times inside [lookAwaySustain], and a single frame back
-/// inside the tolerances costs 150 ms of the hold. A browser's detector ticks every
-/// 350 ms (`web/proctor_face_detector.js`), so *one* `centered` - one tick the model
-/// could not measure, or one sample that landed between two turns - would otherwise
-/// throw away the whole hold, and a real two-second look-away that flickers across
-/// the line would never be reported at all. That is the failure this constant fixes.
+/// A browser's detector ticks every 350 ms (`web/proctor_face_detector.js`), so
+/// *one* `centered` - one tick the model could not measure, or one sample that
+/// landed between two turns - would otherwise throw away the whole hold, and a real
+/// two-second look-away that flickers across the line would never be reported at
+/// all. That is the failure this constant fixes.
 ///
 /// So a return is *confirmed* rather than assumed: the head has to be seen inside
 /// the tolerances and then not seen outside them for this long before the episode
 /// ends. It is the browser's version of the phone's three-frame absence buffer -
 /// the same idea, in the other direction: the phone does not report a face as
 /// missing on one frame, and the web does not report a student as back on one
-/// tick.
+/// tick. The phone's own version of *this* constant is
+/// [lookAwayNativeReturnDwell], and it exists for exactly the same reason: one
+/// frame back is a sample, not a return.
 ///
 /// A *time*, not a count of samples, so it means the same thing to a detector that
 /// ticks twice a second and to one that ticks twenty times - and so a page that
@@ -185,6 +185,41 @@ const int lookAwayImmediateFrames = 2;
 /// is confirmed is measured to the *first* sample back inside - the flicker is not
 /// added to the student's time away.
 const Duration lookAwayWebReturnDwell = Duration(milliseconds: 700);
+
+/// How long a phone's head has to be *back inside* the tolerances before a
+/// look-away episode is judged over: two engine frames, 300 ms.
+///
+/// The phone's [lookAwayWebReturnDwell], and it fixes a miss that made the
+/// on-device detector the weaker of the two. An ML Kit Euler estimate that sits a
+/// degree or two over [lookAwayYawDegrees] *flickers* across the line - the same
+/// head reads 17, 14, 16, 15, 18 over a second - and with an episode ended by a
+/// single frame inside the tolerances, every one of those frames cleared the clock
+/// [lookAwaySustain] is measured against. A student who held their head at 20
+/// degrees for ten seconds could therefore never accumulate two unbroken seconds,
+/// and the phone reported nothing at all: the browser caught that turn and the
+/// phone did not, which is the wrong way round for the platform with the better
+/// sensor.
+///
+/// So a return is *confirmed* rather than assumed, exactly as it is on the web: the
+/// head has to be seen inside the tolerances, and then not seen outside them for
+/// this long, before the episode is over. Two frames, matching the two ticks that
+/// [lookAwayWebReturnDwell] buys at 350 ms and the two frames
+/// [lookAwayImmediateFrames] and [missingFaceFrameThreshold] are built on: the
+/// rule everywhere is "seen twice", never "seen once".
+///
+/// What it cannot do is forgive a look-away. The head still has to be past the
+/// tolerances on both sides of the flicker, so a return shorter than this is a
+/// head that never really came back; and because the episode ends the moment the
+/// dwell is satisfied, at most one dwell can be discounted from one episode - a
+/// strike lands at most 300 ms before the head would have been away for a full
+/// [lookAwaySustain] in a run that flickered, and never on a head that stayed
+/// inside the tolerances.
+///
+/// The episode is measured to the *first* frame back inside, so the glance the
+/// rolling window banks ([lookAwayBurstWindow]) is the time the head was actually
+/// turned rather than the time it took to be sure it had come back - the same
+/// arithmetic the browser monitor does.
+const Duration lookAwayNativeReturnDwell = Duration(milliseconds: 300);
 
 // ---------------------------------------------------------------------
 // The look-away rule, second half - the same question asked in a *window*:

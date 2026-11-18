@@ -307,9 +307,14 @@ void main() {
         hasLength(1),
       );
 
-      // A frame back inside the tolerances ends it, and the next turn has to be
+      // A return to the tolerances ends it - observed for a dwell rather than
+      // assumed from a single frame (`returnDwell`) - and the next turn has to be
       // confirmed twice of its own.
-      engine.handleResult(const FaceFrameResult(faceCount: 1));
+      hold(
+        engine,
+        const FaceFrameResult(faceCount: 1),
+        duration: engine.returnDwell + engine.inferenceInterval,
+      );
       now = now.add(engine.inferenceInterval);
       engine.handleResult(turned);
       await pumpEventQueue();
@@ -386,8 +391,14 @@ void main() {
         hasLength(1),
       );
 
-      // ...and so is a chin up, once a centred frame has re-armed the episode.
-      engine.handleResult(const FaceFrameResult(faceCount: 1));
+      // ...and so is a chin up, once a return to the tolerances has re-armed the
+      // episode - held for the dwell, because one frame back is a sample and not a
+      // return.
+      hold(
+        engine,
+        const FaceFrameResult(faceCount: 1),
+        duration: engine.returnDwell + engine.inferenceInterval,
+      );
       await pumpEventQueue();
       engine.handleResult(up);
       hold(engine, up, duration: const Duration(seconds: 2));
@@ -398,21 +409,64 @@ void main() {
       );
     });
 
-    test('a single centred frame restarts the sustain from zero', () async {
+    test('one centred frame is a flicker, so the run carries on', () async {
       final engine = clocked();
       final seen = <GazeSignal>[];
       final sub = engine.signals.listen(seen.add);
       addTearDown(sub.cancel);
 
-      // Halfway out, back, halfway out again: two glances of 1.5s are not one
-      // look-away of 3s. This is the "across consecutive frames" half of the rule,
-      // and the reason glancing at notes every few seconds cannot accumulate into a
-      // strike. 25 degrees keeps the test on the sustained rule: past 30 the turn
-      // would be near-sideways and confirmed in two frames by design.
+      // Halfway out, one frame back inside, halfway out again. That frame is 150 ms
+      // of a head that was never really at the screen - the wobble ML Kit produces on
+      // a turn held just past the tolerance - and `returnDwell` is what stops it
+      // clearing the clock. Without it the phone could never report that turn at all,
+      // while the browser (`lookAwayWebReturnDwell`) reported it; the two platforms
+      // now judge the same head the same way. 25 degrees keeps the test on the
+      // sustained rule: past 30 the turn is near-sideways and confirmed in two
+      // frames by design.
       const turned = FaceFrameResult(faceCount: 1, yawDegrees: 25);
       engine.handleResult(turned);
       hold(engine, turned, duration: const Duration(milliseconds: 1500));
       engine.handleResult(const FaceFrameResult(faceCount: 1));
+
+      await pumpEventQueue();
+      expect(
+        seen,
+        isNot(contains(GazeSignal.lookingAway)),
+        reason: 'a second and a half is not two seconds',
+      );
+
+      engine.handleResult(turned);
+      hold(engine, turned, duration: const Duration(milliseconds: 1500));
+
+      await pumpEventQueue();
+      expect(
+        seen.where((signal) => signal == GazeSignal.lookingAway),
+        hasLength(1),
+        reason: 'the flicker did not end the episode, so its two seconds were '
+            'reached - the same verdict the browser reaches on the same head',
+      );
+    });
+
+    test('a return held for the dwell does restart the sustain from zero',
+        () async {
+      final engine = clocked();
+      final seen = <GazeSignal>[];
+      final sub = engine.signals.listen(seen.add);
+      addTearDown(sub.cancel);
+
+      // Halfway out, actually back for the dwell, halfway out again: two glances of
+      // 1.5 s are not one look-away of 3 s. This is the "across consecutive frames"
+      // half of the rule, and the reason glancing at notes every few seconds cannot
+      // accumulate into a sustained strike - the rolling window is what counts a
+      // student who keeps doing it.
+      const turned = FaceFrameResult(faceCount: 1, yawDegrees: 25);
+      engine.handleResult(turned);
+      hold(engine, turned, duration: const Duration(milliseconds: 1500));
+      hold(
+        engine,
+        const FaceFrameResult(faceCount: 1),
+        duration: engine.returnDwell + engine.inferenceInterval,
+      );
 
       await pumpEventQueue();
       expect(seen, isNot(contains(GazeSignal.lookingAway)));
@@ -424,7 +478,7 @@ void main() {
       expect(
         seen.where((signal) => signal == GazeSignal.lookingAway),
         isEmpty,
-        reason: 'the centred frame ended the episode, so the clock restarted',
+        reason: 'the confirmed return ended the episode, so the clock restarted',
       );
     });
 
@@ -445,10 +499,15 @@ void main() {
         hasLength(1),
       );
 
-      // Back to centered, then away again: a new episode, which has to earn its own
-      // evidence - one frame is a guess whether the hold or the near-sideways count
-      // is the rule that will confirm it.
-      feed(engine, const FaceFrameResult(faceCount: 1), 1);
+      // Back at the screen for longer than the dwell - a return, not a flicker - and
+      // then away again: a new episode, which has to earn its own evidence - one
+      // frame is a guess whether the hold or the near-sideways count is the rule that
+      // will confirm it.
+      hold(
+        engine,
+        const FaceFrameResult(faceCount: 1),
+        duration: engine.returnDwell + engine.inferenceInterval,
+      );
       engine.handleResult(away);
       await pumpEventQueue();
       expect(
@@ -614,19 +673,26 @@ void main() {
       }
     }
 
-    /// One glance of [length], ended by a frame back inside the tolerances, and
-    /// [gap] spent looking at the screen before the next one. Both lengths are
-    /// multiples of the inference interval, so a glance is exactly as long as it
-    /// says: 600 ms is a glance, 300 ms is a fragment.
+    /// One glance of [length], ended by the frames that show the head back at the
+    /// screen, and [gap] spent looking at the screen before the next one.
+    ///
+    /// The return is *observed* rather than assumed - a single frame inside the
+    /// tolerances does not end an episode (`returnDwell`) - so the frames that end
+    /// it are fed too: the first records the return, and the dwell is checked
+    /// against it again on each frame until it is satisfied. [length] and [gap] are
+    /// both multiples of the inference interval, so a glance is exactly as long as
+    /// it says: 600 ms is a glance, 300 ms is a fragment. The rest of the gap is time
+    /// without frames, because one `centered` per glance is what the assertions
+    /// below count.
     void glance(
       MediaPipeProctoringService engine,
       Duration length, {
       Duration gap = const Duration(seconds: 2),
     }) {
       hold(engine, turned, length);
-      now = now.add(engine.inferenceInterval);
-      engine.handleResult(facing);
-      now = now.add(gap);
+      final returnFrames = engine.returnDwell + engine.inferenceInterval;
+      hold(engine, facing, returnFrames);
+      now = now.add(gap - returnFrames);
     }
 
     Iterable<GazeSignal> strikes(List<GazeSignal> seen) =>

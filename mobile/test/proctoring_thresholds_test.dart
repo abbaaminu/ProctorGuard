@@ -149,6 +149,26 @@ void main() {
       expect(cameraStartupGrace, const Duration(seconds: 5));
       expect(web.startupGrace, cameraStartupGrace);
       expect(engine.startupGrace, cameraStartupGrace);
+      // The return is confirmed on both platforms, which is the last asymmetry the
+      // audit found: one `centered` tick on the web and one frame on the phone used
+      // to end an episode, so a head held just past the tolerance - the reading ML
+      // Kit and MediaPipe both produce, a degree of wobble either side of the line -
+      // never completed the hold. The dwells are each platform's own sample rate (two
+      // ticks, two frames) rather than one shared time, because 700 ms is two ticks
+      // in a browser and five frames on a phone.
+      expect(engine.returnDwell, lookAwayNativeReturnDwell);
+      expect(web.returnDwell, lookAwayWebReturnDwell);
+      expect(lookAwayNativeReturnDwell, const Duration(milliseconds: 300));
+      expect(lookAwayWebReturnDwell, const Duration(milliseconds: 700));
+      // Both are a confirmation and not an amnesty: shorter than the hold, or an
+      // episode could never be reported at all, and longer than one frame/tick, which
+      // is the flicker they exist to forgive.
+      expect(lookAwayNativeReturnDwell, lessThan(lookAwaySustain));
+      expect(lookAwayWebReturnDwell, lessThan(lookAwaySustain));
+      expect(
+        lookAwayNativeReturnDwell,
+        greaterThan(const Duration(milliseconds: 150)),
+      );
     });
 
     test('repeated glances are judged in a window, beside the one above', () {
@@ -228,13 +248,19 @@ void main() {
         // tick of `centered` is not a return (`lookAwayWebReturnDwell` - the page
         // says `centered` for a tick it could not measure a pose in): the second
         // message, 700 ms later, is the head *still* facing the screen, and it is
-        // the one that ends the glance. The gap that follows is shortened by the
-        // same 700 ms, so the two hosts see the same sequence in the same two
-        // seconds.
+        // the one that ends the glance. The phone is judged the same way by its own
+        // camera, which keeps delivering: two more frames of an unchanged head, so
+        // the return is `lookAwayNativeReturnDwell` old before the episode ends. The
+        // gap that follows is shortened by the same 700 ms, so the two hosts see the
+        // same sequence in the same two seconds.
         now = now.add(engine.inferenceInterval);
         web.handleMessage(WebFaceMessages.centered);
         engine.handleResult(facing);
-        now = now.add(lookAwayWebReturnDwell);
+        for (var frame = 0; frame < 2; frame++) {
+          now = now.add(engine.inferenceInterval);
+          engine.handleResult(facing);
+        }
+        now = now.add(lookAwayWebReturnDwell - engine.inferenceInterval * 2);
         web.handleMessage(WebFaceMessages.centered);
         now = now.add(const Duration(seconds: 2) - lookAwayWebReturnDwell);
       }

@@ -41,6 +41,7 @@ class MediaPipeProctoringService {
     this.offCenterThresholdDegrees = thresholds.lookAwayYawDegrees,
     this.pitchThresholdDegrees = thresholds.lookAwayPitchDegrees,
     this.lookAwaySustain = thresholds.lookAwaySustain,
+    this.returnDwell = thresholds.lookAwayNativeReturnDwell,
     this.immediateYawDegrees = thresholds.lookAwayImmediateYawDegrees,
     this.immediateFrameThreshold = thresholds.lookAwayImmediateFrames,
     this.startupGrace = thresholds.cameraStartupGrace,
@@ -75,6 +76,15 @@ class MediaPipeProctoringService {
         assert(
           !startupGrace.isNegative,
           'a negative grace would time out before the sitting starts',
+        ),
+        assert(
+          !returnDwell.isNegative,
+          'a negative dwell would end a look-away before it was seen',
+        ),
+        assert(
+          returnDwell < lookAwaySustain,
+          'a dwell as long as the sustain would end every episode before it '
+          'could be reported',
         ),
         _lookAwayBurst = LookAwayBurstWindow(sustain: lookAwaySustain),
         _clock = clock ?? DateTime.now {
@@ -130,17 +140,41 @@ class MediaPipeProctoringService {
   /// and it is still short enough to catch somebody working from a second screen
   /// while they are doing it.
   ///
-  /// A frame back inside the tolerances ends the episode and restarts the clock.
-  /// That does **not** make repeated glances free: [_lookAwayBurst] counts them
-  /// separately (three glances, or five seconds off screen, inside a minute), so
-  /// this rule catches the turn that is held and the window catches the student who
-  /// keeps returning to the same off-screen place.
+  /// A frame back inside the tolerances ends the episode and restarts the clock,
+  /// once the return has been confirmed for [returnDwell] - so a head that merely
+  /// flickers across the line does not clear the clock, and a turn that sits a
+  /// degree over the tolerance is still measured. That does **not** make repeated
+  /// glances free: [_lookAwayBurst] counts them separately (three glances, or five
+  /// seconds off screen, inside a minute), so this rule catches the turn that is
+  /// held and the window catches the student who keeps returning to the same
+  /// off-screen place.
   ///
   /// The hold is not the *only* route to a strike: a turn past [immediateYawDegrees]
   /// is near-sideways and is confirmed in [immediateFrameThreshold] frames, which is
   /// what keeps the detector feeling immediate for the turns that have no innocent
   /// reading. Everything below that angle still has to earn this duration.
   final Duration lookAwaySustain;
+
+  /// How long the head has to be *back inside* the tolerances before the look-away
+  /// episode is judged over.
+  ///
+  /// [thresholds.lookAwayNativeReturnDwell]: 300 ms, two frames. The mirror image of
+  /// [thresholds.lookAwayWebReturnDwell] on the browser, and for the same reason: a
+  /// single frame inside the tolerances is a sample, not a return. ML Kit's Euler
+  /// estimates wobble by a degree or two, so a head held just past
+  /// [thresholds.lookAwayYawDegrees] reads inside the tolerances now and then, and if
+  /// one such frame ended the episode the hold could never be completed - the browser
+  /// reported that student and the phone did not.
+  ///
+  /// Confirmed, not assumed: the head is seen inside and then not seen outside for
+  /// this long, and the episode is still measured to the *first* frame back inside, so
+  /// the flicker is not added to anyone's time away and the glance banked by
+  /// [_lookAwayBurst] is the time the head was actually turned. A frame back outside
+  /// before the dwell is satisfied simply continues the same episode.
+  ///
+  /// Asserted to be shorter than [lookAwaySustain]: a dwell that long would end every
+  /// episode before it could ever be reported.
+  final Duration returnDwell;
 
   /// Yaw past which a turn is *near-sideways*, and so is confirmed in
   /// [immediateFrameThreshold] consecutive frames instead of being held for
@@ -273,9 +307,21 @@ class MediaPipeProctoringService {
   /// run whose head was past the tolerances.
   ///
   /// This is what [lookAwaySustain] is measured against. Null outside an episode;
-  /// any frame back inside the tolerances (or without a face, or with two) sets it
-  /// back to null, so the clock only ever covers *consecutive* off-centre frames.
+  /// a frame back inside the tolerances for [returnDwell] (or one without a face,
+  /// or with two) ends the episode and sets it back to null, so the clock only ever
+  /// covers *consecutive* off-centre frames - with a flicker across the line
+  /// forgiven, never a gap of more than [returnDwell].
   DateTime? _lookAwaySince;
+
+  /// When the head was first seen back inside the tolerances in the current
+  /// episode, or null when it is not currently inside them.
+  ///
+  /// The phone's version of `WebFacePresenceMonitor._insideSince`: the first frame
+  /// back is a question rather than an answer, [returnDwell] is measured from it and
+  /// checked again on every later frame inside the tolerances. Cleared by any
+  /// off-centre frame, so a flicker across the tolerance continues the same episode;
+  /// cleared with the episode, so a later return starts its own dwell.
+  DateTime? _insideSince;
 
   /// The rolling half of the look-away rule, beside [_lookAwaySince]:
   /// [thresholds.lookAwayBurstCount] glances of at least
@@ -392,6 +438,9 @@ class MediaPipeProctoringService {
     // nothing for the whole gap, so a turn it finds on the next frame must start
     // its two seconds there rather than inherit the seconds before the drop.
     _lookAwaySince = null;
+    // ...and so does the pending return: whether the head was back at the screen
+    // before the gap is not evidence about the frames after it.
+    _insideSince = null;
     // ...and so does the rolling window: a camera that was not delivering saw no
     // glances, so the evidence behind a burst strike must not survive the gap.
     _lookAwayBurst.clear();
@@ -607,11 +656,22 @@ class MediaPipeProctoringService {
   ///
   /// [GazeSignal.lookingAway] is reported once the head has stayed past
   /// [offCenterThresholdDegrees] / [pitchThresholdDegrees] for [lookAwaySustain]
-  /// *and* [consecutiveFrameThreshold] frames, with no frame back inside the
-  /// tolerances in between (`_lookAwaySince`). A single glance, a blink and a
-  /// notification therefore produce nothing, which is the point: the old
-  /// single-frame rule turned every one of them into a strike, and a student warned
-  /// for glancing at their own keyboard learns to ignore the warning.
+  /// *and* [consecutiveFrameThreshold] frames, with no confirmed return to the
+  /// tolerances in between (`_lookAwaySince`, ended only by [returnDwell] of frames
+  /// back inside them). A single glance, a blink and a notification therefore
+  /// produce nothing, which is the point: the old single-frame rule turned every one
+  /// of them into a strike, and a student warned for glancing at their own keyboard
+  /// learns to ignore the warning.
+  ///
+  /// The angles are judged as the detector reports them, with no median or moving
+  /// average of its own. The browser does filter - `smoothedPose` in
+  /// `web/proctor_face_detector.js` medians the last three readings - because its
+  /// angle is derived from landmark geometry, where one landmark's jitter moves the
+  /// answer. ML Kit hands back a fitted head pose, and filtering it again would buy
+  /// a little stillness for a frame or two of latency on every turn, including the
+  /// near-sideways ones the fast path exists to make immediate. What a fitted pose
+  /// still does is wobble *across the tolerance line*, and that is what [returnDwell]
+  /// is for.
   ///
   /// [GazeSignal.lookingAway] is *also* reported from the rolling window beside
   /// that rule ([_lookAwayBurst]): [thresholds.lookAwayBurstCount] separate glances
@@ -638,9 +698,12 @@ class MediaPipeProctoringService {
   /// glasses, a hand across the lens) on its own. Each episode emits at most once,
   /// so a sustained look-away or a face that stays out of frame is one strike, not
   /// one per inference. Any frame back in the tolerated state - a visible face, a
-  /// centered head - resets the counters and the episode clock; the episode clock is
-  /// what the two-second rule measures, and it is the window, not the clock, that
-  /// remembers a glance that has ended.
+  /// head that is not the student's alone - resets the counters and the episode
+  /// clock, and so does a centred head, but only once it has *stayed* inside the
+  /// tolerances for [returnDwell]: one frame back is a sample, and letting it clear
+  /// the clock is what made the phone miss turns the browser reported. The episode
+  /// clock is what the two-second rule measures, and it is the window, not the clock,
+  /// that remembers a glance that has ended.
   ///
   /// [GazeSignal.multipleFaces] is the other condition with no threshold (two
   /// people in frame needs no measuring), so it is latched instead: one episode,
@@ -683,6 +746,7 @@ class MediaPipeProctoringService {
       _offCenterFrames = 0;
       _immediateFrames = 0;
       _lookAwaySince = null;
+      _insideSince = null;
       _lookAwayFlagged = false;
       _lookAwayBurst.abandonEpisode();
 
@@ -710,6 +774,7 @@ class MediaPipeProctoringService {
       _offCenterFrames = 0;
       _immediateFrames = 0;
       _lookAwaySince = null;
+      _insideSince = null;
       _lookAwayFlagged = false;
       _lookAwayBurst.abandonEpisode();
       _multipleFacesAt = now;
@@ -737,13 +802,45 @@ class MediaPipeProctoringService {
         pitch.abs() > pitchThresholdDegrees;
 
     if (!isOffCenter) {
-      // Back inside the tolerances: whatever was building is off, and this is
-      // also the signal that re-arms looking_away for a later episode. The episode
-      // clock restarts from the next off-centre frame, which is what makes the
-      // sustain "consecutive frames" rather than "total time in the sitting".
+      // Back inside the tolerances.
+      //
+      // A single frame inside them is a sample, not a return. ML Kit's Euler
+      // estimates wobble by a degree or two, so a head held just past
+      // [offCenterThresholdDegrees] reads inside it every few frames - and if one
+      // such frame ended the episode, the clock [lookAwaySustain] is measured
+      // against would never survive two seconds and the phone would report nothing
+      // for a turn the browser reports. So the return is *confirmed*: the head is
+      // seen inside the tolerances, and then not seen outside them for [returnDwell].
+      //
+      // Nothing is charged for the flicker, and nothing is lost by it either: the
+      // episode keeps its clock, and when the return is confirmed it is closed at
+      // the *first* frame back inside, so the time it took to be sure is not part of
+      // anyone's glance.
+      var returnedAt = now;
+      final insideSince = _insideSince;
+      if (_lookAwaySince != null && returnDwell > Duration.zero) {
+        if (insideSince == null) {
+          // The first frame back: the near-sideways run is over (a later turn has to
+          // be confirmed twice of its own), but the episode clock is left where it
+          // is - whether this is a return or a flicker is the question the dwell
+          // asks. Silent for the same reason: the episode is not over yet.
+          _offCenterFrames = 0;
+          _immediateFrames = 0;
+          _insideSince = now;
+          return;
+        }
+        if (now.difference(insideSince) < returnDwell) return;
+        returnedAt = insideSince;
+      }
+
+      // Whatever was building is off, and this is also the signal that re-arms
+      // looking_away for a later episode. The episode clock restarts from the next
+      // off-centre frame, which is what makes the sustain "consecutive frames"
+      // rather than "total time in the sitting".
       _offCenterFrames = 0;
       _immediateFrames = 0;
       _lookAwaySince = null;
+      _insideSince = null;
       _lookAwayFlagged = false;
       // A return inside the tolerances *ends* a glance rather than pausing it,
       // which is where the rolling window learns how long that glance lasted. It
@@ -755,7 +852,7 @@ class MediaPipeProctoringService {
       // The strike consumes the glances it came from, and the latch stays clear
       // because this frame also says the head is back: the episode is over, so
       // the very next glance is a new one rather than a repeat.
-      if (_lookAwayBurst.closeEpisode(now)) {
+      if (_lookAwayBurst.closeEpisode(returnedAt)) {
         _lookAwayBurst.clear();
         _signalController.add(GazeSignal.lookingAway);
         return;
@@ -765,6 +862,11 @@ class MediaPipeProctoringService {
     }
 
     _offCenterFrames++;
+    // The head is past the tolerances again, so whatever return was being proved is
+    // not one: the episode carries on with the clock it already had, which is what
+    // lets a run that flickers over the line still accumulate
+    // [lookAwaySustain]'s worth of looking away.
+    _insideSince = null;
     // The near-sideways path's own evidence: consecutive frames past
     // [immediateYawDegrees], broken by any frame that is not (which is also every
     // frame inside the tolerances, so the reset above covers the common case).

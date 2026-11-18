@@ -45,6 +45,8 @@ commit each, so the tree has moved under some of the line numbers:
 | §1.4 — the web pose matrix, unverified arithmetic | `580fdd8` | `matrixPose()` now has a test that builds rotation matrices from known angles and reads them back, including a scaled one and a rolled one. It confirms the documented column-major layout and the `Ry·Rx·Rz` decomposition, and shows that a row-major flattening would turn the same 20° pitch into −20°. The sign convention stays unverifiable without a real face — and unused, since Dart judges absolute angles |
 | Found on the deployed build — the web flagged **no** look-away at all | working tree | `web_face_presence.dart` ended an episode on the **first** `centered` detection. The shipped detector ticks every 350 ms and answers `centered` for any tick in which MediaPipe could not measure a pose — which is exactly what a head held turned produces — so one flicker cancelled the whole 2 s hold and the browser's 15° rule was unreachable: the phone flagged the same head, the page never did. A return is now *confirmed* over `lookAwayWebReturnDwell` (700 ms, a shared constant) instead of on one tick; the hold is measured on accumulated off-screen time (`_awaySpan`), credited only across consecutive away detections; and the episode still closes at the **first** detection back inside the tolerances, so the dwell is never charged to the student. `returnDwell: Duration.zero` restores the old single-tick rule for a caller that sees every frame. Five tests in `web_face_presence_test.dart` ("a flickering detector") and the cross-platform glance parity test in `proctoring_thresholds_test.dart` pin it |
 
+| Found on the phone — the same miss, one sample wide | working tree | ML Kit's yaw/pitch wobble a degree either side of the tolerance, and `_handleResult` cleared `_lookAwaySince` on the **first** frame back inside it, so a head held at the line kept restarting the 2 s clock and the turn the browser reports was never completed on the phone. A return is now confirmed over `lookAwayNativeReturnDwell` (300 ms — two 150 ms inferences, the phone's own sample rate) on both axes, the mobile counterpart of `lookAwayWebReturnDwell`; the episode still closes at the **first** frame back inside the tolerances, so the dwell is not charged to the glance, and every reset (stream off, no face, two faces) clears the pending return (`_insideSince`) as well. Two tests in `mediapipe_proctoring_service_test.dart` ("one centred frame is a flicker", "a return held for the dwell does restart") pin it, and the threshold parity test pins the constant to the engine's constructor default |
+
 Everything else in §8 — liveness (P1-1), the frame-stall watchdog (P2-5), the devtools
 and split-screen notes (P2-7, P2-8), the queue cap, D3 and the three wording notes
 (P3-9 … P3-13) — is open and unchanged.
@@ -112,6 +114,8 @@ The numbers live in one file so the two engines cannot drift
 | `lookAwayYawDegrees` | 15.0 | `:53` |
 | `lookAwayPitchDegrees` | 15.0 | `:64` |
 | `lookAwaySustain` | 2 s | `:68` |
+| `lookAwayNativeReturnDwell` | 300 ms | `:222` |
+| `lookAwayWebReturnDwell` | 700 ms | `:187` |
 
 A frame is off screen when `abs(yaw) > 15 || abs(pitch) > 15` — *absolute* on both
 axes, so a turn left and a turn right are one rule and so is a tilt up and a tilt
@@ -120,9 +124,15 @@ the file: which direction a detector calls "chin down" differs between ML Kit an
 the web FaceLandmarker, so a signed rule would judge the same head differently on a
 phone and in a browser (`:58-61`).
 
-It is a **look-away** only once the head has stayed off screen for 2 s *without one
-frame back inside the tolerances* (`:19-22`). One episode is one strike: a latch
-holds the signal until a frame returns inside the tolerances (`:23-24`).
+It is a **look-away** only once the head has stayed off screen for 2 s *without a
+confirmed return* inside the tolerances (`:19-22`). A frame back inside the
+tolerances starts the return dwell — `lookAwayNativeReturnDwell` (300 ms, two
+inferences) on the phone, `lookAwayWebReturnDwell` (700 ms, two ticks) in a browser —
+and only a return that outlasts it ends the episode: a fitted pose wobbles across the
+line, and a single frame of that used to cancel the whole hold. One episode is one
+strike: a latch holds the signal until a return has been confirmed (`:23-24`), and
+the episode is closed at the first frame back inside, so the dwell is never charged
+as time away.
 
 Status: **works as designed**. Pinned by `test/proctoring_thresholds_test.dart`,
 `test/mediapipe_proctoring_service_test.dart`, `test/web_face_presence_test.dart`.
@@ -131,17 +141,17 @@ Status: **works as designed**. Pinned by `test/proctoring_thresholds_test.dart`,
 
 * Engine: `google_mlkit_face_detection`, `FaceDetector` built lazily with
   `performanceMode: accurate` and `minFaceSize: 0.15`
-  (`mobile/lib/core/services/mediapipe_proctoring_service.dart:172-181`). ACCURATE
-  is required because FAST mode leaves the Euler angles null (`:174-177`).
+  (`mobile/lib/core/services/mediapipe_proctoring_service.dart:280-290`). ACCURATE
+  is required because FAST mode leaves the Euler angles null (`:275-279`).
   (`MediaPipeProctoringService` is a historical name — the file says so at `:28-32`.)
-* Throttle: `inferenceInterval` 150 ms ≈ 6-7 FPS (`:39`), enforced at `:313`; the
+* Throttle: `inferenceInterval` 150 ms ≈ 6-7 FPS (`:40`), enforced at `:471`; the
   inference itself is fire-and-forget with error containment so one bad frame
-  cannot wedge the pipeline (`:318-329`).
-* Angles: `face.headEulerAngleY` is yaw, `headEulerAngleX` is pitch (`:349-357`).
+  cannot wedge the pipeline (`:476-487`).
+* Angles: `face.headEulerAngleY` is yaw, `headEulerAngleX` is pitch (`:507-515`).
   **When ML Kit cannot estimate the pose both are null, and the frame is then
-  treated as centred** (`:587-588`, `yawDegrees ?? 0`). That is the fail-safe
+  treated as centred** (`:799-800`, `yawDegrees ?? 0`). That is the fail-safe
   direction: no evidence is never evidence of misconduct.
-* Judgement: `_handleResult` (`:526-619`).
+* Judgement: `_handleResult` (`:719-910`).
 
 Status: the *logic* is works as designed; the *angles themselves* are
 **unverified on device** (§7, test 1). Nothing in the repository has measured what
@@ -151,33 +161,43 @@ ML Kit reports for a real 15° turn on a real phone.
 
 `_handleResult`, in order:
 
-1. **No face** (`:536-551`): the off-centre counters *and the look-away episode
-   clock* are cleared, then `_faceMissingFrames` is incremented and `noFace` is
-   emitted once at 3 frames (`missingFaceFrameThreshold = 3`, `:44`).
-2. **Two or more faces** (`:558-573`): off-centre state cleared, `multipleFaces`
+1. **No face** (`:742-760`): the off-centre counters *and the look-away episode
+   clock* are cleared (the pending return with them), then `_faceMissingFrames` is
+   incremented and `noFace` is emitted once at 3 frames
+   (`missingFaceFrameThreshold = 3`, `:49`).
+2. **Two or more faces** (`:767-785`): off-centre state cleared, `multipleFaces`
    emitted immediately, latched; the episode only ends after 30 s with a single
-   face in frame (`multipleFacesCooldown`, `:45`, applied at `:575-585`).
-3. **One face, inside the tolerances** (`:592-601`): all counters cleared, clock
-   nulled, latch re-armed, `centered` emitted.
-4. **One face, outside the tolerances** (`:604-618`): the first frame starts the
-   clock (`_lookAwaySince`), every later frame in the run leaves it alone, and the
-   signal fires once when *both* `now - since >= 2 s` and
-   `consecutiveFrameThreshold` (1) frames have been seen. The latch
-   (`_lookAwayFlagged`) makes it once per episode.
+   face in frame (`multipleFacesCooldown`, `:50`, applied at `:787-797`).
+3. **One face, inside the tolerances** (`:804-862`): the frame starts (or
+   continues) `_insideSince`. Once the return has held for `returnDwell`
+   (`lookAwayNativeReturnDwell`, 300 ms = two inferences) all counters are cleared,
+   the clock is nulled, the latch re-armed and `centered` emitted (`:836-844`). A
+   single frame back inside keeps the clock running: it is a sample, not a return.
+4. **One face, outside the tolerances** (`:864-890`): `_insideSince` is dropped (a
+   wobble either side of the line is not a return), the first frame starts the clock
+   (`_lookAwaySince`), every later frame in the run leaves it alone, and the signal
+   fires once when *both* `now - since >= 2 s` and `consecutiveFrameThreshold` (1)
+   frames have been seen. The latch (`_lookAwayFlagged`) makes it once per episode.
 
 Two properties worth stating explicitly, because they are what the numbers buy:
 
-* **A glance cannot accumulate.** Any frame back inside the tolerances resets the
-  clock (`:597-599`), so it is *consecutive* time, not total time (`:594-596`).
+* **A glance cannot accumulate.** A *confirmed* return to the tolerances (300 ms
+  inside them, `:804-862`) resets the clock, so it is *consecutive* time, not total
+  time (`:876-878`). Requiring the confirmation is what makes a run that hovers at
+  the line complete its hold instead of restarting it every other frame — ML Kit's
+  Euler angles wobble a degree or so, and one frame of that used to be enough to
+  cancel two seconds of turn. The episode is still closed at the **first** frame
+  back inside (`returnedAt = insideSince`), so the confirmation time is never
+  charged to the student.
 * **A held turn is one strike, not one per frame.** Without the latch, ~7
   inferences/second would have reached the server's 3-point threshold inside half
-  a second (`:611-617`; the same argument for two faces at `:212-214`).
+  a second (`:890-898`; the same argument for two faces at `:767-785`).
 
 **Behaviour when the face is lost mid-turn** — the requested case.
 Step 1 runs first, so a turn steep enough to lose the face entirely is **not** a
 `looking_away`: it is `no_face`, and the in-progress look-away episode is discarded
-(`:540-542`). If the head comes back still turned, the 2 s clock starts again from
-that frame (`:607`). Consequences:
+(`:742-751`). If the head comes back still turned, the 2 s clock starts again from
+that frame (`:878`). Consequences:
 
 * Status: **works as designed**, and it is an under-count on purpose. The student
   is still warned — absence is a counted strike of its own — and the two signals
@@ -1108,6 +1128,21 @@ hold had filled - so the phone flagged the head and the page did not.
 *Status:* `web_face_presence.dart` (`returnDwell`, `_onInsideTolerances`,
 `_settleReturn`), `lookAwayWebReturnDwell` (700 ms), pinned on the VM by the
 "a flickering detector" group in `web_face_presence_test.dart`.
+
+**8b. The same turn on the phone.**
+*Steps:* with the mobile engine on a real handset, hold the head ~20° turned for 3 s
+— at the tolerance and just past it, twice: once steady, once reading a sheet laid
+flat so the chin and gaze drift across the line. Watch the log rows.
+*Expected:* **one** `looking_away` in each case, about 2 s after the turn starts. No
+row in the second case is the regression this fix closed: ML Kit's Euler angles
+wobble across 15°, and one frame inside used to null `_lookAwaySince` before the
+hold filled. A return now has to hold for `lookAwayNativeReturnDwell` (300 ms) before
+it counts, and the episode is still measured to the first frame back inside, so the
+reported glance is the turn itself, not the turn plus the confirmation.
+*Status:* `mediapipe_proctoring_service.dart` (`returnDwell`, `_insideSince`),
+`lookAwayNativeReturnDwell` (300 ms), pinned on the VM by the "one centred frame is a
+flicker" and "a return held for the dwell does restart" tests in
+`mediapipe_proctoring_service_test.dart`.
 
 **9. The near-sideways start.**
 *Steps:* turn 40° for a single detection (under 150 ms on the phone, one 350 ms tick
