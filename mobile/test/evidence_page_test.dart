@@ -28,6 +28,7 @@ void main() {
     List<EvidenceExamOption> examOptions = papers,
     String? initialExamId,
     String? highlightSubmissionId,
+    NavigatorObserver? observer,
   }) => ProviderScope(
     overrides: [
       evidenceRepositoryProvider.overrideWithValue(repository),
@@ -36,6 +37,7 @@ void main() {
       ).overrideWith((ref) async => examOptions),
     ],
     child: MaterialApp(
+      navigatorObservers: <NavigatorObserver>[?observer],
       home: EvidencePage(
         audience: audience,
         initialExamId: initialExamId,
@@ -340,6 +342,147 @@ void main() {
       expect(find.byKey(const Key('evidence-attempt-att-2')), findsOneWidget);
     });
   });
+
+  group('nothing leaves the screen', () {
+    testWidgets(
+      'offers no download, share or save action, at rest or after a tap',
+      (tester) async {
+        final repository = _FakeEvidenceRepository(
+          attempts: <AttemptEvidence>[_attempt()],
+        );
+        final routes = _RouteSpy();
+
+        await tester.pumpWidget(
+          page(repository: repository, observer: routes),
+        );
+        await tester.pumpAndSettle();
+        // The page's own route is not a push this test is about.
+        routes.pushed.clear();
+
+        // Something is on screen for a "save" button to act on, so the scan
+        // below is not passing on an empty page.
+        expect(find.text('Ada Nwosu'), findsOneWidget);
+        expect(find.byKey(const Key('evidence-still-log-1')), findsOneWidget);
+        // ...and the scan can see what is there: the refresh action is a real
+        // tooltip and a real glyph, so an empty pass would still be an absence.
+        expect(find.byTooltip('Refresh'), findsOneWidget);
+        expect(find.byIcon(Icons.refresh), findsOneWidget);
+        _expectNoFileAction(tester, when: 'at rest');
+
+        // A reviewer taps the sitting, then the still inside it. Neither opens a
+        // dialog, a menu, a sheet or a route: the picture is shown to be looked
+        // at, not to be taken.
+        await tester.tapAt(
+          tester.getCenter(find.byKey(const Key('evidence-attempt-att-1'))),
+        );
+        await tester.pumpAndSettle();
+        _expectNoFileAction(tester, when: 'after tapping the sitting');
+
+        await tester.tapAt(
+          tester.getCenter(find.byKey(const Key('evidence-still-log-1'))),
+        );
+        await tester.pumpAndSettle();
+        _expectNoFileAction(tester, when: 'after tapping the still');
+
+        expect(
+          routes.pushed,
+          isEmpty,
+          reason: 'a tap on the evidence must not open anything',
+        );
+        expect(find.byType(EvidencePage), findsOneWidget);
+      },
+    );
+  });
+}
+
+/// Fails if the screen offers a way to take the evidence away.
+///
+/// The stills are for reading, here, once: the page signs each URL for the tile
+/// that shows it and puts it nowhere else - no download, no share sheet, no copy
+/// to the clipboard. This scans what a person could *press* (tooltips, glyphs,
+/// visible labels and semantics labels) rather than one known widget, so a
+/// "save" added later fails here whichever shape it takes, and it fails again
+/// after a tap if the tap opened a dialog or a sheet carrying one.
+void _expectNoFileAction(WidgetTester tester, {required String when}) {
+  final banned = RegExp(r'download|share|save', caseSensitive: false);
+
+  for (final tooltip in tester.widgetList<Tooltip>(find.byType(Tooltip))) {
+    final message = tooltip.message ?? '';
+    expect(
+      banned.hasMatch(message),
+      isFalse,
+      reason: 'a tooltip $when offers to take the still away: "$message"',
+    );
+  }
+
+  for (final text in tester.widgetList<Text>(find.byType(Text))) {
+    final data = text.data ?? '';
+    expect(
+      banned.hasMatch(data),
+      isFalse,
+      reason: 'a label $when offers to take the still away: "$data"',
+    );
+  }
+
+  // Unknown action types print themselves (`EvidenceItem.actionLabel`), so the
+  // scan above cannot be defeated by a label assembled at runtime - but a glyph
+  // is a label without words, and this catches those.
+  for (final icon in tester.widgetList<Icon>(find.byType(Icon))) {
+    expect(
+      _fileActionIcons.contains(icon.icon),
+      isFalse,
+      reason: 'an icon $when offers to take the still away: ${icon.icon}',
+    );
+  }
+
+  for (final semantics in tester.widgetList<Semantics>(
+    find.byType(Semantics),
+  )) {
+    final label = semantics.properties.label ?? '';
+    expect(
+      banned.hasMatch(label),
+      isFalse,
+      reason: 'a semantics label $when offers to take the still away: "$label"',
+    );
+  }
+
+  expect(find.byType(Dialog), findsNothing, reason: 'a dialog opened $when');
+  expect(find.byType(BottomSheet), findsNothing, reason: 'a sheet opened $when');
+}
+
+/// The glyphs a "take this file away" control is drawn with - the Material names
+/// for download, save and share, outlined variants included.
+///
+/// A list, not a set: `IconData` overrides `==`, so a const set would not compile.
+const List<IconData> _fileActionIcons = <IconData>[
+  Icons.download,
+  Icons.download_outlined,
+  Icons.download_for_offline,
+  Icons.download_for_offline_outlined,
+  Icons.cloud_download,
+  Icons.cloud_download_outlined,
+  Icons.get_app,
+  Icons.file_download,
+  Icons.file_download_outlined,
+  Icons.save,
+  Icons.save_alt,
+  Icons.save_as,
+  Icons.save_outlined,
+  Icons.share,
+  Icons.share_outlined,
+  Icons.ios_share,
+];
+
+/// Records what a tap pushed, so "it opened nothing" is asserted rather than
+/// assumed - a dialog, a menu and a bottom sheet are all routes.
+class _RouteSpy extends NavigatorObserver {
+  final List<Route<dynamic>> pushed = <Route<dynamic>>[];
+
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    pushed.add(route);
+    super.didPush(route, previousRoute);
+  }
 }
 
 /// One `exam_evidence()` row, as the RPC answers it.

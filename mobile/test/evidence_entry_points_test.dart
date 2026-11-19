@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:proctorguard/features/admin/presentation/pages/admin_dashboard_page.dart';
 import 'package:proctorguard/features/admin/presentation/providers/admin_providers.dart';
 import 'package:proctorguard/features/authoring/domain/entities/attempt_grading.dart';
@@ -6,11 +8,15 @@ import 'package:proctorguard/features/authoring/domain/repositories/question_aut
 import 'package:proctorguard/features/authoring/presentation/pages/attempt_review_page.dart';
 import 'package:proctorguard/features/authoring/presentation/pages/lecturer_console_page.dart';
 import 'package:proctorguard/features/authoring/presentation/providers/question_authoring_providers.dart';
+import 'package:proctorguard/features/dashboard/presentation/pages/supervisor_dashboard_page.dart';
+import 'package:proctorguard/features/dashboard/presentation/pages/supervisor_exam_picker_page.dart';
 import 'package:proctorguard/features/evidence/domain/entities/attempt_evidence.dart';
 import 'package:proctorguard/features/evidence/domain/repositories/evidence_repository.dart';
+import 'package:proctorguard/features/evidence/presentation/pages/evidence_page.dart';
 import 'package:proctorguard/features/evidence/presentation/providers/evidence_providers.dart';
 import 'package:proctorguard/features/exam/domain/entities/exam.dart';
 import 'package:proctorguard/features/exam/domain/entities/submission.dart';
+import 'package:proctorguard/features/exam/presentation/providers/exam_providers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -21,7 +27,8 @@ import 'package:flutter_test/flutter_test.dart';
 /// they wrote, the administrator on all of them - and the marking screen opens
 /// it on the attempt in front of the marker, paper preselected and card marked
 /// out. There is deliberately no supervisor door: a supervisor's incidents are
-/// the live monitor's job, and the screen is a record review, not a watch.
+/// the live monitor's job, and the screen is a record review, not a watch. The
+/// last test below pins that absence, on both of the console's screens.
 ///
 /// These assert the wiring, not the screen: that the action exists where a
 /// lecturer or administrator would look for it, that it pushes EvidencePage with
@@ -180,6 +187,105 @@ void main() {
     );
     expect((card.shape as RoundedRectangleBorder).side.width, 2);
   });
+
+  testWidgets('the supervisor console has no Evidence door', (tester) async {
+    wideViewport(tester);
+
+    final paper = Exam(
+      id: 'exam-1',
+      title: 'CS101 Midterm',
+      createdBy: 'lecturer-1',
+      durationMinutes: 60,
+      isPublished: true,
+    );
+
+    // The console's home: the picker every supervisor lands on, listing the
+    // papers an administrator assigned to them. This is the screen that could
+    // plausibly grow a "view evidence" action beside each row.
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          publishedExamsProvider.overrideWith((ref) async => <Exam>[paper]),
+        ],
+        child: const MaterialApp(
+          home: SupervisorExamPickerPage(supervisorName: 'Dr. Ada Nwosu'),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Supervisor Console'), findsOneWidget);
+    expect(find.text('CS101 Midterm'), findsOneWidget);
+    // The keys below are visible to the scan, so its silence is an absence and not
+    // a blind spot.
+    expect(find.byKey(const Key('supervisor-home')), findsOneWidget);
+    _expectNoEvidenceDoor(tester, where: 'the supervisor console');
+
+    // ...and the live monitor it opens, the console's other screen and the one
+    // that already shows the incidents themselves. The tree is emptied first so
+    // the second ProviderScope builds its own container rather than being handed
+    // a different number of overrides than the first.
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          examSubmissionsStreamProvider(
+            'exam-1',
+          ).overrideWith((ref) => Stream.value(<Map<String, dynamic>>[])),
+          liveViolationFeedProvider(
+            'exam-1',
+          ).overrideWith((ref) => Stream.value(<Map<String, dynamic>>[])),
+          accountNamesProvider.overrideWith(
+            (ref) => Stream.value(<String, String>{}),
+          ),
+        ],
+        child: const MaterialApp(
+          home: SupervisorDashboardPage(
+            examId: 'exam-1',
+            examTitle: 'CS101 Midterm',
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('CS101 Midterm'), findsOneWidget);
+    expect(find.byKey(const Key('monitor-home')), findsOneWidget);
+    _expectNoEvidenceDoor(tester, where: 'the supervisor live monitor');
+  });
+}
+
+/// Fails if [where] offers a way into the Evidence screen.
+///
+/// A door can be a button, a menu item, a list action or a plain text link, so
+/// this scans what a person could press rather than one named widget: any key
+/// naming evidence (the convention every door in this app uses - see
+/// `review-evidence` on the marking screen), the screen's icon, the screen
+/// itself, and the word as a label. `find.text` is exact on purpose: the
+/// monitor's confirmation prose says "the evidence stays on the record", and that
+/// sentence is not a door.
+void _expectNoEvidenceDoor(WidgetTester tester, {required String where}) {
+  final keys = tester.allWidgets
+      .map((widget) => widget.key?.toString() ?? '')
+      .where((key) => key.toLowerCase().contains('evidence'))
+      .toList(growable: false);
+  expect(keys, isEmpty, reason: '$where carries an Evidence key: $keys');
+
+  expect(
+    find.byIcon(Icons.photo_library_outlined),
+    findsNothing,
+    reason: '$where offers the Evidence icon',
+  );
+  expect(
+    find.byType(EvidencePage),
+    findsNothing,
+    reason: '$where opened EvidencePage',
+  );
+  expect(
+    find.text('Evidence'),
+    findsNothing,
+    reason: '$where labels an action "Evidence"',
+  );
 }
 
 /// A repository that answers one paper's rows and counts what it was asked.
