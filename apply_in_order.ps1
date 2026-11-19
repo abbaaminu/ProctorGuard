@@ -32,8 +32,8 @@ $files = @(
  '20261111090000_single_session',
  '20261111090100_lecturer_isolation',
  '20261112090000_lecturer_roster_read',
-  '20261113090000_predicate_execute_hardening',
-  '20261114090000_exam_evidence'
+ '20261113090000_predicate_execute_hardening',
+ '20261114090000_exam_evidence'
 )
 $i = 0
 foreach ($f in $files) {
