@@ -3979,6 +3979,83 @@ grant execute on function public.proctoring_coverage_for_exam(uuid) to authentic
 comment on function public.proctoring_coverage_for_exam(uuid) is
   'proctoring_coverage() for every attempt in one exam, risk-flagged rows first. Returns setof record, so callers must name the columns: select * from proctoring_coverage_for_exam(...) as c(submission_id uuid, student_id uuid, exam_id uuid, status text, started_at timestamptz, ended_at timestamptz, beats int, expected_beats int, coverage_ratio numeric, first_beat_at timestamptz, last_beat_at timestamptz, longest_gap_seconds int, silent_seconds int, camera_down_beats int, monitoring_down_beats int, risk_flag boolean, reason text).';
 
+-- The Evidence screen's one read: every incident on one paper, with its attempt,
+-- its student and the still's stored path, in a single call.
+--
+-- The stills are already scoped by the bucket's own read policy
+-- (`can_reach_exam()` on the paper the attempt was sat on, section 6), so what
+-- this adds is *enumeration*: a reviewer holding an attempt id only when a
+-- dashboard row happens to show it cannot ask "what happened in this sitting".
+--
+-- `security invoker`, deliberately: row security on `proctoring_logs`,
+-- `exam_submissions` and `profiles` still applies on top, so a mistake here
+-- cannot hand out a row a policy withholds. The scope term is
+-- `can_reach_exam(p_exam_id)` - the lecturer who wrote the paper, an
+-- administrator, or a supervisor assigned to it - and a null paper answers
+-- nothing rather than everything.
+--
+-- One row per incident, not per attempt: a reviewer counts as well as looks.
+-- `weight` / `counts_toward_dq` are `violation_weights` as it stands now, which
+-- is what the action counts as today; the arithmetic that ran when the attempt
+-- closed is not replayed. A missing weight row reads as `(1, true)`, the same
+-- default `register_violation()` uses. `student_name` is null when the caller may
+-- not read that profile, and the screen falls back to a short id rather than a
+-- blank.
+--
+-- It does not sign, cache or serve an image (the client mints one short-lived URL
+-- per tile through the bucket policy), it writes nothing, and it records no
+-- viewing audit - who looked at which photograph is a separate decision.
+-- `supabase/tests/exam_evidence_check.sql` proves the scope: the author reads
+-- their own paper and nothing of a colleague's, an administrator reads both (they
+-- wrote neither), a student and an anonymous caller read nothing, and a null
+-- paper returns nothing.
+create or replace function public.exam_evidence(p_exam_id uuid)
+returns table (
+  log_id             uuid,
+  submission_id      uuid,
+  student_id         uuid,
+  student_name       text,
+  action_type        text,
+  weight             int,
+  counts_toward_dq   boolean,
+  logged_at          timestamptz,
+  snapshot_url       text,
+  attempt_status     text,
+  attempt_started_at timestamptz
+)
+language sql
+security invoker
+stable
+set search_path = public, pg_temp
+as $$
+  select
+    l.id,
+    l.submission_id,
+    s.student_id,
+    p.full_name,
+    l.action_type,
+    coalesce(w.weight, 1),
+    coalesce(w.counts_toward_dq, true),
+    l.timestamp,
+    l.snapshot_url,
+    s.status,
+    s.started_at
+  from public.proctoring_logs l
+  join public.exam_submissions s on s.id = l.submission_id
+  left join public.profiles p on p.id = s.student_id
+  left join public.violation_weights w on w.action_type = l.action_type
+  where p_exam_id is not null
+    and public.can_reach_exam(p_exam_id)
+    and s.exam_id = p_exam_id
+  order by s.started_at desc, l.timestamp;
+$$;
+
+comment on function public.exam_evidence(uuid) is
+  'Every incident logged against one paper, for the Evidence screen: one row per proctoring_logs row with its attempt, student and still path. SECURITY INVOKER, scoped by can_reach_exam(p_exam_id) - the lecturer who wrote the paper, an administrator, or a supervisor assigned to it - so row security still applies on top. Returns nothing for a null paper, and nothing for a student. It signs nothing: the client mints a short-lived URL per still through the bucket policy.';
+
+revoke execute on function public.exam_evidence(uuid) from public, anon;
+grant execute on function public.exam_evidence(uuid) to authenticated, service_role;
+
 -- ---------------------------------------------------------------------
 -- The human decision behind the weighted threshold (RPC)
 -- ---------------------------------------------------------------------

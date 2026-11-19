@@ -24,7 +24,8 @@ $files = @(
  '20261110090200_supervisor_profile_read', '20261111090000_single_session',
  '20261111090100_lecturer_isolation',
  '20261112090000_lecturer_roster_read',
-  '20261113090000_predicate_execute_hardening'
+ '20261113090000_predicate_execute_hardening',
+ '20261114090000_exam_evidence'
 )
 
 # 1. Every file must exist before anything runs.

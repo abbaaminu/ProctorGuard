@@ -462,6 +462,7 @@ operator's decision. See
    supabase db query --linked -f supabase/migrations/20261111090100_lecturer_isolation.sql
    supabase db query --linked -f supabase/migrations/20261112090000_lecturer_roster_read.sql
    supabase db query --linked -f supabase/migrations/20261113090000_predicate_execute_hardening.sql
+   supabase db query --linked -f supabase/migrations/20261114090000_exam_evidence.sql
    ```
    `session_reset_logs.sql` is the one to check for on a project installed
    earlier: without it, an attempt reset from the staff console still works, but
@@ -1070,6 +1071,21 @@ Things worth knowing before you turn it on:
   `supabase/tests/predicate_execute_check.sql` proves both halves: `authenticated`
   still gets the same answers through the same policies, and `anon` gets `42501`. A
   fresh `schema.sql` already carries the nine revokes.
+- Apply `supabase/migrations/20261114090000_exam_evidence.sql` on every project
+  that already exists: it adds `public.exam_evidence(p_exam_id)`, the one read
+  behind the Evidence screen in the lecturer and administrator portals. The read
+  is `security invoker` and scoped by `can_reach_exam(p_exam_id)` - the lecturer
+  who wrote the paper, an administrator, or a supervisor assigned to it - so the
+  row policies on `proctoring_logs`, `exam_submissions` and `profiles` still apply
+  on top, and a null paper returns nothing. It signs no image: the still's stored
+  path comes back and the client mints a short-lived signed URL per tile, which
+  the bucket's own policy then answers. `EXECUTE` is left with `authenticated`
+  and `service_role` only, so an anonymous caller is refused. Without it the
+  Evidence screen reports the missing function and the rest of the console is
+  unaffected; `supabase/tests/exam_evidence_check.sql` proves the scope - the
+  author reads their own paper and nothing of a colleague's, an administrator
+  reads both, a student and an anonymous caller read nothing, and a null paper
+  returns nothing. A fresh `schema.sql` already carries it.
 - Configure the Flutter app with the Supabase project URL and a publishable
   client key. Never embed a service-role or secret key in the app.
 - Review the private `proctor-snapshots` bucket's retention policy in
