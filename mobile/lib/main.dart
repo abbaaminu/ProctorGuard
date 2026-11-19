@@ -23,6 +23,8 @@ import 'features/authoring/data/repositories/question_authoring_repository_impl.
 import 'features/authoring/presentation/providers/question_authoring_providers.dart';
 import 'features/dashboard/data/repositories/dashboard_repository_impl.dart';
 import 'features/dashboard/presentation/providers/dashboard_providers.dart';
+import 'features/evidence/data/repositories/evidence_repository_impl.dart';
+import 'features/evidence/presentation/providers/evidence_providers.dart';
 import 'features/exam/data/repositories/consent_repository_impl.dart';
 import 'features/exam/data/repositories/exam_repository_impl.dart';
 import 'features/proctoring/data/repositories/proctoring_repository_impl.dart';
@@ -134,6 +136,12 @@ Future<void> boot() async {
           if (client != null)
             questionAuthoringRepositoryProvider
                 .overrideWithValue(QuestionAuthoringRepositoryImpl(client)),
+          // The Evidence screen: one RPC for a paper's incidents (scoped
+          // server-side by can_reach_exam) and one Storage signature per still
+          // that is actually shown.
+          if (client != null)
+            evidenceRepositoryProvider
+                .overrideWithValue(EvidenceRepositoryImpl(client)),
           // The admin console's "Assign supervisors" screen: the table that decides
           // which papers a supervisor may supervise at all
           // (`can_supervise_exam()`), written only by an administrator.
