@@ -9,6 +9,8 @@ import '../../../dashboard/presentation/pages/analytics_page.dart';
 import '../../../dashboard/presentation/pages/supervisor_exam_picker_page.dart';
 import '../../../supervision/presentation/pages/assign_supervisors_page.dart';
 import '../../../auth/domain/entities/user_profile.dart';
+import '../../../evidence/domain/entities/attempt_evidence.dart';
+import '../../../evidence/presentation/pages/evidence_page.dart';
 import '../../domain/entities/admin_account_search.dart';
 import '../../domain/entities/managed_account.dart';
 import '../../domain/entities/profile_labels.dart';
@@ -454,6 +456,23 @@ class _AdminDashboardPageState extends ConsumerState<AdminDashboardPage> {
           // console's own button - the affordance stays put so it is in the same
           // place on every screen of this console.
           const HomeButton(key: Key('admin-home')),
+          // The stills behind the incidents, for every paper: an administrator
+          // wrote none of them and reads all of them, because
+          // `can_reach_exam()` answers through `can_supervise_exam()`'s admin
+          // arm. The student search on that page is the roster-sized answer to
+          // "which sitting was this?".
+          IconButton(
+            key: const Key('admin-evidence'),
+            tooltip: 'Evidence',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const EvidencePage(
+                  audience: EvidenceAudience.admin,
+                ),
+              ),
+            ),
+            icon: const Icon(Icons.photo_library_outlined),
+          ),
           // Who runs which paper: the table `can_supervise_exam()` reads, and the
           // reason a supervisor's console lists only their assigned sittings. Next to
           // the exam monitor because both are the exam-side tools of this console.

@@ -4,6 +4,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/widgets/home_button.dart';
 import '../../../../core/widgets/responsive_layout.dart';
+import '../../../evidence/domain/entities/attempt_evidence.dart';
+import '../../../evidence/presentation/pages/evidence_page.dart';
 import '../../domain/entities/attempt_grading.dart';
 import '../../domain/repositories/question_authoring_repository.dart';
 import '../providers/question_authoring_providers.dart';
@@ -180,6 +182,23 @@ class _AttemptReviewPageState extends ConsumerState<AttemptReviewPage> {
         title: const Text('Mark a paper'),
         actions: [
           const HomeButton(key: Key('review-home')),
+          // From the paper in front of the marker to the incidents on it: the
+          // sitting is preselected and its card is marked out, because "what did
+          // this attempt actually do?" is asked while marking.
+          IconButton(
+            key: const Key('review-evidence'),
+            tooltip: 'Evidence for this attempt',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => EvidencePage(
+                  audience: EvidenceAudience.lecturer,
+                  initialExamId: widget.examId,
+                  highlightSubmissionId: attempt.submission.id,
+                ),
+              ),
+            ),
+            icon: const Icon(Icons.photo_library_outlined),
+          ),
           IconButton(
             key: const Key('review-back'),
             tooltip: 'Back to the attempts',

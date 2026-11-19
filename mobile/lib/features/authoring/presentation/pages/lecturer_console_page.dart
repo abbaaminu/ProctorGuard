@@ -8,6 +8,8 @@ import '../../../../core/widgets/responsive_layout.dart';
 import '../../../auth/domain/entities/user_profile.dart';
 import '../../../dashboard/presentation/pages/supervisor_exam_picker_page.dart';
 import '../../../exam/domain/entities/exam.dart';
+import '../../../evidence/domain/entities/attempt_evidence.dart';
+import '../../../evidence/presentation/pages/evidence_page.dart';
 import '../../domain/entities/authored_exam.dart';
 import '../../domain/repositories/question_authoring_repository.dart';
 import '../providers/question_authoring_providers.dart';
@@ -264,6 +266,21 @@ class _LecturerConsolePageState extends ConsumerState<LecturerConsolePage> {
           // control in the same place on every screen this console opens (see
           // [HomeButton]).
           const HomeButton(key: Key('lecturer-home')),
+          // The stills behind the incidents: one paper at a time, read through
+          // `can_reach_exam()` on the server, so this opens on the papers this
+          // account wrote and nothing else.
+          IconButton(
+            key: const Key('lecturer-evidence'),
+            tooltip: 'Evidence',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const EvidencePage(
+                  audience: EvidenceAudience.lecturer,
+                ),
+              ),
+            ),
+            icon: const Icon(Icons.photo_library_outlined),
+          ),
           IconButton(
             key: const Key('lecturer-monitor'),
             tooltip: 'Open the proctoring console',
