@@ -15,7 +15,9 @@
 -- `supabase/schema.sql` (which now carries `public.exam_evidence()`) or
 -- `supabase/migrations/20261114090000_exam_evidence.sql` on an existing project -
 -- plus `20261111090100_lecturer_isolation.sql`, which installs the
--- `can_reach_exam()` guard this read is scoped by, and
+-- `can_reach_exam()` guard this read is scoped by,
+-- `20261109090000_supervisor_exam_assignments.sql`, whose table (i) assigns a
+-- supervisor through and whose predicate (j) turns down, and
 -- `20261113090000_predicate_execute_hardening.sql`, which is why an anonymous
 -- caller is refused rather than answered.
 --
@@ -47,7 +49,17 @@
 --   (h) the columns mean what `20261114090000_exam_evidence.sql` says: the still
 --       path is the stored value (not a signed URL), a row with no still stays
 --       null, and an action type with no `violation_weights` row is read as
---       (1, true) instead of appearing to cost nothing.
+--       (1, true) instead of appearing to cost nothing;
+--   (i) a **supervisor assigned** to the paper reads its evidence - the same rows
+--       the author reads, name, status and still path included. That is by design:
+--       `can_reach_exam()` includes `can_supervise_exam()`, the incident policy
+--       (`logs_select_own_or_supervisor`) already lets an assigned supervisor read
+--       these rows, and `Proctor snapshots read access` already lets them sign the
+--       still this read points at - so the screen shows the invigilator of a
+--       sitting exactly what their monitor could open; and
+--   (j) a supervisor **not assigned** to it reads nothing, with the paper's rows
+--       counted as `postgres` first and `can_reach_exam()` asked directly, so the
+--       zero is the predicate answering and not row security hiding the table.
 --
 -- HOW RLS IS APPLIED
 --   Identical to `supervisor_scope_check.sql` and its family: each block does
@@ -98,6 +110,8 @@ declare
   v_s1         uuid := gen_random_uuid();  -- flagged attempt on the writer's paper
   v_s2         uuid := gen_random_uuid();  -- attempt on the rival's paper
   v_s3         uuid := gen_random_uuid();  -- second, newer attempt on the writer's paper
+  v_sup        uuid := gen_random_uuid();  -- supervisor assigned to the writer's paper
+  v_sup_out    uuid := gen_random_uuid();  -- a supervisor account with no assignment
   v_paper_a    uuid := gen_random_uuid();
   v_paper_b    uuid := gen_random_uuid();
   v_att_a      uuid := gen_random_uuid();
@@ -111,13 +125,25 @@ begin
     (v_rival,  'lecturer', 'Rival Writer',    'evidence.rival@test.local'),
     (v_s1,     'student',  'Student One',     'evidence.s1@test.local'),
     (v_s2,     'student',  'Student Two',     'evidence.s2@test.local'),
-    (v_s3,     'student',  'Student Three',   'evidence.s3@test.local');
+    (v_s3,     'student',  'Student Three',   'evidence.s3@test.local'),
+    -- Two supervisors, because the difference (i) and (j) turn on is the
+    -- assignment row below, not the account: `guard_supervisor_assignment()`
+    -- refuses anything that is not a `supervisor`, so both are one.
+    (v_sup,     'supervisor', 'Duty Supervisor', 'evidence.supervisor@test.local'),
+    (v_sup_out, 'supervisor', 'Off Duty',        'evidence.supervisor.out@test.local');
 
   -- The administrator wrote neither paper: every row it reads below arrived
   -- through the admin arm of can_supervise_exam(), not through owns_exam().
   insert into public.exams (id, title, created_by, duration_minutes, is_published) values
     (v_paper_a, 'Paper under test', v_writer, 60, true),
     (v_paper_b, 'Colleague paper',  v_rival,  60, true);
+
+  -- One supervisor runs the paper under test. `assigned_by` is explicit because
+  -- this block runs as the owner, where `auth.uid()` (the column's default) is
+  -- null. The other supervisor is left unassigned on purpose: (j) asks about a
+  -- person who could ask and was never put in charge of anything.
+  insert into public.supervisor_exam_assignments (exam_id, supervisor_id, assigned_by)
+    values (v_paper_a, v_sup, v_admin);
 
   -- Two sittings of the writer's paper (the newer one first in the expected
   -- order) and one of the rival's.
@@ -165,6 +191,8 @@ begin
   perform set_config('test.rival',   v_rival::text,   false);
   perform set_config('test.s1',      v_s1::text,      false);
   perform set_config('test.s2',      v_s2::text,      false);
+  perform set_config('test.sup',     v_sup::text,     false);
+  perform set_config('test.sup_out', v_sup_out::text, false);
   perform set_config('test.paper_a', v_paper_a::text, false);
   perform set_config('test.paper_b', v_paper_b::text, false);
   perform set_config('test.att_a',   v_att_a::text,   false);
@@ -516,6 +544,112 @@ begin
   end if;
 
   raise notice 'PASS (h): a missing weight row is read as (1, true), the same default register_violation() applies';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- =====================================================================
+-- (i)  a supervisor assigned to the paper reads its evidence
+-- =====================================================================
+-- Not a widening of the screen's scope: `can_reach_exam()` includes
+-- `can_supervise_exam()`, `logs_select_own_or_supervisor` already lets an assigned
+-- supervisor read these incident rows, and `Proctor snapshots read access` already
+-- lets them sign the still this read points at. So the answer here is the answer
+-- the invigilator's own monitor could assemble - same rows, same fields - and (j)
+-- is the other half: no assignment, no reach.
+--
+-- (h) added a fourth incident to this paper, so the expected count is 4.
+set local role authenticated;
+select set_config('request.jwt.claims',
+  jsonb_build_object(
+    'sub',   current_setting('test.sup'),
+    'role',  'authenticated',
+    'email', 'evidence.supervisor@test.local'
+  )::text, true);
+do $$
+declare
+  v_rows   int;
+  v_name   text;
+  v_status text;
+  v_path   text;
+begin
+  if not public.can_reach_exam(current_setting('test.paper_a')::uuid) then
+    raise exception 'FAIL (i): can_reach_exam() answered false for the supervisor assigned to the paper';
+  end if;
+
+  select count(*) into v_rows
+  from public.exam_evidence(current_setting('test.paper_a')::uuid);
+  if v_rows <> 4 then
+    raise exception 'FAIL (i)ii: the assigned supervisor read % incident row(s) of their paper, expected 4', v_rows;
+  end if;
+
+  -- The same row the author reads - not a redacted one: the student's name, the
+  -- attempt's state and the stored still path all arrive, so the supervisor can
+  -- sign the picture the panel points at.
+  select e.student_name, e.attempt_status, e.snapshot_url
+    into v_name, v_status, v_path
+  from public.exam_evidence(current_setting('test.paper_a')::uuid) e
+  where e.action_type = 'looking_away'
+  limit 1;
+  if v_name <> 'Student One' then
+    raise exception 'FAIL (i)iii: the assigned supervisor did not get the student''s name (got %)', v_name;
+  end if;
+  if v_status <> 'flagged_for_review' then
+    raise exception 'FAIL (i)iv: the assigned supervisor did not get the attempt''s status (got %)', v_status;
+  end if;
+  if v_path <> current_setting('test.att_a') || '/looking_away_1.jpg' then
+    raise exception 'FAIL (i)v: the assigned supervisor did not get the still path (got %)', v_path;
+  end if;
+
+  raise notice 'PASS (i): a supervisor assigned to the paper reads its evidence, the same rows the author reads';
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+-- =====================================================================
+-- (j)  a supervisor with no assignment to that paper reads nothing
+-- =====================================================================
+-- The control the zero needs, asked as `postgres`: the paper really holds the four
+-- incidents (i) just counted, so an empty answer below is the predicate answering
+-- rather than row security hiding an empty table.
+do $$
+declare
+  v_rows int;
+begin
+  select count(*) into v_rows
+  from public.proctoring_logs l
+  join public.exam_submissions s on s.id = l.submission_id
+  where s.exam_id = current_setting('test.paper_a')::uuid;
+  if v_rows <> 4 then
+    raise exception 'FAIL (j): the paper holds % incident row(s), expected 4 - the zero below would prove nothing', v_rows;
+  end if;
+end $$;
+
+set local role authenticated;
+select set_config('request.jwt.claims',
+  jsonb_build_object(
+    'sub',   current_setting('test.sup_out'),
+    'role',  'authenticated',
+    'email', 'evidence.supervisor.out@test.local'
+  )::text, true);
+do $$
+declare
+  v_rows int;
+begin
+  -- The predicate itself first, because row security would hide these rows from
+  -- this account anyway (logs_select_own_or_supervisor asks the same question):
+  -- the sentence the screen is scoped by has to answer for itself.
+  if public.can_reach_exam(current_setting('test.paper_a')::uuid) then
+    raise exception 'FAIL (j)ii: can_reach_exam() answered true for a supervisor with no assignment to the paper';
+  end if;
+
+  select count(*) into v_rows
+  from public.exam_evidence(current_setting('test.paper_a')::uuid);
+  if v_rows <> 0 then
+    raise exception 'FAIL (j)iii: an unassigned supervisor read % incident row(s) of a paper they do not run', v_rows;
+  end if;
+
+  raise notice 'PASS (j): a supervisor with no assignment to the paper reads nothing - no row means no reach';
 end $$;
 reset role;
 select set_config('request.jwt.claims', '', true);
