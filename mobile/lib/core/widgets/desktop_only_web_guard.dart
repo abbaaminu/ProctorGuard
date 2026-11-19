@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
+import 'android_app_download_block.dart';
 import 'desktop_only_web_guard_user_agent_stub.dart'
     if (dart.library.js_interop) 'desktop_only_web_guard_user_agent_web.dart'
     as user_agent;
@@ -244,6 +245,10 @@ class _NoticePage extends StatelessWidget {
                 'tablet.',
                 style: theme.textTheme.bodyMedium,
               ),
+              // `isWeb: true` is a fact about this page, not an override: the
+              // notice only exists in a browser, and saying so keeps the block
+              // visible in a VM test of the notice.
+              const AndroidAppDownloadBlock(isWeb: true),
             ],
           ),
         ),

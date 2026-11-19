@@ -1143,7 +1143,11 @@ void main() {
       expect(exams.textAnswers, isEmpty);
       expect(proctoring.violations, isEmpty);
 
-      // And the refusal is not a dead end.
+      // And the refusal is not a dead end. The page scrolls and the download
+      // block sits above this button, so it starts below the fold on a short
+      // window: scroll to it the way a student would.
+      await tester.ensureVisible(find.text('Back to my exams'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('Back to my exams'));
       await tester.pumpAndSettle();
 

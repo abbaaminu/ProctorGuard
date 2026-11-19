@@ -210,6 +210,61 @@ void main() {
     });
   });
 
+  group('the Android app block', () {
+    const downloadKey = Key('android-app-download');
+    const blockKey = Key('android-app-download-block');
+
+    testWidgets('a browser sees it and tapping it does not sign in',
+        (tester) async {
+      var calls = 0;
+      await tester.pumpWidget(
+        wrap(
+          LoginPage(
+            isWeb: true,
+            signIn: ({required email, required password}) async {
+              calls++;
+              return const AuthOutcome.success();
+            },
+          ),
+        ),
+      );
+
+      // A phone that reaches the sign-in page has no other way to the app the
+      // exams are actually sat in.
+      expect(find.byKey(blockKey), findsOneWidget);
+
+      await tester.ensureVisible(find.byKey(downloadKey));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(downloadKey));
+      await tester.pump();
+
+      // The button sits inside the `Form`: it must not validate it, submit it,
+      // or navigate anywhere. (Because the button is visible, this tap also
+      // proves it is tappable rather than behind the form.)
+      expect(calls, 0, reason: 'the download is not a sign-in');
+      expect(find.byKey(submitKey), findsOneWidget);
+      expect(find.byKey(emailKey), findsOneWidget);
+      expect(find.textContaining('Enter your email'), findsNothing);
+    });
+
+    testWidgets('the Android app does not', (tester) async {
+      // The one shared surface: the login page is also the app's first screen,
+      // and there the block would be a button that downloads the app it is in.
+      await tester.pumpWidget(
+        wrap(
+          LoginPage(
+            isWeb: false,
+            signIn: ({required email, required password}) async =>
+                const AuthOutcome.success(),
+          ),
+        ),
+      );
+
+      expect(find.byKey(blockKey), findsNothing);
+      expect(find.text('Download the Android app'), findsNothing);
+    });
+  });
+
   group('role gate', () {
     testWidgets('a ready build with no session shows the sign-in form',
         (tester) async {

@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
+import '../../../../core/widgets/android_app_download_block.dart';
 import '../../../../core/widgets/desktop_only_web_guard.dart'
     show browserIdentity, isMobileBrowser;
 
@@ -117,6 +118,10 @@ class MobileExamOnlyPage extends StatelessWidget {
                     textAlign: TextAlign.center,
                     style: theme.textTheme.bodySmall,
                   ),
+                  // The hint says "install ProctorGuard on your Android phone";
+                  // this is where. The page only exists in a browser (see
+                  // `examRunsOnPlatform`), hence `isWeb: true`.
+                  const AndroidAppDownloadBlock(isWeb: true),
                   if (onLeave != null) ...[
                     const SizedBox(height: 24),
                     OutlinedButton.icon(
@@ -167,7 +172,20 @@ Future<void> showMobileExamOnlyDialog(
       key: const Key('exam-mobile-only-dialog'),
       icon: const Icon(Icons.phone_iphone),
       title: const Text(examMobileOnlyTitle),
-      content: Text('$examMobileOnlyBody\n\n$examMobileOnlyHint'),
+      // This is the refusal most students meet (the exam list calls it before an
+      // attempt exists), so it carries the download block as well as the page.
+      // Scrollable because a phone held sideways leaves roughly 260 px of dialog:
+      // three sentences and a button do not fit, and a clipped one-way-out is
+      // worse than a scrolling one.
+      scrollable: true,
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text('$examMobileOnlyBody\n\n$examMobileOnlyHint'),
+          const AndroidAppDownloadBlock(isWeb: true),
+        ],
+      ),
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(),

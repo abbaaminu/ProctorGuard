@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../../../core/services/crash_reporting.dart';
 import '../../../../core/services/supabase_service.dart';
+import '../../../../core/widgets/android_app_download_block.dart';
 import '../../../../core/widgets/responsive_layout.dart';
 
 /// Signature of the auth call the form performs.
@@ -26,10 +27,21 @@ typedef SignInRequest = Future<AuthOutcome> Function({
 /// to [SupabaseService.signedInChanges] and swaps this screen for the role home
 /// as soon as the session exists.
 class LoginPage extends StatefulWidget {
-  const LoginPage({super.key, this.signIn});
+  const LoginPage({super.key, this.signIn, this.isWeb});
 
   /// Overridable for tests; defaults to the Supabase-backed implementation.
   final SignInRequest? signIn;
+
+  /// Whether this page is being read in a browser, for the Android app block
+  /// at the foot of the form; null asks `kIsWeb`.
+  ///
+  /// A seam rather than a direct `kIsWeb` read for the same reason
+  /// `DesktopOnlyWebGuard` and `showMobileExamOnlyDialog` take one: a Dart VM
+  /// test cannot become a browser, and "does a phone browser see the download
+  /// block, and does tapping it submit the form?" is exactly the question worth
+  /// pinning. Production passes nothing and gets the real answer, which is what
+  /// keeps the block out of the Android app.
+  final bool? isWeb;
 
   @override
   State<LoginPage> createState() => _LoginPageState();
@@ -236,6 +248,9 @@ class _LoginPageState extends State<LoginPage> {
                         )
                       : const Text('Sign in'),
                 ),
+                // A browser's one way to the app. Inside the Android app this
+                // renders nothing (`isWeb`), because the app is the destination.
+                AndroidAppDownloadBlock(isWeb: widget.isWeb),
               ],
             ),
           ),

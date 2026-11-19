@@ -131,6 +131,12 @@ void main() {
       expect(examMobileOnlyHint, contains('Android'));
       expect(examMobileOnlyHint, contains('desktop browser'));
 
+      // The page scrolls (it is a `SingleChildScrollView`) and the download
+      // block sits above this button, so it starts below the fold on a short
+      // window - scroll to it the way a student would.
+      await tester.ensureVisible(find.text('Back to my exams'));
+      await tester.pumpAndSettle();
+
       await tester.tap(find.text('Back to my exams'));
       expect(left, 1);
     });
